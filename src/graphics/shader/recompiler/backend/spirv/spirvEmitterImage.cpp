@@ -256,12 +256,29 @@ uint32_t ResultVector(ValueEmitContext& ctx, uint32_t value,
 				                         high_bits, mask),
 				                  ConstantU32(ctx.state, 16u)));
 			} else {
-				const auto pair = ctx.state.builder.AllocateId();
-				ctx.state.builder.AddFunction(spv::OpCompositeConstruct,
-				                              TypeF32Vector(ctx.state, 2), pair, low, high);
-				packed[word] = ctx.state.builder.AllocateId();
-				ctx.state.builder.AddFunction(spv::OpExtInst, TypeU32(ctx.state), packed[word],
-				                              GlslStd450(ctx.state), GLSLstd450PackHalf2x16, pair);
+				// Pack each lane on its own and merge with integer ops. The bits are identical to
+				// PackHalf2x16(low, high), but AMD RDNA4 Windows drivers crash in
+				// vkCreateComputePipelines when PackHalf2x16 consumes two components of one
+				// sample result directly (NHL 27 PPSA34063, RX 9070 XT, driver 32.0.31041).
+				const auto pack_lane = [&](uint32_t lane) {
+					const auto pair = ctx.state.builder.AllocateId();
+					ctx.state.builder.AddFunction(spv::OpCompositeConstruct,
+					                              TypeF32Vector(ctx.state, 2), pair, lane,
+					                              ZeroF32(ctx.state));
+					const auto bits = ctx.state.builder.AllocateId();
+					ctx.state.builder.AddFunction(spv::OpExtInst, TypeU32(ctx.state), bits,
+					                              GlslStd450(ctx.state), GLSLstd450PackHalf2x16,
+					                              pair);
+					return bits;
+				};
+				packed[word] = pack_lane(low);
+				if (high_index < mem.component_count) {
+					packed[word] = Binary(ctx.state, spv::OpBitwiseOr, TypeU32(ctx.state),
+					                      packed[word],
+					                      Binary(ctx.state, spv::OpShiftLeftLogical,
+					                             TypeU32(ctx.state), pack_lane(high),
+					                             ConstantU32(ctx.state, 16u)));
+				}
 			}
 		}
 		const auto result = ctx.state.builder.AllocateId();
