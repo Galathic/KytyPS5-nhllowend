@@ -1626,11 +1626,11 @@ bool BuildTapeForPlan(const ResourcePlan& plan, bool with_clean,
 				op.args[3] = static_cast<uint32_t>(d);
 				break;
 			}
-			default:
+		default:
 				// Any lazy/short-circuiting op (Select, Phi, ReadFirstLane, LogicalAnd, LogicalOr)
 				// falls back to the dynamic walker.
 				reject_reason = 4;
-				return false;
+				return -1;
 		}
 
 		uint32_t op_idx = static_cast<uint32_t>(tape.ops.size());

@@ -828,6 +828,26 @@ void TestTapeSeparatesCleanAndOrdinaryReadDomains() {
         "Tape published a read result into the wrong evaluator memo domain");
 }
 
+void TestTapeUnsupportedRootFallsBack() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  ResourcePlan plan;
+  plan.stage = Libs::Graphics::ShaderType::Compute;
+  plan.srt_plan_complete = plan.resource_tracking_complete = true;
+  auto &selection = plan.value_storage.emplace_back(ValueOpcode::SelectU32);
+  selection.SetArg(0, Value(true));
+  selection.SetArg(1, Value(0x22222222u));
+  selection.SetArg(2, Value(0x33333333u));
+  // Keep a valid Tape op at index zero. Before the fix, the unsupported Select
+  // returned `false` (integer zero), silently aliasing this first slot's op.
+  plan.srt_reads.push_back({Value(0x11111111u), 0u});
+  plan.srt_reads.push_back({Value(&selection), 1u});
+
+  std::vector<uint32_t> flat;
+  Check(SrtWalker(plan, {}).RefreshFlatBuffer(flat) &&
+            flat == std::vector<uint32_t>{0x11111111u, 0x22222222u},
+        "unsupported Tape root did not fall back to the recursive evaluator");
+}
+
 void TestExactReciprocalDescriptorArithmetic() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   Program program;
@@ -1104,6 +1124,7 @@ void DbgExit(int) { std::abort(); }
 } // namespace Common
 
 int main() {
+  TestTapeUnsupportedRootFallsBack();
   TestTapeSeparatesCleanAndOrdinaryReadDomains();
   TestTapeVerifyReplaysReaderDomains();
   TestTapeVerifyMismatchFallbackAndUnmatchedReplay();
