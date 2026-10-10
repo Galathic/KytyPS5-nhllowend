@@ -78,7 +78,7 @@ Gameplay also has heavy GPU passes. The goal for menus is a stable 30 fps.
 Build `kyty_emulator` (see the upstream build instructions below), then run:
 
 ```powershell
-kyty_emulator.exe --game "<path>\PPSA34063-app0\eboot.bin" --screen-width 1920 --screen-height 1080 --redzone
+kyty_emulator.exe --game "<path>\eboot.bin" --screen-width 1920 --screen-height 1080 --redzone
 ```
 
 Recommended environment variables (all are needed for current performance and stability):
