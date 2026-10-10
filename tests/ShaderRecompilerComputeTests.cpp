@@ -41037,6 +41037,7 @@ void CheckNativeDrawShaderOffsets() {
 }
 
 #include "BdaPreparationTests.inc"
+#include "WaveReductionTests.inc"
 
 void CheckNativeIndexedPreparation(RenderContext& renderer) {
   GraphicsInitJmpTables();
@@ -41785,6 +41786,11 @@ int main(int argc, char **argv) {
   const bool renderdoc_smoke =
       argc == 2 && std::strcmp(argv[1], "--renderdoc-only") == 0;
   EnsureConfigInitialized(renderdoc_smoke);
+  if (argc == 2 && std::strcmp(argv[1], "--wave-reduction-only") == 0) {
+    VulkanHarness vulkan;
+    CheckWaveReduction(vulkan);
+    return 0;
+  }
   if (renderdoc_smoke) {
 #if defined(_WIN32)
     // Exercise production loading before any Vulkan call, with either an
