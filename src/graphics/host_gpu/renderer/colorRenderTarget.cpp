@@ -9,6 +9,7 @@
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -44,6 +45,8 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
                                               uint32_t         render_target_slice_offset,
                                               uint32_t rt_slot, bool ignore_target_mask,
                                               bool exact_format) {
+	FrameBreakdown::Timer prep_timer(FrameBreakdown::g_counters.prep_color_target_ns,
+	                                 FrameBreakdown::DetailEnabled());
 	KYTY_PROFILER_FUNCTION();
 	const auto& hw = buffer.GetRegisters();
 

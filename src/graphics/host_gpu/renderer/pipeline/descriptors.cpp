@@ -19,6 +19,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -906,6 +907,8 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 }
 
 void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
+	FrameBreakdown::Timer prep_timer(FrameBreakdown::g_counters.prep_find_buffers_ns,
+	                                 FrameBreakdown::DetailEnabled());
 	KYTY_PROFILER_FUNCTION();
 	auto& cache = m_context.GetBufferCache();
 	for (auto* stage: stages) {
@@ -965,6 +968,8 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 }
 
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
+	FrameBreakdown::Timer prep_timer(FrameBreakdown::g_counters.prep_rebind_buffers_ns,
+	                                 FrameBreakdown::DetailEnabled());
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
 	const auto& program   = *prepared.runtime->program;
@@ -1003,6 +1008,8 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 }
 
 void RenderExecutor::RebindImages(PreparedBindings& prepared) {
+	FrameBreakdown::Timer prep_timer(FrameBreakdown::g_counters.prep_rebind_images_ns,
+	                                 FrameBreakdown::DetailEnabled());
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
 	const auto& program  = *prepared.runtime->program;
@@ -1087,6 +1094,12 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     vk::PipelineBindPoint              pipeline_bind_point,
                                     const PipelineCache::Pipeline&     pipeline,
                                     std::span<PreparedBindings* const> prepared_bindings) {
+	FrameBreakdown::Timer prep_graphics_timer(
+	    FrameBreakdown::g_counters.prep_commit_graphics_ns,
+	    pipeline_bind_point == vk::PipelineBindPoint::eGraphics && FrameBreakdown::DetailEnabled());
+	FrameBreakdown::Timer prep_compute_timer(
+	    FrameBreakdown::g_counters.prep_commit_compute_ns,
+	    pipeline_bind_point == vk::PipelineBindPoint::eCompute && FrameBreakdown::DetailEnabled());
 	KYTY_PROFILER_FUNCTION();
 	auto   vk_buffer        = buffer.Handle();
 	size_t descriptor_count = 0;

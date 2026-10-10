@@ -26,6 +26,15 @@ inline bool Enabled() {
 	return enabled;
 }
 
+// Fine-grained CPU preparation timing is intentionally opt-in; it can perturb hot paths.
+inline bool DetailEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PERF_DRAW_DETAIL");
+		return Enabled() && value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
 struct Counters {
 	std::atomic<uint64_t> flip_ns {0};          // presented flip -> presented flip
 	std::atomic<uint64_t> flip_intervals {0};   // number of those intervals (= frames)
@@ -41,6 +50,16 @@ struct Counters {
 	std::atomic<uint64_t> draw_prep_ns {0};     // PrepareDrawRenderState entry -> vkCmd draw
 	std::atomic<uint64_t> draws {0};            // draw calls emitted (indirect = 1 call)
 	std::atomic<uint64_t> dispatches {0};       // guest compute dispatches emitted
+	// These are inclusive aggregates: graphics program lookup and color-target resolution
+	// contain shared graphics work, while descriptor preparation also includes compute paths.
+	std::atomic<uint64_t> prep_graphics_programs_ns {0};
+	std::atomic<uint64_t> prep_compute_program_ns {0};
+	std::atomic<uint64_t> prep_color_target_ns {0};
+	std::atomic<uint64_t> prep_find_buffers_ns {0};
+	std::atomic<uint64_t> prep_rebind_images_ns {0};
+	std::atomic<uint64_t> prep_rebind_buffers_ns {0};
+	std::atomic<uint64_t> prep_commit_graphics_ns {0};
+	std::atomic<uint64_t> prep_commit_compute_ns {0};
 };
 inline Counters g_counters;
 
@@ -140,6 +159,14 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 	const uint64_t draw_prep_ns  = Take(c.draw_prep_ns);
 	const uint64_t draws         = Take(c.draws);
 	const uint64_t dispatches    = Take(c.dispatches);
+	const uint64_t prep_graphics_programs_ns = Take(c.prep_graphics_programs_ns);
+	const uint64_t prep_compute_program_ns = Take(c.prep_compute_program_ns);
+	const uint64_t prep_color_target_ns = Take(c.prep_color_target_ns);
+	const uint64_t prep_find_buffers_ns = Take(c.prep_find_buffers_ns);
+	const uint64_t prep_rebind_images_ns = Take(c.prep_rebind_images_ns);
+	const uint64_t prep_rebind_buffers_ns = Take(c.prep_rebind_buffers_ns);
+	const uint64_t prep_commit_graphics_ns = Take(c.prep_commit_graphics_ns);
+	const uint64_t prep_commit_compute_ns = Take(c.prep_commit_compute_ns);
 	g_window_start = now;
 	if (frames == 0) {
 		return;
@@ -158,6 +185,16 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 	            per(fault_n), ms(compile_ns), per(compile_n), ms(draw_prep_ns), draw_us,
 	            per(draws), per(dispatches));
 	std::fflush(stdout);
+	if (DetailEnabled()) {
+		std::printf("NHL27PREP frames=%" PRIu64
+		            " graphics_programs=%.3fms compute_program=%.3fms color_target=%.3fms"
+		            " find_buffers=%.3fms rebind_images=%.3fms rebind_buffers=%.3fms"
+		            " commit_graphics=%.3fms commit_compute=%.3fms\n",
+		            frames, ms(prep_graphics_programs_ns), ms(prep_compute_program_ns),
+		            ms(prep_color_target_ns), ms(prep_find_buffers_ns), ms(prep_rebind_images_ns),
+		            ms(prep_rebind_buffers_ns), ms(prep_commit_graphics_ns), ms(prep_commit_compute_ns));
+		std::fflush(stdout);
+	}
 }
 
 // Called on every presented flip (guest PM4 EOP flip and CPU flip both end here).
