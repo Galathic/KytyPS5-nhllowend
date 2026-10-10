@@ -146,6 +146,7 @@ public:
 	                             const ShaderProgram&          compute_program);
 
 private:
+	friend struct PipelineCacheTestAccess;
 	struct ProgramCache;
 
 	struct GraphicsPipelineKey {
