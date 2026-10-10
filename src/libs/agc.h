@@ -284,6 +284,8 @@ uint32_t* KYTY_SYSV_ABI AgcDcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8
                                          uint64_t mask, uint32_t poll_cycles);
 uint64_t KYTY_SYSV_ABI  AgcDcbWaitOnAddressGetSize(uint32_t size);
 bool                    AgcIsInternalDataPacket(uint32_t cmd_id, const uint32_t* payload);
+bool                    AgcInternalDataPacketNeedsTag(uint32_t cmd_id, uint32_t offset);
+bool                    AgcIsInternalDataPacket(uint32_t cmd_id, uint32_t offset, uint32_t tag);
 uint32_t* KYTY_SYSV_ABI AgcDcbSetMarker(CommandBuffer* buf, const char* str, uint32_t color);
 uint32_t* KYTY_SYSV_ABI AgcDcbPushMarker(CommandBuffer* buf, const char* str, uint32_t color);
 uint32_t* KYTY_SYSV_ABI AgcDcbPopMarker(CommandBuffer* buf);

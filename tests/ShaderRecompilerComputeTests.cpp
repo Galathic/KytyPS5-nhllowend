@@ -4061,6 +4061,80 @@ public:
           processor.Process(changed_uc_execution, uc_packet) == Pm4ProcessResult::Complete &&
           processor.GetUcfg().GetObjectId() == 0,
           "UC backing read ignored overlapping GPU writes");
+
+      // UC packet metadata can be clean while unrelated GPU-owned data protects
+      // the same guest page. Only exact-clean metadata may bypass that page fault.
+      constexpr uint64_t clean_nop_address = base + 0x300;
+      constexpr uint64_t clean_agc_address = base + 0x320;
+      constexpr uint64_t dirty_agc_address = base + 0x340;
+      constexpr uint64_t protected_neighbor = base + 0x500;
+      const std::array<uint32_t, 3> clean_nop_packet{
+          KYTY_PM4(3, Pm4::IT_SET_UCONFIG_REG, Pm4::R_ZERO), Pm4::UC_NOP, 0u};
+      const std::array<uint32_t, 4> clean_agc_packet{
+          KYTY_PM4(4, Pm4::IT_SET_UCONFIG_REG, 1u), 0x342u, 0xc8010000u, 0u};
+      const std::array<uint32_t, 4> dirty_agc_packet{
+          KYTY_PM4(4, Pm4::IT_SET_UCONFIG_REG, 1u), 0x342u, 0u, 0u};
+      const auto initialize_metadata_packet = [&](uint64_t address,
+                                                   std::span<const uint32_t> words) {
+        for (size_t i = 0; i < words.size(); ++i) {
+          if (!cache.TryWriteLabel(address + i * sizeof(uint32_t), &words[i], sizeof(uint32_t)))
+            return false;
+        }
+        return true;
+      };
+      Require(name, "metadata packet initialization",
+              initialize_metadata_packet(clean_nop_address, clean_nop_packet) &&
+                  initialize_metadata_packet(clean_agc_address, clean_agc_packet) &&
+                  initialize_metadata_packet(dirty_agc_address, dirty_agc_packet),
+              "could not initialize UC metadata packets");
+      auto protected_word = cache.ObtainBuffer(protected_neighbor, sizeof(uint32_t), true, false);
+      protected_word.first->Fill(protected_word.second, sizeof(uint32_t), pattern);
+      const char *metadata_setting = std::getenv("KYTY_PM4_CLEAN_METADATA");
+      const char *header_setting = std::getenv("KYTY_PM4_CLEAN_BACKING");
+      uint32_t probe = 0;
+      const bool clean_peeks_requested =
+          metadata_setting != nullptr && metadata_setting[0] == '1' &&
+          header_setting != nullptr && header_setting[0] == '1';
+      if (clean_peeks_requested) {
+        Require(name, "clean metadata probe",
+                processor.TryPeekGuest(reinterpret_cast<const void *>(clean_nop_address + sizeof(uint32_t)),
+                                       &probe, sizeof(probe)),
+                "requested metadata regression cannot use exact-clean reads");
+        const auto run_clean_metadata_packet = [&](uint64_t address, uint32_t words,
+                                                   const char *stage) {
+          const auto tick_before = scheduler.CurrentTick();
+          Pm4Execution metadata_execution;
+          const auto packet = std::span<const uint32_t>(
+              reinterpret_cast<const uint32_t *>(address), words);
+          Require(name, stage,
+                  processor.Process(metadata_execution, packet) == Pm4ProcessResult::Complete &&
+                      scheduler.CurrentTick() == tick_before &&
+                      cache.HasGpuDirtyBytes(protected_neighbor, sizeof(uint32_t)),
+                  "clean UC metadata waited for or downloaded unrelated GPU-owned page data");
+        };
+        run_clean_metadata_packet(clean_nop_address, clean_nop_packet.size(),
+                                  "clean UC NOP metadata");
+        run_clean_metadata_packet(clean_agc_address, clean_agc_packet.size(),
+                                  "clean AGC tag metadata");
+
+        auto dirty_tag = cache.ObtainBuffer(dirty_agc_address + 2 * sizeof(uint32_t),
+                                            sizeof(uint32_t), true, false);
+        dirty_tag.first->Fill(dirty_tag.second, sizeof(uint32_t), 0xc8010000u);
+        const auto tick_before_fallback = scheduler.CurrentTick();
+        Pm4Execution dirty_tag_execution;
+        const auto packet = std::span<const uint32_t>(
+            reinterpret_cast<const uint32_t *>(dirty_agc_address), dirty_agc_packet.size());
+        Require(name, "dirty AGC tag fallback",
+                processor.Process(dirty_tag_execution, packet) == Pm4ProcessResult::Complete &&
+                    scheduler.CurrentTick() > tick_before_fallback &&
+                    !cache.HasGpuDirtyBytes(dirty_agc_address + 2 * sizeof(uint32_t),
+                                            sizeof(uint32_t)),
+                "dirty AGC tag did not use the synchronized volatile fallback");
+        std::printf("[host]    %-32s ok\n", "Pm4CleanUconfigMetadata");
+      } else {
+        std::printf("[host]    %-32s skipped (clean backing disabled)\n",
+                    "Pm4CleanUconfigMetadata");
+      }
       // Updating the register pair on the GPU must still synchronize before decoding.
       auto changed = cache.ObtainBuffer(address + 4, 4, true, false);
       changed.first->Fill(changed.second, 4, 0);

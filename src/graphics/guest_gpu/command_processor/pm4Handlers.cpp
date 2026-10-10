@@ -20,6 +20,7 @@
 #include <atomic>
 #include <bit>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -2494,11 +2495,30 @@ KYTY_CP_OP_PARSER(CpOpSetShaderReg) {
 KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
 	KYTY_PROFILER_FUNCTION();
 
-	if (Gen5::AgcIsInternalDataPacket(cmd_id, buffer)) {
+	static const bool clean_backing = [] {
+		const char* setting = std::getenv("KYTY_PM4_CLEAN_METADATA");
+		return setting != nullptr && setting[0] == '1';
+	}();
+	uint32_t raw_cmd_offset = 0;
+	const bool clean_offset = clean_backing && cp.TryPeekGuest(buffer, &raw_cmd_offset,
+	                                                         sizeof(raw_cmd_offset));
+	if (!clean_offset) {
+		raw_cmd_offset = buffer[0];
+	}
+	if (clean_offset) {
+		if (Gen5::AgcInternalDataPacketNeedsTag(cmd_id, raw_cmd_offset)) {
+			uint32_t tag = 0;
+			if (!clean_backing || !cp.TryPeekGuest(buffer + 1, &tag, sizeof(tag))) {
+				tag = buffer[1];
+			}
+			if (Gen5::AgcIsInternalDataPacket(cmd_id, raw_cmd_offset, tag)) {
+				return KYTY_PM4_LEN(cmd_id) - 1u;
+			}
+		}
+	} else if (Gen5::AgcIsInternalDataPacket(cmd_id, buffer)) {
 		return KYTY_PM4_LEN(cmd_id) - 1u;
 	}
 
-	auto raw_cmd_offset = buffer[0];
 	auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
 
 	if (((cmd_id >> 8u) & 0xffu) == Pm4::IT_SET_UCONFIG_REG_INDEX) {

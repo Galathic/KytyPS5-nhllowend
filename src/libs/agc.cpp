@@ -3997,22 +3997,33 @@ static uint32_t wait_reg_mem64_control(uint8_t compare_function, uint8_t op, uin
 	       ((static_cast<uint32_t>(cache_policy) & 0x3u) << 25u);
 }
 
-bool AgcIsInternalDataPacket(uint32_t cmd_id, const uint32_t* payload) {
-	if (payload == nullptr || ((cmd_id >> 8u) & 0xffu) != Pm4::IT_SET_UCONFIG_REG ||
-	    KYTY_PM4_R(cmd_id) != 1u || payload[0] != AGC_INTERNAL_DATA_REGISTER) {
+bool AgcInternalDataPacketNeedsTag(uint32_t cmd_id, uint32_t offset) {
+	return ((cmd_id >> 8u) & 0xffu) == Pm4::IT_SET_UCONFIG_REG && KYTY_PM4_R(cmd_id) == 1u &&
+	       offset == AGC_INTERNAL_DATA_REGISTER &&
+	       (KYTY_PM4_LEN(cmd_id) == AGC_WAIT_USER_DATA_BEGIN_DW ||
+	        KYTY_PM4_LEN(cmd_id) == AGC_INTERNAL_DATA_PACKET_SIZE_DW);
+}
+
+bool AgcIsInternalDataPacket(uint32_t cmd_id, uint32_t offset, uint32_t tag) {
+	if (!AgcInternalDataPacketNeedsTag(cmd_id, offset)) {
 		return false;
 	}
-
-	const auto size_dw = KYTY_PM4_LEN(cmd_id);
-	if (size_dw == AGC_WAIT_USER_DATA_BEGIN_DW) {
-		const auto tag = payload[1] & 0xffff0000u;
+	if (KYTY_PM4_LEN(cmd_id) == AGC_WAIT_USER_DATA_BEGIN_DW) {
+		tag &= 0xffff0000u;
 		return tag == AGC_WAIT_USER_DATA_BEGIN_32_TAG || tag == AGC_WAIT_USER_DATA_BEGIN_64_TAG;
 	}
+	return tag == AGC_WAIT_USER_DATA_END_TAG || tag == AGC_DRAW_INDIRECT_MULTI_BEGIN_TAG ||
+	       tag == AGC_DRAW_INDIRECT_MULTI_END_TAG;
+}
 
-	return size_dw == AGC_INTERNAL_DATA_PACKET_SIZE_DW &&
-	       (payload[1] == AGC_WAIT_USER_DATA_END_TAG ||
-	        payload[1] == AGC_DRAW_INDIRECT_MULTI_BEGIN_TAG ||
-	        payload[1] == AGC_DRAW_INDIRECT_MULTI_END_TAG);
+bool AgcIsInternalDataPacket(uint32_t cmd_id, const uint32_t* payload) {
+	if (payload == nullptr || ((cmd_id >> 8u) & 0xffu) != Pm4::IT_SET_UCONFIG_REG ||
+	    KYTY_PM4_R(cmd_id) != 1u) {
+		return false;
+	}
+	const auto offset = payload[0];
+	return AgcInternalDataPacketNeedsTag(cmd_id, offset) &&
+	       AgcIsInternalDataPacket(cmd_id, offset, payload[1]);
 }
 
 uint32_t* KYTY_SYSV_ABI AgcDcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8_t compare_function,
