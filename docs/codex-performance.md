@@ -106,8 +106,10 @@ Hardware: AMD Ryzen 7 5800X3D, Radeon RX 9070 XT, Windows. Isolated test window:
   times were 16,661.25 us scalar versus 9,525.75 us batched in that run. Eligible
   sets and machine load differ, so totals must not be compared with the earlier
   unconditional-only run. Additional tests confirm reached suffixes and gaps do
-  not fetch unreachable slots. GPU verification is pending while another
-  emulator is active; neither option is enabled by default.
+  not fetch unreachable slots. Focused GPU checks (`--flat-d16-only`,
+  `--lds-limit-only`, `--indirect-image-only`, `--pipeline-warmup-only`) pass
+  with batching enabled and a single-state memo. Live FPS verification remains
+  pending; batching is not enabled by default.
 - Renderer `--lds-limit-only` passes with the single-state resource memo enabled.
 - `--wave-reduction-only`: SPIR-V validation and GPU results pass for all cases.
 - `--flat-d16-only`: all targeted D16/subword GPU cases pass.
