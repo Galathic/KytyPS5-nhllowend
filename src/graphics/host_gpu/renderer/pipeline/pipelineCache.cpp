@@ -285,6 +285,9 @@ struct PipelineCache::ProgramCache {
 		size_t                                     last_permutation = std::numeric_limits<size_t>::max();
 		bool                                       native_plan_checked = false;
 		bool                                       native_plan_allowed = false;
+		uint64_t                                   refresh_ns = 0;
+		uint64_t                                   refresh_calls = 0;
+		uint64_t                                   refresh_hits = 0;
 	};
 
 	struct ProgramKeyHash {
@@ -392,8 +395,16 @@ struct PipelineCache::ProgramCache {
         }
         const bool memo_enabled = reuse_enabled && replaying == nullptr;
         const auto refresh = [&](SourceEntry& source, bool& reused) {
+            const auto begin = resource_timing ? std::chrono::steady_clock::now()
+                                               : std::chrono::steady_clock::time_point {};
             const bool ok = source.resource_memo.Refresh(source.resource_plan, runtime,
                 source.resources, source.specialization, memo_enabled, reused);
+            if (resource_timing) {
+                source.refresh_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - begin).count();
+                ++source.refresh_calls;
+                source.refresh_hits += reused;
+            }
             if (!ok && replaying == nullptr) EXIT("Resource materialization failed\n");
             return ok;
         };
@@ -565,14 +576,14 @@ struct PipelineCache::ProgramCache {
 			const char* value = std::getenv("KYTY_PERF_STATS");
 			return value != nullptr && value[0] == '1';
 		}();
-		if (!stats || (lookups & 16383u) != 0) return;
+		if ((!stats && !resource_timing) || (lookups & 16383u) != 0) return;
 		const auto now = std::chrono::steady_clock::now();
 		if (now - last_stats < std::chrono::seconds(5)) return;
-		std::printf("NHL27PROGRAM: cache=%d lookups=%llu source_hits=%llu resource_hits=%llu materialize=%llu perm_hits=%llu\n",
+		if (stats) std::printf("NHL27PROGRAM: cache=%d lookups=%llu source_hits=%llu resource_hits=%llu materialize=%llu perm_hits=%llu\n",
 		    enabled, static_cast<unsigned long long>(lookups), static_cast<unsigned long long>(source_hits),
 		    static_cast<unsigned long long>(resource_hits), static_cast<unsigned long long>(materializations),
 		    static_cast<unsigned long long>(permutation_hits));
-		if (enabled) {
+		if (stats && enabled) {
 			std::printf("NHL27PROGRAMMISS: cold=%llu base=%llu regs=%llu groups=%llu read_failed=%llu memory_changed=%llu\n",
 			    static_cast<unsigned long long>(resource_misses[static_cast<size_t>(ResourceMemo::Miss::Cold)]),
 			    static_cast<unsigned long long>(resource_misses[static_cast<size_t>(ResourceMemo::Miss::ShaderBase)]),
@@ -581,11 +592,39 @@ struct PipelineCache::ProgramCache {
 			    static_cast<unsigned long long>(resource_misses[static_cast<size_t>(ResourceMemo::Miss::ReadFailed)]),
 			    static_cast<unsigned long long>(resource_misses[static_cast<size_t>(ResourceMemo::Miss::MemoryChanged)]));
 		}
+		if (resource_timing) {
+			std::vector<std::pair<const ProgramKey*, SourceEntry*>> measured;
+			uint64_t total_ns = 0;
+			for (auto& [key, source]: programs) {
+				total_ns += source.refresh_ns;
+				if (source.refresh_calls != 0) measured.emplace_back(&key, &source);
+			}
+			std::ranges::sort(measured, {}, [](const auto& item) {
+				return UINT64_MAX - item.second->refresh_ns;
+			});
+			std::printf("NHL27RESOURCE: window=%.2f s refresh=%.2f ms sources=%zu\n",
+			    std::chrono::duration<double>(now - last_stats).count(), total_ns / 1e6, measured.size());
+			for (size_t i = 0; i < std::min<size_t>(15, measured.size()); ++i) {
+				const auto& [key, source] = measured[i];
+				const auto& plan = source->resource_plan;
+				std::printf("NHL27RESOURCE: hash=%016llx stage=%u ms=%.2f n=%llu hits=%llu avg=%.2f us values=%zu srt=%zu sources=%zu flat=%zu\n",
+				    static_cast<unsigned long long>(key->hash), static_cast<unsigned>(key->stage),
+				    source->refresh_ns / 1e6, static_cast<unsigned long long>(source->refresh_calls),
+				    static_cast<unsigned long long>(source->refresh_hits),
+				    source->refresh_ns / 1e3 / source->refresh_calls, plan.value_storage.size(),
+				    plan.srt_reads.size(), plan.descriptor_sources.size(), source->resources.flattened_srt.size());
+			}
+			for (const auto& item: measured) {
+				item.second->refresh_ns = item.second->refresh_calls = item.second->refresh_hits = 0;
+			}
+		}
 		last_stats = now;
 	}
 
 	explicit ProgramCache(vk::Device device): device(device) {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
+		const char* timing = std::getenv("KYTY_PERF_RESOURCE_TIMING");
+		resource_timing = timing != nullptr && timing[0] == '1';
 	}
 	~ProgramCache() {
 		for (const auto& [key, entry]: programs) {
@@ -601,6 +640,7 @@ struct PipelineCache::ProgramCache {
 	struct LastSource { const ProgramKey* key = nullptr; SourceEntry* source = nullptr; };
 	std::array<LastSource, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> last_sources {};
 	uint64_t lookups = 0, source_hits = 0, resource_hits = 0, materializations = 0, permutation_hits = 0;
+	bool resource_timing = false;
 	std::array<uint64_t, static_cast<size_t>(ResourceMemo::Miss::Count)> resource_misses {};
 	std::chrono::steady_clock::time_point last_stats = std::chrono::steady_clock::now();
 	vk::Device                                                  device;
