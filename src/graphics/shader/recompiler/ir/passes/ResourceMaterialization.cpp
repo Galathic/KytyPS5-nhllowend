@@ -996,6 +996,52 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		}
 	}
 	plan.srt_reads.reserve(program.srt_reads.size());
+	plan.descriptor_gathers.resize(plan.descriptor_sources.size());
+	for (size_t source_index = 0; source_index < plan.descriptor_sources.size(); ++source_index) {
+		const auto& source = plan.descriptor_sources[source_index];
+		auto& gather = plan.descriptor_gathers[source_index];
+		if (source.indirect_descriptor.has_value() || source.dword_count > gather.words.size()) continue;
+		gather.valid = true;
+		for (uint32_t word = 0; word < source.dword_count; ++word) {
+			const auto value = source.dwords[word].Resolve();
+			auto& target = gather.words[word];
+			if (value.IsImmediate()) {
+				switch (value.GetType()) {
+					case Type::U1: target.value = value.U1(); break;
+					case Type::U8: target.value = value.U8(); break;
+					case Type::U16: target.value = value.U16(); break;
+					case Type::U32: target.value = value.U32(); break;
+					case Type::U64: target.value = static_cast<uint32_t>(value.U64()); break;
+					case Type::F32: target.value = std::bit_cast<uint32_t>(value.F32Value()); break;
+					default: gather.valid = false; break;
+				}
+			} else if (const auto* inst = value.TryInstruction();
+			           inst != nullptr && inst->GetOpcode() == ValueOpcode::GetUserData) {
+				target.kind = ResourcePlan::DescriptorGather::Word::Kind::UserData;
+				target.value = RegIndex(inst->Arg(0).ScalarRegister());
+			} else if (const auto* inst = value.TryInstruction();
+			           inst != nullptr && inst->GetOpcode() == ValueOpcode::ReadConst) {
+				const auto slot = inst->Arg(1).Resolve();
+				if (!slot.IsImmediate() || slot.GetType() != Type::U32 ||
+				    slot.U32() >= program.srt_reads.size()) {
+					gather.valid = false;
+				} else {
+					target.kind = ResourcePlan::DescriptorGather::Word::Kind::Flat;
+					target.value = program.srt_reads[slot.U32()].flat_offset;
+					// Each cached slot must name one read, not a slot overwritten by
+					// a different read during the refresh.
+					gather.valid = target.value < program.srt_reads.size() &&
+					    std::ranges::count_if(program.srt_reads, [&](const auto& read) {
+						    return read.flat_offset == target.value;
+					    }) == 1;
+					gather.needs_flat = true;
+				}
+			} else {
+				gather.valid = false;
+			}
+			if (!gather.valid) break;
+		}
+	}
 	for (const auto& read: program.srt_reads) {
 		plan.srt_reads.push_back({Clone(read.value), read.flat_offset});
 	}

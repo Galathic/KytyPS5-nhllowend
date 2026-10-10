@@ -556,6 +556,18 @@ struct UniformFillPlan {
 // Resource analysis retained by the shader cache. It owns immutable descriptor/SRT,
 // condition and fill values without translated blocks, plus reusable evaluation scratch.
 struct ResourcePlan {
+	// Compiled descriptor gathers avoid interpreting literal/user-data leaves on
+	// every refresh. Register numbers stay absolute so rebasing remains valid.
+	struct DescriptorGather {
+		struct Word {
+			enum class Kind { Literal, UserData, Flat };
+			uint32_t value = 0;
+			Kind kind = Kind::Literal;
+		};
+		std::array<Word, 8> words {};
+		bool valid = false;
+		bool needs_flat = false;
+	};
 	struct EvaluationContext {
 		struct Entry {
 			uint64_t value      = 0;
@@ -564,6 +576,9 @@ struct ResourcePlan {
 
 		std::vector<Entry> values;
 		uint64_t           generation = 0;
+		// Keep the vector identity, not its data pointer: indirect materialization
+		// can append mappings and reallocate its storage after a successful refresh.
+		const std::vector<uint32_t>* refreshed_flat = nullptr;
 	};
 
 	ResourcePlan() = default;
@@ -581,6 +596,7 @@ struct ResourcePlan {
 	std::list<Inst>                     value_storage;
 	std::vector<MemoryInfo>             memory_info;
 	std::vector<DescriptorSource>       descriptor_sources;
+	std::vector<DescriptorGather>       descriptor_gathers;
 	std::vector<ResourceBlock>          control_flow;
 	std::vector<SrtRead>                srt_reads;
 	std::vector<uint8_t>                clean_flat_slots;
@@ -598,6 +614,29 @@ struct ResourcePlan {
 	mutable std::vector<uint8_t>            visited_blocks;
 	mutable std::vector<uint32_t>           pending_blocks;
 	mutable std::vector<uint32_t>           material_keys;
+	// Linearized SRT read expressions (KYTY_SRT_TAPE=1). Built lazily on the GPU thread,
+	// one per variant: [0] = no clean evaluator, [1] = with clean evaluator. Ops are in the
+	// exact order the recursive walker would evaluate them, so captured reads and failure
+	// points match. Plans with conditional/lazy operators stay on the walker.
+	struct SrtTape {
+		enum class State : uint8_t { Unbuilt, Ready, Unsupported };
+		enum class Kind : uint8_t { Immediate, UserData, ShaderBase, Inst, RawRead };
+		struct Op {
+			ValueOpcode             opcode {};
+			Kind                    kind       = Kind::Immediate;
+			uint8_t                 clean      = 0;
+			uint8_t                 aux        = 0;
+			uint32_t                memo_index = UINT32_MAX;
+			std::array<uint32_t, 5> args {};
+			uint64_t                imm = 0;
+		};
+		std::vector<Op>       ops;
+		std::vector<uint32_t> slot_ops;
+		bool                  clean_root = false;
+		State                 state      = State::Unbuilt;
+	};
+	mutable std::array<SrtTape, 2> srt_tapes;
+	mutable std::vector<uint64_t>  srt_tape_values;
 };
 
 struct Program: ResourcePlan {

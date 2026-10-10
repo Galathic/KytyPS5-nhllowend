@@ -1,5 +1,6 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/host_gpu/renderer/pipeline/resourceMemo.h"
 
 #include <bit>
@@ -148,6 +149,145 @@ Libs::Graphics::ShaderRecompiler::IR::Program MixedSamplerProgram() {
   program.info.sampled_pairs.push_back({.image = 0, .sampler = 1});
   program.info.sampled_pairs.push_back({.image = 1, .sampler = 1});
   return program;
+}
+
+void TestCompiledDescriptorGatherMatchesWalker() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  program.user_data_base = 8;
+  auto &block = AddValueBlock(program);
+  auto &reg8 = block.AppendNewInst(ValueOpcode::GetUserData,
+                                   {Value(static_cast<ScalarReg>(8))});
+  auto &reg10 = block.AppendNewInst(ValueOpcode::GetUserData,
+                                    {Value(static_cast<ScalarReg>(10))});
+  DescriptorSource descriptor;
+  descriptor.dword_count = 8;
+  descriptor.dwords = {Value(&reg8), Value(0x12345678u), Value(&reg10), Value(&reg8),
+                      Value::F32(1.25f), Value(uint64_t{0xfedcba9876543210u}),
+                      Value(true), Value(0u)};
+  program.descriptor_sources.push_back(descriptor);
+  auto plan = ExtractResourcePlan(program);
+  Check(plan.descriptor_gathers.size() == 1 && plan.descriptor_gathers[0].valid,
+        "literal/user-data descriptor did not compile a gather");
+  const auto compare = [&](std::span<const uint32_t> words, bool expected_success) {
+    const SrtRuntime runtime{.user_data = words};
+    DescriptorValue fast, slow;
+    bool fast_ok;
+    { SrtWalker walker(plan, runtime); fast_ok = walker.EvaluateDescriptor(0, fast); }
+    plan.descriptor_gathers[0].valid = false;
+    bool slow_ok;
+    { SrtWalker walker(plan, runtime); slow_ok = walker.EvaluateDescriptor(0, slow); }
+    plan.descriptor_gathers[0].valid = true;
+    Check(fast_ok == expected_success && fast_ok == slow_ok && fast == slow,
+          "compiled gather changed descriptor values or failure behavior");
+  };
+  std::array<uint32_t, 3> words{0x100u, 0x200u, 0x300u};
+  compare(words, true);
+  words = {0x400u, 0x500u, 0x600u};
+  compare(words, true);
+  compare(std::span(words).first(2), false);
+  // Store absolute register indices; changing the plan's base must not leave
+  // stale relative offsets compiled into the gather.
+  plan.user_data_base = 10;
+  compare(words, false);
+  plan.user_data_base = 0;
+  std::array<uint32_t, 11> rebased{};
+  rebased[8] = 0x700u;
+  rebased[10] = 0x800u;
+  compare(rebased, true);
+  DescriptorValue masked;
+  {
+    SrtWalker walker(plan, {.user_data = rebased}, {}, nullptr,
+                     plan.descriptor_sources[0].dwords[0]);
+    Check(walker.EvaluateDescriptor(0, masked) && masked.dwords[0] == 1u &&
+              masked.dwords[3] == 1u && masked.dwords[2] == 0x800u,
+          "compiled gather bypassed the active-mask evaluation context");
+  }
+  auto memory_plan = SrtPlan(0x1000u);
+  Check(memory_plan.descriptor_gathers[0].valid &&
+            memory_plan.descriptor_gathers[0].needs_flat,
+        "SRT descriptor lost its refresh requirement");
+}
+
+void TestFlatDescriptorGatherRequiresOwnCompleteRefresh() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  auto plan = SrtPlan(0x1000u);
+  struct Reads { uint32_t value = 0x100u; uint32_t count = 0; bool fail = false; } reads;
+  const SrtRuntime runtime{
+      .read_memory = +[](void* data, uint64_t address, std::span<uint32_t> words) {
+        auto& reads = *static_cast<Reads*>(data);
+        ++reads.count;
+        if (reads.fail || address != 0x1000u || words.size() != 1) return false;
+        words[0] = reads.value;
+        return true;
+      }, .userdata = &reads};
+  DescriptorValue descriptor;
+  std::vector<uint32_t> flat;
+  {
+    SrtWalker walker(plan, runtime);
+    Check(walker.EvaluateDescriptor(0, descriptor) && descriptor.dwords[0] == reads.value &&
+              reads.count == 1,
+          "unrefreshed flat gather bypassed ordinary memory evaluation");
+  }
+  for (const auto value: {0x200u, 0x300u}) {
+    reads.value = value;
+    reads.count = 0;
+    SrtWalker walker(plan, runtime);
+    Check(walker.RefreshFlatBuffer(flat) && reads.count == 1 && flat[0] == value,
+          "SRT refresh retained values from a prior evaluation session");
+    // Indirect descriptor materialization can append and reallocate this vector.
+    flat.reserve(flat.capacity() + 128);
+    flat.push_back(0xdeadbeefu);
+    Check(walker.EvaluateDescriptor(0, descriptor) && descriptor.dwords[0] == value &&
+              reads.count == 1,
+          "flat descriptor gather lost refreshed values after vector reallocation");
+    flat.clear();
+    Check(walker.EvaluateDescriptor(0, descriptor) && descriptor.dwords[0] == value &&
+              reads.count == 1,
+          "short flat storage did not safely fall back to the same-session memo");
+  }
+  reads.fail = true;
+  {
+    SrtWalker walker(plan, runtime);
+    Check(!walker.RefreshFlatBuffer(flat) && !walker.EvaluateDescriptor(0, descriptor),
+          "failed refresh reused a prior session's flat descriptor");
+  }
+  reads.fail = false;
+  {
+    const auto mask = plan.descriptor_sources[0].dwords[0];
+    SrtWalker walker(plan, runtime, {}, nullptr, mask);
+    Check(walker.RefreshFlatBuffer(flat) && walker.EvaluateDescriptor(0, descriptor) &&
+              descriptor.dwords[0] == 1u,
+          "flat gather bypassed active-mask semantics");
+  }
+  // A clean writable-descriptor session must not consume another walker's
+  // ordinary flattened values. Its own strict reader supplies the descriptor.
+  const SrtRuntime mixed{
+      .read_memory = runtime.read_memory, .userdata = &reads,
+      .read_specialization_memory = +[](void*, uint64_t address, std::span<uint32_t> words) {
+        if (address != 0x1000u || words.size() != 1) return false;
+        words[0] = 0x555u;
+        return true;
+      }};
+  {
+    SrtWalker ordinary(plan, mixed);
+    Check(ordinary.RefreshFlatBuffer(flat), "ordinary SRT refresh failed");
+    SrtWalker clean(plan, CleanRuntime(mixed));
+    Check(clean.EvaluateDescriptor(0, descriptor) && descriptor.dwords[0] == 0x555u,
+          "unrefreshed clean walker consumed ordinary flat values");
+  }
+  // Control-flow refresh may leave unreachable slots zero. Such sessions must
+  // retain the interpreter even after a successful refresh.
+  plan.control_flow.emplace_back();
+  plan.control_flow[0].srt_reads.push_back(0);
+  plan.control_flow[0].sources.push_back(0);
+  {
+    SrtWalker walker(plan, runtime);
+    Check(walker.RefreshFlatBuffer(flat), "control-flow SRT refresh failed");
+    flat[0] = 0xbadu;
+    Check(walker.EvaluateDescriptor(0, descriptor) && descriptor.dwords[0] == reads.value,
+          "control-flow session used the unconditional flat gather");
+  }
 }
 
 void TestResourceMemoTracksMemoryAndRuntime() {
@@ -704,6 +844,8 @@ void DbgExit(int) { std::abort(); }
 } // namespace Common
 
 int main() {
+  TestCompiledDescriptorGatherMatchesWalker();
+  TestFlatDescriptorGatherRequiresOwnCompleteRefresh();
   TestResourceMemoTracksMemoryAndRuntime();
   TestResourceMemoAlternatingObjects();
   TestMappedSrtUsesDirectReaderByDefault();

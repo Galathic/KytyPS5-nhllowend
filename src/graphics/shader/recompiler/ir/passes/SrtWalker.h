@@ -27,6 +27,19 @@ bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
 // Uses the strict reader for values that affect shader specialization.
 SrtRuntime CleanRuntime(SrtRuntime runtime);
 
+// KYTY_SRT_TAPE counters (GPU thread; relaxed atomics).
+struct SrtTapeStats {
+	uint64_t runs = 0;          // flat refreshes served by a tape
+	uint64_t failed = 0;        // tape run reported a walker-equivalent failure
+	uint64_t walker = 0;        // refreshes that fell back to the recursive walker
+	uint64_t built = 0;         // tapes built
+	uint64_t unsupported = 0;   // plans rejected by the tape builder
+	uint64_t ops = 0;           // total ops executed
+	std::array<uint64_t, 8> reject {}; // rejection reasons, see SrtTapeRejectName
+};
+SrtTapeStats GetSrtTapeStats();
+const char*  SrtTapeRejectName(size_t reason);
+
 // One memoized evaluation session shared by the entire shader resource refresh.
 class SrtWalker {
 public:
@@ -51,6 +64,8 @@ private:
 	bool EvaluateExtract(const Inst& inst, uint64_t& result);
 	bool EvaluateRawRead(const Inst& inst, uint64_t& result);
 	bool EvaluateInst(const Inst& inst, uint64_t& result);
+	// 1 = refreshed, 0 = failed (same as walker), -1 = tape not applicable.
+	int  RunTape(std::vector<uint32_t>& flat);
 
 	const ResourcePlan&              m_program;
 	SrtRuntime                      m_runtime;

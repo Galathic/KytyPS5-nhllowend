@@ -580,6 +580,14 @@ struct PipelineCache::ProgramCache {
 			    static_cast<unsigned long long>(resource_misses[static_cast<size_t>(ResourceMemo::Miss::Workgroups)]),
 			    static_cast<unsigned long long>(resource_misses[static_cast<size_t>(ResourceMemo::Miss::ReadFailed)]),
 			    static_cast<unsigned long long>(resource_misses[static_cast<size_t>(ResourceMemo::Miss::MemoryChanged)]));
+			const auto tape = ShaderRecompiler::IR::GetSrtTapeStats();
+			std::printf("NHL27SRTTAPE: runs=%llu failed=%llu walker=%llu built=%llu unsupported=%llu ops=%llu\n",
+			    static_cast<unsigned long long>(tape.runs),
+			    static_cast<unsigned long long>(tape.failed),
+			    static_cast<unsigned long long>(tape.walker),
+			    static_cast<unsigned long long>(tape.built),
+			    static_cast<unsigned long long>(tape.unsupported),
+			    static_cast<unsigned long long>(tape.ops));
 		}
 		last_stats = now;
 	}
@@ -833,6 +841,7 @@ void PipelineCache::WarmUp(PipelineRecord::Records& records) {
     const auto start = std::chrono::steady_clock::now();
     // Shared ProgramCache/compiler state is serialized; do not race translation or insertion.
     std::vector<ShaderProgram> handles(records.programs.size());
+    std::vector<ShaderRecompiler::IR::ResourceSnapshot> snapshots(records.programs.size());
     for (size_t index = 0; index < records.programs.size(); ++index) {
         auto& source = records.programs[index];
         if (source.user_data.size() > ShaderParams{}.user_data.size()) continue;
@@ -862,6 +871,17 @@ void PipelineCache::WarmUp(PipelineRecord::Records& records) {
             default: break;
         }
         m_program_cache->replaying = nullptr;
+        if (handles[index]) {
+            const ShaderStageRuntime* runtime = nullptr;
+            switch (source.stage) {
+                case ShaderType::Vertex: runtime = &source.vertex.stage; break;
+                case ShaderType::Pixel: runtime = &source.pixel.stage; break;
+                case ShaderType::Compute: runtime = &source.compute.stage; break;
+                default: break;
+            }
+            if (runtime != nullptr && runtime->resources != nullptr)
+                snapshots[index] = *runtime->resources;
+        }
         if (handles[index]) m_program_cache->ordinals[handles[index].id] = static_cast<uint32_t>(index);
     }
     std::unordered_map<uint64_t, const ShaderRecompiler::IR::CompiledShaderInfo*> compiled;
@@ -881,7 +901,11 @@ void PipelineCache::WarmUp(PipelineRecord::Records& records) {
         if (m_graphics_pipelines.contains(key)) continue;
         GraphicsPrograms programs; programs.vertex[0] = vertex; programs.pixel = pixel;
         record.vertex.stage.program = compiled.at(vertex.id);
-        if (ps_active) record.pixel.stage.program = compiled.at(pixel.id);
+        record.vertex.stage.resources = &snapshots[record.vertex_program];
+        if (ps_active) {
+            record.pixel.stage.program = compiled.at(pixel.id);
+            record.pixel.stage.resources = &snapshots[record.pixel_program];
+        }
         auto pipeline = std::make_unique<Pipeline>();
         CreatePipelineInternal(m_graphics, *pipeline, key.rendering, key.vertex_input,
             std::span<const ShaderVertexInputInfo>(&record.vertex, 1),
@@ -892,6 +916,7 @@ void PipelineCache::WarmUp(PipelineRecord::Records& records) {
         const auto program = handles[record.program];
         if (!program || m_compute_pipelines.contains(program.id)) continue;
         record.compute.stage.program = compiled.at(program.id);
+        record.compute.stage.resources = &snapshots[record.program];
         record.compute.host_subgroup_size = records.programs[record.program].compute.host_subgroup_size;
         record.compute.lds_storage = records.programs[record.program].compute.lds_storage;
         auto pipeline = std::make_unique<Pipeline>();
