@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
+#include "graphics/host_gpu/renderer/bindEpoch.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -326,6 +327,7 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset,
 			                                           : vk::DescriptorType::eStorageBuffer;
 			writes[index].pBufferInfo     = &infos[index];
 		}
+		InvalidateRedundantBinds();
 		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0,
 		                             static_cast<uint32_t>(writes.size()), writes.data());
 		command.bindPipeline(vk::PipelineBindPoint::eCompute, GetPipeline(dispatch.pipeline_slot));
@@ -561,6 +563,7 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 				writes[index].descriptorType  = vk::DescriptorType::eStorageBuffer;
 				writes[index].pBufferInfo     = &infos[index];
 			}
+			InvalidateRedundantBinds();
 			command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0,
 			                             static_cast<uint32_t>(writes.size()), writes.data());
 			Push push {};
@@ -570,6 +573,7 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 			push.height      = rows;
 			push.pitch_bytes = static_cast<uint32_t>(layout.source_row_stride);
 			push.slice_bytes = static_cast<uint32_t>(layout.target_row_stride);
+			InvalidateRedundantBinds();
 			command.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
 			                      sizeof(push), &push);
 			command.dispatch(static_cast<uint32_t>(groups_x), rows, 1);
@@ -642,6 +646,7 @@ void TileManager::TransformColor(Result input, Result output, ColorTransform tra
 	    vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
 	    vk::PipelineStageFlagBits::eComputeShader, {}, 0, nullptr, 2, barriers, 0, nullptr);
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_color_transform);
+	InvalidateRedundantBinds();
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0,
 	                             static_cast<uint32_t>(writes.size()), writes.data());
 	Push push {};
@@ -650,6 +655,7 @@ void TileManager::TransformColor(Result input, Result output, ColorTransform tra
 	push.width           = pixels;
 	push.color_transform = static_cast<uint32_t>(transform);
 	push.to_host         = to_host;
+	InvalidateRedundantBinds();
 	command.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),
 	                      &push);
 	command.dispatch((pixels + 63u) / 64u, 1, 1);

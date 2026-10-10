@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/nativeIndirect.h"
+#include "graphics/host_gpu/renderer/bindEpoch.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
@@ -37,6 +38,7 @@ void NativeIndirectPrep::Record(CommandBuffer& buffer, const NativeIndirectDraw&
  const Params params {source.snapshot->BufferDeviceAddress(), source.stride / 4,
                       source.max_count, source.index_count_limit, 0};
  command.bindPipeline(vk::PipelineBindPoint::eCompute, m_pipeline);
+ InvalidateRedundantBinds();
  command.pushConstants(m_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(params), &params);
  command.dispatch((source.max_count + 63u) / 64u, 1, 1);
 }

@@ -16,6 +16,7 @@
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/hostMemory.h"
+#include "graphics/host_gpu/renderer/bindEpoch.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
@@ -1263,17 +1264,84 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		prepared->push_dwords_valid = has_push_data;
 	}
 
+	// KYTY_SKIP_REDUNDANT_BINDS=1: within one command buffer and pipeline layout, push
+	// descriptors and push constants stay bound, so identical consecutive pushes can be skipped.
+	// Objects referenced by the current command buffer are not destroyed while it records.
+	static const bool skip_redundant = [] {
+		const char* v = std::getenv("KYTY_SKIP_REDUNDANT_BINDS");
+		return v != nullptr && v[0] == '1';
+	}();
+	auto& last = m_redundant[pipeline_bind_point == vk::PipelineBindPoint::eCompute ? 1 : 0];
+	if (skip_redundant) {
+		const auto tick  = m_context.GetCommandScheduler().CurrentTick();
+		const auto epoch = BindEpoch();
+		if (last.tick != tick || last.epoch != epoch || last.buffer != vk_buffer ||
+		    last.layout != pipeline.pipeline_layout) {
+			last.tick              = tick;
+			last.epoch             = epoch;
+			last.buffer            = vk_buffer;
+			last.layout            = pipeline.pipeline_layout;
+			last.descriptors_valid = false;
+			last.push_valid        = false;
+		}
+	}
+
 	if (has_push_data) {
-		vk_buffer.pushConstants(pipeline.pipeline_layout, push_stages, 0, sizeof(push_data),
-		                        push_data.dwords.data());
+		const bool same = skip_redundant && last.push_valid && last.push_stages == push_stages &&
+		                  std::equal(last.push.begin(), last.push.end(), push_data.dwords.begin(),
+		                             push_data.dwords.end());
+		if (!same) {
+			vk_buffer.pushConstants(pipeline.pipeline_layout, push_stages, 0, sizeof(push_data),
+			                        push_data.dwords.data());
+			if (skip_redundant) {
+				last.push.assign(push_data.dwords.begin(), push_data.dwords.end());
+				last.push_stages = push_stages;
+				last.push_valid  = true;
+			}
+		}
 	}
 
 	if (!m_descriptor_writes.empty()) {
 		EXIT_IF(pipeline.descriptor_set_layout == nullptr);
 		if (pipeline.uses_push_descriptors) {
-			vk_buffer.pushDescriptorSetKHR(pipeline_bind_point, pipeline.pipeline_layout, 0,
-			                               static_cast<uint32_t>(m_descriptor_writes.size()),
-			                               m_descriptor_writes.data());
+			bool same = false;
+			if (skip_redundant) {
+				auto& key = m_descriptor_key;
+				key.clear();
+				for (const auto& write: m_descriptor_writes) {
+					key.push_back((uint64_t {write.dstBinding} << 32u) |
+					              (uint64_t {static_cast<uint32_t>(write.descriptorType)} << 16u) |
+					              write.descriptorCount);
+					for (uint32_t i = 0; i < write.descriptorCount; i++) {
+						if (write.pBufferInfo != nullptr) {
+							const auto& info = write.pBufferInfo[i];
+							key.push_back(reinterpret_cast<uint64_t>(static_cast<VkBuffer>(info.buffer)));
+							key.push_back(info.offset);
+							key.push_back(info.range);
+						} else if (write.pImageInfo != nullptr) {
+							const auto& info = write.pImageInfo[i];
+							key.push_back(reinterpret_cast<uint64_t>(static_cast<VkSampler>(info.sampler)));
+							key.push_back(reinterpret_cast<uint64_t>(static_cast<VkImageView>(info.imageView)));
+							key.push_back(static_cast<uint64_t>(info.imageLayout));
+						} else if (write.pTexelBufferView != nullptr) {
+							key.push_back(reinterpret_cast<uint64_t>(
+							    static_cast<VkBufferView>(write.pTexelBufferView[i])));
+						} else {
+							key.push_back(UINT64_MAX);
+						}
+					}
+				}
+				same = last.descriptors_valid && last.descriptors == key;
+				if (!same) {
+					last.descriptors.assign(key.begin(), key.end());
+					last.descriptors_valid = true;
+				}
+			}
+			if (!same) {
+				vk_buffer.pushDescriptorSetKHR(pipeline_bind_point, pipeline.pipeline_layout, 0,
+				                               static_cast<uint32_t>(m_descriptor_writes.size()),
+				                               m_descriptor_writes.data());
+			}
 		} else {
 			const auto set = m_context.GetDescriptorHeap().Commit(pipeline.descriptor_set_layout);
 			for (auto& write: m_descriptor_writes) {
@@ -1282,6 +1350,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			m_context.GetGraphics().device.updateDescriptorSets(
 			    static_cast<uint32_t>(m_descriptor_writes.size()), m_descriptor_writes.data(), 0,
 			    nullptr);
+			InvalidateRedundantBinds();
 			vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, 0, 1, &set,
 			                             0, nullptr);
 		}
