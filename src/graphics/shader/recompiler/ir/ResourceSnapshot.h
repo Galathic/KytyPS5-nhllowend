@@ -29,6 +29,19 @@ struct UniformFill {
 	bool operator==(const UniformFill&) const = default;
 };
 
+// A compute shader whose only effect is dst[i] = src[i] for every invocation i (same index,
+// same element size), e.g. NHL 27's dword copy 5f193bbc12f9c6d3. The emulator can perform the
+// copy on guest memory as well, so later CPU readers need no GPU readback.
+struct UniformCopy {
+	bool     valid        = false;
+	uint32_t source       = 0;
+	uint32_t destination  = 0;
+	uint32_t words        = 0;
+	uint32_t group_stride = 0;
+
+	bool operator==(const UniformCopy&) const = default;
+};
+
 struct ResourceSnapshot {
 	std::vector<DescriptorValue> buffers;
 	std::vector<DescriptorValue> images;
@@ -37,6 +50,7 @@ struct ResourceSnapshot {
 	std::vector<uint32_t>        user_data;
 	std::vector<std::pair<uint64_t, uint64_t>> specialization_reads;
 	UniformFill                 uniform_fill;
+	UniformCopy                 uniform_copy;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

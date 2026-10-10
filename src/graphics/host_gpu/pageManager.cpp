@@ -3,6 +3,7 @@
 #include "common/alignment.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/regionDefinitions.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
@@ -27,6 +28,35 @@
 #endif
 
 namespace Libs::Graphics {
+namespace {
+std::atomic<uint64_t> g_protect_calls {0};
+std::atomic<uint64_t> g_protect_bytes {0};
+std::atomic<uint64_t> g_protect_gpu_calls {0};
+std::atomic<uint64_t> g_read_faults {0};
+std::atomic<uint64_t> g_write_faults {0};
+} // namespace
+
+void ProtectStats::Count(uint64_t bytes) noexcept {
+	g_protect_calls.fetch_add(1, std::memory_order_relaxed);
+	g_protect_bytes.fetch_add(bytes, std::memory_order_relaxed);
+	if (GuestGpu::IsGpuThread()) {
+		g_protect_gpu_calls.fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
+void ProtectStats::CountFault(bool write) noexcept {
+	(write ? g_write_faults : g_read_faults).fetch_add(1, std::memory_order_relaxed);
+}
+
+void ProtectStats::Read(uint64_t& calls, uint64_t& bytes, uint64_t& gpu_calls,
+                        uint64_t& read_faults, uint64_t& write_faults) noexcept {
+	calls        = g_protect_calls.load(std::memory_order_relaxed);
+	bytes        = g_protect_bytes.load(std::memory_order_relaxed);
+	gpu_calls    = g_protect_gpu_calls.load(std::memory_order_relaxed);
+	read_faults  = g_read_faults.load(std::memory_order_relaxed);
+	write_faults = g_write_faults.load(std::memory_order_relaxed);
+}
+
 namespace {
 
 constexpr uint64_t PAGE_SIZE    = TRACKER_PAGE_SIZE;
@@ -191,6 +221,7 @@ struct PageManager::Impl {
 	}
 
 	void Protect(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode) noexcept {
+		ProtectStats::Count(size);
 		if (!Libs::LibKernel::Memory::ProtectGuestHostMemory(vaddr, size, mode)) {
 			Fatal("address-space protection failed at 0x%016" PRIx64 ", mode=0x%08" PRIx32, vaddr,
 			      static_cast<uint32_t>(mode));

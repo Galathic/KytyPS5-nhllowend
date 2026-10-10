@@ -65,6 +65,7 @@ struct FaultPageStat {
 	uint64_t    writer_hash = 0;
 	double      ms          = 0;
 	uint32_t    pm4_op      = 0; // PM4 opcode being processed when the GPU thread itself faulted
+	const char* via         = "fault";
 };
 std::unordered_map<uint64_t, FaultPageStat> g_fault_pages;
 
@@ -149,20 +150,33 @@ void BufferCache::PerfMaybePrint() {
 	            static_cast<unsigned long long>(events[4]),
 	            static_cast<unsigned long long>(events[5]),
 	            static_cast<unsigned long long>(events[6]), GuestSyncOnly() ? 1 : 0);
+	{
+		static uint64_t last[5] {};
+		uint64_t        now[5] {};
+		ProtectStats::Read(now[0], now[1], now[2], now[3], now[4]);
+		std::printf("NHL27PERF: protect calls=%llu (gpu-thread %llu) MiB=%.1f | tracking faults "
+		            "read=%llu write=%llu\n",
+		            static_cast<unsigned long long>(now[0] - last[0]),
+		            static_cast<unsigned long long>(now[2] - last[2]),
+		            static_cast<double>(now[1] - last[1]) / (1024.0 * 1024.0),
+		            static_cast<unsigned long long>(now[3] - last[3]),
+		            static_cast<unsigned long long>(now[4] - last[4]));
+		std::copy(std::begin(now), std::end(now), std::begin(last));
+	}
 	std::vector<std::pair<uint64_t, FaultPageStat>> pages(g_fault_pages.begin(), g_fault_pages.end());
 	std::sort(pages.begin(), pages.end(),
 	          [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
 	for (size_t i = 0; i < pages.size() && i < 8; ++i) {
 		const auto& [page, stat] = pages[i];
 		std::printf("NHL27PERF: fault page=0x%llx count=%llu bytes=%llu exact=%llu ms=%.1f "
-		            "thread=%s tid=%llu pm4_op=0x%x writer=%s hash=%016llx\n",
+		            "thread=%s tid=%llu pm4_op=0x%x writer=%s hash=%016llx via=%s\n",
 		            static_cast<unsigned long long>(page),
 		            static_cast<unsigned long long>(stat.count),
 		            static_cast<unsigned long long>(stat.bytes),
 		            static_cast<unsigned long long>(stat.exact), stat.ms,
 		            stat.gpu_thread ? "gpu-cp" : "guest-cpu",
 		            static_cast<unsigned long long>(stat.tid), stat.pm4_op, stat.writer,
-		            static_cast<unsigned long long>(stat.writer_hash));
+		            static_cast<unsigned long long>(stat.writer_hash), stat.via);
 	}
 	if (!pages.empty()) {
 		uint64_t gpu_count = 0, cpu_count = 0, unique_pages = pages.size();
@@ -235,6 +249,21 @@ void BufferCache::DiscardGpuModified(uint64_t vaddr, uint64_t size) {
 	DropGpuFills(vaddr, size);
 	m_gpu_modified_ranges.Subtract(vaddr, size);
 	m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+}
+
+void BufferCache::ForgetGpuWrite(uint64_t vaddr, uint64_t size) {
+	if (size == 0 || !GuestRange {vaddr, size}.Valid()) {
+		return;
+	}
+	DropGpuFills(vaddr, size);
+	m_gpu_modified_ranges.Subtract(vaddr, size);
+	const auto first = vaddr & ~(TRACKER_PAGE_SIZE - 1);
+	const auto last  = (vaddr + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
+	for (auto page = first; page < last; page += TRACKER_PAGE_SIZE) {
+		if (!m_gpu_modified_ranges.Intersects(page, TRACKER_PAGE_SIZE)) {
+			m_memory_tracker.UnmarkRegionAsGpuModified(page, TRACKER_PAGE_SIZE);
+		}
+	}
 }
 
 void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source,
@@ -501,9 +530,11 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadC
 		    timed && caller == ReadCaller::Fault && !is_write && HasGpuDirtyBytes(vaddr, 1);
 		const bool downloaded = DownloadBufferMemory<false>(buffer, vaddr, size);
 		if (timed) {
-			if (downloaded && caller == ReadCaller::Fault && !is_write) {
+			if (downloaded && (caller == ReadCaller::Fault || caller == ReadCaller::Other) &&
+			    !is_write) {
 				const auto page = vaddr & ~(TRACKER_PAGE_SIZE - 1);
 				auto&      stat = g_fault_pages[page];
+				stat.via        = caller == ReadCaller::Fault ? "fault" : "other";
 				stat.count++;
 				stat.bytes += m_last_download_bytes;
 				stat.exact += exact_dirty ? 1 : 0;

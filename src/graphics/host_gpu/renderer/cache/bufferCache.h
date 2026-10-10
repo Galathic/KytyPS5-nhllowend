@@ -86,6 +86,9 @@ public:
 	// Drops GPU ownership of whole pages without a download. The caller must be about to
 	// overwrite the CPU backing of the range and mark it CPU-modified.
 	void DiscardGpuModified(uint64_t vaddr, uint64_t size);
+	// The bytes were published to guest memory by the CPU with the same values the GPU writes,
+	// so they no longer need a readback. Pages keep GPU ownership while other bytes on them do.
+	void ForgetGpuWrite(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,

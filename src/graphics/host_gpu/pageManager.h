@@ -10,6 +10,15 @@ namespace Libs::Graphics {
 
 enum class PageFaultAccess { Read, Write, Execute, Unknown };
 
+// KYTY_PERF_STATS diagnostics: page-protection changes and GPU-tracking faults.
+struct ProtectStats {
+	static void Count(uint64_t bytes) noexcept;
+	static void CountFault(bool write) noexcept;
+	// Totals since start: protection calls, bytes, calls made on the GPU thread, read/write faults.
+	static void Read(uint64_t& calls, uint64_t& bytes, uint64_t& gpu_calls, uint64_t& read_faults,
+	                 uint64_t& write_faults) noexcept;
+};
+
 class PageManager final {
 public:
 	PageManager();

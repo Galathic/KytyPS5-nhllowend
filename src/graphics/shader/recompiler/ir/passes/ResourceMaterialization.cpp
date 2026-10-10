@@ -828,6 +828,77 @@ static std::optional<std::array<uint64_t, 3>> FillIndex(Value value, uint32_t ax
 	return left;
 }
 
+// One buffer store whose data is a load of the same element from another buffer at the same
+// invocation index: dst[i] = src[i]. Both accesses are raw, index-addressed and unconditional
+// for the whole dispatch, so the copied range follows from the descriptors and dispatch size.
+static UniformCopy AnalyzeUniformCopy(const Program& program) {
+	if (program.stage != ShaderType::Compute || program.blocks.empty() ||
+	    program.blocks.size() != program.block_info.size() || program.info.uses_dma ||
+	    !program.info.samplers.empty() || !program.info.images.empty() ||
+	    program.info.buffers.size() != 2) {
+		return {};
+	}
+	std::unordered_set<uint32_t> visited;
+	uint32_t                     index = 0;
+	const Inst*                  store = nullptr;
+	for (;;) {
+		if (!visited.insert(index).second) return {};
+		for (const auto& inst: *program.blocks[index]) {
+			if (AddressOpcodeInfoOf(inst.GetOpcode()).access != AddressAccess::None) return {};
+			if (!inst.MayHaveSideEffects()) continue;
+			if (store != nullptr || BufferAccessOf(inst.GetOpcode()) != BufferAccess::Write) return {};
+			store = &inst;
+		}
+		const auto& term = program.block_info[index].terminator;
+		if (term.kind == CFG::TerminatorKind::Return) break;
+		if (term.kind != CFG::TerminatorKind::Branch) return {};
+		const auto next = std::ranges::find(program.block_info, term.true_block, &BlockInfo::id);
+		if (next == program.block_info.end()) return {};
+		index = static_cast<uint32_t>(next - program.block_info.begin());
+	}
+	if (store == nullptr || visited.size() != program.blocks.size()) return {};
+	constexpr std::array stores {ValueOpcode::StoreBufferU32, ValueOpcode::StoreBufferU32x2,
+	                             ValueOpcode::StoreBufferU32x3, ValueOpcode::StoreBufferU32x4};
+	constexpr std::array loads {ValueOpcode::LoadBufferU32, ValueOpcode::LoadBufferU32x2,
+	                            ValueOpcode::LoadBufferU32x3, ValueOpcode::LoadBufferU32x4};
+	const auto store_op = std::ranges::find(stores, store->GetOpcode());
+	if (store_op == stores.end() || store->Arg(2).Resolve() != Value(0u) ||
+	    store->Arg(3).Resolve() != Value(0u))
+		return {};
+	const auto words = static_cast<uint32_t>(store_op - stores.begin() + 1);
+	const auto guard = store->Arg(5).Resolve();
+	if (!IsFullDispatchPredicate(guard)) return {};
+	const auto* load = store->Arg(4).Resolve().TryInstruction();
+	if (load == nullptr || load->GetOpcode() != loads[words - 1] ||
+	    load->Arg(2).Resolve() != Value(0u) || load->Arg(3).Resolve() != Value(0u))
+		return {};
+	const auto load_guard = load->Arg(4).Resolve();
+	if (load_guard != Value(true) && load_guard != guard) return {};
+	const auto& dst = program.memory_info.at(store->Flags<MemoryFlags>().index);
+	const auto& src = program.memory_info.at(load->Flags<MemoryFlags>().index);
+	const auto  raw = [words](const MemoryInfo& memory) {
+		return !memory.formatted && !memory.typed && memory.idxen && !memory.offen &&
+		       memory.offset == 0 && memory.data_bits == 32 && memory.data_dwords == words;
+	};
+	if (!raw(dst) || !raw(src) || dst.resource == src.resource ||
+	    dst.resource >= program.info.buffers.size() || src.resource >= program.info.buffers.size())
+		return {};
+	const auto& src_buffer = program.info.buffers[src.resource];
+	const auto& dst_buffer = program.info.buffers[dst.resource];
+	if (!src_buffer.read || src_buffer.written || dst_buffer.read || !dst_buffer.written) return {};
+	// The load and the store must address the same element.
+	if (ResolveActiveU32(load->Arg(1), guard) != ResolveActiveU32(store->Arg(1), guard)) return {};
+	const auto address = FillIndex(store->Arg(1), 0, guard);
+	if (!address || (*address)[0] != 0 || (*address)[1] != 1 || (*address)[2] == 0) return {};
+	UniformCopy result;
+	result.valid        = true;
+	result.source       = src.resource;
+	result.destination  = dst.resource;
+	result.words        = words;
+	result.group_stride = static_cast<uint32_t>((*address)[2]);
+	return result;
+}
+
 static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 	if (program.stage != ShaderType::Compute || program.blocks.empty() ||
 	    program.blocks.size() != program.block_info.size() || program.info.uses_dma ||
@@ -1045,6 +1116,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	};
 	plan.control_flow = ResourceControlFlow(program, ClonePredicate);
 	plan.uniform_fill = AnalyzeUniformFill(program);
+	plan.uniform_copy = AnalyzeUniformCopy(program);
 	for (uint32_t i = 0; i < plan.uniform_fill.fill.words; ++i) {
 		plan.uniform_fill.values[i] = Clone(plan.uniform_fill.values[i]);
 	}
@@ -1148,6 +1220,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	}
 	const auto active = std::span<const uint8_t>(program.active_sources);
 	snapshot.uniform_fill = {};
+	snapshot.uniform_copy = program.uniform_copy;
 	const auto& fill = program.uniform_fill;
 	const auto words = fill.fill.words;
 	std::array<uint32_t, 4> stored {};

@@ -31,7 +31,9 @@
 #include <cstring>
 #include <fmt/format.h>
 #include <magic_enum.hpp>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -750,6 +752,33 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			case CoreAccess::Write: access = GpuAccess::Write; break;
 			case CoreAccess::Execute: access = GpuAccess::Execute; break;
 			case CoreAccess::Unknown: return false;
+		}
+		// KYTY_PERF_FAULT_RIPS=1 (diagnostic): report which host/guest instructions take GPU
+		// tracking faults, so false-sharing reads (no GPU-dirty byte touched) can be found.
+		static const bool fault_rips = std::getenv("KYTY_PERF_FAULT_RIPS") != nullptr;
+		if (fault_rips) {
+			static std::mutex                         mutex;
+			static std::map<uint64_t, uint64_t>      counts;
+#if defined(_WIN32)
+			static const uint64_t host_base = reinterpret_cast<uint64_t>(GetModuleHandleA(nullptr));
+#else
+			static const uint64_t host_base = 0;
+#endif
+			uint64_t                                  count = 0;
+			{
+				std::scoped_lock lock {mutex};
+				count = ++counts[info->exception_address];
+			}
+			if (count == 1 || count == 10 || count == 100 || count % 1000 == 0) {
+				const auto rip = info->exception_address;
+				const bool host = rip >= host_base && rip < host_base + 0x10000000u;
+				std::printf("NHL27FAULTRIP: %s rip=0x%016llx host+0x%llx vaddr=0x%016llx access=%d "
+				            "count=%llu\n",
+				            host ? "host" : "other", static_cast<unsigned long long>(rip),
+				            static_cast<unsigned long long>(host ? rip - host_base : 0),
+				            static_cast<unsigned long long>(info->access_violation_vaddr),
+				            static_cast<int>(access), static_cast<unsigned long long>(count));
+			}
 		}
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			return true;

@@ -25,6 +25,7 @@
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/shader.h"
 #include "kernel/eventQueue.h"
+#include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
@@ -32,6 +33,7 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -126,6 +128,63 @@ bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t grou
 	resolved_descriptor = descriptor;
 	resolved_clear      = fill.value;
 	resolved_size       = size;
+	return true;
+}
+
+// KYTY_CPU_COPY_FORWARD=1: a proven dst[i] = src[i] copy dispatch (UniformCopy) over contiguous,
+// in-bounds, disjoint ranges. The dispatch still runs on the GPU; the emulator also copies the
+// bytes in guest memory so CPU readers of the destination need no GPU readback.
+static bool CpuCopyForwardEnabled() {
+	static const bool enabled = [] {
+		const char* v = std::getenv("KYTY_CPU_COPY_FORWARD");
+		return v != nullptr && v[0] == '1';
+	}();
+	return enabled;
+}
+
+static bool ResolveComputeBufferCopy(const ShaderComputeInputInfo& input, uint32_t group_x,
+                                     uint32_t group_y, uint32_t group_z, uint32_t mode,
+                                     uint64_t& source, uint64_t& destination, uint64_t& size) {
+	const auto& resources = *input.stage.resources;
+	const auto& copy      = resources.uniform_copy;
+	if (!copy.valid || copy.words == 0 || copy.words > 4 ||
+	    copy.source >= resources.buffers.size() || copy.destination >= resources.buffers.size()) {
+		return false;
+	}
+	const uint32_t element = copy.words * sizeof(uint32_t);
+	const auto     src = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[copy.source]);
+	const auto     dst =
+	    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[copy.destination]);
+	for (const auto* d: {&src, &dst}) {
+		if (d->Stride() != element || d->SwizzleEnabled() || d->IndexStride() != 0 || d->AddTid() ||
+		    d->Base48() == 0) {
+			return false;
+		}
+	}
+	if (input.threads_num[0] == 0 || input.threads_num[0] != copy.group_stride ||
+	    input.threads_num[1] != 1 || input.threads_num[2] != 1 || group_x == 0 || group_y != 1 ||
+	    group_z != 1 || mode != (input.dispatch_thread_dimensions ? 0x61u : 0x41u)) {
+		return false;
+	}
+	const uint64_t invocations = input.dispatch_thread_dimensions
+	                                 ? group_x
+	                                 : static_cast<uint64_t>(group_x) * input.threads_num[0];
+	if (input.dispatch_thread_dimensions &&
+	    (group_x % input.threads_num[0] != 0 || input.dispatch_threads_num[0] != group_x ||
+	     input.dispatch_threads_num[1] != 1 || input.dispatch_threads_num[2] != 1)) {
+		return false;
+	}
+	// Every invocation must be in bounds for both buffers, so each one copies exactly one element.
+	if (invocations == 0 || invocations > src.NumRecords() || invocations > dst.NumRecords()) {
+		return false;
+	}
+	size        = invocations * element;
+	source      = src.Base48();
+	destination = dst.Base48();
+	if (size > (uint64_t {256} << 20u) ||
+	    !(source + size <= destination || destination + size <= source)) {
+		return false;
+	}
 	return true;
 }
 
@@ -364,6 +423,14 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		                             mode, fill_descriptor, known_fill_value, known_fill_size)) {
 			known_fill_address = fill_descriptor.Base48();
 		}
+	}
+	uint64_t copy_source      = 0;
+	uint64_t copy_destination = 0;
+	uint64_t copy_size        = 0;
+	if (CpuCopyForwardEnabled() && resources.specialization_reads.empty() &&
+	    !ResolveComputeBufferCopy(input_info, thread_group_x, thread_group_y, thread_group_z, mode,
+	                              copy_source, copy_destination, copy_size)) {
+		copy_size = 0;
 	}
 
 	if (use_thread_dimensions) {
@@ -607,6 +674,28 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		// Recorded after the bindings marked the range GPU-written, which clears older records.
 		m_context.GetBufferCache().RecordGpuFill(known_fill_address, known_fill_size,
 		                                         known_fill_value);
+	}
+	if (copy_size != 0) {
+		auto& cache = m_context.GetBufferCache();
+		// Only when the source bytes in guest memory are what the GPU reads: no pending GPU
+		// writes to the source. Its CPU writes were uploaded when the source was bound above.
+		if (!cache.HasGpuDirtyBytes(copy_source, copy_size)) {
+			std::vector<uint8_t> bytes(static_cast<size_t>(copy_size));
+			if (LibKernel::Memory::TryReadBacking(copy_source, bytes.data(), bytes.size())) {
+				LibKernel::Memory::WriteBacking(copy_destination, bytes.data(), bytes.size());
+				cache.ForgetGpuWrite(copy_destination, copy_size);
+				static std::atomic<uint64_t> forwarded {0};
+				const auto n = forwarded.fetch_add(1, std::memory_order_relaxed) + 1;
+				if (n <= 4 || n % 5000 == 0) {
+					std::printf("NHL27COPY: forwarded #%llu cs=%016llx 0x%llx -> 0x%llx (%llu bytes)\n",
+					            static_cast<unsigned long long>(n),
+					            static_cast<unsigned long long>(program.shader_hash),
+					            static_cast<unsigned long long>(copy_source),
+					            static_cast<unsigned long long>(copy_destination),
+					            static_cast<unsigned long long>(copy_size));
+				}
+			}
+		}
 	}
 	if (gds_trace_now) {
 		uint32_t gds_after[4] {};
