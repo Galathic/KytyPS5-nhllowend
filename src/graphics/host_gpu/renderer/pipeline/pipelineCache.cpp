@@ -799,8 +799,6 @@ void PipelineCache::Save() {
 	}
 	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
 	                 Common::PathToString(m_driver_cache_path));
-	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
-	m_driver_cache = nullptr;
 }
 
 void PipelineCache::InitializeShaderRecord() {
@@ -864,10 +862,13 @@ void PipelineCache::WarmUp(PipelineRecord::Records& records) {
         m_program_cache->replaying = nullptr;
         if (handles[index]) m_program_cache->ordinals[handles[index].id] = static_cast<uint32_t>(index);
     }
-    std::unordered_map<uint64_t, const ShaderRecompiler::IR::CompiledShaderInfo*> compiled;
+    // Replay records omit runtime pointers. Rebind both parts of the stage after
+    // all permutations have been inserted, since insertion can move their programs.
+    std::unordered_map<uint64_t, ShaderStageRuntime> compiled;
     for (const auto& [key, entry]: m_program_cache->programs)
         for (const auto& permutation: entry.permutations)
-            compiled[permutation.handle.id] = &permutation.program;
+            compiled[permutation.handle.id] = {.program = &permutation.program,
+                                              .resources = &entry.resources};
     size_t graphics_count = 0, compute_count = 0;
     for (auto& record: records.graphics) {
         const auto vertex = handles[record.vertex_program];
@@ -880,8 +881,8 @@ void PipelineCache::WarmUp(PipelineRecord::Records& records) {
         key.static_params = record.static_params;
         if (m_graphics_pipelines.contains(key)) continue;
         GraphicsPrograms programs; programs.vertex[0] = vertex; programs.pixel = pixel;
-        record.vertex.stage.program = compiled.at(vertex.id);
-        if (ps_active) record.pixel.stage.program = compiled.at(pixel.id);
+        record.vertex.stage = compiled.at(vertex.id);
+        if (ps_active) record.pixel.stage = compiled.at(pixel.id);
         auto pipeline = std::make_unique<Pipeline>();
         CreatePipelineInternal(m_graphics, *pipeline, key.rendering, key.vertex_input,
             std::span<const ShaderVertexInputInfo>(&record.vertex, 1),
@@ -891,7 +892,7 @@ void PipelineCache::WarmUp(PipelineRecord::Records& records) {
     for (auto& record: records.compute) {
         const auto program = handles[record.program];
         if (!program || m_compute_pipelines.contains(program.id)) continue;
-        record.compute.stage.program = compiled.at(program.id);
+        record.compute.stage = compiled.at(program.id);
         record.compute.host_subgroup_size = records.programs[record.program].compute.host_subgroup_size;
         record.compute.lds_storage = records.programs[record.program].compute.lds_storage;
         auto pipeline = std::make_unique<Pipeline>();

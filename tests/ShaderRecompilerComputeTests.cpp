@@ -27,6 +27,7 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineRecord.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/nativeIndirect.h"
@@ -212,6 +213,26 @@ struct ImageTestAccess {
                            uint64_t capacity) {
     return Image::CopyRows(row_size, rows, capacity);
   }
+};
+
+struct PipelineCacheTestAccess {
+  static void SetDriverCache(PipelineCache& cache, vk::PipelineCache driver,
+                             const std::filesystem::path& path) {
+    RequireEmpty(cache);
+    cache.m_driver_cache = driver;
+    cache.m_driver_cache_path = path;
+  }
+  static void WarmUp(PipelineCache& cache, PipelineRecord::Records& records) {
+    cache.WarmUp(records);
+  }
+  static vk::PipelineCache DriverCache(const PipelineCache& cache) {
+    return cache.m_driver_cache;
+  }
+  static size_t ComputePipelines(const PipelineCache& cache) {
+    return cache.m_compute_pipelines.size();
+  }
+private:
+  static void RequireEmpty(const PipelineCache& cache) { EXIT_IF(cache.m_driver_cache != nullptr); }
 };
 
 struct TileManagerTestAccess {
@@ -36436,6 +36457,8 @@ std::vector<GraphicsCase> MakeGraphicsCases() {
   };
 }
 
+#include "PipelineWarmupTests.inc"
+
 void CheckComputeLdsLimit(VulkanHarness &vulkan) {
   constexpr const char *name = "ComputeLdsLimit";
   std::vector<u32> code;
@@ -42349,6 +42372,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--bda-dirty-cache-only") == 0) {
     VulkanHarness vulkan;
     CheckBdaPreparationCache(vulkan.RuntimeContext());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--pipeline-warmup-only") == 0) {
+    VulkanHarness vulkan;
+    CheckPipelineWarmup(vulkan);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--native-indirect-state-only") == 0) {
