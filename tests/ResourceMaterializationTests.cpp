@@ -225,6 +225,33 @@ void TestResourceMemoAlternatingObjects() {
 
 }
 
+void TestSingleResourceMemoChangesOutput() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  auto plan = UserDataBufferPlan();
+  std::array<uint32_t, 2> registers{0x8000, 7};
+  SrtRuntime runtime{.user_data = registers};
+  ResourceSnapshot first, second;
+  ResourceSpecialization first_specialization, second_specialization;
+  Libs::Graphics::ResourceMemo memo(1);
+  bool reused = true;
+  Check(memo.Refresh(plan, runtime, first, first_specialization, true, reused) && !reused,
+        "single memo reused its absent output");
+  Check(memo.Refresh(plan, runtime, second, second_specialization, true, reused) && !reused &&
+            second.buffers == first.buffers && second.user_data == first.user_data &&
+            second_specialization == first_specialization,
+        "single memo treated an empty replacement output as a cached snapshot");
+  Check(memo.Refresh(plan, runtime, second, second_specialization, true, reused) && reused,
+        "single memo did not retain the current output");
+  registers[1] = 19;
+  Check(memo.Refresh(plan, runtime, second, second_specialization, true, reused) && reused &&
+            second.user_data[1] == 19 && first.user_data[1] == 7,
+        "single memo failed to update push data independently of the old output");
+  registers[0] = 0x9000;
+  Check(memo.Refresh(plan, runtime, first, first_specialization, true, reused) && !reused &&
+            first.buffers[0].dwords[0] == 0x9000 && second.buffers[0].dwords[0] == 0x8000,
+        "single memo refreshed the wrong output or reused a changed resource register");
+}
+
 void TestMappedSrtUsesDirectReaderByDefault() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   const uint32_t dword = 0x12345678;
@@ -706,6 +733,7 @@ void DbgExit(int) { std::abort(); }
 int main() {
   TestResourceMemoTracksMemoryAndRuntime();
   TestResourceMemoAlternatingObjects();
+  TestSingleResourceMemoChangesOutput();
   TestMappedSrtUsesDirectReaderByDefault();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestFailedRuntimeReadIsMemoizedPerRefresh();
