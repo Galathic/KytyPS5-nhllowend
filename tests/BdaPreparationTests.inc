@@ -1,5 +1,7 @@
 // GPU regression for KYTY_BDA_DIRTY_CACHE=1. Included by the renderer harness.
 void CheckBdaPreparationCache(GraphicContext& graphics) {
+  const auto* dirty_setting = std::getenv("KYTY_BDA_DIRTY_REGIONS");
+  const bool dirty_regions = dirty_setting != nullptr && std::strcmp(dirty_setting, "1") == 0;
   constexpr const char* name = "BdaPreparationCache";
   constexpr uintptr_t base = 0x0000000200d00000ull;
   constexpr uint64_t size = 0x10000;
@@ -37,6 +39,12 @@ void CheckBdaPreparationCache(GraphicContext& graphics) {
     context.PrepareBda();
     Require(name, "CPU invalidation", context.GetBdaPreparationStats().scans == stats.scans + 1,
         "CPU update reused stale preparation");
+    if (dirty_regions) {
+      const auto updated = context.GetBdaPreparationStats();
+      Require(name, "bounded CPU upload", updated.full_scans == stats.full_scans &&
+          updated.dirty_regions == stats.dirty_regions + 1,
+          "a write in one region rescanned all mapped buffers");
+    }
     Buffer readback(graphics, scheduler, MemoryUsage::Download, 0, AllFlags, 0x1000);
     auto verify = [&](uint32_t expected) {
       auto& command = scheduler.Current();
@@ -79,6 +87,10 @@ void CheckBdaPreparationCache(GraphicContext& graphics) {
     context.PrepareBda();
     Require(name, "new buffer", context.GetBdaPreparationStats().scans == stats.scans + 1,
         "new buffer reused stale preparation");
+    if (dirty_regions) {
+      Require(name, "bounded registration", context.GetBdaPreparationStats().full_scans == stats.full_scans,
+          "a new buffer unnecessarily rescanned all mapped ranges");
+    }
     context.UnmapMemory(base + 0x8000, 0x1000);
     stats = context.GetBdaPreparationStats();
     context.PrepareBda();
