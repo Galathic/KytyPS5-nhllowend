@@ -566,7 +566,6 @@ static void DbgLogSmallTextureDraw(const PreparedBindings* ps, const DrawRenderS
 	std::fflush(stdout);
 }
 
-RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
 // DIAGNOSTIC (KYTY_DBG_DEPTH_ALIAS_ADDR): sampled/storage bindings of a draw that overlap the
 // address filter. Only called while the filter is set.
 static void LogDepthAliasBinds(uint64_t seq, std::span<PreparedBindings* const> stages) {
@@ -590,6 +589,7 @@ static void LogDepthAliasBinds(uint64_t seq, std::span<PreparedBindings* const> 
 	}
 }
 
+RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
                                                  uint32_t color_count, RenderDepthInfo& depth,
                                                  vk::ImageAspectFlags& feedback_aspects,
                                                  std::span<PreparedBindings* const> stages) {
@@ -601,7 +601,6 @@ static void LogDepthAliasBinds(uint64_t seq, std::span<PreparedBindings* const> 
 	state.height                = std::numeric_limits<uint32_t>::max();
 	state.num_layers            = std::numeric_limits<uint32_t>::max();
 	state.num_color_attachments = 0;
-	for (uint32_t i = 0; i < color_count; i++) {
 	// DIAGNOSTIC (KYTY_DBG_DEPTH_ALIAS): one sequence number per draw, shared by its depth,
 	// colour and bind lines. Without the address filter only depth-target draws take one.
 	const uint64_t dbg_seq = DepthAliasLog::Enabled() && (depth.image_id || DepthAliasLog::Filtered())
@@ -610,6 +609,7 @@ static void LogDepthAliasBinds(uint64_t seq, std::span<PreparedBindings* const> 
 	if (DepthAliasLog::Enabled() && DepthAliasLog::Filtered()) {
 		LogDepthAliasBinds(dbg_seq, stages);
 	}
+	for (uint32_t i = 0; i < color_count; i++) {
 		auto& target = colors[i];
 		EXIT_IF(!target.image_id);
 		if (DepthAliasLog::Enabled() && DepthAliasLog::Filtered() &&
@@ -722,8 +722,8 @@ static void LogDepthAliasBinds(uint64_t seq, std::span<PreparedBindings* const> 
 				            meta_clear ? 1 : 0);
 			}
 		}
-		    !cache.TouchMeta(metadata.range.address, depth.desc.view_info.base_layer, false)) {
 		if (meta_clear &&
+		    !cache.TouchMeta(metadata.range.address, depth.desc.view_info.base_layer, false)) {
 			EXIT("failed to consume HTile clear state\n");
 		}
 		auto& image = cache.GetImage(depth.image_id);
