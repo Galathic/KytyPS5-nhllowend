@@ -1,6 +1,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
+#include "common/experiments.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -136,11 +137,7 @@ bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t grou
 // in-bounds, disjoint ranges. The dispatch still runs on the GPU; the emulator also copies the
 // bytes in guest memory so CPU readers of the destination need no GPU readback.
 static bool CpuCopyForwardEnabled() {
-	static const bool enabled = [] {
-		const char* v = std::getenv("KYTY_CPU_COPY_FORWARD");
-		return v != nullptr && v[0] == '1';
-	}();
-	return enabled;
+	return Common::Experiments::Enabled(Common::Experiments::CpuCopyForward);
 }
 
 static bool ResolveComputeBufferCopy(const ShaderComputeInputInfo& input, uint32_t group_x,

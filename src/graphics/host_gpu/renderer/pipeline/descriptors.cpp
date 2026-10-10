@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
+#include "common/experiments.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -1267,10 +1268,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	// KYTY_SKIP_REDUNDANT_BINDS=1: within one command buffer and pipeline layout, push
 	// descriptors and push constants stay bound, so identical consecutive pushes can be skipped.
 	// Objects referenced by the current command buffer are not destroyed while it records.
-	static const bool skip_redundant = [] {
-		const char* v = std::getenv("KYTY_SKIP_REDUNDANT_BINDS");
-		return v != nullptr && v[0] == '1';
-	}();
+	const bool skip_redundant =
+	    Common::Experiments::Enabled(Common::Experiments::SkipRedundantBinds);
 	auto& last = m_redundant[pipeline_bind_point == vk::PipelineBindPoint::eCompute ? 1 : 0];
 	if (skip_redundant) {
 		const auto tick  = m_context.GetCommandScheduler().CurrentTick();
@@ -1284,6 +1283,11 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			last.descriptors_valid = false;
 			last.push_valid        = false;
 		}
+	} else {
+		// The experiment can be switched at run time: pushes made while it is off are not
+		// remembered, so forget the last state.
+		last.descriptors_valid = false;
+		last.push_valid        = false;
 	}
 
 	if (has_push_data) {

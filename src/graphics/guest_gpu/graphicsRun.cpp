@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
+#include "common/experiments.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -1489,10 +1490,7 @@ void CommandProcessor::EmitGlobalBarrier() {
 	Common::LockGuard lock(m_renderer.GetMutex());
 	// KYTY_DEDUP_BARRIERS=1: a global barrier with no draw or dispatch recorded since the previous
 	// one in the same command buffer orders nothing new.
-	static const bool dedup = [] {
-		const char* v = std::getenv("KYTY_DEDUP_BARRIERS");
-		return v != nullptr && v[0] == '1';
-	}();
+	const bool dedup = Common::Experiments::Enabled(Common::Experiments::DedupBarriers);
 	static uint64_t last_epoch = UINT64_MAX;
 	static uint64_t last_tick  = UINT64_MAX;
 	if (dedup) {

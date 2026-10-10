@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "common/experiments.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -77,8 +78,7 @@ bool PerfStatsEnabled() {
 } // namespace
 
 bool BufferCache::GuestSyncOnly() {
-	static const bool enabled = EnvFlag("KYTY_GUEST_SYNC");
-	return enabled;
+	return Common::Experiments::Enabled(Common::Experiments::GuestSync);
 }
 
 bool BufferCache::PerfNoSyncReadback() {
@@ -144,7 +144,7 @@ void BufferCache::PerfMaybePrint() {
 	            static_cast<unsigned long long>(events[0]),
 	            static_cast<unsigned long long>(events[1]), PerfNoSyncReadback() ? 1 : 0);
 	std::printf("NHL27PERF: work dispatches=%llu draws=%llu auto_dispatch_barriers=%llu "
-	            "guest_barriers=%llu (skipped %llu) acquire_mem=%llu render_passes=%llu guest_sync=%d\n",
+	            "guest_barriers=%llu (skipped %llu) acquire_mem=%llu render_passes=%llu experiments=%d\n",
 	            static_cast<unsigned long long>(events[2]),
 	            static_cast<unsigned long long>(events[3]),
 	            static_cast<unsigned long long>(events[4]),
@@ -152,7 +152,7 @@ void BufferCache::PerfMaybePrint() {
 	            static_cast<unsigned long long>(
 	                events[static_cast<size_t>(PerfEvent::BarrierSkipped)]),
 	            static_cast<unsigned long long>(events[6]),
-	            static_cast<unsigned long long>(events[7]), GuestSyncOnly() ? 1 : 0);
+	            static_cast<unsigned long long>(events[7]), static_cast<int>(Common::Experiments::Mask()));
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	{
 		// GPU-thread CPU time per presented frame: the frame cost of emulation work without the

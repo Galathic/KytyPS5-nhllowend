@@ -1,0 +1,25 @@
+#ifndef EMULATOR_SRC_COMMON_EXPERIMENTS_H_
+#define EMULATOR_SRC_COMMON_EXPERIMENTS_H_
+
+#include <cstdint>
+
+namespace Common::Experiments {
+
+// Opt-in performance experiments that can be switched while the emulator runs, so A/B
+// comparisons can alternate inside one match instead of comparing noisy separate runs.
+// Each bit starts from its KYTY_* environment variable ("1" = on). When KYTY_EXPERIMENT_FILE
+// names a file, a background thread reads a decimal mask from it every 500 ms; while the file
+// exists its mask replaces the environment defaults.
+enum Bit : uint32_t {
+	GuestSync          = 1u << 0u, // KYTY_GUEST_SYNC
+	SkipRedundantBinds = 1u << 1u, // KYTY_SKIP_REDUNDANT_BINDS
+	DedupBarriers      = 1u << 2u, // KYTY_DEDUP_BARRIERS
+	CpuCopyForward     = 1u << 3u, // KYTY_CPU_COPY_FORWARD
+};
+
+[[nodiscard]] bool Enabled(Bit bit) noexcept;
+[[nodiscard]] uint32_t Mask() noexcept;
+
+} // namespace Common::Experiments
+
+#endif // EMULATOR_SRC_COMMON_EXPERIMENTS_H_
