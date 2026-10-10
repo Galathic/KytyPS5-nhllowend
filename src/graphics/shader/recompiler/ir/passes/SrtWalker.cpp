@@ -1042,8 +1042,16 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		visited[index] = 1u;
 		const auto& block = m_program.control_flow[index];
 		for (const auto source: block.sources) active[source] = 1u;
-		for (const auto slot: block.srt_reads) {
-			if (!refresh(slot)) return false;
+		for (size_t position = 0; position < block.srt_reads.size();) {
+			const auto slot = block.srt_reads[position];
+			const auto possible = m_runtime.batch_reads && slot < m_program.srt_batch_counts.size()
+			                          ? m_program.srt_batch_counts[slot] : 1u;
+			uint32_t count = 1;
+			// Do not fetch adjacent reads belonging to another branch or a gap in this block.
+			while (count < possible && position + count < block.srt_reads.size() &&
+			       block.srt_reads[position + count] == slot + count) ++count;
+			if (!(count > 1 ? RefreshReadBatch(slot, count, flat) : refresh(slot))) return false;
+			position += count;
 		}
 		uint32_t condition = 0;
 		auto& predicate = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;

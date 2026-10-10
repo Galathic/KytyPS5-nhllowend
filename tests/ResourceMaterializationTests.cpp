@@ -827,6 +827,16 @@ void TestContiguousScalarReadBatches() {
   Check(MaterializeResources(conditional, runtime, snapshot, specialization) &&
             reads.calls == 2 && snapshot.flattened_srt == std::vector<uint32_t>({11, 0, 0, 0}),
         "conditional refresh read unreachable scalar slots through a batch");
+  conditional.control_flow.back().srt_reads = {1, 2, 3};
+  reads.calls = 0;
+  Check(MaterializeResources(conditional, runtime, snapshot, specialization) &&
+            reads.calls == 2 && snapshot.flattened_srt == std::vector<uint32_t>({0, 22, 33, 44}),
+        "reached-block batching lost a suffix or fetched an unreachable prefix");
+  conditional.control_flow.back().srt_reads = {0, 2};
+  reads.calls = 0;
+  Check(MaterializeResources(conditional, runtime, snapshot, specialization) &&
+            reads.calls == 3 && snapshot.flattened_srt == std::vector<uint32_t>({11, 0, 33, 0}),
+        "reached-block batch crossed nonconsecutive scalar slots");
   auto mapped = make_plan(false, 16, false, 4, reinterpret_cast<uint64_t>(reads.words.data()));
   Check(MaterializeResources(mapped, {.batch_reads = true}, snapshot, specialization) &&
             snapshot.flattened_srt == std::vector<uint32_t>({11, 22, 33, 44}),

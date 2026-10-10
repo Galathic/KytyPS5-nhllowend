@@ -70,10 +70,11 @@ Game files and saved profiles, caches, captures and logs must stay outside Git.
   changes between lookups, invalidating resource memos while retaining compiled
   pipelines. New shader sources inherit the active policy. This allows comparisons
   within one warmed match; exclude transitions from measured intervals.
-- `KYTY_SRT_BATCH_READS=1` groups up to 64 adjacent, unconditional scalar DWORD
+- `KYTY_SRT_BATCH_READS=1` groups up to 64 adjacent scalar DWORD
   reads sharing the same descriptor and dynamic offset. It preserves strict
   readers, scalar-buffer bounds, prior evaluation results and descriptor memos.
-  Conditional and vector reads keep their ordinary evaluation path. The option
+  In conditional shaders, groups stop at gaps and reached-block boundaries;
+  untaken blocks are not fetched. Vector reads keep their ordinary evaluation path. The option
   defaults off pending live GPU/gameplay checks. An optional second value (`0`
   or `1`) in the diagnostic control file switches batching within the same run.
 
@@ -100,6 +101,13 @@ Hardware: AMD Ryzen 7 5800X3D, Radeon RX 9070 XT, Windows. Isolated test window:
   records, summed per-record refresh time was 4,825.97 us scalar versus 2,446.49 us
   batched. This uses recorded CPU memory, without GPU waits or draw-frequency
   weighting, and does not establish a gameplay FPS gain.
+- Extending grouping within reached blocks still matched all 1,409 records,
+  with zero skipped. Now 1,378 records have candidates. Their summed refresh
+  times were 16,661.25 us scalar versus 9,525.75 us batched in that run. Eligible
+  sets and machine load differ, so totals must not be compared with the earlier
+  unconditional-only run. Additional tests confirm reached suffixes and gaps do
+  not fetch unreachable slots. GPU verification is pending while another
+  emulator is active; neither option is enabled by default.
 - Renderer `--lds-limit-only` passes with the single-state resource memo enabled.
 - `--wave-reduction-only`: SPIR-V validation and GPU results pass for all cases.
 - `--flat-d16-only`: all targeted D16/subword GPU cases pass.
@@ -157,11 +165,14 @@ comparison without a matching scene and settings.
 `tools/codex/build.cmd` builds only in `_Build/codex`, using VS 2022 Build Tools
 and the portable LLVM/glslang bundle. `KYTY_TOOLS` overrides its default location
 under the user's Downloads directory. It accepts optional target names.
+`KYTY_BUILD_JOBS` controls build parallelism (default 6); use 1 while another
+session is using the machine for performance work.
 `tools/codex/start-test.ps1` records exact executable SHA256, PID, arguments,
 environment and log paths in the isolated run's `test.json`, restores its
 calling process environment, and refuses to launch alongside another emulator.
 `-Game` overrides the local game path; the default points to the supplied backup.
 Profiling switches (`-Stats`, `-GpuTiming`, `-ResourceTiming`) default off.
+`-BatchReads` opts into scalar batching and is recorded in the run metadata.
 `capture-test.ps1` captures only a specified emulator process window.
 For CPU replay checks, copy the `.shaders` file into an isolated directory and run
 `shader_recompiler_compute_tests --resource-replay-benchmark <copied-file>` there.

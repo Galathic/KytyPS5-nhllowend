@@ -106,7 +106,7 @@ int ResourceReplayBenchmark(const char* path) {
     if (scalar_us < 0 || batch_us < 0) return 1;
     total_scalar += scalar_us;
     total_batch += batch_us;
-    std::printf("ResourceReplay: hash=%016llx stage=%u scalar_us=%.2f batch_us=%.2f groups=%zu srt=%zu\n",
+    std::printf("ResourceReplay: hash=%016llx stage=%u scalar_us=%.2f batch_us=%.2f starts=%zu srt=%zu\n",
                 static_cast<unsigned long long>(record.hash), static_cast<unsigned>(record.stage),
                 scalar_us, batch_us, static_cast<size_t>(batches), plan.srt_reads.size());
   }

@@ -6,6 +6,7 @@ param(
     [switch]$ResourceTiming,
     [switch]$DirtyRegions,
     [switch]$MultiResources,
+    [switch]$BatchReads,
     [switch]$PreGen,
     [string]$Game = (Join-Path $env:USERPROFILE 'Downloads\NHL27\NHL 27\PPSA34063-app0\eboot.bin'),
     [hashtable]$Overrides = @{}
@@ -25,6 +26,7 @@ $settings = @{
     KYTY_WORKGROUP_BUFFER_SYNC='1'; KYTY_BDA_DIRTY_CACHE='1'; KYTY_PROGRAM_RESOURCE_CACHE='1';
     KYTY_PERF_NO_SYNC_READBACK='1'; KYTY_SHADER_PREGEN=[string][int]$PreGen.IsPresent; KYTY_PIXEL_QUAD_CORRECT='0';
     KYTY_RESOURCE_MULTI_CACHE=[string][int]$MultiResources.IsPresent;
+    KYTY_SRT_BATCH_READS=[string][int]$BatchReads.IsPresent;
     KYTY_BDA_DIRTY_REGIONS=[string][int]$DirtyRegions.IsPresent;
     KYTY_PERF_STATS=[string][int]$Stats.IsPresent; KYTY_PERF_GPU_TIMING=[string][int]$GpuTiming.IsPresent;
     KYTY_PERF_RESOURCE_TIMING=[string][int]$ResourceTiming.IsPresent;

@@ -612,7 +612,7 @@ struct PipelineCache::ProgramCache {
 				const auto& [key, source] = measured[i];
 				const auto& plan = source->resource_plan;
 				const auto batches = std::ranges::count_if(plan.srt_batch_counts, [](uint32_t count) { return count > 1; });
-				std::printf("NHL27RESOURCE: hash=%016llx stage=%u ms=%.2f n=%llu hits=%llu avg=%.2f us values=%zu srt=%zu sources=%zu flat=%zu batches=%zu\n",
+				std::printf("NHL27RESOURCE: hash=%016llx stage=%u ms=%.2f n=%llu hits=%llu avg=%.2f us values=%zu srt=%zu sources=%zu flat=%zu batch_starts=%zu\n",
 				    static_cast<unsigned long long>(key->hash), static_cast<unsigned>(key->stage),
 				    source->refresh_ns / 1e6, static_cast<unsigned long long>(source->refresh_calls),
 				    static_cast<unsigned long long>(source->refresh_hits),
@@ -644,6 +644,7 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 		last_stats = now;
+		std::fflush(stdout);
 	}
 
 	explicit ProgramCache(vk::Device device): device(device) {

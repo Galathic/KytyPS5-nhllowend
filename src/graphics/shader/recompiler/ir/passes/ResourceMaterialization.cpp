@@ -1079,9 +1079,9 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		}
 	}
 	if (capture_indirect_reads) plan.resource_tracking_complete &= !program.has_address_writes;
-	// Preserve reachability and reader semantics. Only group adjacent, unconditional
-	// scalar reads with an identical descriptor/offset expression and contiguous bytes.
-	if (plan.control_flow.empty()) {
+	// Runtime traversal limits these candidates to consecutive reads in a reached block.
+	// Descriptor/offset expressions, reader semantics and bytes must all match.
+	{
 		plan.srt_batch_counts.assign(plan.srt_reads.size(), 1u);
 		const auto raw = [&](uint32_t slot) -> const Inst* {
 			const auto* inst = plan.srt_reads[slot].value.Resolve().TryInstruction();
@@ -1116,7 +1116,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 					++count;
 				}
 			}
-			plan.srt_batch_counts[first] = count;
+			for (uint32_t i = 0; i < count; ++i) plan.srt_batch_counts[first + i] = count - i;
 			first += count;
 		}
 	}
