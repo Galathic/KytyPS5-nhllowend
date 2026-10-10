@@ -859,8 +859,9 @@ uint32_t EmitWaveReduceU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 		case IR::WaveReduceOp::And: op = spv::OpGroupNonUniformBitwiseAnd; break;
 	}
 	const auto result = state.builder.AllocateId();
+	// Execution scope is an ID; GroupOperation is a literal enum operand.
 	state.builder.AddFunction(op, TypeU32(state), result, ConstantU32(state, spv::ScopeSubgroup),
-	                          ConstantU32(state, spv::GroupOperationReduce), ctx.Arg(inst, 0));
+	                          static_cast<uint32_t>(spv::GroupOperationReduce), ctx.Arg(inst, 0));
 	return result;
 }
 
