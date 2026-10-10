@@ -2616,14 +2616,27 @@ static uint32_t CpOpWaitRegMemSized(CommandProcessor& cp, uint32_t cmd_id, const
 
 	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != opcode || KYTY_PM4_R(cmd_id) != 0u);
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != packet_dw);
+	static const bool clean_metadata = [] {
+		const char* setting = std::getenv("KYTY_PM4_CLEAN_METADATA");
+		return setting != nullptr && setting[0] == '1';
+	}();
+	std::array<uint32_t, 8> clean_payload{};
+	const uint32_t* params = buffer;
+	if (clean_metadata && cp.TryPeekGuest(buffer, clean_payload.data(),
+	                                      static_cast<uint64_t>(payload_dw) * sizeof(uint32_t))) {
+		// WAIT_REG_MEM has a fixed, fully consumed payload. Snapshot only the
+		// exact-clean packet bytes; dirty or unavailable backing keeps the
+		// original volatile packet path.
+		params = clean_payload.data();
+	}
 
 	constexpr auto address_align_mask = (sizeof(T) == sizeof(uint32_t) ? 0x3u : 0x7u);
-	auto  ctrl = buffer[0];
-	auto* addr = reinterpret_cast<const T*>((buffer[1] & ~address_align_mask) |
-	                                        (static_cast<uint64_t>(buffer[2] & 0x3ffffu) << 32u));
-	auto  ref  = CpOpWaitRegMemReadValue<T>(buffer + 3u);
-	auto  mask = CpOpWaitRegMemReadValue<T>(buffer + 3u + value_dw);
-	auto  poll = buffer[3u + value_dw * 2u];
+	auto  ctrl = params[0];
+	auto* addr = reinterpret_cast<const T*>((params[1] & ~address_align_mask) |
+	                                        (static_cast<uint64_t>(params[2] & 0x3ffffu) << 32u));
+	auto  ref  = CpOpWaitRegMemReadValue<T>(params + 3u);
+	auto  mask = CpOpWaitRegMemReadValue<T>(params + 3u + value_dw);
+	auto  poll = params[3u + value_dw * 2u];
 
 	EXIT_NOT_IMPLEMENTED((ctrl & 0x10u) == 0);
 

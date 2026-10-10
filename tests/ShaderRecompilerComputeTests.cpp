@@ -4117,6 +4117,101 @@ public:
         run_clean_metadata_packet(clean_agc_address, clean_agc_packet.size(),
                                   "clean AGC tag metadata");
 
+        constexpr uint64_t wait_target32 = base + 0x700;
+        constexpr uint64_t wait_target64 = base + 0x708;
+        constexpr uint32_t wait_value32 = 0x13579bdfu;
+        constexpr uint64_t wait_value64 = 0x0123456789abcdefull;
+        Require(name, "wait target initialization",
+                cache.TryWriteLabel(wait_target32, &wait_value32, sizeof(wait_value32)) &&
+                    cache.TryWriteLabel(wait_target64, &wait_value64, sizeof(wait_value64)),
+                "could not initialize WAIT_REG_MEM targets");
+        const auto make_wait32 = [&](uint32_t poll) {
+          return std::array<uint32_t, 7>{
+              KYTY_PM4(7, Pm4::IT_WAIT_REG_MEM, Pm4::R_ZERO), 0x13u,
+              static_cast<uint32_t>(wait_target32),
+              static_cast<uint32_t>(wait_target32 >> 32u), wait_value32,
+              UINT32_MAX, poll};
+        };
+        const auto make_wait64 = [&](uint32_t poll) {
+          return std::array<uint32_t, 9>{
+              KYTY_PM4(9, Pm4::IT_WAIT_REG_MEM_64, Pm4::R_ZERO), 0x13u,
+              static_cast<uint32_t>(wait_target64),
+              static_cast<uint32_t>(wait_target64 >> 32u),
+              static_cast<uint32_t>(wait_value64),
+              static_cast<uint32_t>(wait_value64 >> 32u), UINT32_MAX,
+              UINT32_MAX, poll};
+        };
+        const auto run_wait_metadata = [&](uint64_t packet_address,
+                                           const auto &packet_words,
+                                           uint64_t dirty_word_address,
+                                           const char *stage) {
+          Require(name, stage, initialize_metadata_packet(
+                      packet_address,
+                      std::span<const uint32_t>(packet_words.data(), packet_words.size())),
+                  "could not initialize exact-clean WAIT_REG_MEM packet");
+          auto wait_neighbor = cache.ObtainBuffer(protected_neighbor, sizeof(uint32_t), true, false);
+          wait_neighbor.first->Fill(wait_neighbor.second, sizeof(uint32_t), pattern);
+          Require(name, "wait metadata dirty neighbor setup",
+                  cache.HasGpuDirtyBytes(protected_neighbor, sizeof(uint32_t)),
+                  "wait metadata fixture did not establish GPU-dirty neighboring bytes");
+          const auto tick_before = scheduler.CurrentTick();
+          Pm4Execution wait_execution;
+          const auto guest_packet = std::span<const uint32_t>(
+              reinterpret_cast<const uint32_t *>(packet_address), packet_words.size());
+          std::array<uint32_t, 8> payload_before{};
+          const bool payload_peek_before = processor.TryPeekGuest(
+              reinterpret_cast<const void *>(packet_address + sizeof(uint32_t)),
+              payload_before.data(), (packet_words.size() - 1) * sizeof(uint32_t));
+          uint64_t target_before = 0;
+          const uint64_t target_address = packet_words.size() == 7 ? wait_target32 : wait_target64;
+          const bool target_read_before = Libs::LibKernel::Memory::TryReadBacking(
+              target_address, &target_before, packet_words.size() == 7 ? sizeof(uint32_t)
+                                                                       : sizeof(uint64_t));
+          const auto wait_result = processor.Process(wait_execution, guest_packet);
+          const auto tick_after = scheduler.CurrentTick();
+          const bool neighbor_dirty_after =
+              cache.HasGpuDirtyBytes(protected_neighbor, sizeof(uint32_t));
+          if (wait_result != Pm4ProcessResult::Complete || tick_after != tick_before ||
+              !neighbor_dirty_after) {
+            std::printf("[host] WAIT diagnostic %s: result=%u tick=%llu->%llu neighbor_dirty=%u payload_peek=%u payload=[",
+                        stage, static_cast<unsigned>(wait_result),
+                        static_cast<unsigned long long>(tick_before),
+                        static_cast<unsigned long long>(tick_after),
+                        neighbor_dirty_after ? 1u : 0u, payload_peek_before ? 1u : 0u);
+            for (size_t i = 0; i + 1 < packet_words.size(); ++i) {
+              std::printf("%s%08x", i == 0 ? "" : ",", payload_before[i]);
+            }
+            std::printf("] target_read=%u target=%llx dirty_payload=%u\n",
+                        target_read_before ? 1u : 0u,
+                        static_cast<unsigned long long>(target_before),
+                        cache.HasGpuDirtyBytes(packet_address + sizeof(uint32_t),
+                                               (packet_words.size() - 1) * sizeof(uint32_t))
+                            ? 1u
+                            : 0u);
+          }
+          Require(name, stage,
+                  wait_result == Pm4ProcessResult::Complete && tick_after == tick_before &&
+                      neighbor_dirty_after,
+                  "clean WAIT_REG_MEM payload waited for unrelated GPU-owned bytes");
+
+          auto gpu_payload = cache.ObtainBuffer(dirty_word_address, sizeof(uint32_t), true, false);
+          const uint32_t updated_poll = packet_words.back() + 1u;
+          gpu_payload.first->Fill(gpu_payload.second, sizeof(updated_poll), updated_poll);
+          const auto fallback_tick = scheduler.CurrentTick();
+          Pm4Execution fallback_execution;
+          Require(name, "dirty WAIT_REG_MEM fallback",
+                  processor.Process(fallback_execution, guest_packet) == Pm4ProcessResult::Complete &&
+                      scheduler.CurrentTick() > fallback_tick &&
+                      !cache.HasGpuDirtyBytes(dirty_word_address, sizeof(uint32_t)),
+                  "dirty WAIT_REG_MEM payload did not use the synchronized packet path");
+        };
+        const auto wait32 = make_wait32(25u);
+        run_wait_metadata(base + 0x400, wait32, base + 0x400 + 6 * sizeof(uint32_t),
+                          "clean 32-bit WAIT_REG_MEM");
+        const auto wait64 = make_wait64(25u);
+        run_wait_metadata(base + 0x440, wait64, base + 0x440 + 8 * sizeof(uint32_t),
+                          "clean 64-bit WAIT_REG_MEM");
+
         auto dirty_tag = cache.ObtainBuffer(dirty_agc_address + 2 * sizeof(uint32_t),
                                             sizeof(uint32_t), true, false);
         dirty_tag.first->Fill(dirty_tag.second, sizeof(uint32_t), 0xc8010000u);
