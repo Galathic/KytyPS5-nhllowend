@@ -38,13 +38,19 @@ class ResourceMemoEntry {
         auto& capture = *static_cast<Capture*>(userdata);
         const bool valid = ReadValues(capture.source, strict, address, values);
         auto& reads = capture.memo.m_reads;
-        if (valid && !reads.empty() && reads.back().valid && reads.back().strict == strict &&
-            reads.back().address + reads.back().values.size() * sizeof(uint32_t) == address) {
-            reads.back().values.insert(reads.back().values.end(), values.begin(), values.end());
+        auto* previous = capture.memo.m_read_count == 0 ? nullptr
+            : &reads[capture.memo.m_read_count - 1];
+        if (valid && previous != nullptr && previous->valid && previous->strict == strict &&
+            previous->address + previous->values.size() * sizeof(uint32_t) == address) {
+            previous->values.insert(previous->values.end(), values.begin(), values.end());
         } else {
-            reads.push_back({address, strict,
-                valid ? std::vector<uint32_t>(values.begin(), values.end())
-                      : std::vector<uint32_t>(values.size(), 0u), valid});
+            if (capture.memo.m_read_count == reads.size()) reads.emplace_back();
+            auto& read = reads[capture.memo.m_read_count++];
+            read.address = address;
+            read.strict = strict;
+            read.valid = valid;
+            if (valid) read.values.assign(values.begin(), values.end());
+            else read.values.assign(values.size(), 0u);
         }
         return valid;
     }
@@ -54,7 +60,7 @@ public:
     Miss LastMiss() const { return m_last_miss; }
     size_t RecordedWords() const {
         size_t total = 0;
-        for (const auto& read: m_reads) total += read.values.size();
+        for (const auto& read: std::span(m_reads).first(m_read_count)) total += read.values.size();
         return total;
     }
 
@@ -74,7 +80,7 @@ public:
         }
         if (inputs_equal) {
             bool equal = true;
-            for (const auto& read: m_reads) {
+            for (const auto& read: std::span(m_reads).first(m_read_count)) {
                 m_check.resize(read.values.size());
                 const bool valid = ReadValues(runtime, read.strict, read.address, m_check);
                 if (valid != read.valid) {
@@ -98,7 +104,7 @@ public:
         }
         if (probe_only) return false;
         m_valid = false;
-        m_reads.clear();
+        m_read_count = 0;
         if (!enabled) {
             return ShaderRecompiler::IR::MaterializeResources(plan, runtime, snapshot, specialization);
         }
@@ -143,6 +149,7 @@ private:
     std::vector<uint32_t> m_workgroups;
     std::vector<uint32_t> m_register_inputs;
     std::vector<Read> m_reads;
+    size_t m_read_count = 0;
     std::vector<uint32_t> m_check;
 };
 
@@ -192,26 +199,26 @@ public:
             return true;
         }
         if (count == 0) m_last_miss = Miss::Cold;
-        Entry fresh;
-        if (!fresh.memo.Refresh(plan, runtime, snapshot, specialization, true, reused)) {
+        // Recycle the victim in place. Its dependency list and captured-read storage
+        // survive misses instead of rebuilding/freeing them for every object.
+        const size_t selected = count < m_capacity ? count : m_next++ % m_capacity;
+        if (count < m_capacity) m_entries.emplace_back();
+        auto& entry = m_entries[selected];
+        if (!entry.memo.Refresh(plan, runtime, entry.snapshot, entry.specialization, true, reused)) {
             m_entries.clear();
             m_last_hit = SIZE_MAX;
             return false;
         }
-        // Large descriptor walks must not multiply memory use sixteenfold.
-        if (fresh.memo.RecordedWords() > 4096) {
+        if (entry.memo.RecordedWords() > 4096) {
+            snapshot = std::move(entry.snapshot);
+            specialization = std::move(entry.specialization);
+            m_entries.erase(m_entries.begin() + selected);
             m_last_hit = SIZE_MAX;
             return true;
         }
-        fresh.snapshot = snapshot;
-        fresh.specialization = specialization;
-        if (m_entries.size() < m_capacity) {
-            m_last_hit = m_entries.size();
-            m_entries.push_back(std::move(fresh));
-        } else {
-            m_last_hit = m_next++ % m_capacity;
-            m_entries[m_last_hit] = std::move(fresh);
-        }
+        snapshot = entry.snapshot;
+        specialization = entry.specialization;
+        m_last_hit = selected;
         m_output = &snapshot;
         m_specialization = &specialization;
         return true;

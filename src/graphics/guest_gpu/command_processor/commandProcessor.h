@@ -72,6 +72,8 @@ public:
 	HW::Context&    GetCtx() { return m_ctx; }
 	HW::UserConfig& GetUcfg() { return m_ucfg; }
 	HW::Shader&     GetShCtx() { ResolveNativeShaderRegisters(); return m_sh_ctx; }
+	// PM4 setters for disjoint state do not consume pending GS draw-offset registers.
+	HW::Shader& GetShCtxForStateUpdate() { return m_sh_ctx; }
 	HW::Shader& GetShCtxForWrite(uint32_t location) { CancelNativeShaderRegister(location); return m_sh_ctx; }
 
 	void SetIndexType(uint32_t index_type_and_size);

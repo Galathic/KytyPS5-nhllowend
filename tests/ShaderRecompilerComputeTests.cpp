@@ -116,6 +116,9 @@ struct CommandProcessorTestAccess {
   static void PendingShader(CommandProcessor& cp, NativeIndirectDraw source) {
     cp.m_pending_shader_offsets.push_back(std::move(source));
   }
+  static size_t PendingShaderCount(const CommandProcessor& cp) {
+    return cp.m_pending_shader_offsets.size();
+  }
 };
 
 
@@ -40922,6 +40925,28 @@ void CheckNativeIndexedPreparation(RenderContext& renderer) {
       processor.GetShCtx().GetVs().gs_user_sgpr.value[5] == 7, "empty draw overwrote a prior shader offset");
   source.shader_regs = {Pm4::SPI_SHADER_USER_DATA_GS_0 + 5, Pm4::SPI_SHADER_USER_DATA_GS_0 + 6, Pm4::SPI_SHADER_USER_DATA_GS_0 + 7};
   scheduler.Current().Handle().updateBuffer(source.snapshot->Handle(), 0, sizeof(data), data.data());
+  CommandProcessorTestAccess::PendingShader(processor, source);
+  const auto unrelated_tick = scheduler.CurrentTick();
+  g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_DATA_PS_0 + 3](
+      processor, Pm4::SPI_SHADER_USER_DATA_PS_0 + 3, 321);
+  g_hw_sh_indirect_func[Pm4::COMPUTE_USER_DATA_0](
+      processor, Pm4::COMPUTE_USER_DATA_0, 654);
+  g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_LO_GS](
+      processor, Pm4::SPI_SHADER_PGM_LO_GS, 0x1234);
+  const auto& updated = processor.GetShCtxForStateUpdate();
+  Require("NativeIndexedPrep", "unrelated state updates preserve pending offsets without a drain",
+      CommandProcessorTestAccess::PendingShaderCount(processor) == 1 &&
+      scheduler.CurrentTick() == unrelated_tick &&
+      updated.GetPs().ps_user_sgpr.value[3] == 321 &&
+      updated.GetCs().cs_user_sgpr.value[0] == 654 &&
+      updated.GetVs().gs_regs.data_addr == 0x123400,
+      "unrelated shader state consumed pending offsets or forced a GPU drain");
+  processor.GetShCtxForWrite(Pm4::SPI_SHADER_USER_DATA_GS_0 + 5).SetGsUserSgpr(
+      5, 501, HW::UserSgprType::Unknown);
+  const auto& partial = processor.GetShCtx().GetVs().gs_user_sgpr;
+  Require("NativeIndexedPrep", "partial overwrite preserves unconsumed GPU offsets",
+      partial.value[5] == 501 && partial.value[6] == 88 && partial.value[7] == 7,
+      "resolving pending offsets overwrote an explicit field or lost a retained field");
   CommandProcessorTestAccess::PendingShader(processor, source);
   const auto tick = scheduler.CurrentTick();
   for (uint32_t slot = 5; slot <= 7; ++slot) {

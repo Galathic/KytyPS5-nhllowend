@@ -1002,7 +1002,7 @@ KYTY_HW_SH_PARSER(HwShSetRegisters) {
 }
 
 static void HwShSetCsRegister(CommandProcessor& cp, uint32_t cmd_offset, uint32_t value) {
-	auto cs_regs = cp.GetShCtx().GetCs().cs_regs;
+	auto cs_regs = cp.GetShCtxForStateUpdate().GetCs().cs_regs;
 
 	switch (cmd_offset) {
 		case Pm4::COMPUTE_PGM_LO:
@@ -1071,7 +1071,7 @@ static void HwShSetCsRegister(CommandProcessor& cp, uint32_t cmd_offset, uint32_
 			     value);
 	}
 
-	cp.GetShCtx().SetCsShader(cs_regs);
+	cp.GetShCtxForStateUpdate().SetCsShader(cs_regs);
 }
 
 KYTY_HW_SH_PARSER(HwShSetCsRegisters) {
@@ -1104,7 +1104,7 @@ KYTY_HW_SH_PARSER(HwShSetCsUserSgpr) {
 	auto write_num = UserSgprWriteNum(slot, reg_num, 16u, "cs");
 
 	for (uint32_t i = 0; i < write_num; i++) {
-		cp.GetShCtx().SetCsUserSgpr(slot + i, buffer[i], cp.GetUserDataMarker());
+		cp.GetShCtxForStateUpdate().SetCsUserSgpr(slot + i, buffer[i], cp.GetUserDataMarker());
 	}
 	cp.SetUserDataMarker(HW::UserSgprType::Unknown);
 
@@ -1121,7 +1121,7 @@ KYTY_HW_SH_PARSER(HwShSetPsUserSgpr) {
 	auto write_num = UserSgprWriteNum(slot, reg_num, 32u, "ps");
 
 	for (uint32_t i = 0; i < write_num; i++) {
-		cp.GetShCtx().SetPsUserSgpr(slot + i, buffer[i], cp.GetUserDataMarker());
+		cp.GetShCtxForStateUpdate().SetPsUserSgpr(slot + i, buffer[i], cp.GetUserDataMarker());
 	}
 	cp.SetUserDataMarker(HW::UserSgprType::Unknown);
 
@@ -1155,7 +1155,7 @@ KYTY_HW_SH_PARSER(HwShSetHsUserSgpr) {
 	auto write_num = UserSgprWriteNum(slot, reg_num, 32u, "hs");
 
 	for (uint32_t i = 0; i < write_num; i++) {
-		cp.GetShCtx().SetHsUserSgpr(slot + i, buffer[i], cp.GetUserDataMarker());
+		cp.GetShCtxForStateUpdate().SetHsUserSgpr(slot + i, buffer[i], cp.GetUserDataMarker());
 	}
 	cp.SetUserDataMarker(HW::UserSgprType::Unknown);
 
@@ -3619,7 +3619,7 @@ void GraphicsInitJmpTablesShIndirect() {
 	for (uint32_t slot = 0; slot < 16; slot++) {
 		g_hw_sh_indirect_func[Pm4::COMPUTE_USER_DATA_0 + slot] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 			auto sgpr = cmd_offset - Pm4::COMPUTE_USER_DATA_0;
-			cp.GetShCtx().SetCsUserSgpr(sgpr, value, cp.GetUserDataMarker());
+			cp.GetShCtxForStateUpdate().SetCsUserSgpr(sgpr, value, cp.GetUserDataMarker());
 			cp.SetUserDataMarker(HW::UserSgprType::Unknown);
 		};
 	}
@@ -3632,7 +3632,7 @@ void GraphicsInitJmpTablesShIndirect() {
 		g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_DATA_PS_0 + slot] =
 		    [](KYTY_HW_SH_INDIRECT_ARGS) {
 			    auto sgpr = cmd_offset - Pm4::SPI_SHADER_USER_DATA_PS_0;
-			    cp.GetShCtx().SetPsUserSgpr(sgpr, value, cp.GetUserDataMarker());
+			    cp.GetShCtxForStateUpdate().SetPsUserSgpr(sgpr, value, cp.GetUserDataMarker());
 			    cp.SetUserDataMarker(HW::UserSgprType::Unknown);
 		    };
 		g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_DATA_GS_0 + slot] =
@@ -3644,7 +3644,7 @@ void GraphicsInitJmpTablesShIndirect() {
 		g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_DATA_HS_0 + slot] =
 		    [](KYTY_HW_SH_INDIRECT_ARGS) {
 			    auto sgpr = cmd_offset - Pm4::SPI_SHADER_USER_DATA_HS_0;
-			    cp.GetShCtx().SetHsUserSgpr(sgpr, value, cp.GetUserDataMarker());
+			    cp.GetShCtxForStateUpdate().SetHsUserSgpr(sgpr, value, cp.GetUserDataMarker());
 			    cp.SetUserDataMarker(HW::UserSgprType::Unknown);
 		    };
 	}
@@ -3671,13 +3671,13 @@ void GraphicsInitJmpTablesShIndirect() {
 	for (uint32_t offset = Pm4::SPI_SHADER_USER_DATA_ADDR_LO_PS;
 	     offset <= Pm4::SPI_SHADER_USER_DATA_ADDR_HI_PS; offset++) {
 		g_hw_sh_indirect_func[offset] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-			cp.GetShCtx().SetPsUserDataAddress(cmd_offset - Pm4::SPI_SHADER_USER_DATA_ADDR_LO_PS,
+			cp.GetShCtxForStateUpdate().SetPsUserDataAddress(cmd_offset - Pm4::SPI_SHADER_USER_DATA_ADDR_LO_PS,
 			                                   value);
 		};
 	}
 	for (uint32_t offset = 4; offset <= 5; offset++) {
 		g_hw_sh_indirect_func[offset] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-			cp.GetShCtx().SetPsAuxiliaryTableAddress(cmd_offset - 4, value);
+			cp.GetShCtxForStateUpdate().SetPsAuxiliaryTableAddress(cmd_offset - 4, value);
 		};
 	}
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PACE_ID_GS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
@@ -3697,7 +3697,7 @@ void GraphicsInitJmpTablesShIndirect() {
 	for (uint32_t offset = Pm4::SPI_SHADER_USER_DATA_ADDR_LO_GS;
 	     offset <= Pm4::SPI_SHADER_USER_DATA_ADDR_HI_GS; offset++) {
 		g_hw_sh_indirect_func[offset] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-			cp.GetShCtx().SetGsUserDataAddress(cmd_offset - Pm4::SPI_SHADER_USER_DATA_ADDR_LO_GS,
+			cp.GetShCtxForStateUpdate().SetGsUserDataAddress(cmd_offset - Pm4::SPI_SHADER_USER_DATA_ADDR_LO_GS,
 			                                   value);
 		};
 	}
@@ -3713,22 +3713,22 @@ void GraphicsInitJmpTablesShIndirect() {
 	for (uint32_t offset = Pm4::SPI_SHADER_USER_DATA_ADDR_LO_HS;
 	     offset <= Pm4::SPI_SHADER_USER_DATA_ADDR_HI_HS; offset++) {
 		g_hw_sh_indirect_func[offset] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-			cp.GetShCtx().SetHsUserDataAddress(cmd_offset - Pm4::SPI_SHADER_USER_DATA_ADDR_LO_HS,
+			cp.GetShCtxForStateUpdate().SetHsUserDataAddress(cmd_offset - Pm4::SPI_SHADER_USER_DATA_ADDR_LO_HS,
 			                                   value);
 		};
 	}
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_LO_HS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		auto base = cp.GetShCtx().GetVs().hs_regs.data_addr;
+		auto base = cp.GetShCtxForStateUpdate().GetVs().hs_regs.data_addr;
 		base &= 0xFFFFFF00000000FFull;
 		base |= static_cast<uint64_t>(value) << 8u;
-		cp.GetShCtx().SetHsShaderBase(base);
+		cp.GetShCtxForStateUpdate().SetHsShaderBase(base);
 	};
 
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_HI_HS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		auto base = cp.GetShCtx().GetVs().hs_regs.data_addr;
+		auto base = cp.GetShCtxForStateUpdate().GetVs().hs_regs.data_addr;
 		base &= 0xFFFF00FFFFFFFFFFull;
 		base |= (static_cast<uint64_t>(value) & 0xffu) << 40u;
-		cp.GetShCtx().SetHsShaderBase(base);
+		cp.GetShCtxForStateUpdate().SetHsShaderBase(base);
 	};
 
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_RSRC1_HS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
@@ -3744,7 +3744,7 @@ void GraphicsInitJmpTablesShIndirect() {
 		r1.threadgroup_configuration = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_HS, WGP_MODE) != 0;
 		r1.ls_vgpr_component_count = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_HS, LS_VGPR_COMP_CNT);
 		r1.fp16_overflow           = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_HS, FP16_OVFL) != 0;
-		cp.GetShCtx().SetHsShaderResource1(r1);
+		cp.GetShCtxForStateUpdate().SetHsShaderResource1(r1);
 	};
 
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_RSRC2_HS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
@@ -3754,21 +3754,21 @@ void GraphicsInitJmpTablesShIndirect() {
 		                  (KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_HS, USER_SGPR_MSB) << 5u);
 		r2.lds_size     = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_HS, LDS_SIZE);
 		r2.shared_vgprs = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_HS, SHARED_VGPR_CNT);
-		cp.GetShCtx().SetHsShaderResource2(r2);
+		cp.GetShCtxForStateUpdate().SetHsShaderResource2(r2);
 	};
 
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_LO_LS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		auto base = cp.GetShCtx().GetVs().ls_regs.data_addr;
+		auto base = cp.GetShCtxForStateUpdate().GetVs().ls_regs.data_addr;
 		base &= 0xFFFFFF00000000FFull;
 		base |= static_cast<uint64_t>(value) << 8u;
-		cp.GetShCtx().SetLsShaderBase(base);
+		cp.GetShCtxForStateUpdate().SetLsShaderBase(base);
 	};
 
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_HI_LS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		auto base = cp.GetShCtx().GetVs().ls_regs.data_addr;
+		auto base = cp.GetShCtxForStateUpdate().GetVs().ls_regs.data_addr;
 		base &= 0xFFFF00FFFFFFFFFFull;
 		base |= (static_cast<uint64_t>(value) & 0xffu) << 40u;
-		cp.GetShCtx().SetLsShaderBase(base);
+		cp.GetShCtxForStateUpdate().SetLsShaderBase(base);
 	};
 
 	// RDNA merges LS into HS and ES into GS; the merged stages run with the HS/GS RSRC registers,
@@ -3783,31 +3783,31 @@ void GraphicsInitJmpTablesShIndirect() {
 	}
 
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_LO_ES] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		auto base = cp.GetShCtx().GetVs().es_regs.data_addr;
+		auto base = cp.GetShCtxForStateUpdate().GetVs().es_regs.data_addr;
 		base &= 0xFFFFFF00000000FFull;
 		base |= static_cast<uint64_t>(value) << 8u;
-		cp.GetShCtx().SetEsShaderBase(base);
+		cp.GetShCtxForStateUpdate().SetEsShaderBase(base);
 	};
 
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_HI_ES] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		auto base = cp.GetShCtx().GetVs().es_regs.data_addr;
+		auto base = cp.GetShCtxForStateUpdate().GetVs().es_regs.data_addr;
 		base &= 0xFFFF00FFFFFFFFFFull;
 		base |= (static_cast<uint64_t>(value) & 0xffu) << 40u;
-		cp.GetShCtx().SetEsShaderBase(base);
+		cp.GetShCtxForStateUpdate().SetEsShaderBase(base);
 	};
 
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_LO_GS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		auto base = cp.GetShCtx().GetVs().gs_regs.data_addr;
+		auto base = cp.GetShCtxForStateUpdate().GetVs().gs_regs.data_addr;
 		base &= 0xFFFFFF00000000FFull;
 		base |= static_cast<uint64_t>(value) << 8u;
-		cp.GetShCtx().SetGsShaderBase(base);
+		cp.GetShCtxForStateUpdate().SetGsShaderBase(base);
 	};
 
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_HI_GS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		auto base = cp.GetShCtx().GetVs().gs_regs.data_addr;
+		auto base = cp.GetShCtxForStateUpdate().GetVs().gs_regs.data_addr;
 		base &= 0xFFFF00FFFFFFFFFFull;
 		base |= (static_cast<uint64_t>(value) & 0xffu) << 40u;
-		cp.GetShCtx().SetGsShaderBase(base);
+		cp.GetShCtxForStateUpdate().SetGsShaderBase(base);
 	};
 
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_RSRC1_GS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
@@ -3824,7 +3824,7 @@ void GraphicsInitJmpTablesShIndirect() {
 		r1.threadgroup_configuration = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_GS, WGP_MODE) != 0;
 		r1.gs_vgpr_component_count = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_GS, GS_VGPR_COMP_CNT);
 		r1.fp16_overflow           = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_GS, FP16_OVFL) != 0;
-		cp.GetShCtx().SetGsShaderResource1(r1);
+		cp.GetShCtxForStateUpdate().SetGsShaderResource1(r1);
 	};
 
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_RSRC2_GS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
@@ -3836,21 +3836,21 @@ void GraphicsInitJmpTablesShIndirect() {
 		r2.offchip_lds             = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_GS, OC_LDS_EN) != 0;
 		r2.lds_size                = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_GS, LDS_SIZE);
 		r2.shared_vgprs            = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_GS, SHARED_VGPR_CNT);
-		cp.GetShCtx().SetGsShaderResource2(r2);
+		cp.GetShCtxForStateUpdate().SetGsShaderResource2(r2);
 	};
 
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_LO_PS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		auto base = cp.GetShCtx().GetPs().ps_regs.data_addr;
+		auto base = cp.GetShCtxForStateUpdate().GetPs().ps_regs.data_addr;
 		base &= 0xFFFFFF00000000FFull;
 		base |= static_cast<uint64_t>(value) << 8u;
-		cp.GetShCtx().SetPsShaderBase(base);
+		cp.GetShCtxForStateUpdate().SetPsShaderBase(base);
 	};
 
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_HI_PS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
-		auto base = cp.GetShCtx().GetPs().ps_regs.data_addr;
+		auto base = cp.GetShCtxForStateUpdate().GetPs().ps_regs.data_addr;
 		base &= 0xFFFF00FFFFFFFFFFull;
 		base |= (static_cast<uint64_t>(value) & 0xffu) << 40u;
-		cp.GetShCtx().SetPsShaderBase(base);
+		cp.GetShCtxForStateUpdate().SetPsShaderBase(base);
 	};
 
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_RSRC1_PS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
@@ -3865,7 +3865,7 @@ void GraphicsInitJmpTablesShIndirect() {
 		r1.require_forward_progress =
 		    KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_PS, FWD_PROGRESS) != 0;
 		r1.fp16_overflow = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC1_PS, FP16_OVFL) != 0;
-		cp.GetShCtx().SetPsShaderResource1(r1);
+		cp.GetShCtxForStateUpdate().SetPsShaderResource1(r1);
 	};
 
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_RSRC2_PS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
@@ -3878,7 +3878,7 @@ void GraphicsInitJmpTablesShIndirect() {
 		r2.raster_ordered_shading =
 		    KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_PS, RASTER_ORDERED_SHADING);
 		r2.shared_vgprs = KYTY_PM4_GET(value, SPI_SHADER_PGM_RSRC2_PS, SHARED_VGPR_CNT);
-		cp.GetShCtx().SetPsShaderResource2(r2);
+		cp.GetShCtxForStateUpdate().SetPsShaderResource2(r2);
 	};
 }
 

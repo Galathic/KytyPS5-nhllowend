@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -40,6 +41,42 @@ static thread_local CommandProcessor* g_current_processor = nullptr;
 static thread_local Pm4Execution*     g_current_execution = nullptr;
 static thread_local bool              g_gpu_thread        = false;
 static thread_local GuestGpu*         g_gpu_state         = nullptr;
+
+struct Pm4FaultScope {
+	uint64_t packet_addr = 0;
+	uint32_t packet_dw   = 0;
+	uint32_t header      = 0;
+	bool     executing   = false;
+};
+static thread_local Pm4FaultScope g_pm4_fault_scope;
+
+void NotePm4MemoryFault(uint64_t fault_vaddr, uint32_t access) noexcept {
+	static const bool enabled = [] {
+		const char* setting = std::getenv("KYTY_PERF_STATS");
+		return setting != nullptr && setting[0] == '1';
+	}();
+	if (!enabled || !GuestGpu::IsGpuThread() || g_pm4_fault_scope.packet_addr == 0) return;
+	// Limit log traffic without exhausting the diagnostic during startup before training.
+	static thread_local auto interval = std::chrono::steady_clock::now();
+	static thread_local uint32_t lines = 0;
+	const auto now = std::chrono::steady_clock::now();
+	if (now - interval >= std::chrono::seconds(5)) {
+		interval = now;
+		lines = 0;
+	}
+	if (lines++ >= 8) return;
+	const auto& scope = g_pm4_fault_scope;
+	const uint64_t bytes = static_cast<uint64_t>(scope.packet_dw) * sizeof(uint32_t);
+	const bool in_packet = fault_vaddr >= scope.packet_addr &&
+	                       fault_vaddr - scope.packet_addr < bytes;
+	std::printf("NHL27PM4FAULT: fault=0x%llx access=%u packet=0x%llx packet_dw=%u "
+	            "header=0x%08x op=0x%x custom=0x%x phase=%s in_packet=%u\n",
+	            static_cast<unsigned long long>(fault_vaddr), access,
+	            static_cast<unsigned long long>(scope.packet_addr), scope.packet_dw,
+	            scope.header, scope.executing ? ((scope.header >> 8u) & 0xffu) : UINT32_MAX,
+	            scope.executing ? KYTY_PM4_R(scope.header) : UINT32_MAX,
+	            scope.executing ? "handler" : "fetch", static_cast<unsigned>(in_packet));
+}
 
 struct DrawIndirectArgs {
 	uint32_t vertex_count_per_instance;
@@ -731,7 +768,18 @@ void CommandProcessor::SuspendPm4() {
 }
 
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
+	static const bool clean_backing = [] {
+		const char* setting = std::getenv("KYTY_PM4_CLEAN_BACKING");
+		return setting != nullptr && setting[0] == '1';
+	}();
+	// Only bypass exact-clean header reads. Some register handlers fuse adjacent packets,
+	// so their payload pointer and available stream length must remain the original ones.
+	struct FaultScopeRestore {
+		Pm4FaultScope previous = g_pm4_fault_scope;
+		~FaultScopeRestore() { g_pm4_fault_scope = previous; }
+	} fault_scope_restore;
 	while (!execution.m_buffer_stack.empty()) {
+		g_pm4_fault_scope = {};
 		if (g_gpu_state != nullptr) {
 			g_gpu_state->ProcessCommands();
 		}
@@ -745,8 +793,15 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		const auto* const packet        = cursor.commands.data() + cursor.offset_dw;
 		const auto        total_dw      = static_cast<uint32_t>(cursor.commands.size());
 		const auto        remaining_dw  = total_dw - cursor.offset_dw;
-		const auto        packet_header = packet[0];
+		g_pm4_fault_scope = {reinterpret_cast<uint64_t>(packet), 1, 0, false};
+		uint32_t packet_header = 0;
+		if (!clean_backing || !TryPeekGuest(packet, &packet_header, sizeof(packet_header))) {
+			packet_header = packet[0];
+		}
 		const auto        opcode        = (packet_header >> 8u) & 0xffu;
+		g_pm4_fault_scope = {reinterpret_cast<uint64_t>(packet),
+		                     std::min<uint32_t>(KYTY_PM4_LEN(packet_header), remaining_dw),
+		                     packet_header, true};
 		EXIT_NOT_IMPLEMENTED(remaining_dw > total_dw);
 
 		if (packet_header == 0x80000000u) {
@@ -756,6 +811,8 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		}
 
 		EXIT_NOT_IMPLEMENTED(remaining_dw < 2);
+		const auto declared_dw = KYTY_PM4_LEN(packet_header);
+		EXIT_NOT_IMPLEMENTED(declared_dw > remaining_dw);
 
 		if (GraphicsRunDebugDumpEnabled()) {
 			LOGF("CP packet: offset=0x%05" PRIx32 " cmd_id=0x%08" PRIx32 " op=0x%02" PRIx32
