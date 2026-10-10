@@ -144,12 +144,13 @@ void BufferCache::PerfMaybePrint() {
 	            static_cast<unsigned long long>(events[0]),
 	            static_cast<unsigned long long>(events[1]), PerfNoSyncReadback() ? 1 : 0);
 	std::printf("NHL27PERF: work dispatches=%llu draws=%llu auto_dispatch_barriers=%llu "
-	            "guest_barriers=%llu acquire_mem=%llu guest_sync=%d\n",
+	            "guest_barriers=%llu acquire_mem=%llu render_passes=%llu guest_sync=%d\n",
 	            static_cast<unsigned long long>(events[2]),
 	            static_cast<unsigned long long>(events[3]),
 	            static_cast<unsigned long long>(events[4]),
 	            static_cast<unsigned long long>(events[5]),
-	            static_cast<unsigned long long>(events[6]), GuestSyncOnly() ? 1 : 0);
+	            static_cast<unsigned long long>(events[6]),
+	            static_cast<unsigned long long>(events[7]), GuestSyncOnly() ? 1 : 0);
 	{
 		static uint64_t last[5] {};
 		uint64_t        now[5] {};
