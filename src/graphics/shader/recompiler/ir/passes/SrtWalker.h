@@ -45,7 +45,7 @@ class SrtWalker {
 public:
 	SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
 	          std::span<const uint8_t> clean_flat_slots = {}, SrtWalker* clean_evaluator = nullptr,
-	          Value active_mask = {});
+	          Value active_mask = {}, bool skip_tape = false);
 	~SrtWalker();
 	SrtWalker(const SrtWalker&)            = delete;
 	SrtWalker& operator=(const SrtWalker&) = delete;
@@ -72,6 +72,7 @@ private:
 	std::span<const uint8_t>         m_clean_flat_slots;
 	SrtWalker*                      m_clean_evaluator = nullptr;
 	Value                           m_active_mask;
+	bool                            m_skip_tape = false;
 	uint64_t                        m_cycle_count = 0;
 	ResourcePlan::EvaluationContext& m_context;
 };

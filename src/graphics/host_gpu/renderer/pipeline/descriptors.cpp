@@ -41,6 +41,7 @@
 #include <mutex>
 #include <span>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 
 #ifdef min
@@ -55,6 +56,42 @@ namespace Libs::Graphics {
 namespace {
 
 using BindingKind = ShaderRecompiler::IR::DescriptorBindingKind;
+
+struct UnmappedBufferKey {
+	uint64_t shader_hash;
+	uint64_t address;
+	uint64_t size;
+	uint32_t resource;
+	ShaderType stage;
+	bool operator==(const UnmappedBufferKey&) const = default;
+};
+
+struct UnmappedBufferKeyHash {
+	size_t operator()(const UnmappedBufferKey& key) const {
+		size_t hash = std::hash<uint64_t> {}(key.shader_hash);
+		const auto mix = [&](size_t value) {
+			hash ^= value + 0x9e3779b9u + (hash << 6u) + (hash >> 2u);
+		};
+		mix(std::hash<uint64_t> {}(key.address));
+		mix(std::hash<uint64_t> {}(key.size));
+		mix(std::hash<uint32_t> {}(key.resource));
+		mix(std::hash<unsigned> {}(static_cast<unsigned>(key.stage)));
+		return hash;
+	}
+};
+
+bool ShouldLogUnmappedBuffer(const UnmappedBufferKey& key) {
+	thread_local std::unordered_set<UnmappedBufferKey, UnmappedBufferKeyHash> logged;
+	return logged.insert(key).second;
+}
+
+bool IsSrtTapeVerifyEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SRT_TAPE_VERIFY");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
 
 } // namespace
 
@@ -910,6 +947,15 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 					                   (graphics.StorageMinAlignment() - 1);
 					size = std::min({size, uint64_t {256} * 1024 * 1024, limit});
 				}
+			}
+			if (IsSrtTapeVerifyEnabled() && !m_context.IsMapped(address, size) &&
+			    ShouldLogUnmappedBuffer({program.shader_hash, address, size, resource, program.stage})) {
+				const auto& raw = snapshot.buffers[resource];
+				LOGF("GPU buffer descriptor range not fully mapped stage=%u shader=0x%016" PRIx64
+				     " resource=%u addr=0x%016" PRIx64 " size=0x%016" PRIx64
+				     " records=%u dwords=%08x,%08x,%08x,%08x\n",
+				     static_cast<unsigned>(program.stage), program.shader_hash, resource, address, size,
+				     descriptor.NumRecords(), raw.dwords[0], raw.dwords[1], raw.dwords[2], raw.dwords[3]);
 			}
 			size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
 			prepared.buffer_sources.push_back({address, size, cache.FindBuffer(address, size)});

@@ -636,6 +636,198 @@ void TestGuardedVectorReadTapeFallback() {
         "true vector-load guard did not read the descriptor exactly once");
 }
 
+void TestTapeVerifyReplaysReaderDomains() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  const char *verify = std::getenv("KYTY_SRT_TAPE_VERIFY");
+  const char *tape = std::getenv("KYTY_SRT_TAPE");
+  if (verify == nullptr || verify[0] != '1' || (tape != nullptr && tape[0] == '0')) return;
+
+  ResourcePlan plan;
+  plan.stage = Libs::Graphics::ShaderType::Compute;
+  plan.srt_plan_complete = true;
+  plan.resource_tracking_complete = true;
+  plan.memory_info.push_back({.kind = ResourceKind::ScalarAddress, .planning_only = true});
+  plan.memory_info.push_back({.kind = ResourceKind::Buffer});
+  auto &scalar_handle = plan.value_storage.emplace_back(ValueOpcode::GetAddressResource);
+  scalar_handle.SetArg(0, Value(0x2000u));
+  scalar_handle.SetArg(1, Value(0u));
+  auto &scalar_read = plan.value_storage.emplace_back(ValueOpcode::LoadAddressU32);
+  scalar_read.SetFlags(MemoryFlags{.index = 0});
+  scalar_read.SetArg(0, Value(&scalar_handle));
+  scalar_read.SetArg(1, Value(0u));
+  scalar_read.SetArg(2, Value(0u));
+  scalar_read.SetArg(3, Value(true));
+  auto &buffer_handle = plan.value_storage.emplace_back(ValueOpcode::GetBufferResource);
+  buffer_handle.SetArg(0, Value(0x3000u));
+  buffer_handle.SetArg(1, Value(4u << 16u));
+  buffer_handle.SetArg(2, Value(1u));
+  buffer_handle.SetArg(3, Value(0x16204u));
+  auto &vector_read = plan.value_storage.emplace_back(ValueOpcode::LoadBufferU32);
+  vector_read.SetFlags(MemoryFlags{.index = 1});
+  vector_read.SetArg(0, Value(&buffer_handle));
+  vector_read.SetArg(1, Value(0u));
+  vector_read.SetArg(2, Value(0u));
+  vector_read.SetArg(3, Value(0u));
+  vector_read.SetArg(4, Value(true));
+  plan.srt_reads.push_back({Value(&scalar_read), 0});
+  plan.srt_reads.push_back({Value(&vector_read), 1});
+
+  struct Reads { uint32_t ordinary = 0; uint32_t strict = 0; } reads;
+  const SrtRuntime runtime{
+      .read_memory = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+        auto &state = *static_cast<Reads *>(data);
+        ++state.ordinary;
+        if (address != 0x2000u || words.size() != 1u) return false;
+        words[0] = 0x12345678u;
+        return true;
+      },
+      .userdata = &reads,
+      .read_specialization_memory = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+        auto &state = *static_cast<Reads *>(data);
+        ++state.strict;
+        if (address != 0x3000u || words.size() != 1u) return false;
+        words[0] = 0x87654321u;
+        return true;
+      }};
+  std::vector<uint32_t> flat;
+  Check(SrtWalker(plan, runtime).RefreshFlatBuffer(flat) &&
+            flat == std::vector<uint32_t>{0x12345678u, 0x87654321u} &&
+            reads.ordinary == 1u && reads.strict == 1u,
+        "tape verifier reread memory or crossed ordinary/strict reader domains");
+
+  reads = {};
+  auto failed_runtime = runtime;
+  failed_runtime.read_memory = +[](void *data, uint64_t, std::span<uint32_t>) {
+    ++static_cast<Reads *>(data)->ordinary;
+    return false;
+  };
+  Check(!SrtWalker(plan, failed_runtime).RefreshFlatBuffer(flat) &&
+            reads.ordinary == 1u && reads.strict == 0u,
+        "tape verifier changed failed-reader behavior");
+}
+
+void TestTapeVerifyMismatchFallbackAndUnmatchedReplay() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  const char *verify = std::getenv("KYTY_SRT_TAPE_VERIFY");
+  const char *tape = std::getenv("KYTY_SRT_TAPE");
+  if (verify == nullptr || verify[0] != '1' || (tape != nullptr && tape[0] == '0')) return;
+  const auto add_read = [](ResourcePlan &plan, uint64_t address, uint32_t index) {
+    plan.memory_info.push_back({.kind = ResourceKind::ScalarAddress, .planning_only = true});
+    auto &handle = plan.value_storage.emplace_back(ValueOpcode::GetAddressResource);
+    handle.SetArg(0, Value(static_cast<uint32_t>(address)));
+    handle.SetArg(1, Value(static_cast<uint32_t>(address >> 32u)));
+    auto &read = plan.value_storage.emplace_back(ValueOpcode::LoadAddressU32);
+    read.SetFlags(MemoryFlags{.index = index});
+    read.SetArg(0, Value(&handle));
+    read.SetArg(1, Value(0u));
+    read.SetArg(2, Value(0u));
+    read.SetArg(3, Value(true));
+    return Value(&read);
+  };
+  struct MutatingRead {
+    ResourcePlan *plan = nullptr;
+    Value replacement;
+    uint32_t calls = 0;
+  };
+  const auto reader = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+    auto &state = *static_cast<MutatingRead *>(data);
+    ++state.calls;
+    if (address != 0x4000u || words.size() != 1u) return false;
+    words[0] = 0xabcdef01u;
+    state.plan->srt_reads[0].value = state.replacement;
+    return true;
+  };
+
+  ResourcePlan mismatch_plan;
+  mismatch_plan.stage = Libs::Graphics::ShaderType::Compute;
+  mismatch_plan.srt_plan_complete = true;
+  mismatch_plan.resource_tracking_complete = true;
+  const auto original = add_read(mismatch_plan, 0x4000u, 0u);
+  mismatch_plan.srt_reads.push_back({original, 0u});
+  mismatch_plan.srt_reads.push_back({original, 1u});
+  auto &descriptor_expression = mismatch_plan.value_storage.emplace_back(ValueOpcode::IAdd32);
+  descriptor_expression.SetArg(0, original);
+  descriptor_expression.SetArg(1, Value(1u));
+  DescriptorSource descriptor_source;
+  descriptor_source.dword_count = 1;
+  descriptor_source.dwords[0] = Value(&descriptor_expression);
+  mismatch_plan.descriptor_sources.push_back(descriptor_source);
+  MutatingRead mismatch_state{&mismatch_plan, Value(0x55aa55aau)};
+  const SrtRuntime mismatch_runtime{.read_memory = reader, .userdata = &mismatch_state};
+  std::vector<uint32_t> flat;
+  SrtWalker mismatch_walker(mismatch_plan, mismatch_runtime);
+  Check(mismatch_walker.RefreshFlatBuffer(flat) &&
+            flat == std::vector<uint32_t>{0x55aa55aau, 0xabcdef01u} && mismatch_state.calls == 1u,
+        "tape verifier did not fall back to the recursive value after a synthetic mismatch");
+  DescriptorValue descriptor;
+  Check(mismatch_walker.EvaluateDescriptor(0u, descriptor) &&
+            descriptor.dwords[0] == 0xabcdef02u && mismatch_state.calls == 1u,
+        "mismatch fallback did not transfer the validated recursive memo into descriptor evaluation");
+
+  ResourcePlan unmatched_plan;
+  unmatched_plan.stage = Libs::Graphics::ShaderType::Compute;
+  unmatched_plan.srt_plan_complete = true;
+  unmatched_plan.resource_tracking_complete = true;
+  const auto first = add_read(unmatched_plan, 0x4000u, 0u);
+  const auto second = add_read(unmatched_plan, 0x5000u, 1u);
+  unmatched_plan.srt_reads.push_back({first, 0u});
+  MutatingRead unmatched_state{&unmatched_plan, second};
+  const SrtRuntime unmatched_runtime{.read_memory = reader, .userdata = &unmatched_state};
+  Check(SrtWalker(unmatched_plan, unmatched_runtime).RefreshFlatBuffer(flat) &&
+            flat == std::vector<uint32_t>{0xabcdef01u} && unmatched_state.calls == 1u,
+        "unmatched replay was treated as a mismatch or reread live memory");
+}
+
+void TestTapeSeparatesCleanAndOrdinaryReadDomains() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  ResourcePlan plan;
+  plan.stage = Libs::Graphics::ShaderType::Compute;
+  plan.srt_plan_complete = plan.resource_tracking_complete = true;
+  plan.memory_info.push_back({.kind = ResourceKind::ScalarAddress, .planning_only = true});
+  auto &handle = plan.value_storage.emplace_back(ValueOpcode::GetAddressResource);
+  handle.SetArg(0, Value(0x2000u));
+  handle.SetArg(1, Value(0u));
+  auto &read = plan.value_storage.emplace_back(ValueOpcode::LoadAddressU32);
+  read.SetFlags(MemoryFlags{.index = 0});
+  read.SetArg(0, Value(&handle));
+  read.SetArg(1, Value(0u));
+  read.SetArg(2, Value(0u));
+  read.SetArg(3, Value(true));
+  plan.srt_reads.push_back({Value(&read), 0u});
+  plan.srt_reads.push_back({Value(&read), 1u});
+  plan.clean_flat_slots = {0u, 1u};
+
+  struct Reads { uint32_t ordinary = 0; uint32_t strict = 0; } reads;
+  const SrtRuntime runtime{
+      .read_memory = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+        auto &state = *static_cast<Reads *>(data);
+        ++state.ordinary;
+        if (address != 0x2000u || words.size() != 1u) return false;
+        words[0] = 0x11111111u;
+        return true;
+      },
+      .userdata = &reads,
+      .read_specialization_memory = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+        auto &state = *static_cast<Reads *>(data);
+        ++state.strict;
+        if (address != 0x2000u || words.size() != 1u) return false;
+        words[0] = 0x22222222u;
+        return true;
+      }};
+  SrtWalker clean(plan, CleanRuntime(runtime));
+  SrtWalker walker(plan, runtime, plan.clean_flat_slots, &clean);
+  std::vector<uint32_t> flat;
+  Check(walker.RefreshFlatBuffer(flat) &&
+            flat == std::vector<uint32_t>{0x11111111u, 0x22222222u},
+        "Tape merged ordinary and clean versions of one shared IR read");
+  uint32_t ordinary_value = 0;
+  uint32_t strict_value = 0;
+  Check(walker.Evaluate(Value(&read), ordinary_value) && ordinary_value == 0x11111111u &&
+            clean.Evaluate(Value(&read), strict_value) && strict_value == 0x22222222u &&
+            reads.ordinary == 1u && reads.strict == 1u,
+        "Tape published a read result into the wrong evaluator memo domain");
+}
+
 void TestExactReciprocalDescriptorArithmetic() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   Program program;
@@ -912,6 +1104,9 @@ void DbgExit(int) { std::abort(); }
 } // namespace Common
 
 int main() {
+  TestTapeSeparatesCleanAndOrdinaryReadDomains();
+  TestTapeVerifyReplaysReaderDomains();
+  TestTapeVerifyMismatchFallbackAndUnmatchedReplay();
   TestCompiledDescriptorGatherMatchesWalker();
   TestFlatDescriptorGatherRequiresOwnCompleteRefresh();
   TestResourceMemoTracksMemoryAndRuntime();
