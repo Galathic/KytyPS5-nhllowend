@@ -4,6 +4,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cmath>
 #include <cstring>
@@ -473,7 +474,8 @@ bool SrtWalker::EvaluateExtract(const Inst& inst, uint64_t& result) {
 	return false;
 }
 
-bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
+bool SrtWalker::RawReadAddress(const Inst& inst, uint64_t& address, uint64_t bytes, bool& zero) {
+	zero = false;
 	const auto flags = inst.Flags<MemoryFlags>();
 	if (flags.index >= m_program.memory_info.size()) {
 		return false;
@@ -485,7 +487,7 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		uint64_t enabled = 0;
 		if (!Arg(inst, 4, enabled)) return false;
 		if (enabled == 0u) {
-			result = 0u;
+			zero = true;
 			return true;
 		}
 	}
@@ -501,7 +503,6 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 	}
 	const auto base      = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
 	const auto immediate = static_cast<int64_t>(static_cast<int32_t>(mem.offset));
-	uint64_t   address   = 0;
 	if (inst.GetOpcode() == ValueOpcode::ReadConstBuffer || vector) {
 		uint64_t records = 0;
 		uint64_t word3   = 0;
@@ -519,14 +520,14 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 			if ((high & (1u << 31u)) != 0u || (word3 & ((1u << 23u) | 0xf0000000u)) != 0u)
 				return false;
 			if (stride == 0u || records == 0u || ((word3 >> 12u) & 0x7fu) == 0u) {
-				result = 0u;
+				zero = true;
 				return true;
 			}
 		}
 		const auto size = stride == 0u
 		                      ? static_cast<uint64_t>(static_cast<uint32_t>(records))
 		                      : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
-		if (byte_offset > size || size - byte_offset < sizeof(uint32_t)) {
+		if (byte_offset > size || size - byte_offset < bytes) {
 			return false;
 		}
 		address = (base & ~uint64_t {3}) + byte_offset;
@@ -537,7 +538,16 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 			return false;
 		}
 	}
+	return bytes != 0 && address <= AddressMask && bytes - 1 <= AddressMask - address;
+}
+
+bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
+	uint64_t address = 0;
+	bool zero = false;
+	if (!RawReadAddress(inst, address, sizeof(uint32_t), zero)) return false;
+	if (zero) { result = 0; return true; }
 	uint32_t word = 0;
+	const bool vector = inst.GetOpcode() == ValueOpcode::LoadBufferU32;
 	const auto reader = vector ? m_runtime.read_specialization_memory : m_runtime.read_memory;
 	if (reader != nullptr) {
 		if (!reader(m_runtime.userdata, address, {&word, 1})) {
@@ -548,6 +558,49 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
 	}
 	result = word;
+	return true;
+}
+
+bool SrtWalker::RefreshReadBatch(uint32_t slot, uint32_t count, std::vector<uint32_t>& flat) {
+	const auto& read = m_program.srt_reads[slot];
+	const bool clean = read.flat_offset < m_clean_flat_slots.size() && m_clean_flat_slots[read.flat_offset] != 0;
+	if (clean && (m_clean_evaluator == nullptr || m_runtime.read_specialization_memory == nullptr)) return false;
+	auto& evaluator = clean ? *m_clean_evaluator : *this;
+	if (read.flat_offset > flat.size() || count > flat.size() - read.flat_offset) return false;
+	std::array<uint32_t, 64> indices;
+	for (uint32_t i = 0; i < count; ++i)
+		indices[i] = m_program.srt_reads[slot + i].value.ResolveInstruction()->EvaluationIndex(m_program.evaluation_value_count);
+	const auto already_evaluated = [&] {
+		for (uint32_t i = 0; i < count; ++i) {
+			if (indices[i] < evaluator.m_context.values.size() &&
+			    (evaluator.m_context.values[indices[i]].generation & ~uint64_t{3}) == evaluator.m_context.generation)
+				return true;
+		}
+		return false;
+	};
+	const auto scalar = [&] {
+		for (uint32_t i = 0; i < count; ++i)
+			if (!evaluator.Evaluate(m_program.srt_reads[slot + i].value, flat[read.flat_offset + i])) return false;
+		return true;
+	};
+	// A batch must preserve prior successes/failures in this evaluation session.
+	if (already_evaluated()) return scalar();
+	uint64_t address = 0;
+	bool zero = false;
+	if (!evaluator.RawReadAddress(*read.value.ResolveInstruction(), address, count * 4u, zero) || zero) return false;
+	if (already_evaluated()) return scalar();
+	const auto words = std::span(flat).subspan(read.flat_offset, count);
+	if (evaluator.m_runtime.read_memory != nullptr) {
+		if (!evaluator.m_runtime.read_memory(evaluator.m_runtime.userdata, address, words)) return false;
+	} else {
+		std::memcpy(words.data(), reinterpret_cast<const void*>(address), words.size_bytes());
+	}
+	// Descriptor expressions can refer back to individual raw reads. Publish each
+	// result into the same dense memo used by ordinary scalar evaluation.
+	if (evaluator.m_context.values.size() < m_program.evaluation_value_count)
+		evaluator.m_context.values.resize(m_program.evaluation_value_count);
+	for (uint32_t i = 0; i < count; ++i)
+		evaluator.m_context.values[indices[i]] = {words[i], evaluator.m_context.generation};
 	return true;
 }
 
@@ -964,8 +1017,11 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	if (m_program.control_flow.empty()) {
 		active.clear();
 		flat.resize(m_program.srt_reads.size());
-		for (uint32_t slot = 0; slot < m_program.srt_reads.size(); ++slot) {
-			if (!refresh(slot)) return false;
+		for (uint32_t slot = 0; slot < m_program.srt_reads.size();) {
+			const auto count = m_runtime.batch_reads && slot < m_program.srt_batch_counts.size()
+			                       ? m_program.srt_batch_counts[slot] : 1u;
+			if (!(count > 1 ? RefreshReadBatch(slot, count, flat) : refresh(slot))) return false;
+			slot += count;
 		}
 		return true;
 	}

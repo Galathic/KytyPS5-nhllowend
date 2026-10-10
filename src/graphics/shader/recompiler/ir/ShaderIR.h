@@ -583,6 +583,8 @@ struct ResourcePlan {
 	std::vector<DescriptorSource>       descriptor_sources;
 	std::vector<ResourceBlock>          control_flow;
 	std::vector<SrtRead>                srt_reads;
+	// Contiguous scalar reads eligible for one backing read, indexed by first slot.
+	std::vector<uint32_t>               srt_batch_counts;
 	std::vector<uint8_t>                clean_flat_slots;
 	bool                                requires_specialization_memory = false;
 	bool                                capture_specialization_reads = false;

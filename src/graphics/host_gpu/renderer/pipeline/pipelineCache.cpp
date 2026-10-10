@@ -395,6 +395,7 @@ struct PipelineCache::ProgramCache {
             runtime.userdata = const_cast<PipelineRecord::Program*>(replaying);
         }
         const bool memo_enabled = reuse_enabled && replaying == nullptr;
+		runtime.batch_reads = batch_reads;
         const auto refresh = [&](SourceEntry& source, bool& reused) {
             // Newly encountered shaders must use the current diagnostic policy too.
             if (cache_control_capacity != 0) source.resource_memo.SetCapacity(cache_control_capacity);
@@ -610,12 +611,13 @@ struct PipelineCache::ProgramCache {
 			for (size_t i = 0; i < std::min<size_t>(15, measured.size()); ++i) {
 				const auto& [key, source] = measured[i];
 				const auto& plan = source->resource_plan;
-				std::printf("NHL27RESOURCE: hash=%016llx stage=%u ms=%.2f n=%llu hits=%llu avg=%.2f us values=%zu srt=%zu sources=%zu flat=%zu\n",
+				const auto batches = std::ranges::count_if(plan.srt_batch_counts, [](uint32_t count) { return count > 1; });
+				std::printf("NHL27RESOURCE: hash=%016llx stage=%u ms=%.2f n=%llu hits=%llu avg=%.2f us values=%zu srt=%zu sources=%zu flat=%zu batches=%zu\n",
 				    static_cast<unsigned long long>(key->hash), static_cast<unsigned>(key->stage),
 				    source->refresh_ns / 1e6, static_cast<unsigned long long>(source->refresh_calls),
 				    static_cast<unsigned long long>(source->refresh_hits),
 				    source->refresh_ns / 1e3 / source->refresh_calls, plan.value_storage.size(),
-				    plan.srt_reads.size(), plan.descriptor_sources.size(), source->resources.flattened_srt.size());
+				    plan.srt_reads.size(), plan.descriptor_sources.size(), source->resources.flattened_srt.size(), static_cast<size_t>(batches));
 			}
 			for (const auto& item: measured) {
 				item.second->refresh_ns = item.second->refresh_calls = item.second->refresh_hits = 0;
@@ -625,12 +627,19 @@ struct PipelineCache::ProgramCache {
 			if (!cache_control_file.empty()) {
 				unsigned capacity = 0;
 				std::ifstream control(cache_control_file);
-				if (control >> capacity && (capacity == 1 || capacity == 16) &&
-				    capacity != cache_control_capacity) {
-					size_t changed = 0;
-					for (auto& [key, source]: programs) changed += source.resource_memo.SetCapacity(capacity);
-					cache_control_capacity = capacity;
-					std::printf("NHL27RESOURCE: cache_capacity=%u changed=%zu\n", capacity, changed);
+				if (control >> capacity && (capacity == 1 || capacity == 16)) {
+					if (capacity != cache_control_capacity) {
+						size_t changed = 0;
+						for (auto& [key, source]: programs) changed += source.resource_memo.SetCapacity(capacity);
+						cache_control_capacity = capacity;
+						std::printf("NHL27RESOURCE: cache_capacity=%u changed=%zu\n", capacity, changed);
+					}
+					unsigned batch = 0;
+					if (control >> batch && batch <= 1 && (batch != batch_reads || !batch_policy_reported)) {
+						batch_reads = batch != 0;
+						batch_policy_reported = true;
+						std::printf("NHL27RESOURCE: batch_reads=%u\n", batch);
+					}
 				}
 			}
 		}
@@ -641,6 +650,8 @@ struct PipelineCache::ProgramCache {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 		const char* timing = std::getenv("KYTY_PERF_RESOURCE_TIMING");
 		resource_timing = timing != nullptr && timing[0] == '1';
+		const char* batch = std::getenv("KYTY_SRT_BATCH_READS");
+		batch_reads = batch != nullptr && batch[0] == '1';
 		if (resource_timing) {
 			if (const char* path = std::getenv("KYTY_RESOURCE_CACHE_CONTROL_FILE")) cache_control_file = path;
 		}
@@ -660,6 +671,8 @@ struct PipelineCache::ProgramCache {
 	std::array<LastSource, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> last_sources {};
 	uint64_t lookups = 0, source_hits = 0, resource_hits = 0, materializations = 0, permutation_hits = 0;
 	bool resource_timing = false;
+	bool batch_reads = false;
+	bool batch_policy_reported = false;
 	std::string cache_control_file;
 	unsigned cache_control_capacity = 0;
 	std::array<uint64_t, static_cast<size_t>(ResourceMemo::Miss::Count)> resource_misses {};

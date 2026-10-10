@@ -1079,6 +1079,47 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		}
 	}
 	if (capture_indirect_reads) plan.resource_tracking_complete &= !program.has_address_writes;
+	// Preserve reachability and reader semantics. Only group adjacent, unconditional
+	// scalar reads with an identical descriptor/offset expression and contiguous bytes.
+	if (plan.control_flow.empty()) {
+		plan.srt_batch_counts.assign(plan.srt_reads.size(), 1u);
+		const auto raw = [&](uint32_t slot) -> const Inst* {
+			const auto* inst = plan.srt_reads[slot].value.Resolve().TryInstruction();
+			if (inst == nullptr ||
+			    (inst->GetOpcode() != ValueOpcode::LoadAddressU32 &&
+			     inst->GetOpcode() != ValueOpcode::ReadConstBuffer)) return nullptr;
+			if (inst->NumArgs() != (inst->GetOpcode() == ValueOpcode::LoadAddressU32 ? 4u : 2u)) return nullptr;
+			const auto index = inst->Flags<MemoryFlags>().index;
+			if (index >= plan.memory_info.size()) return nullptr;
+			const auto kind = inst->GetOpcode() == ValueOpcode::LoadAddressU32
+			                      ? ResourceKind::ScalarAddress : ResourceKind::ScalarBuffer;
+			return plan.memory_info[index].kind == kind ? inst : nullptr;
+		};
+		for (uint32_t first = 0; first < plan.srt_reads.size();) {
+			const auto* head = raw(first);
+			uint32_t count = 1;
+			if (head != nullptr && plan.srt_reads[first].flat_offset < plan.clean_flat_slots.size()) {
+				const auto start_offset = static_cast<int64_t>(static_cast<int32_t>(
+				    plan.memory_info[head->Flags<MemoryFlags>().index].offset)) & ~int64_t{3};
+				const auto flat_offset = plan.srt_reads[first].flat_offset;
+				while (count < 64 && first + count < plan.srt_reads.size()) {
+					const auto* next = raw(first + count);
+					if (next == nullptr || next->GetOpcode() != head->GetOpcode() ||
+					    next->Arg(0).Resolve() != head->Arg(0).Resolve() ||
+					    next->Arg(1).Resolve() != head->Arg(1).Resolve() ||
+					    plan.srt_reads[first + count].flat_offset != flat_offset + count ||
+					    flat_offset + count >= plan.clean_flat_slots.size() ||
+					    plan.clean_flat_slots[flat_offset + count] != plan.clean_flat_slots[flat_offset]) break;
+					const auto offset = static_cast<int64_t>(static_cast<int32_t>(
+					    plan.memory_info[next->Flags<MemoryFlags>().index].offset)) & ~int64_t{3};
+					if (offset != start_offset + count * 4u) break;
+					++count;
+				}
+			}
+			plan.srt_batch_counts[first] = count;
+			first += count;
+		}
+	}
 	return plan;
 }
 

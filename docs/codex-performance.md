@@ -70,6 +70,12 @@ Game files and saved profiles, caches, captures and logs must stay outside Git.
   changes between lookups, invalidating resource memos while retaining compiled
   pipelines. New shader sources inherit the active policy. This allows comparisons
   within one warmed match; exclude transitions from measured intervals.
+- `KYTY_SRT_BATCH_READS=1` groups up to 64 adjacent, unconditional scalar DWORD
+  reads sharing the same descriptor and dynamic offset. It preserves strict
+  readers, scalar-buffer bounds, prior evaluation results and descriptor memos.
+  Conditional and vector reads keep their ordinary evaluation path. The option
+  defaults off pending live GPU/gameplay checks. An optional second value (`0`
+  or `1`) in the diagnostic control file switches batching within the same run.
 
 ## Verification and baseline
 
@@ -84,6 +90,16 @@ Hardware: AMD Ryzen 7 5800X3D, Radeon RX 9070 XT, Windows. Isolated test window:
 - Renderer `--bda-dirty-cache-only`: passes with dirty regions both off and on.
 - `resource_materialization_tests`: all cases pass with retained allocations.
 - Resource memo tests also cover output changes and repeated capacity transitions.
+- Batched scalar tests pass for both address and constant-buffer reads, strict
+  reads, changed backing words, invalid bounds, failed reads, previously memoized
+  values, noncontiguous offsets, conditional reachability, direct mapped memory,
+  and the 64-word batch limit.
+- `--resource-replay-benchmark` compares both paths on a disposable copy of a
+  warm-up record, without initializing guest memory or Vulkan. All 1,409 captured
+  NHL program records matched, with zero skipped records. For 842 eligible
+  records, summed per-record refresh time was 4,825.97 us scalar versus 2,446.49 us
+  batched. This uses recorded CPU memory, without GPU waits or draw-frequency
+  weighting, and does not establish a gameplay FPS gain.
 - Renderer `--lds-limit-only` passes with the single-state resource memo enabled.
 - `--wave-reduction-only`: SPIR-V validation and GPU results pass for all cases.
 - `--flat-d16-only`: all targeted D16/subword GPU cases pass.
@@ -124,6 +140,11 @@ Hardware: AMD Ryzen 7 5800X3D, Radeon RX 9070 XT, Windows. Isolated test window:
   3D-engine samples averaged 49.10%. Some shaders were still compiling; this
   is not a fully warmed result. The 1280x720 host window does not establish
   the game's internal render resolution. The 60 FPS objective remains unmet.
+- A diagnostic in-match capacity comparison recorded 5.877 FPS over 90.685
+  seconds with 16 states. The following one-state interval crossed into
+  intermission; the later intervals remained there. These intervals are excluded
+  from gameplay comparisons. Initial apparent differences are not evidence of
+  a gameplay improvement.
 
 User-provided reference: RX 6800 XT / Ryzen 5 5600 / 32 GB DDR4-3200 reports
 14-19 FPS in the main menu, 26-29 in franchise menus (30 FPS cap), 7-12 in team
@@ -142,6 +163,10 @@ calling process environment, and refuses to launch alongside another emulator.
 `-Game` overrides the local game path; the default points to the supplied backup.
 Profiling switches (`-Stats`, `-GpuTiming`, `-ResourceTiming`) default off.
 `capture-test.ps1` captures only a specified emulator process window.
+For CPU replay checks, copy the `.shaders` file into an isolated directory and run
+`shader_recompiler_compute_tests --resource-replay-benchmark <copied-file>` there.
+The record reader opens for appending and can repair incomplete records, so only
+use a disposable copy. Captured game shader binaries remain outside Git.
 On this machine desktop processes/windows require execution outside the sandbox;
 a sandboxed process check alone does not establish that the desktop is idle.
 

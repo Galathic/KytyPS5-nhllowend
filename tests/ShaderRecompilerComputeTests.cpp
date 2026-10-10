@@ -79,6 +79,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <initializer_list>
 #include <limits>
 #include <memory>
@@ -91,6 +92,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
@@ -985,7 +987,7 @@ std::string Hex(u32 value) {
 void Require(const char *shader_name, const char *stage, bool value,
              const std::string &message);
 
-void EnsureConfigInitialized(bool renderdoc = false) {
+void EnsureConfigInitialized(bool renderdoc = false, bool guest_memory = true) {
   static bool config_initialized = false;
   if (!config_initialized) {
     static Common::Subsystems subsystems;
@@ -997,7 +999,7 @@ void EnsureConfigInitialized(bool renderdoc = false) {
     options.renderdoc_enabled = renderdoc;
     Config::Load(options);
     subsystems.Initialize<Log::Lifecycle>();
-    subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
+    if (guest_memory) subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
     ShaderInit();
     config_initialized = true;
   }
@@ -41609,6 +41611,8 @@ void CheckPm4CeCompletion(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", "Pm4CeCompletion");
 }
 
+#include "ResourceReplayBenchmark.inc"
+
 } // namespace
 } // namespace Libs::Graphics
 
@@ -41623,6 +41627,10 @@ int main(int argc, char **argv) {
 #endif
   const bool renderdoc_smoke =
       argc == 2 && std::strcmp(argv[1], "--renderdoc-only") == 0;
+  if (argc == 3 && std::strcmp(argv[1], "--resource-replay-benchmark") == 0) {
+    EnsureConfigInitialized(false, false);
+    return ResourceReplayBenchmark(argv[2]);
+  }
   EnsureConfigInitialized(renderdoc_smoke);
   if (argc == 2 && std::strcmp(argv[1], "--wave-reduction-only") == 0) {
     VulkanHarness vulkan;

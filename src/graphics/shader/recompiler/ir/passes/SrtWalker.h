@@ -18,6 +18,7 @@ struct SrtRuntime {
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
 	std::span<const uint32_t> workgroup_counts;
+	bool                      batch_reads = false;
 };
 
 enum class RuntimeValueType { Any, Integer };
@@ -50,6 +51,8 @@ private:
 	bool EvaluatePhi(const Inst& inst, uint64_t& result);
 	bool EvaluateExtract(const Inst& inst, uint64_t& result);
 	bool EvaluateRawRead(const Inst& inst, uint64_t& result);
+	bool RawReadAddress(const Inst& inst, uint64_t& address, uint64_t bytes, bool& zero);
+	bool RefreshReadBatch(uint32_t slot, uint32_t count, std::vector<uint32_t>& flat);
 	bool EvaluateInst(const Inst& inst, uint64_t& result);
 
 	const ResourcePlan&              m_program;

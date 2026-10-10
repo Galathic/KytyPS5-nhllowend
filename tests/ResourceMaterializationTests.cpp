@@ -695,6 +695,152 @@ void TestFiniteImageRefreshReusesScalarReads() {
         "finite image refresh grew reusable resource storage after warmup");
 }
 
+void TestContiguousScalarReadBatches() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  const auto make_plan = [](bool buffer, uint32_t size = 16, bool gap = false,
+                            uint32_t count = 4, uint64_t address = 0x1000) {
+    Program program;
+    program.stage = Libs::Graphics::ShaderType::Compute;
+    program.srt_plan_complete = program.resource_tracking_complete = true;
+    auto &block = AddValueBlock(program);
+    auto &handle = buffer
+        ? block.AppendNewInst(ValueOpcode::GetBufferResource,
+            {Value(static_cast<uint32_t>(address)), Value(static_cast<uint32_t>(address >> 32)), Value(size), Value(0u)})
+        : block.AppendNewInst(ValueOpcode::GetAddressResource,
+            {Value(static_cast<uint32_t>(address)), Value(static_cast<uint32_t>(address >> 32))});
+    DescriptorSource source;
+    source.dword_count = 4;
+    source.dwords.fill(Value(0u));
+    for (uint32_t index = 0; index < count; ++index) {
+      program.memory_info.push_back({.kind = buffer ? ResourceKind::ScalarBuffer : ResourceKind::ScalarAddress,
+                                     .offset = index * 4 + (gap && index > 0 ? 4u : 0u),
+                                     .planning_only = true});
+      auto &read = buffer
+          ? block.AppendNewInst(ValueOpcode::ReadConstBuffer, {Value(&handle), Value(0u)})
+          : block.AppendNewInst(ValueOpcode::LoadAddressU32, {Value(&handle), Value(0u), Value(0u), Value(true)});
+      read.SetFlags(MemoryFlags{.index = index});
+      program.srt_reads.push_back({Value(&read), index});
+      // Descriptor dependencies must see the published scalar memo, without rereading.
+      if (index == 0 || index == count - 1) source.dwords[index == 0 ? 0 : 1] = Value(&read);
+    }
+    program.descriptor_sources.push_back(source);
+    program.info.samplers.push_back({.source = 0});
+    return ExtractResourcePlan(program);
+  };
+  struct Reads {
+    std::vector<uint32_t> words{11, 22, 33, 44, 55};
+    uint32_t calls = 0;
+    bool available = true;
+  } reads;
+  const auto reader = +[](void *data, uint64_t address, std::span<uint32_t> values) {
+    auto &state = *static_cast<Reads *>(data);
+    ++state.calls;
+    if (!state.available || address < 0x1000 || address - 0x1000 > state.words.size() * 4 ||
+        values.size_bytes() > state.words.size() * 4 - (address - 0x1000)) return false;
+    std::copy_n(state.words.begin() + (address - 0x1000) / 4, values.size(), values.begin());
+    return true;
+  };
+  SrtRuntime runtime{.read_memory = reader, .userdata = &reads, .batch_reads = true};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  for (const bool buffer : {false, true}) {
+    auto plan = make_plan(buffer);
+    Check(plan.srt_batch_counts[0] == 4, "contiguous scalar reads were not grouped");
+    for (const bool batched : {false, true}) {
+      runtime.batch_reads = batched;
+      reads.calls = 0;
+      Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+                snapshot.flattened_srt == std::vector<uint32_t>({11, 22, 33, 44}) &&
+                snapshot.samplers[0].dwords[0] == 11 && snapshot.samplers[0].dwords[1] == 44 &&
+                reads.calls == (batched ? 1 : 4),
+            "batched scalar values or descriptor memo differ from scalar evaluation");
+    }
+    runtime.batch_reads = true;
+    {
+      reads.calls = 0;
+      SrtWalker walker(plan, runtime);
+      uint32_t first = 0;
+      Check(walker.Evaluate(plan.srt_reads[0].value, first) && first == 11,
+            "could not seed an earlier scalar evaluation");
+      reads.words[0] = 99;
+      Check(walker.RefreshFlatBuffer(snapshot.flattened_srt) && snapshot.flattened_srt[0] == 11 && reads.calls == 4,
+            "batch reread a value already memoized within this session");
+      reads.words[0] = 11;
+    }
+    reads.available = false;
+    Check(!MaterializeResources(plan, runtime, snapshot, specialization), "failed batch read was accepted");
+    reads.available = true;
+    for (const size_t capacity : {size_t{1}, size_t{16}}) {
+      Libs::Graphics::ResourceMemo memo(capacity);
+      bool reused = false;
+      Check(memo.Refresh(plan, runtime, snapshot, specialization, true, reused) && !reused,
+            "initial batched resource memo failed");
+      Check(memo.Refresh(plan, runtime, snapshot, specialization, true, reused) && reused,
+            "unchanged batched resource memo missed");
+      ++reads.words[3];
+      Check(memo.Refresh(plan, runtime, snapshot, specialization, true, reused) && !reused &&
+                snapshot.flattened_srt[3] == reads.words[3], "batch memo reused changed backing words");
+      reads.words[3] = 44;
+    }
+    // A clean batch must use the strict reader exclusively.
+    plan.clean_flat_slots.assign(4, 1);
+    plan.requires_specialization_memory = true;
+    auto &srt = plan.value_storage.emplace_back(ValueOpcode::GetSrtResource);
+    for (const uint32_t slot : {0u, 3u}) {
+      auto &flat = plan.value_storage.emplace_back(ValueOpcode::ReadConst);
+      flat.SetArg(0, Value(&srt));
+      flat.SetArg(1, Value(slot));
+      plan.descriptor_sources[0].dwords[slot == 0 ? 0 : 1] = Value(&flat);
+    }
+    uint32_t ordinary_calls = 0;
+    struct Pair { Reads *strict; uint32_t *ordinary; } pair{&reads, &ordinary_calls};
+    runtime.userdata = &pair;
+    runtime.read_memory = +[](void *data, uint64_t, std::span<uint32_t>) {
+      ++*static_cast<Pair *>(data)->ordinary; return false;
+    };
+    runtime.read_specialization_memory = +[](void *data, uint64_t address, std::span<uint32_t> values) {
+      auto &state = *static_cast<Pair *>(data)->strict;
+      ++state.calls;
+      std::copy_n(state.words.begin() + (address - 0x1000) / 4, values.size(), values.begin());
+      return true;
+    };
+    reads.calls = 0;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) && ordinary_calls == 0 && reads.calls == 1,
+          "clean batch bypassed or repeated strict reads");
+    runtime.read_memory = reader;
+    runtime.read_specialization_memory = nullptr;
+    runtime.userdata = &reads;
+  }
+  auto bounded = make_plan(true, 15);
+  Check(!MaterializeResources(bounded, runtime, snapshot, specialization), "batch crossed scalar buffer bounds");
+  auto gap = make_plan(false, 32, true);
+  reads.calls = 0;
+  Check(gap.srt_batch_counts[0] == 1 && gap.srt_batch_counts[1] == 3 &&
+            MaterializeResources(gap, runtime, snapshot, specialization) && reads.calls == 2 &&
+            snapshot.flattened_srt == std::vector<uint32_t>({11, 33, 44, 55}),
+        "batch crossed a scalar-read gap or lost later grouping");
+  auto conditional = make_plan(false);
+  conditional.control_flow.emplace_back();
+  conditional.control_flow.back().sources = {0};
+  conditional.control_flow.back().srt_reads = {0};
+  reads.calls = 0;
+  Check(MaterializeResources(conditional, runtime, snapshot, specialization) &&
+            reads.calls == 2 && snapshot.flattened_srt == std::vector<uint32_t>({11, 0, 0, 0}),
+        "conditional refresh read unreachable scalar slots through a batch");
+  auto mapped = make_plan(false, 16, false, 4, reinterpret_cast<uint64_t>(reads.words.data()));
+  Check(MaterializeResources(mapped, {.batch_reads = true}, snapshot, specialization) &&
+            snapshot.flattened_srt == std::vector<uint32_t>({11, 22, 33, 44}),
+        "direct mapped backing batch differs from scalar words");
+  reads.words.resize(70);
+  for (uint32_t index = 0; index < reads.words.size(); ++index) reads.words[index] = index + 1;
+  auto large = make_plan(true, 280, false, 70);
+  reads.calls = 0;
+  Check(large.srt_batch_counts[0] == 64 && large.srt_batch_counts[64] == 6 &&
+            MaterializeResources(large, runtime, snapshot, specialization) && reads.calls == 2 &&
+            snapshot.flattened_srt == reads.words,
+        "scalar batches exceeded their limit or lost the trailing words");
+}
+
 void TestMixedSamplerVariantsShareRuntimeDescriptor() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   auto program = MixedSamplerProgram();
@@ -756,6 +902,7 @@ int main() {
   TestWrittenDescriptorUsesStrictReaderOnce();
   TestFailedMaterializationRejectsStage();
   TestFiniteImageRefreshReusesScalarReads();
+  TestContiguousScalarReadBatches();
   TestMixedSamplerVariantsShareRuntimeDescriptor();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
