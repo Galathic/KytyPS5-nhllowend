@@ -339,6 +339,271 @@ void TestResourceMemoTracksMemoryAndRuntime() {
         "non-resource register update failed to reuse resources or update push data");
 }
 
+void TestResourceMemoHitVerifier() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  const char *flag = std::getenv("KYTY_RESOURCE_MEMO_VERIFY");
+  if (flag == nullptr || flag[0] != '1') return;
+
+  uint32_t value = 0x12345678u;
+  auto plan = SrtPlan(0x1000u);
+  struct Reads { uint32_t ordinary = 0; uint32_t strict = 0; } reads;
+  const SrtRuntime runtime{
+      .read_memory = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+        auto &state = *static_cast<Reads *>(data);
+        ++state.ordinary;
+        if (address != 0x1000u || words.size() != 1u) return false;
+        words[0] = 0x12345678u;
+        return true;
+      },
+      .userdata = &reads};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Libs::Graphics::ResourceMemoEntry memo;
+  bool reused = false;
+  Check(memo.Refresh(plan, runtime, snapshot, specialization, true, reused) && !reused,
+        "memo verifier failed to establish a cached resource");
+  auto calls = reads.ordinary;
+  Check(memo.Refresh(plan, runtime, snapshot, specialization, true, reused) && reused &&
+            memo.VerifyChecks() == 1u && memo.VerifyMatches() == 1u &&
+            reads.ordinary == calls + 1u,
+        "matched memo verification performed extra live reads");
+
+  snapshot.flattened_srt[0] ^= 1u;
+  calls = reads.ordinary;
+  Check(memo.Refresh(plan, runtime, snapshot, specialization, true, reused) && !reused &&
+            memo.LastMiss() == Libs::Graphics::ResourceMemoEntry::Miss::VerifyMismatch &&
+            memo.VerifyMismatches() == 1u && reads.ordinary == calls + 2u &&
+            snapshot.flattened_srt[0] == value,
+        "memo verifier did not invalidate and rematerialize a corrupted snapshot");
+
+  auto unknown_plan = SrtPlan(0x1000u);
+  Libs::Graphics::ResourceMemoEntry unknown_memo;
+  ResourceSnapshot unknown_snapshot;
+  ResourceSpecialization unknown_specialization;
+  Check(unknown_memo.Refresh(unknown_plan, runtime, unknown_snapshot,
+                            unknown_specialization, true, reused) && !reused,
+        "unknown-read fixture failed to establish a cached resource");
+  auto address_changed = false;
+  for (auto &inst: unknown_plan.value_storage) {
+    if (inst.GetOpcode() != ValueOpcode::GetAddressResource) continue;
+    inst.SetArg(0, Value(0x2000u));
+    address_changed = true;
+    break;
+  }
+  Check(address_changed, "unknown-read fixture could not find its address node");
+  unknown_plan.srt_tapes = {};
+  unknown_plan.cfg_srt_tapes = {};
+  reads.ordinary = 0;
+  const SrtRuntime unknown_runtime{
+      .read_memory = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+        ++static_cast<Reads *>(data)->ordinary;
+        if (words.size() != 1u || (address != 0x1000u && address != 0x2000u)) return false;
+        words[0] = address == 0x1000u ? 0x12345678u : 0x87654321u;
+        return true;
+      },
+      .userdata = &reads};
+  Check(unknown_memo.Refresh(unknown_plan, unknown_runtime, unknown_snapshot,
+                            unknown_specialization, true, reused) && !reused &&
+            unknown_memo.LastMiss() == Libs::Graphics::ResourceMemoEntry::Miss::VerifyInconclusive &&
+            unknown_memo.VerifyInconclusive() == 1u && reads.ordinary == 2u &&
+            unknown_snapshot.flattened_srt[0] == 0x87654321u,
+        "uncaptured dependency was not treated as inconclusive and rematerialized");
+
+  ResourcePlan domains;
+  domains.stage = Libs::Graphics::ShaderType::Compute;
+  domains.srt_plan_complete = domains.resource_tracking_complete = true;
+  domains.requires_specialization_memory = true;
+  domains.memory_info.push_back({.kind = ResourceKind::ScalarAddress, .planning_only = true});
+  auto &handle = domains.value_storage.emplace_back(ValueOpcode::GetAddressResource);
+  handle.SetArg(0, Value(0x3000u));
+  handle.SetArg(1, Value(0u));
+  for (uint32_t i = 0; i < 2u; ++i) {
+    auto &read = domains.value_storage.emplace_back(ValueOpcode::LoadAddressU32);
+    read.SetFlags(MemoryFlags{.index = 0u});
+    read.SetArg(0, Value(&handle));
+    read.SetArg(1, Value(0u));
+    read.SetArg(2, Value(0u));
+    read.SetArg(3, Value(true));
+    domains.srt_reads.push_back({Value(&read), i});
+    domains.clean_flat_slots.push_back(i == 0u ? 0u : 1u);
+  }
+  struct DomainsReads { uint32_t ordinary = 0; uint32_t strict = 0; } domain_reads;
+  const SrtRuntime domain_runtime{
+      .read_memory = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+        ++static_cast<DomainsReads *>(data)->ordinary;
+        if (address != 0x3000u || words.size() != 1u) return false;
+        words[0] = 0x11111111u;
+        return true;
+      },
+      .userdata = &domain_reads,
+      .read_specialization_memory = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+        ++static_cast<DomainsReads *>(data)->strict;
+        if (address != 0x3000u || words.size() != 1u) return false;
+        words[0] = 0x22222222u;
+        return true;
+      }};
+  Libs::Graphics::ResourceMemoEntry domain_memo;
+  ResourceSnapshot domain_snapshot;
+  ResourceSpecialization domain_specialization;
+  Check(domain_memo.Refresh(domains, domain_runtime, domain_snapshot,
+                            domain_specialization, true, reused) && !reused &&
+            domain_snapshot.flattened_srt == std::vector<uint32_t>{0x11111111u, 0x22222222u},
+        "strict/ordinary setup failed to produce distinct same-address values");
+  const auto ordinary_calls = domain_reads.ordinary;
+  const auto strict_calls = domain_reads.strict;
+  Check(domain_memo.Refresh(domains, domain_runtime, domain_snapshot,
+                            domain_specialization, true, reused) && reused &&
+            domain_memo.VerifyMatches() == 1u &&
+            domain_reads.ordinary == ordinary_calls + 1u &&
+            domain_reads.strict == strict_calls + 1u,
+        "strict and ordinary same-address reads were merged during replay");
+}
+
+void TestResourceMemoTracksConsumedRegisters() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  const char *dynamic_flag = std::getenv("KYTY_RESOURCE_DYNAMIC_DEPS");
+  const bool dynamic = dynamic_flag != nullptr && dynamic_flag[0] == '1';
+  ResourcePlan plan;
+  plan.stage = Libs::Graphics::ShaderType::Compute;
+  plan.srt_plan_complete = plan.resource_tracking_complete = true;
+  plan.capture_specialization_reads = true; // Exercise the nested memory-capture runtime wrapper.
+  const auto user = [&](uint32_t index) {
+    auto &inst = plan.value_storage.emplace_back(ValueOpcode::GetUserData);
+    inst.SetArg(0, Value(static_cast<ScalarReg>(index)));
+    return Value(&inst);
+  };
+  const auto guard = user(2);
+  const auto selected = user(0);
+  const auto inactive = user(1);
+  plan.memory_info.push_back({.kind = ResourceKind::ScalarAddress, .planning_only = true});
+  auto &handle = plan.value_storage.emplace_back(ValueOpcode::GetAddressResource);
+  handle.SetArg(0, Value(0x1000u));
+  handle.SetArg(1, Value(0u));
+  auto &memory_read = plan.value_storage.emplace_back(ValueOpcode::LoadAddressU32);
+  memory_read.SetFlags(MemoryFlags{.index = 0u});
+  memory_read.SetArg(0, Value(&handle));
+  memory_read.SetArg(1, Value(0u));
+  memory_read.SetArg(2, Value(0u));
+  memory_read.SetArg(3, Value(true));
+  plan.srt_reads.push_back({Value(&memory_read), 0u});
+  plan.descriptor_sources.resize(2);
+  for (auto &source: plan.descriptor_sources) {
+    source.dword_count = 4;
+    source.dwords.fill(Value(0u));
+  }
+  plan.descriptor_sources[0].dwords[0] = selected;
+  plan.descriptor_sources[1].dwords[0] = inactive;
+  plan.descriptor_gathers.resize(2);
+  for (uint32_t i = 0; i < plan.descriptor_gathers.size(); ++i) {
+    auto &gather = plan.descriptor_gathers[i];
+    gather.valid = true;
+    gather.words[0] = {.value = i == 0 ? 0u : 1u,
+                       .kind = ResourcePlan::DescriptorGather::Word::Kind::UserData};
+  }
+  plan.info.buffers = {{.source = 0}, {.source = 1}};
+  plan.control_flow.resize(3);
+  plan.control_flow[0].condition = guard;
+  plan.control_flow[0].successors = {1u, 2u};
+  plan.control_flow[1].srt_reads = {0u};
+  plan.control_flow[1].sources = {0u};
+  plan.control_flow[2].sources = {1u};
+
+  std::array<uint32_t, 4> regs{0x8000u, 0x9000u, 1u, 17u};
+  std::vector<uint32_t> forwarded;
+  struct Memory { uint32_t value = 0x12345678u; } memory;
+  SrtRuntime runtime{.user_data = regs,
+                     .read_memory = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+                       if (address != 0x1000u || words.size() != 1u) return false;
+                       words[0] = static_cast<Memory *>(data)->value;
+                       return true;
+                     },
+                     .userdata = &memory,
+                     .observe_user_data = +[](void *data, uint32_t index) {
+                       static_cast<std::vector<uint32_t> *>(data)->push_back(index);
+                     },
+                     .user_data_observer_userdata = &forwarded};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Libs::Graphics::ResourceMemoEntry memo;
+  bool reused = false;
+  Check(memo.Refresh(plan, runtime, snapshot, specialization, true, reused) && !reused &&
+            snapshot.buffers[0].dwords[0] == regs[0] && snapshot.buffers[1].dwords[0] == 0u,
+        "CFG dependency fixture did not materialize only the active descriptor");
+  Check(memo.StaticRegisterDependencyCount() == 3u &&
+            memo.RegisterDependencyCount() == (dynamic ? 2u : 3u),
+        "resource memo reported an incorrect static/consumed register set");
+
+  regs[1] = 0xdead0000u; // Descriptor in the inactive successor must not invalidate in dynamic mode.
+  Check(memo.Refresh(plan, runtime, snapshot, specialization, true, reused) &&
+            reused == dynamic,
+        "inactive CFG descriptor register dependency was not handled by the selected mode");
+  regs[3] = 99u; // Push data outside every resource expression is always refreshed on a hit.
+  forwarded.clear();
+  Check(memo.Refresh(plan, runtime, snapshot, specialization, true, reused) && reused &&
+            snapshot.user_data[3] == 99u,
+        "non-resource push data invalidated resources or was not refreshed");
+  Check(forwarded.size() == memo.RegisterDependencyCount(),
+        "resource memo cache hit did not forward its validated dependencies");
+
+  regs[0] = 0x8100u;
+  Check(memo.Refresh(plan, runtime, snapshot, specialization, true, reused) && !reused &&
+            snapshot.buffers[0].dwords[0] == regs[0],
+        "selected descriptor register change reused a stale resource snapshot");
+  regs[2] = 0u; // The branch predicate is a dependency even when active roots change.
+  Check(memo.Refresh(plan, runtime, snapshot, specialization, true, reused) && !reused &&
+            snapshot.buffers[1].dwords[0] == regs[1],
+        "CFG guard change did not invalidate and select the other resource");
+
+  // The shared ResourcePlan's active_sources belong to its most recent materialization,
+  // which may be a different cached entry. Verify against each entry's own path.
+  Libs::Graphics::ResourceMemo alternating_memo(2);
+  regs[2] = 1u;
+  Check(alternating_memo.Refresh(plan, runtime, snapshot, specialization, true, reused) && !reused,
+        "alternating CFG memo failed to capture its first path");
+  regs[2] = 0u;
+  Check(alternating_memo.Refresh(plan, runtime, snapshot, specialization, true, reused) && !reused,
+        "alternating CFG memo failed to capture its second path");
+  regs[2] = 1u;
+  Check(alternating_memo.Refresh(plan, runtime, snapshot, specialization, true, reused) && reused &&
+            snapshot.buffers[0].dwords[0] == regs[0],
+        "alternating CFG cache entry compared against another entry's active path");
+}
+
+void TestResourceMemoLazySelectDependencies() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  const char *flag = std::getenv("KYTY_RESOURCE_DYNAMIC_DEPS");
+  const bool dynamic = flag != nullptr && flag[0] == '1';
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  auto &block = AddValueBlock(program);
+  auto &selected = block.AppendNewInst(ValueOpcode::GetUserData,
+                                       {Value(static_cast<ScalarReg>(0))});
+  auto &unused = block.AppendNewInst(ValueOpcode::GetUserData,
+                                     {Value(static_cast<ScalarReg>(1))});
+  auto &selection = block.AppendNewInst(ValueOpcode::SelectU32,
+                                         {Value(true), Value(&selected), Value(&unused)});
+  DescriptorSource source;
+  source.dword_count = 4;
+  source.dwords.fill(Value(0u));
+  source.dwords[0] = Value(&selection);
+  program.descriptor_sources.push_back(source);
+  program.info.buffers.push_back({.source = 0});
+  auto plan = ExtractResourcePlan(program);
+  std::array<uint32_t, 2> regs{0x8000u, 0xdead0000u};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Libs::Graphics::ResourceMemoEntry memo;
+  bool reused = false;
+  Check(memo.Refresh(plan, SrtRuntime{.user_data = regs}, snapshot, specialization,
+                     true, reused) && !reused && snapshot.buffers[0].dwords[0] == regs[0],
+        "lazy-select resource fixture failed to materialize its selected arm");
+  regs[1] = 0xbad00000u;
+  Check(memo.Refresh(plan, SrtRuntime{.user_data = regs}, snapshot, specialization,
+                     true, reused) && reused == dynamic,
+        "lazy-select unused arm was included in dynamic resource dependencies");
+}
+
 void TestResourceMemoAlternatingObjects() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   // Alternating objects must reuse both entries, and still reject changed memory.
@@ -1173,6 +1438,67 @@ void TestTapeUnsupportedRootFallsBack() {
         "unsupported Tape root did not fall back to the recursive evaluator");
 }
 
+void TestTapeDeduplicatesRawImmediateBits() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  ResourcePlan plan;
+  plan.stage = Libs::Graphics::ShaderType::Compute;
+  plan.srt_plan_complete = plan.resource_tracking_complete = true;
+  plan.memory_info = {
+      {.kind = ResourceKind::ScalarAddress, .offset = 0u, .planning_only = true},
+      {.kind = ResourceKind::ScalarAddress, .offset = 4u, .planning_only = true}};
+
+  auto &handle = plan.value_storage.emplace_back(ValueOpcode::GetAddressResource);
+  handle.SetArg(0, Value(0x2000u));
+  handle.SetArg(1, Value(0u));
+  const auto read = [&](uint32_t memory_index) {
+    auto &inst = plan.value_storage.emplace_back(ValueOpcode::LoadAddressU32);
+    inst.SetFlags(MemoryFlags{.index = memory_index});
+    inst.SetArg(0, Value(&handle));
+    inst.SetArg(1, Value(0u));
+    inst.SetArg(2, Value(0u));
+    inst.SetArg(3, Value(true));
+    return Value(&inst);
+  };
+  plan.srt_reads = {
+      {read(0u), 0u},
+      {Value::F32(1.0f), 1u},
+      {Value(0x3f800000u), 2u},
+      {read(1u), 3u},
+      {Value(uint64_t{0x3f800000u}), 4u}};
+
+  struct Reads {
+    std::vector<uint64_t> addresses;
+  } reads_state;
+  const SrtRuntime runtime{
+      .read_memory = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+        auto &state = *static_cast<Reads *>(data);
+        if (words.size() != 1u || (address != 0x2000u && address != 0x2004u)) return false;
+        state.addresses.push_back(address);
+        words[0] = address == 0x2000u ? 0xaaaaaaaau : 0xbbbbbbbbu;
+        return true;
+      },
+      .userdata = &reads_state};
+
+  std::vector<uint32_t> flat;
+  Check(SrtWalker(plan, runtime).RefreshFlatBuffer(flat),
+        "tape refresh with duplicate immediate bits failed");
+  Check(flat == std::vector<uint32_t>{0xaaaaaaaau, 0x3f800000u, 0x3f800000u,
+                                      0xbbbbbbbbu, 0x3f800000u},
+        "tape immediate deduplication changed mixed-type raw-bit results");
+  Check(reads_state.addresses == std::vector<uint64_t>{0x2000u, 0x2004u},
+        "tape immediate deduplication changed raw-read order");
+  const char *tape_enabled = std::getenv("KYTY_SRT_TAPE");
+  if (tape_enabled != nullptr && tape_enabled[0] == '0') return;
+  const auto &tape = plan.srt_tapes[0];
+  const auto matching_constants = std::ranges::count_if(tape.ops, [](const auto &op) {
+    return op.kind == ResourcePlan::SrtTape::Kind::Immediate && op.imm == 0x3f800000u;
+  });
+  Check(matching_constants == 1u,
+        "tape emitted repeated immediate ops for the same raw 64-bit value");
+  Check(tape.ops.size() == 5u,
+        "tape did not reduce this mixed-immediate fixture to five shared ops");
+}
+
 void TestTapePreservesWideMemoryIndex() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   ResourcePlan plan;
@@ -1491,6 +1817,7 @@ int main() {
   TestVectorLoadUsesCleanDependencies(true, true);
   TestTapeSeparatesCleanAndOrdinaryReadDomains(true);
   TestTapePreservesWideMemoryIndex();
+  TestTapeDeduplicatesRawImmediateBits();
   TestTapeUnsupportedRootFallsBack();
   TestVectorLoadUsesCleanDependencies(false);
   TestVectorLoadUsesCleanDependencies(true);
@@ -1500,6 +1827,9 @@ int main() {
   TestCompiledDescriptorGatherMatchesWalker();
   TestFlatDescriptorGatherRequiresOwnCompleteRefresh();
   TestResourceMemoTracksMemoryAndRuntime();
+  TestResourceMemoHitVerifier();
+  TestResourceMemoTracksConsumedRegisters();
+  TestResourceMemoLazySelectDependencies();
   TestResourceMemoAlternatingObjects();
   TestMappedSrtUsesDirectReaderByDefault();
   TestIntegerRuntimeValueFollowsSrtReads();

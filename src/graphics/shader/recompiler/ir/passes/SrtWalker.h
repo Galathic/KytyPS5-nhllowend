@@ -10,6 +10,7 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 class Value;
 
 using SrtMemoryReader = bool (*)(void* userdata, uint64_t address, std::span<uint32_t> values);
+using SrtUserDataObserver = void (*)(void* userdata, uint32_t index);
 
 struct SrtRuntime {
 	std::span<const uint32_t> user_data;
@@ -18,6 +19,9 @@ struct SrtRuntime {
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
 	std::span<const uint32_t> workgroup_counts;
+	// Independent from userdata, which belongs to the memory-reader callbacks.
+	SrtUserDataObserver       observe_user_data = nullptr;
+	void*                     user_data_observer_userdata = nullptr;
 };
 
 enum class RuntimeValueType { Any, Integer };

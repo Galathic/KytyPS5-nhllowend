@@ -766,7 +766,11 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 			    reg - m_program.user_data_base >= m_runtime.user_data.size()) {
 				return false;
 			}
-			result = m_runtime.user_data[reg - m_program.user_data_base];
+			const auto index = reg - m_program.user_data_base;
+			if (m_runtime.observe_user_data != nullptr) {
+				m_runtime.observe_user_data(m_runtime.user_data_observer_userdata, index);
+			}
+			result = m_runtime.user_data[index];
 			return true;
 		}
 		case ValueOpcode::GetShaderBase: result = m_runtime.shader_base; return true;
@@ -1158,7 +1162,11 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 				if (word.kind == ResourcePlan::DescriptorGather::Word::Kind::UserData) {
 					if (word.value < m_program.user_data_base ||
 					    word.value - m_program.user_data_base >= m_runtime.user_data.size()) return false;
-					result.dwords[index] = m_runtime.user_data[word.value - m_program.user_data_base];
+					const auto user_data_index = word.value - m_program.user_data_base;
+					if (m_runtime.observe_user_data != nullptr) {
+						m_runtime.observe_user_data(m_runtime.user_data_observer_userdata, user_data_index);
+					}
+					result.dwords[index] = m_runtime.user_data[user_data_index];
 				} else if (word.kind == ResourcePlan::DescriptorGather::Word::Kind::Flat) {
 					result.dwords[index] = (*flat)[word.value];
 				} else {
@@ -1195,6 +1203,8 @@ bool SrtWalker::VerifyCfgRefresh(std::vector<uint32_t>& flat) {
 		const auto& actual = m_clean_evaluator->m_runtime;
 		if (actual.userdata != expected.userdata || actual.read_memory != expected.read_memory ||
 		    actual.read_specialization_memory != expected.read_specialization_memory ||
+		    actual.observe_user_data != expected.observe_user_data ||
+		    actual.user_data_observer_userdata != expected.user_data_observer_userdata ||
 		    actual.shader_base != expected.shader_base ||
 		    actual.user_data.data() != expected.user_data.data() || actual.user_data.size() != expected.user_data.size() ||
 		    actual.workgroup_counts.data() != expected.workgroup_counts.data() ||
@@ -1712,6 +1722,9 @@ bool BuildTapeForPlan(const ResourcePlan& plan, bool with_clean,
 
 	std::unordered_map<TapeInstKey, uint32_t, TapeInstKeyHash> inst_to_op;
 	std::unordered_set<TapeInstKey, TapeInstKeyHash> compiling;
+	// Immediate values have no evaluation or memory-reader domain. Share their raw
+	// 64-bit representation across roots, including values with different IR types.
+	std::unordered_map<uint64_t, uint32_t> immediate_to_op;
 
 	auto get_value_u64 = [](Value val, uint64_t& out) -> bool {
 		val = val.Resolve();
@@ -1735,11 +1748,15 @@ bool BuildTapeForPlan(const ResourcePlan& plan, bool with_clean,
 		if (val.IsImmediate()) {
 			uint64_t imm = 0;
 			if (!get_value_u64(val, imm)) return -1;
+			if (const auto found = immediate_to_op.find(imm); found != immediate_to_op.end()) {
+				return static_cast<int>(found->second);
+			}
 			uint32_t op_idx = static_cast<uint32_t>(tape.ops.size());
 			ResourcePlan::SrtTape::Op op;
 			op.kind = ResourcePlan::SrtTape::Kind::Immediate;
 			op.imm = imm;
 			tape.ops.push_back(op);
+			immediate_to_op.emplace(imm, op_idx);
 			return static_cast<int>(op_idx);
 		}
 
@@ -2170,7 +2187,11 @@ bool SrtWalker::ExecuteTapeOp(const ResourcePlan::SrtTape::Op& op,
 				g_tape_stats.failed.fetch_add(1, std::memory_order_relaxed);
 				return false;
 			}
-			result = m_runtime.user_data[reg - m_program.user_data_base];
+			const auto user_data_index = reg - m_program.user_data_base;
+			if (m_runtime.observe_user_data != nullptr) {
+				m_runtime.observe_user_data(m_runtime.user_data_observer_userdata, user_data_index);
+			}
+			result = m_runtime.user_data[user_data_index];
 			break;
 		}
 		case ResourcePlan::SrtTape::Kind::ShaderBase:
