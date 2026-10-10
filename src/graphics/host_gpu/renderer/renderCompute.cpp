@@ -12,6 +12,7 @@
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/depthAliasLog.h"
+#include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/host_gpu/renderer/frameDump.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
@@ -566,6 +567,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	                                   (static_cast<uint64_t>(thread_group_x) << 40u) |
 	                                       (static_cast<uint64_t>(thread_group_y) << 20u) |
 	                                       thread_group_z);
+	FrameBreakdown::Add(FrameBreakdown::g_counters.dispatches);
 	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 	BreadcrumbEnd(m_context.GetGraphics(), vk_buffer, crumb);
 

@@ -13,6 +13,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
+#include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/presenter.h"
@@ -1285,6 +1286,8 @@ bool FlipQueue::Flip(uint32_t micros) {
 		if (Config::GraphicsDebugDumpEnabled() &&
 		    Config::GetPrintfDirection() != Config::LogDirection::Silent) {
 			LOGF("Flip done: %d\n", requests[0].index);
+		// KYTY_PERF_STATS: frame boundary for the NHL27FRAME breakdown (every presented flip).
+		Graphics::FrameBreakdown::OnPresentedFlip();
 		}
 	}
 	return due;

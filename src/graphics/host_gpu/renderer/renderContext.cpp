@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
 
@@ -64,6 +65,9 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		return false;
 	}
+	// KYTY_PERF_STATS: fault time includes any synchronous readback it triggers (overlaps readback).
+	FrameBreakdown::Timer fault_timer(FrameBreakdown::g_counters.fault_ns);
+	FrameBreakdown::Add(FrameBreakdown::g_counters.fault_count);
 	if (access == PageFaultAccess::Write) {
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);

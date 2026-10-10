@@ -10,6 +10,7 @@
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -612,7 +613,13 @@ void GuestGpu::ThreadRun(void* data) {
 		}
 
 		EXIT_IF(!has_submission);
-		const bool complete = gpu->Process(submission);
+		bool complete = false;
+		{
+			// KYTY_PERF_STATS: GPU thread busy = Process wall time minus its master-semaphore waits.
+			FrameBreakdown::Timer process_timer(FrameBreakdown::g_counters.gpu_process_ns);
+			complete = gpu->Process(submission);
+		}
+		FrameBreakdown::MaybePrint();
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
 		if (!complete) {

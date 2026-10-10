@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/host_gpu/renderer/frameDump.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -519,6 +520,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadC
 				const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
 				                    std::chrono::steady_clock::now() - start)
 				                    .count();
+				FrameBreakdown::AddReadback(static_cast<uint64_t>(ns));
 				g_perf.waits[bucket].fetch_add(1, std::memory_order_relaxed);
 				g_perf.wait_ns[bucket].fetch_add(static_cast<uint64_t>(ns),
 				                                 std::memory_order_relaxed);
