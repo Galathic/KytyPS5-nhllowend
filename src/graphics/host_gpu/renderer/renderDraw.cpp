@@ -1540,6 +1540,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x600u);
 	}
 	BufferCache::PerfCount(BufferCache::PerfEvent::Draw);
+	NoteShaderWork();
 	vk::PipelineStageFlags shader_write_stages = {};
 	for (const auto& stage: vertex_stages) {
 		if (HasShaderBufferWrites(stage.stage)) {

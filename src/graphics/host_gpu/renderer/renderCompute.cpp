@@ -11,6 +11,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/bindEpoch.h"
 #include "graphics/host_gpu/renderer/depthAliasLog.h"
 #include "graphics/host_gpu/renderer/frameDump.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
@@ -508,6 +509,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	                }) ||
 	    has_storage_writes;
 	BufferCache::PerfCount(BufferCache::PerfEvent::Dispatch);
+	NoteShaderWork();
 	if (has_storage_writes && !BufferCache::GuestSyncOnly()) {
 		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
 		// while allowing the queue to execute asynchronously.
@@ -759,6 +761,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		                                ShaderRecompiler::IR::ImageResourceClass::Storage;
 	    });
 	BufferCache::PerfCount(BufferCache::PerfEvent::Dispatch);
+	NoteShaderWork();
 	if (has_storage_writes && !BufferCache::GuestSyncOnly()) {
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 		BufferCache::PerfCount(BufferCache::PerfEvent::AutoDispatchBarrier);

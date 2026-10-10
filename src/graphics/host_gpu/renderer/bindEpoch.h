@@ -19,6 +19,19 @@ inline void InvalidateRedundantBinds() noexcept {
 	return g_bind_epoch.load(std::memory_order_relaxed);
 }
 
+// Incremented for every recorded draw and dispatch. Buffer copies/fills and image transitions
+// carry their own barriers, so two guest global barriers with no draw or dispatch between them
+// in one command buffer are redundant.
+inline std::atomic<uint64_t> g_work_epoch {0};
+
+inline void NoteShaderWork() noexcept {
+	g_work_epoch.fetch_add(1, std::memory_order_relaxed);
+}
+
+[[nodiscard]] inline uint64_t WorkEpoch() noexcept {
+	return g_work_epoch.load(std::memory_order_relaxed);
+}
+
 } // namespace Libs::Graphics
 
 #endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_BINDEPOCH_H_

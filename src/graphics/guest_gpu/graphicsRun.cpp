@@ -1,4 +1,5 @@
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/renderer/bindEpoch.h"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -1486,6 +1487,24 @@ void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_
 
 void CommandProcessor::EmitGlobalBarrier() {
 	Common::LockGuard lock(m_renderer.GetMutex());
+	// KYTY_DEDUP_BARRIERS=1: a global barrier with no draw or dispatch recorded since the previous
+	// one in the same command buffer orders nothing new.
+	static const bool dedup = [] {
+		const char* v = std::getenv("KYTY_DEDUP_BARRIERS");
+		return v != nullptr && v[0] == '1';
+	}();
+	static uint64_t last_epoch = UINT64_MAX;
+	static uint64_t last_tick  = UINT64_MAX;
+	if (dedup) {
+		const auto epoch = WorkEpoch();
+		const auto tick  = GetScheduler().CurrentTick();
+		if (epoch == last_epoch && tick == last_tick) {
+			BufferCache::PerfCount(BufferCache::PerfEvent::BarrierSkipped);
+			return;
+		}
+		last_epoch = epoch;
+		last_tick  = tick;
+	}
 	BufferCache::PerfCount(BufferCache::PerfEvent::GuestBarrier);
 
 	vk::MemoryBarrier2 barrier {};
