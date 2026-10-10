@@ -100,6 +100,8 @@ struct ShaderProgram {
 };
 
 // The owning renderer serializes access, including saves while the GPU is running.
+namespace PipelineRecord { class RecordFile; struct Records; }
+
 class PipelineCache {
 public:
 	explicit PipelineCache(GraphicContext& graphics);
@@ -182,6 +184,12 @@ private:
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 
 	void InitializeDriverCache();
+	std::unique_ptr<PipelineRecord::RecordFile> m_record;
+	void InitializeShaderRecord();
+	void WarmUp(PipelineRecord::Records& records);
+	void RecordGraphicsPipeline(const GraphicsPipelineKey& key,
+	                            std::span<const ShaderVertexInputInfo> vertex_info,
+	                            const ShaderPixelInputInfo* ps_input_info);
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);

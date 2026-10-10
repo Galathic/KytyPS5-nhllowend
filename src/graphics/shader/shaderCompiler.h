@@ -20,9 +20,11 @@ struct ShaderParams {
 	uint32_t                  user_data_count = 0;
 	uint64_t                  hash = 0;
 	std::span<const uint32_t> back_code;
+	// Original guest address when replaying code from a warm-up record.
+	uint64_t base = 0;
 
 	[[nodiscard]] uint64_t Base() const {
-		return reinterpret_cast<uint64_t>(code.data());
+		return base != 0 ? base : reinterpret_cast<uint64_t>(code.data());
 	}
 };
 

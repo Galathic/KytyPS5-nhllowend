@@ -5,21 +5,23 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cstdlib>
 #include <vector>
 
 namespace Libs::Graphics {
 
 // A resource snapshot depends on register inputs AND guest memory. Validate the
 // actual reads with their original readers; unchanged pointers alone are insufficient.
-class ResourceMemo {
+class ResourceMemoEntry {
     using Runtime = ShaderRecompiler::IR::SrtRuntime;
     struct Read {
         uint64_t address;
         bool strict;
         std::vector<uint32_t> values;
+        bool valid = true;
     };
     struct Capture {
-        ResourceMemo& memo;
+        ResourceMemoEntry& memo;
         const Runtime& source;
     };
 
@@ -34,25 +36,32 @@ class ResourceMemo {
     template <bool strict>
     static bool CaptureRead(void* userdata, uint64_t address, std::span<uint32_t> values) {
         auto& capture = *static_cast<Capture*>(userdata);
-        if (!ReadValues(capture.source, strict, address, values)) return false;
+        const bool valid = ReadValues(capture.source, strict, address, values);
         auto& reads = capture.memo.m_reads;
-        if (!reads.empty() && reads.back().strict == strict &&
+        if (valid && !reads.empty() && reads.back().valid && reads.back().strict == strict &&
             reads.back().address + reads.back().values.size() * sizeof(uint32_t) == address) {
             reads.back().values.insert(reads.back().values.end(), values.begin(), values.end());
         } else {
-            reads.push_back({address, strict, {values.begin(), values.end()}});
+            reads.push_back({address, strict,
+                valid ? std::vector<uint32_t>(values.begin(), values.end())
+                      : std::vector<uint32_t>(values.size(), 0u), valid});
         }
-        return true;
+        return valid;
     }
 
 public:
     enum class Miss { None, Cold, ShaderBase, Registers, Workgroups, ReadFailed, MemoryChanged, Count };
     Miss LastMiss() const { return m_last_miss; }
+    size_t RecordedWords() const {
+        size_t total = 0;
+        for (const auto& read: m_reads) total += read.values.size();
+        return total;
+    }
 
     bool Refresh(const ShaderRecompiler::IR::ResourcePlan& plan, const Runtime& runtime,
                  ShaderRecompiler::IR::ResourceSnapshot& snapshot,
                  ShaderRecompiler::IR::ResourceSpecialization& specialization,
-                 bool enabled, bool& reused) {
+                 bool enabled, bool& reused, bool probe_only = false) {
         reused = false;
         m_last_miss = Miss::None;
         bool inputs_equal = enabled;
@@ -67,12 +76,13 @@ public:
             bool equal = true;
             for (const auto& read: m_reads) {
                 m_check.resize(read.values.size());
-                if (!ReadValues(runtime, read.strict, read.address, m_check)) {
+                const bool valid = ReadValues(runtime, read.strict, read.address, m_check);
+                if (valid != read.valid) {
                     m_last_miss = Miss::ReadFailed;
                     equal = false;
                     break;
                 }
-                if (m_check != read.values) {
+                if (valid && m_check != read.values) {
                     m_last_miss = Miss::MemoryChanged;
                     equal = false;
                     break;
@@ -86,6 +96,7 @@ public:
                 return true;
             }
         }
+        if (probe_only) return false;
         m_valid = false;
         m_reads.clear();
         if (!enabled) {
@@ -95,8 +106,7 @@ public:
         auto observed = runtime;
         observed.userdata = &capture;
         observed.read_memory = CaptureRead<false>;
-        observed.read_specialization_memory = runtime.read_specialization_memory != nullptr
-                                                ? CaptureRead<true> : nullptr;
+        observed.read_specialization_memory = CaptureRead<true>;
         if (!ShaderRecompiler::IR::MaterializeResources(plan, observed, snapshot, specialization)) return false;
         if (m_plan != &plan) {
             m_register_inputs.clear();
@@ -134,6 +144,90 @@ private:
     std::vector<uint32_t> m_register_inputs;
     std::vector<Read> m_reads;
     std::vector<uint32_t> m_check;
+};
+
+// Keep multiple validated states so alternating materials do not evict each other.
+// Never cache solely by pointer: each candidate still replays its dependency reads.
+class ResourceMemo {
+public:
+    explicit ResourceMemo(size_t capacity = 0) : m_capacity(capacity) {
+        if (m_capacity == 0) {
+            const char* flag = std::getenv("KYTY_RESOURCE_MULTI_CACHE");
+            m_capacity = flag != nullptr && flag[0] == '1' ? 16 : 1;
+        }
+        m_capacity = std::clamp(m_capacity, size_t{1}, size_t{16});
+    }
+    using Miss = ResourceMemoEntry::Miss;
+    Miss LastMiss() const { return m_last_miss; }
+    bool Refresh(const ShaderRecompiler::IR::ResourcePlan& plan,
+                 const ShaderRecompiler::IR::SrtRuntime& runtime,
+                 ShaderRecompiler::IR::ResourceSnapshot& snapshot,
+                 ShaderRecompiler::IR::ResourceSpecialization& specialization,
+                 bool enabled, bool& reused) {
+        if (!enabled) {
+            m_entries.clear();
+            m_last_hit = SIZE_MAX;
+            reused = false;
+            return ShaderRecompiler::IR::MaterializeResources(plan, runtime, snapshot, specialization);
+        }
+        const auto count = m_entries.size();
+        for (size_t step = 0; step < count; ++step) {
+            const size_t index = m_last_hit < count ? (m_last_hit + step) % count : step;
+            auto& entry = m_entries[index];
+            if (!entry.memo.Refresh(plan, runtime, entry.snapshot, entry.specialization,
+                                    true, reused, true)) {
+                if (step == 0) m_last_miss = entry.memo.LastMiss();
+                continue;
+            }
+            if (m_last_hit != index || m_output != &snapshot || m_specialization != &specialization) {
+                snapshot = entry.snapshot;
+                specialization = entry.specialization;
+            } else {
+                snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
+            }
+            m_last_hit = index;
+            m_output = &snapshot;
+            m_specialization = &specialization;
+            m_last_miss = Miss::None;
+            return true;
+        }
+        if (count == 0) m_last_miss = Miss::Cold;
+        Entry fresh;
+        if (!fresh.memo.Refresh(plan, runtime, snapshot, specialization, true, reused)) {
+            m_entries.clear();
+            m_last_hit = SIZE_MAX;
+            return false;
+        }
+        // Large descriptor walks must not multiply memory use sixteenfold.
+        if (fresh.memo.RecordedWords() > 4096) {
+            m_last_hit = SIZE_MAX;
+            return true;
+        }
+        fresh.snapshot = snapshot;
+        fresh.specialization = specialization;
+        if (m_entries.size() < m_capacity) {
+            m_last_hit = m_entries.size();
+            m_entries.push_back(std::move(fresh));
+        } else {
+            m_last_hit = m_next++ % m_capacity;
+            m_entries[m_last_hit] = std::move(fresh);
+        }
+        m_output = &snapshot;
+        m_specialization = &specialization;
+        return true;
+    }
+private:
+    struct Entry {
+        ResourceMemoEntry memo;
+        ShaderRecompiler::IR::ResourceSnapshot snapshot;
+        ShaderRecompiler::IR::ResourceSpecialization specialization;
+    };
+    std::vector<Entry> m_entries;
+    size_t m_capacity;
+    size_t m_last_hit = SIZE_MAX, m_next = 0;
+    const void* m_output = nullptr;
+    const void* m_specialization = nullptr;
+    Miss m_last_miss = Miss::None;
 };
 
 } // namespace Libs::Graphics

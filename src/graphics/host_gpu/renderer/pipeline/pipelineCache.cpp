@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/pipeline/resourceMemo.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineRecord.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
@@ -81,7 +82,7 @@ std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties)
 		uuid[i * 2]     = hex[properties.pipelineCacheUUID[i] >> 4u];
 		uuid[i * 2 + 1] = hex[properties.pipelineCacheUUID[i] & 0xfu];
 	}
-	return fmt::format("KytyPC1:{}:{:08x}:{:08x}:{:08x}:{}\n", KYTY_GIT_REVISION,
+	return fmt::format("KytyPC2:{:08x}:{:08x}:{:08x}:{}\n",
 	                   properties.vendorID, properties.deviceID, properties.driverVersion, uuid);
 }
 
@@ -111,6 +112,33 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 	// Image synchronization belongs to formatted buffer bindings, not these reads.
 	return !values.empty() &&
 	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
+}
+
+
+bool ReplayRecordedWords(void* data, uint64_t address, std::span<uint32_t> values, bool strict) {
+    const auto& record = *static_cast<const PipelineRecord::Program*>(data);
+    return PipelineRecord::ReplayWords(record, address, values, strict);
+}
+bool ReplayRawWords(void* data, uint64_t address, std::span<uint32_t> values) {
+    return ReplayRecordedWords(data, address, values, false);
+}
+bool ReplayCleanWords(void* data, uint64_t address, std::span<uint32_t> values) {
+    return ReplayRecordedWords(data, address, values, true);
+}
+bool CaptureRecordedWords(void* data, uint64_t address, std::span<uint32_t> values, bool strict) {
+    auto& record = *static_cast<PipelineRecord::Program*>(data);
+    const bool valid = strict ? ReadShaderGuestMemory(nullptr, address, values) : true;
+    if (!strict) std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
+    auto& reads = strict ? record.reads : record.raw_reads;
+    for (size_t index = 0; index < values.size(); ++index)
+        reads.push_back({address + index * 4, valid ? values[index] : 0u, valid ? 1u : 0u});
+    return valid;
+}
+bool CaptureRawWords(void* data, uint64_t address, std::span<uint32_t> values) {
+    return CaptureRecordedWords(data, address, values, false);
+}
+bool CaptureCleanWords(void* data, uint64_t address, std::span<uint32_t> values) {
+    return CaptureRecordedWords(data, address, values, true);
 }
 
 // NHL26 debugging: KYTY_DBG_DUMP_SHADERS=<hex>[,<hex>...] dumps just those shaders.
@@ -357,7 +385,19 @@ struct PipelineCache::ProgramCache {
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			runtime.workgroup_counts = input_info.workgroup_counts;
 		}
-		const auto native_plan_safe = [&](const ShaderRecompiler::IR::ResourcePlan& plan) {
+		if (replaying != nullptr) {
+            runtime.read_memory = ReplayRawWords;
+            runtime.read_specialization_memory = ReplayCleanWords;
+            runtime.userdata = const_cast<PipelineRecord::Program*>(replaying);
+        }
+        const bool memo_enabled = reuse_enabled && replaying == nullptr;
+        const auto refresh = [&](SourceEntry& source, bool& reused) {
+            const bool ok = source.resource_memo.Refresh(source.resource_plan, runtime,
+                source.resources, source.specialization, memo_enabled, reused);
+            if (!ok && replaying == nullptr) EXIT("Resource materialization failed\n");
+            return ok;
+        };
+        const auto native_plan_safe = [&](const ShaderRecompiler::IR::ResourcePlan& plan) {
 			if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 				if (input_info.native_draw.Enabled()) {
 					for (const auto& value: plan.value_storage) {
@@ -382,8 +422,7 @@ struct PipelineCache::ProgramCache {
 		if (entry != nullptr) {
 			if (!check_native_plan(*entry)) return {};
 			bool reused = false;
-			EXIT_IF(!entry->resource_memo.Refresh(entry->resource_plan, runtime,
-			    entry->resources, entry->specialization, reuse_enabled, reused));
+			if (!refresh(*entry, reused)) return {};
 			resource_hits += reused;
 			materializations += !reused;
 			if (reuse_enabled && !reused) ++resource_misses[static_cast<size_t>(entry->resource_memo.LastMiss())];
@@ -472,14 +511,37 @@ struct PipelineCache::ProgramCache {
 			last = {&found->first, entry};
 			if (!check_native_plan(*entry)) return {};
 			bool reused = false;
-			EXIT_IF(!entry->resource_memo.Refresh(entry->resource_plan, runtime,
-			    entry->resources, entry->specialization, reuse_enabled, reused));
+			if (!refresh(*entry, reused)) return {};
 			++materializations;
 		}
-		entry->permutations.push_back(CompilePermutation(
+
+        PipelineRecord::Program recorded;
+        bool recording = record != nullptr && record->IsOpen() && replaying == nullptr &&
+                         PipelineRecord::IsRecordableStage(stage);
+        if (recording) {
+            recorded.stage = stage; recorded.hash = params.hash;
+            recorded.shader_base = params.Base(); recorded.push_data_cursor = push_data_cursor;
+            recorded.code.assign(params.code.begin(), params.code.end());
+            recorded.back_code.assign(params.back_code.begin(), params.back_code.end());
+            recorded.user_data.assign(user_data.begin(), user_data.end());
+            if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) recorded.vertex = input_info;
+            else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) recorded.pixel = input_info;
+            else recorded.compute = input_info;
+            auto capture_runtime = runtime;
+            capture_runtime.userdata = &recorded;
+            capture_runtime.read_memory = CaptureRawWords;
+            capture_runtime.read_specialization_memory = CaptureCleanWords;
+            ShaderRecompiler::IR::ResourceSnapshot captured;
+            ShaderRecompiler::IR::ResourceSpecialization captured_specialization;
+            recording = ShaderRecompiler::IR::MaterializeResources(entry->resource_plan, capture_runtime,
+                                                                  captured, captured_specialization) &&
+                        captured_specialization == entry->specialization;
+        }
+        entry->permutations.push_back(CompilePermutation(
 		    stage_name, options, std::move(translated), entry->specialization, push_data_cursor));
 		entry->last_permutation = entry->permutations.size() - 1;
 		const auto& permutation = entry->permutations.back();
+        if (recording) ordinals[permutation.handle.id] = record->AppendProgram(recorded);
 		input_info.stage = {.program = &permutation.program, .resources = &entry->resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
 
@@ -543,6 +605,13 @@ struct PipelineCache::ProgramCache {
 	std::chrono::steady_clock::time_point last_stats = std::chrono::steady_clock::now();
 	vk::Device                                                  device;
 	uint64_t                                                    next_shader_id = 0;
+    PipelineRecord::RecordFile* record = nullptr;
+    const PipelineRecord::Program* replaying = nullptr;
+    std::unordered_map<uint64_t, uint32_t> ordinals;
+    uint32_t Ordinal(uint64_t id) const {
+        const auto found = ordinals.find(id);
+        return found == ordinals.end() ? PipelineRecord::NoProgram : found->second;
+    }
 	// NHL debugging: shader hash -> number of skip warnings printed.
 	std::unordered_map<uint64_t, uint32_t>                      failed_shaders;
 };
@@ -551,6 +620,7 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
     : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
+	InitializeShaderRecord();
 }
 
 PipelineCache::~PipelineCache() {
@@ -605,7 +675,7 @@ void PipelineCache::InitializeDriverCache() {
 		const auto   file_size = file.IsInvalid() ? 0 : file.Size();
 		const auto   signature = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
 		if (file_size >= signature.size() + sizeof(uint64_t) &&
-		    file_size <= std::numeric_limits<uint32_t>::max()) {
+		    file_size <= 1024ull * 1024ull * 1024ull) {
 			std::string cached_signature(signature.size(), '\0');
 			uint64_t    payload_hash = 0;
 			initial_data.resize(file_size - signature.size() - sizeof(payload_hash));
@@ -668,7 +738,7 @@ void PipelineCache::AutoSave() {
 	if (m_last_save_ms == 0) {
 		m_last_save_ms = now;
 	}
-	if (now - m_last_save_ms >= 30000) {
+	if (now - m_last_save_ms >= 30000 || m_unsaved_pipelines >= 128) {
 		Save();
 		m_unsaved_pipelines = 0;
 		m_last_save_ms      = now;
@@ -733,6 +803,133 @@ void PipelineCache::Save() {
 	m_driver_cache = nullptr;
 }
 
+void PipelineCache::InitializeShaderRecord() {
+	const char* flag = std::getenv("KYTY_SHADER_PREGEN");
+	if (!Config::PreGenEnabled() || (flag != nullptr && flag[0] == '0')) {
+		PipelineCacheLog("Shader warm-up: disabled (--pre-gen false)");
+		return;
+	}
+	const auto title_id = PipelineCacheTitleId();
+	if (title_id.empty()) {
+		return;
+	}
+	const auto path = std::filesystem::path("_PipelineCache") / (title_id + ".shaders");
+	PipelineRecord::Records records;
+	m_record = std::make_unique<PipelineRecord::RecordFile>();
+	if (!m_record->Open(path, records)) {
+		PipelineCacheLog("Shader warm-up: cannot write {}; new shaders are not recorded",
+		                 Common::PathToString(path));
+	}
+	m_program_cache->record = m_record.get();
+	WarmUp(records);
+}
+
+
+void PipelineCache::WarmUp(PipelineRecord::Records& records) {
+    if (records.programs.empty()) {
+        PipelineCacheLog("Shader warm-up: no records yet; recording during play");
+        return;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    // Shared ProgramCache/compiler state is serialized; do not race translation or insertion.
+    std::vector<ShaderProgram> handles(records.programs.size());
+    for (size_t index = 0; index < records.programs.size(); ++index) {
+        auto& source = records.programs[index];
+        if (source.user_data.size() > ShaderParams{}.user_data.size()) continue;
+        if (source.stage == ShaderType::Vertex && source.vertex.native_draw.Enabled() &&
+            !m_graphics.native_draw_parameters_enabled) continue;
+        if (source.stage == ShaderType::Pixel) {
+            const char* quad = std::getenv("KYTY_PIXEL_QUAD_CORRECT");
+            source.pixel.pixel_quad_correct = m_graphics.pixel_quad_supported &&
+                quad != nullptr && quad[0] == '1';
+        }
+        if (source.stage == ShaderType::Compute) {
+            source.compute.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
+            source.compute.lds_storage = source.compute.lds_size_dwords * 4u >
+                m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
+        }
+        ShaderParams params;
+        params.code = source.code; params.back_code = source.back_code;
+        params.base = source.shader_base; params.hash = source.hash;
+        params.user_data_count = static_cast<uint32_t>(source.user_data.size());
+        std::copy(source.user_data.begin(), source.user_data.end(), params.user_data.begin());
+        auto cursor = source.push_data_cursor;
+        m_program_cache->replaying = &source;
+        switch (source.stage) {
+            case ShaderType::Vertex: handles[index] = m_program_cache->Get(params, source.vertex, cursor); break;
+            case ShaderType::Pixel: handles[index] = m_program_cache->Get(params, source.pixel, cursor); break;
+            case ShaderType::Compute: handles[index] = m_program_cache->Get(params, source.compute, cursor); break;
+            default: break;
+        }
+        m_program_cache->replaying = nullptr;
+        if (handles[index]) m_program_cache->ordinals[handles[index].id] = static_cast<uint32_t>(index);
+    }
+    std::unordered_map<uint64_t, const ShaderRecompiler::IR::CompiledShaderInfo*> compiled;
+    for (const auto& [key, entry]: m_program_cache->programs)
+        for (const auto& permutation: entry.permutations)
+            compiled[permutation.handle.id] = &permutation.program;
+    size_t graphics_count = 0, compute_count = 0;
+    for (auto& record: records.graphics) {
+        const auto vertex = handles[record.vertex_program];
+        const bool ps_active = record.pixel_program != PipelineRecord::NoProgram;
+        const auto pixel = ps_active ? handles[record.pixel_program] : ShaderProgram{};
+        if (!vertex || (ps_active && !pixel)) continue;
+        GraphicsPipelineKey key;
+        key.rendering = record.rendering; key.vertex_shader_ids[0] = vertex.id;
+        key.ps_shader_id = pixel.id; key.vertex_input = record.vertex_input;
+        key.static_params = record.static_params;
+        if (m_graphics_pipelines.contains(key)) continue;
+        GraphicsPrograms programs; programs.vertex[0] = vertex; programs.pixel = pixel;
+        record.vertex.stage.program = compiled.at(vertex.id);
+        if (ps_active) record.pixel.stage.program = compiled.at(pixel.id);
+        auto pipeline = std::make_unique<Pipeline>();
+        CreatePipelineInternal(m_graphics, *pipeline, key.rendering, key.vertex_input,
+            std::span<const ShaderVertexInputInfo>(&record.vertex, 1),
+            ps_active ? &record.pixel : nullptr, programs, key.static_params, m_driver_cache);
+        m_graphics_pipelines.emplace(std::move(key), std::move(pipeline)); ++graphics_count;
+    }
+    for (auto& record: records.compute) {
+        const auto program = handles[record.program];
+        if (!program || m_compute_pipelines.contains(program.id)) continue;
+        record.compute.stage.program = compiled.at(program.id);
+        record.compute.host_subgroup_size = records.programs[record.program].compute.host_subgroup_size;
+        record.compute.lds_storage = records.programs[record.program].compute.lds_storage;
+        auto pipeline = std::make_unique<Pipeline>();
+        CreatePipelineInternal(m_graphics, *pipeline, record.compute, program.module, m_driver_cache);
+        m_compute_pipelines.emplace(program.id, std::move(pipeline)); ++compute_count;
+    }
+    Save();
+    PipelineCacheLog("Shader warm-up: {} programs, {} graphics and {} compute pipelines in {:.1f}s",
+        std::ranges::count_if(handles, [](const auto& handle) { return bool(handle); }),
+        graphics_count, compute_count,
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+}
+
+void PipelineCache::RecordGraphicsPipeline(const GraphicsPipelineKey&             key,
+                                           std::span<const ShaderVertexInputInfo> vertex_info,
+                                           const ShaderPixelInputInfo*            ps_input_info) {
+	if (m_record == nullptr || !m_record->IsOpen() || vertex_info.size() != 1 ||
+	    vertex_info[0].logical_stage != ShaderType::Vertex) {
+		return;
+	}
+	PipelineRecord::GraphicsPipeline record;
+	record.vertex_program = m_program_cache->Ordinal(key.vertex_shader_ids[0]);
+	record.pixel_program  = ps_input_info != nullptr ? m_program_cache->Ordinal(key.ps_shader_id)
+	                                                 : PipelineRecord::NoProgram;
+	if (record.vertex_program == PipelineRecord::NoProgram ||
+	    (ps_input_info != nullptr && record.pixel_program == PipelineRecord::NoProgram)) {
+		return;
+	}
+	record.rendering     = key.rendering;
+	record.vertex_input  = key.vertex_input;
+	record.static_params = key.static_params;
+	record.vertex        = vertex_info[0];
+	if (ps_input_info != nullptr) {
+		record.pixel = *ps_input_info;
+	}
+	m_record->AppendGraphicsPipeline(record);
+}
+
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
@@ -768,6 +965,11 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	ShaderParams pixel_params;
 	if (pixel_active) {
 		pixel_params      = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
+		static const bool quad_enabled = [] {
+			const char* flag = std::getenv("KYTY_PIXEL_QUAD_CORRECT");
+			return flag != nullptr && flag[0] == '1';
+		}();
+		pixel_info.pixel_quad_correct = quad_enabled && m_graphics.pixel_quad_supported;
 		const auto& blend = context.GetBlendControl(0);
 		pixel_info.dual_source_blending =
 		    blend.enable && !context.GetRenderTarget(0).info.blend_bypass &&
@@ -1040,6 +1242,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
 
+	RecordGraphicsPipeline(key, vertex_info, ps_input_info);
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 	EXIT_IF(!inserted);
 	AutoSave();
@@ -1069,7 +1272,11 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
 
-	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
+if (m_record != nullptr && m_record->IsOpen() && m_program_cache->replaying == nullptr) {
+        const auto ordinal = m_program_cache->Ordinal(compute_program.id);
+        if (ordinal != PipelineRecord::NoProgram) m_record->AppendComputePipeline({ordinal, input_info});
+    }
+    auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
 	EXIT_IF(!inserted);
 	AutoSave();
 

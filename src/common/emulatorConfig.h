@@ -60,6 +60,7 @@ struct ConfigOptions {
 	uint32_t               console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
 	bool                   shader_validation_enabled   = false;
+	bool                   pre_gen_enabled             = true;
 	ShaderOptimizationType shader_optimization_type    = ShaderOptimizationType::None;
 	LogDirection           shader_log_direction        = LogDirection::Silent;
 	std::filesystem::path  shader_log_folder           = "_Shaders";
@@ -105,6 +106,7 @@ uint32_t GetConsoleLanguage();
 bool     VulkanValidationEnabled();
 
 bool                   ShaderValidationEnabled();
+bool                   PreGenEnabled();
 ShaderOptimizationType GetShaderOptimizationType();
 LogDirection           GetShaderLogDirection();
 std::filesystem::path  GetShaderLogFolder();

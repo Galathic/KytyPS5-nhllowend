@@ -19,6 +19,7 @@ struct VulkanImage;
 inline constexpr uint32_t VULKAN_TARGET_API_VERSION = VK_API_VERSION_1_3;
 
 struct GraphicContext {
+	bool pixel_quad_supported = false;
 	vk::Instance                       instance                              = nullptr;
 	vk::DebugUtilsMessengerEXT         debug_messenger                       = nullptr;
 	vk::PhysicalDevice                 physical_device                       = nullptr;
