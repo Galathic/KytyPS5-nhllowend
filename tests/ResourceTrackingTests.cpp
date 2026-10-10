@@ -126,7 +126,7 @@ struct Fixture {
                  Value(0u), Value(0u), Value(0u)});
   }
 
-  void PlanAndTrack() {
+  void PlanAndTrack(bool gpu_scalar_data = false) {
     for (size_t index = 0; index < program.block_info.size(); ++index) {
       const auto condition = program.block_info[index].condition;
       if (!condition.IsEmpty())
@@ -148,7 +148,7 @@ struct Fixture {
         Emit(ValueOpcode::ReferenceU32, {value}, 0, target);
       }
     }
-    TrackResources(program, {}, {});
+    TrackResources(program, {}, {}, gpu_scalar_data);
   }
 };
 
@@ -2290,6 +2290,56 @@ void TestSrtFlatteningAndRuntimeMemoization() {
         "flattened typed SRT reads did not receive a binding");
 }
 
+void TestGpuScalarDataKeepsDescriptorReads() {
+  for (const bool gpu_scalar_data : {false, true}) {
+    Fixture fixture;
+    const auto base = fixture.Address(fixture.UserData(0), fixture.UserData(1), 4);
+    MemoryInfo scalar;
+    scalar.kind = ResourceKind::ScalarAddress;
+    const auto descriptor_read = fixture.Emit(ValueOpcode::LoadAddressU32,
+        {base, Value(0u), Value(0u), Value(true)}, fixture.AddMemory(scalar, 4));
+    scalar.offset = 4;
+    const auto data = fixture.Emit(ValueOpcode::LoadAddressU32,
+        {base, Value(0u), Value(0u), Value(true)}, fixture.AddMemory(scalar, 8));
+    const auto descriptor = fixture.Buffer({descriptor_read, Value(0u), Value(64u), Value(0u)}, 12);
+    MemoryInfo buffer;
+    buffer.kind = ResourceKind::Buffer;
+    fixture.Emit(ValueOpcode::LoadBufferU32,
+        {descriptor, Value(0u), Value(0u), Value(0u), Value(true)}, fixture.AddMemory(buffer, 12));
+    fixture.Emit(ValueOpcode::ReferenceU32, {data});
+    fixture.PlanAndTrack(gpu_scalar_data);
+    Check(fixture.program.srt_reads.size() == (gpu_scalar_data ? 1u : 2u) &&
+          fixture.program.memory_info[0].planning_only &&
+          fixture.program.memory_info[1].planning_only != gpu_scalar_data &&
+          fixture.program.info.uses_dma == gpu_scalar_data,
+          "GPU scalar data changed descriptor planning or did not retain its BDA load");
+    Check(!gpu_scalar_data || data.ResolveInstruction()->GetOpcode() == ValueOpcode::LoadAddressU32,
+          "GPU scalar data was replaced by a flattened host read");
+    TestMemory memory;
+    memory.words[0] = 0x2000;
+    memory.words[1] = 0xdeadbeef;
+    const std::array<uint32_t, 2> user_data{0x1000u, 0u};
+    auto plan = ExtractResourcePlan(fixture.program);
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, {.user_data = user_data, .read_memory = ReadTestMemory,
+                                     .userdata = &memory}, snapshot, specialization) &&
+          snapshot.buffers.size() == 1 && snapshot.buffers[0].dwords[0] == 0x2000 &&
+          memory.reads == (gpu_scalar_data ? 1u : 2u),
+          "GPU scalar data changed the materialized descriptor or fetched unused data");
+    if (gpu_scalar_data) {
+      memory.reads = 0;
+      memory.fail_after = 1;
+      memory.words[0] = 0x3000;
+      memory.words[1] = 0xbadc0de;
+      Check(MaterializeResources(plan, {.user_data = user_data, .read_memory = ReadTestMemory,
+                                       .userdata = &memory}, snapshot, specialization) &&
+            snapshot.buffers[0].dwords[0] == 0x3000 && memory.reads == 1,
+            "GPU scalar data stopped refreshing a changed descriptor");
+    }
+  }
+}
+
 void TestDynamicSrtReadRemainsExplicit() {
   Fixture fixture;
   const auto base =
@@ -3075,101 +3125,103 @@ void TestConditionalBufferMaterialization() {
 
 void TestGuardedScalarDescriptorReads() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
-  for (const bool shared : {false, true}) {
-    for (const bool exec : {false, true}) {
-      Fixture fixture;
-      auto *entry = fixture.block;
-      auto *optional = fixture.AddBlock();
-      auto *done = fixture.AddBlock();
-      entry->AddBranch(optional);
-      entry->AddBranch(done);
-      optional->AddBranch(done);
-      fixture.program.block_info[0].terminator = {
-          .kind = CFG::TerminatorKind::ConditionalBranch, .true_block = 1, .false_block = 2};
-      fixture.program.block_info[1].terminator = {
-          .kind = CFG::TerminatorKind::Branch, .true_block = 2};
-      fixture.program.block_info[2].terminator.kind = CFG::TerminatorKind::Return;
-      const auto control = fixture.Buffer({fixture.UserData(0), fixture.UserData(1),
-                                          fixture.UserData(2), fixture.UserData(3)});
-      MemoryInfo scalar;
-      scalar.kind = ResourceKind::ScalarBuffer;
-      scalar.offset = 28;
-      const auto flag = fixture.Emit(ValueOpcode::ReadConstBuffer, {control, Value(0u)},
-                                     fixture.AddMemory(scalar, 4));
-      const auto lane = fixture.Emit(ValueOpcode::GetBuiltin,
-          {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
-      const auto varying = fixture.Emit(ValueOpcode::INotEqual32, {lane, Value(0u)});
-      const auto enabled = fixture.Emit(ValueOpcode::INotEqual32, {flag, Value(0u)});
-      fixture.program.block_info[0].condition =
-          fixture.Emit(ValueOpcode::LogicalAnd, {varying, enabled});
-      const auto root = fixture.Address(fixture.UserData(4), Value(0u));
-      const auto Load = [&](Block *block) {
-        fixture.block = block;
-        MemoryInfo address;
-        address.kind = ResourceKind::ScalarAddress;
-        const auto pointer = fixture.Emit(ValueOpcode::LoadAddressU32,
-            {root, Value(0u), Value(0u), Value(exec)}, fixture.AddMemory(address, 8));
-        const auto table = fixture.Address(pointer, Value(0u));
-        std::array<Value, 4> words;
-        for (uint32_t word = 0; word < words.size(); ++word) {
-          address.offset = 40 + word * 4;
-          words[word] = fixture.Emit(ValueOpcode::LoadAddressU32,
-              {table, Value(0u), Value(0u), Value(exec)}, fixture.AddMemory(address, 12));
+  for (const bool gpu_scalar_data : {false, true}) {
+    for (const bool shared : {false, true}) {
+      for (const bool exec : {false, true}) {
+        Fixture fixture;
+        auto *entry = fixture.block;
+        auto *optional = fixture.AddBlock();
+        auto *done = fixture.AddBlock();
+        entry->AddBranch(optional);
+        entry->AddBranch(done);
+        optional->AddBranch(done);
+        fixture.program.block_info[0].terminator = {
+            .kind = CFG::TerminatorKind::ConditionalBranch, .true_block = 1, .false_block = 2};
+        fixture.program.block_info[1].terminator = {
+            .kind = CFG::TerminatorKind::Branch, .true_block = 2};
+        fixture.program.block_info[2].terminator.kind = CFG::TerminatorKind::Return;
+        const auto control = fixture.Buffer({fixture.UserData(0), fixture.UserData(1),
+                                            fixture.UserData(2), fixture.UserData(3)});
+        MemoryInfo scalar;
+        scalar.kind = ResourceKind::ScalarBuffer;
+        scalar.offset = 28;
+        const auto flag = fixture.Emit(ValueOpcode::ReadConstBuffer, {control, Value(0u)},
+                                       fixture.AddMemory(scalar, 4));
+        const auto lane = fixture.Emit(ValueOpcode::GetBuiltin,
+            {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+        const auto varying = fixture.Emit(ValueOpcode::INotEqual32, {lane, Value(0u)});
+        const auto enabled = fixture.Emit(ValueOpcode::INotEqual32, {flag, Value(0u)});
+        fixture.program.block_info[0].condition =
+            fixture.Emit(ValueOpcode::LogicalAnd, {varying, enabled});
+        const auto root = fixture.Address(fixture.UserData(4), Value(0u));
+        const auto Load = [&](Block *block) {
+          fixture.block = block;
+          MemoryInfo address;
+          address.kind = ResourceKind::ScalarAddress;
+          const auto pointer = fixture.Emit(ValueOpcode::LoadAddressU32,
+              {root, Value(0u), Value(0u), Value(exec)}, fixture.AddMemory(address, 8));
+          const auto table = fixture.Address(pointer, Value(0u));
+          std::array<Value, 4> words;
+          for (uint32_t word = 0; word < words.size(); ++word) {
+            address.offset = 40 + word * 4;
+            words[word] = fixture.Emit(ValueOpcode::LoadAddressU32,
+                {table, Value(0u), Value(0u), Value(exec)}, fixture.AddMemory(address, 12));
+          }
+          scalar.offset = 0;
+          fixture.Emit(ValueOpcode::ReadConstBuffer, {fixture.Buffer(words), Value(0u)},
+                       fixture.AddMemory(scalar, 16));
+        };
+        Load(optional);
+        if (shared) Load(done);
+        fixture.block = done;
+        MemoryInfo store;
+        store.kind = ResourceKind::Buffer;
+        fixture.Emit(ValueOpcode::StoreBufferU32,
+            {fixture.Buffer({Value(0x9000u), Value(0u), Value(4u), Value(0u)}),
+             Value(0u), Value(0u), Value(0u), Value(1u), Value(true)}, fixture.AddMemory(store, 20));
+        fixture.PlanAndTrack(gpu_scalar_data);
+        auto plan = ExtractResourcePlan(fixture.program);
+        Check(!exec || (!plan.srt_reads.empty() && !plan.control_flow[1].srt_reads.empty() &&
+                        (!shared || !plan.control_flow[2].srt_reads.empty())),
+              "guarded shared-read fixture lost its flattened execution sites");
+        struct Memory { LinearTestMemory data; uint32_t null_reads = 0; } memory;
+        const auto Read = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+          auto &memory = *static_cast<Memory *>(data);
+          if (address == 40) ++memory.null_reads;
+          return ReadLinearTestMemory(&memory.data, address, words);
+        };
+        const std::array<uint32_t, 5> user_data{0x1000u, 0u, 64u, 0u, 0x1040u};
+        const SrtRuntime runtime{.user_data = user_data, .read_memory = Read,
+                                 .userdata = &memory, .read_specialization_memory = Read};
+        memory.data.words[0xa8 / 4] = 0x2000u;
+        memory.data.words[0xb0 / 4] = 4u;
+        ResourceSnapshot snapshot;
+        ResourceSpecialization specialization;
+        if (!shared) {
+          Check(MaterializeResources(plan, runtime, snapshot, specialization) && memory.null_reads == 0 &&
+                    std::ranges::all_of(snapshot.flattened_srt, [](auto word) { return word == 0; }),
+                "disabled feature speculatively dereferenced its null BVH table");
+          memory.data.words[7] = 1;
+          Check(!MaterializeResources(plan, runtime, snapshot, specialization) && memory.null_reads == 1,
+                "active feature accepted an unreadable BVH table");
         }
-        scalar.offset = 0;
-        fixture.Emit(ValueOpcode::ReadConstBuffer, {fixture.Buffer(words), Value(0u)},
-                     fixture.AddMemory(scalar, 16));
-      };
-      Load(optional);
-      if (shared) Load(done);
-      fixture.block = done;
-      MemoryInfo store;
-      store.kind = ResourceKind::Buffer;
-      fixture.Emit(ValueOpcode::StoreBufferU32,
-          {fixture.Buffer({Value(0x9000u), Value(0u), Value(4u), Value(0u)}),
-           Value(0u), Value(0u), Value(0u), Value(1u), Value(true)}, fixture.AddMemory(store, 20));
-      fixture.PlanAndTrack();
-      auto plan = ExtractResourcePlan(fixture.program);
-      Check(!exec || (!plan.srt_reads.empty() && !plan.control_flow[1].srt_reads.empty() &&
-                      (!shared || !plan.control_flow[2].srt_reads.empty())),
-            "guarded shared-read fixture lost its flattened execution sites");
-      struct Memory { LinearTestMemory data; uint32_t null_reads = 0; } memory;
-      const auto Read = +[](void *data, uint64_t address, std::span<uint32_t> words) {
-        auto &memory = *static_cast<Memory *>(data);
-        if (address == 40) ++memory.null_reads;
-        return ReadLinearTestMemory(&memory.data, address, words);
-      };
-      const std::array<uint32_t, 5> user_data{0x1000u, 0u, 64u, 0u, 0x1040u};
-      const SrtRuntime runtime{.user_data = user_data, .read_memory = Read,
-                               .userdata = &memory, .read_specialization_memory = Read};
-      memory.data.words[0xa8 / 4] = 0x2000u;
-      memory.data.words[0xb0 / 4] = 4u;
-      ResourceSnapshot snapshot;
-      ResourceSpecialization specialization;
-      if (!shared) {
-        Check(MaterializeResources(plan, runtime, snapshot, specialization) && memory.null_reads == 0 &&
-                  std::ranges::all_of(snapshot.flattened_srt, [](auto word) { return word == 0; }),
-              "disabled feature speculatively dereferenced its null BVH table");
-        memory.data.words[7] = 1;
-        Check(!MaterializeResources(plan, runtime, snapshot, specialization) && memory.null_reads == 1,
-              "active feature accepted an unreadable BVH table");
-      }
-      memory.data.words[0x40 / 4] = 0x1080u;
-      memory.data.watched_address = 0x10a8u;
-      memory.data.watched_reads = 0;
-      Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-                std::ranges::any_of(snapshot.buffers, [](const auto& descriptor) {
-                  return descriptor.dwords[0] == 0x2000u;
-                }) &&
-                (!exec || (memory.data.watched_reads == 1 &&
-                           std::ranges::find(snapshot.flattened_srt, 0x2000u) != snapshot.flattened_srt.end())),
-            "active or shared descriptor read was omitted after refreshing the cached plan");
-      if (!shared) {
-        memory.data.words[7] = 0;
-        memory.data.words[0x40 / 4] = 0;
-        Check(MaterializeResources(plan, runtime, snapshot, specialization) && memory.null_reads == 1 &&
-                  std::ranges::all_of(snapshot.flattened_srt, [](auto word) { return word == 0; }),
-              "cached plan retained reads after the feature was disabled");
+        memory.data.words[0x40 / 4] = 0x1080u;
+        memory.data.watched_address = 0x10a8u;
+        memory.data.watched_reads = 0;
+        Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+                  std::ranges::any_of(snapshot.buffers, [](const auto& descriptor) {
+                    return descriptor.dwords[0] == 0x2000u;
+                  }) &&
+                  (!exec || (memory.data.watched_reads == 1 &&
+                             std::ranges::find(snapshot.flattened_srt, 0x2000u) != snapshot.flattened_srt.end())),
+              "active or shared descriptor read was omitted after refreshing the cached plan");
+        if (!shared) {
+          memory.data.words[7] = 0;
+          memory.data.words[0x40 / 4] = 0;
+          Check(MaterializeResources(plan, runtime, snapshot, specialization) && memory.null_reads == 1 &&
+                    std::ranges::all_of(snapshot.flattened_srt, [](auto word) { return word == 0; }),
+                "cached plan retained reads after the feature was disabled");
+        }
       }
     }
   }
@@ -3580,6 +3632,7 @@ int main() {
     Run("image descriptor fields", TestImageDescriptorFields);
     Run("draw-uniform scalar image", TestUniformScalarBufferImage);
     Run("SRT runtime", TestSrtFlatteningAndRuntimeMemoization);
+    Run("GPU scalar data", TestGpuScalarDataKeepsDescriptorReads);
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);
     Run("writable descriptor phi", TestWritableDescriptorPhi);
     Run("conditional sampler phi", TestConditionalSamplerPhi);

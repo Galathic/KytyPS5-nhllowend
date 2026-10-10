@@ -77,6 +77,11 @@ Game files and saved profiles, caches, captures and logs must stay outside Git.
   untaken blocks are not fetched. Vector reads keep their ordinary evaluation path. The option
   defaults off pending live GPU/gameplay checks. An optional second value (`0`
   or `1`) in the diagnostic control file switches batching within the same run.
+- `KYTY_GPU_SCALAR_DATA=1` leaves scalar address loads used only as shader data
+  on the existing GPU BDA path. Descriptor dependencies retain their CPU planning
+  reads. The recompiler also exposes this through `CompileOptions::gpu_scalar_data`
+  for focused checks. This experiment defaults off; live GPU execution and match
+  verification remain required.
 
 ## Verification and baseline
 
@@ -110,6 +115,15 @@ Hardware: AMD Ryzen 7 5800X3D, Radeon RX 9070 XT, Windows. Isolated test window:
   `--lds-limit-only`, `--indirect-image-only`, `--pipeline-warmup-only`) pass
   with batching enabled and a single-state memo. Live FPS verification remains
   pending; batching is not enabled by default.
+- GPU scalar-data planning passes resource tracking tests with changed descriptors
+  and guarded/shared descriptor reads, including untaken branches. A CPU-only
+  replay matches buffer/image/sampler descriptors, user data, uniform fills and
+  specialization for all 1,409 records, with zero skipped. 756 records retain
+  fewer flattened reads. A separate CPU-only compilation validates SPIR-V for
+  all 1,409 records. These checks deliberately exclude flattened data and captured
+  read ranges from the cross-plan comparison because data reads move to the GPU;
+  they do not verify the resulting GPU loads. Focused GPU execution is deferred
+  while another emulator is active. The option remains disabled by default.
 - Renderer `--lds-limit-only` passes with the single-state resource memo enabled.
 - `--wave-reduction-only`: SPIR-V validation and GPU results pass for all cases.
 - `--flat-d16-only`: all targeted D16/subword GPU cases pass.
@@ -155,6 +169,14 @@ Hardware: AMD Ryzen 7 5800X3D, Radeon RX 9070 XT, Windows. Isolated test window:
   intermission; the later intervals remained there. These intervals are excluded
   from gameplay comparisons. Initial apparent differences are not evidence of
   a gameplay improvement.
+- A warmed 20-minute CAR vs CHI diagnostic match switched batching off/on/off/on
+  with a one-state memo. Four approximately 67-68 second intervals averaged
+  6.838 / 7.744 / 5.712 / 7.949 FPS. CPU resource and readback counters were on,
+  GPU timestamp profiling was off, and no other emulator ran during these intervals.
+  Captures show penalty/player cutscenes and team transition screens in the first
+  three intervals. The final interval advances from 17:22 to 16:21 during play.
+  Scene differences prevent a repeatable gameplay gain claim. A profiling-off
+  comparison is still required, and stable 60 FPS has not been reached.
 
 User-provided reference: RX 6800 XT / Ryzen 5 5600 / 32 GB DDR4-3200 reports
 14-19 FPS in the main menu, 26-29 in franchise menus (30 FPS cap), 7-12 in team
@@ -175,11 +197,15 @@ calling process environment, and refuses to launch alongside another emulator.
 `-Game` overrides the local game path; the default points to the supplied backup.
 Profiling switches (`-Stats`, `-GpuTiming`, `-ResourceTiming`) default off.
 `-BatchReads` opts into scalar batching and is recorded in the run metadata.
+`-GpuScalarData` opts into GPU scalar-data loads and is recorded too.
 `capture-test.ps1` captures only a specified emulator process window.
 For CPU replay checks, copy the `.shaders` file into an isolated directory and run
 `shader_recompiler_compute_tests --resource-replay-benchmark <copied-file>` there.
 The record reader opens for appending and can repair incomplete records, so only
 use a disposable copy. Captured game shader binaries remain outside Git.
+`--resource-scalar-gpu-replay <copied-file>` compares resource descriptors with
+GPU scalar-data planning. `--resource-scalar-gpu-compile <copied-file>` also
+compiles and validates the resulting SPIR-V without initializing Vulkan.
 On this machine desktop processes/windows require execution outside the sandbox;
 a sandboxed process check alone does not establish that the desktop is idle.
 

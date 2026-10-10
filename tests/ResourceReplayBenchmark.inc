@@ -1,6 +1,7 @@
 // CPU-only comparison using a disposable copy of a shader warm-up record.
 // No Vulkan device is created and no guest memory is dereferenced.
-int ResourceReplayBenchmark(const char* path) {
+int ResourceReplayBenchmark(const char* path, bool gpu_scalar_data = false,
+                            bool compile_spirv = false) {
   using namespace ShaderRecompiler;
   using namespace ShaderRecompiler::IR;
   PipelineRecord::Records records;
@@ -21,8 +22,8 @@ int ResourceReplayBenchmark(const char* path) {
   };
   const auto same = [&](const ResourceSnapshot& a, const ResourceSnapshot& b) {
     return a.buffers == b.buffers && a.images == b.images && a.samplers == b.samplers &&
-           a.flattened_srt == b.flattened_srt && a.user_data == b.user_data &&
-           a.uniform_fill == b.uniform_fill && ranges(a) == ranges(b);
+           (gpu_scalar_data || a.flattened_srt == b.flattened_srt) && a.user_data == b.user_data &&
+           a.uniform_fill == b.uniform_fill && (gpu_scalar_data || ranges(a) == ranges(b));
   };
   struct Memory {
     std::unordered_map<uint64_t, PipelineRecord::MemoryRead> ordinary, strict;
@@ -64,6 +65,14 @@ int ResourceReplayBenchmark(const char* path) {
     auto translated = TranslateProgram(record.code, options);
     if (translated.build_failed) { ++skipped; continue; }
     auto plan = ExtractResourcePlan(translated.program);
+    ResourcePlan gpu_plan;
+    TranslateResult gpu_translated;
+    if (gpu_scalar_data) {
+      options.gpu_scalar_data = true;
+      gpu_translated = TranslateProgram(record.code, options);
+      if (gpu_translated.build_failed) return 1;
+      gpu_plan = ExtractResourcePlan(gpu_translated.program);
+    }
     Memory memory;
     for (const auto read : record.raw_reads) memory.ordinary.emplace(read.address, read);
     for (const auto read : record.reads) memory.strict.emplace(read.address, read);
@@ -81,9 +90,11 @@ int ResourceReplayBenchmark(const char* path) {
     };
     ResourceSnapshot scalar, batch;
     ResourceSpecialization scalar_spec, batch_spec;
+    runtime.batch_reads = gpu_scalar_data;
     const bool scalar_ok = MaterializeResources(plan, runtime, scalar, scalar_spec);
     runtime.batch_reads = true;
-    const bool batch_ok = MaterializeResources(plan, runtime, batch, batch_spec);
+    const auto& candidate_plan = gpu_scalar_data ? gpu_plan : plan;
+    const bool batch_ok = MaterializeResources(candidate_plan, runtime, batch, batch_spec);
     if (scalar_ok != batch_ok || (scalar_ok && (!same(scalar, batch) || scalar_spec != batch_spec))) {
       std::fprintf(stderr, "ResourceReplay: mismatch hash=%016llx stage=%u\n",
                    static_cast<unsigned long long>(record.hash), static_cast<unsigned>(record.stage));
@@ -92,13 +103,21 @@ int ResourceReplayBenchmark(const char* path) {
     if (!scalar_ok) { ++skipped; continue; }
     ++checked;
     const auto batches = std::ranges::count_if(plan.srt_batch_counts, [](uint32_t count) { return count > 1; });
-    if (batches == 0) continue;
+    const bool changed = gpu_scalar_data ? plan.srt_reads.size() != gpu_plan.srt_reads.size() : batches != 0;
+    if (compile_spirv) {
+      auto compiled = CompileProgram(std::move(gpu_translated), options, batch_spec, record.push_data_cursor);
+      ValidateSpirv("ResourceReplayGPUScalar", compiled.spirv);
+      eligible += changed;
+      continue;
+    }
+    if (!changed) continue;
     ++eligible;
     const auto measure = [&](bool batching) {
-      runtime.batch_reads = batching;
+      runtime.batch_reads = gpu_scalar_data || batching;
+      const auto& timed_plan = gpu_scalar_data && batching ? gpu_plan : plan;
       const auto begin = std::chrono::steady_clock::now();
       for (unsigned i = 0; i < 20; ++i)
-        if (!MaterializeResources(plan, runtime, batch, batch_spec)) return -1.0;
+        if (!MaterializeResources(timed_plan, runtime, batch, batch_spec)) return -1.0;
       return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - begin).count() / 20;
     };
     const auto scalar_us = measure(false);
@@ -106,11 +125,12 @@ int ResourceReplayBenchmark(const char* path) {
     if (scalar_us < 0 || batch_us < 0) return 1;
     total_scalar += scalar_us;
     total_batch += batch_us;
-    std::printf("ResourceReplay: hash=%016llx stage=%u scalar_us=%.2f batch_us=%.2f starts=%zu srt=%zu\n",
+    std::printf("ResourceReplay: hash=%016llx stage=%u scalar_us=%.2f candidate_us=%.2f starts=%zu srt=%zu candidate_srt=%zu\n",
                 static_cast<unsigned long long>(record.hash), static_cast<unsigned>(record.stage),
-                scalar_us, batch_us, static_cast<size_t>(batches), plan.srt_reads.size());
+                scalar_us, batch_us, static_cast<size_t>(batches), plan.srt_reads.size(), candidate_plan.srt_reads.size());
   }
-  std::printf("ResourceReplay: checked=%u eligible=%u skipped=%u sum_scalar_us=%.2f sum_batch_us=%.2f\n",
+  std::printf("ResourceReplay: mode=%s checked=%u eligible=%u skipped=%u sum_scalar_us=%.2f sum_candidate_us=%.2f\n",
+              compile_spirv ? "gpu-scalar-spirv" : gpu_scalar_data ? "gpu-scalar-data" : "batch",
               checked, eligible, skipped, total_scalar, total_batch);
   return 0;
 }

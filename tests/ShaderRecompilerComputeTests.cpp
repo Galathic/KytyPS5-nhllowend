@@ -1355,6 +1355,7 @@ struct TestCase {
   u32 dispatch_z = 1;
   std::array<u32, 64> user_data{};
   bool has_user_data = false;
+  bool gpu_scalar_data = false;
   u32 image_descriptor_swizzle = DstSel(4, 5, 6, 7);
   bool compile_only = false;
   size_t storage_buffer_range_bytes = 0;
@@ -1639,6 +1640,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   ShaderRecompiler::CompileOptions options;
   options.stage = ShaderType::Compute;
   options.dump_ir = true;
+  options.gpu_scalar_data = test.gpu_scalar_data;
   auto compute_info = test.compute_info;
   compute_info.host_subgroup_size = host_subgroup_size;
   options.input_info.compute = &compute_info;
@@ -41631,10 +41633,29 @@ int main(int argc, char **argv) {
     EnsureConfigInitialized(false, false);
     return ResourceReplayBenchmark(argv[2]);
   }
+  if (argc == 3 && std::strcmp(argv[1], "--resource-scalar-gpu-replay") == 0) {
+    EnsureConfigInitialized(false, false);
+    return ResourceReplayBenchmark(argv[2], true);
+  }
+  if (argc == 3 && std::strcmp(argv[1], "--resource-scalar-gpu-compile") == 0) {
+    EnsureConfigInitialized(false, false);
+    return ResourceReplayBenchmark(argv[2], true, true);
+  }
   EnsureConfigInitialized(renderdoc_smoke);
   if (argc == 2 && std::strcmp(argv[1], "--wave-reduction-only") == 0) {
     VulkanHarness vulkan;
     CheckWaveReduction(vulkan);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--gpu-scalar-data-only") == 0) {
+    VulkanHarness vulkan;
+    for (auto test : {ScalarMemoryLoadVariants(), ScalarLoadSignedImmediateOffsetAddsSoffset()}) {
+      test.gpu_scalar_data = true;
+      test.bda_mappings = {{0, 0}};
+      if (std::strcmp(test.name, "ScalarMemoryLoadVariants") == 0)
+        test.forbidden_spirv.push_back("flattened_srt");
+      RunCase(&vulkan, test);
+    }
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--block-storage-shadow-only") == 0) {

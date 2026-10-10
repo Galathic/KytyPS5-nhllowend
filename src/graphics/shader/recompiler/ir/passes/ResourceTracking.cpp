@@ -336,9 +336,11 @@ private:
 
 class Tracker {
 public:
-	Tracker(Program& program, const Decoder::Program& decoded, const CFG::Graph& native_cfg)
+	Tracker(Program& program, const Decoder::Program& decoded, const CFG::Graph& native_cfg,
+	        bool gpu_scalar_data)
 	    : m_program(program), m_decoded(decoded), m_native_cfg(native_cfg),
-	      m_scalar_writes(std::move(program.scalar_writes)), m_info(program.info) {
+	      m_scalar_writes(std::move(program.scalar_writes)), m_info(program.info),
+	      m_gpu_scalar_data(gpu_scalar_data) {
 		std::ranges::sort(m_scalar_writes, {}, &Program::ScalarWrite::pc);
 		m_info.buffers.clear();
 		m_info.images.clear();
@@ -805,7 +807,9 @@ private:
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
 				uint32_t index = 0;
-				if (inst.GetOpcode() == ValueOpcode::LoadAddressU32 &&
+				// Descriptor dependencies were collected above. Other scalar data can
+				// use the existing BDA load path without a host readback for every draw.
+				if (!m_gpu_scalar_data && inst.GetOpcode() == ValueOpcode::LoadAddressU32 &&
 				    ScalarReadMemory(inst, index) != nullptr && inst.Arg(1).Resolve().IsImmediate() &&
 				    ValidateRuntimeValue(m_program, Value(&inst)))
 					CollectScalarRead(Value(&inst), inst.Flags<MemoryFlags>().pc);
@@ -2425,12 +2429,14 @@ private:
 	std::vector<IndirectDescriptorPlan>             m_indirect_descriptors;
 	std::vector<std::pair<const Inst*, Value>> m_descriptor_selections;
 	bool                                       m_shader_writes = false;
+	bool                                       m_gpu_scalar_data = false;
 };
 
 } // namespace
 
-void TrackResources(Program& program, const Decoder::Program& decoded, const CFG::Graph& native_cfg) {
-	Tracker(program, decoded, native_cfg).Run();
+void TrackResources(Program& program, const Decoder::Program& decoded, const CFG::Graph& native_cfg,
+                    bool gpu_scalar_data) {
+	Tracker(program, decoded, native_cfg, gpu_scalar_data).Run();
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

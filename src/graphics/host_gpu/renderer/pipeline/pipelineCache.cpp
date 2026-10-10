@@ -499,6 +499,11 @@ struct PipelineCache::ProgramCache {
 		options.back_code      = params.back_code;
 		options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
 		options.early_dump  = options.dump_ir;
+		static const bool gpu_scalar_data = [] {
+			const char* value = std::getenv("KYTY_GPU_SCALAR_DATA");
+			return value != nullptr && value[0] == '1' && value[1] == 0;
+		}();
+		options.gpu_scalar_data = gpu_scalar_data;
 		options.dump_label  = label;
 		options.input_info  = stage_input;
 
