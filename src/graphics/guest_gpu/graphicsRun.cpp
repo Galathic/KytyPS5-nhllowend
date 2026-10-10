@@ -341,6 +341,11 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	if (!TestWaitRegMemValue(value, ref, mask, func)) {
 		SuspendPm4();
 	}
+	// KYTY_GUEST_SYNC: labels are written at CP time, so a guest RELEASE_MEM + WAIT_REG_MEM pair
+	// no longer orders GPU work by itself. Without the automatic dispatch barriers the wait must.
+	if (BufferCache::GuestSyncOnly()) {
+		EmitGlobalBarrier();
+	}
 }
 
 template void CommandProcessor::WaitRegMem<uint32_t>(uint32_t, const uint32_t*, uint32_t, uint32_t,

@@ -12,6 +12,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/tile.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -537,6 +538,7 @@ static int ReserveFlipRequest(VideoOutDriver::Impl& driver, int handle, int inde
 	if (!driver.GetFlipQueue().Reserve(*video_out, index, flip_arg, source, request_id)) {
 		return VIDEO_OUT_ERROR_FLIP_QUEUE_FULL;
 	}
+	Graphics::BufferCache::PerfCount(Graphics::BufferCache::PerfEvent::Flip);
 	return OK;
 }
 

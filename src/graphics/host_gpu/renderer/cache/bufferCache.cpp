@@ -151,6 +151,29 @@ void BufferCache::PerfMaybePrint() {
 	            static_cast<unsigned long long>(events[5]),
 	            static_cast<unsigned long long>(events[6]),
 	            static_cast<unsigned long long>(events[7]), GuestSyncOnly() ? 1 : 0);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	{
+		// GPU-thread CPU time per presented frame: the frame cost of emulation work without the
+		// time spent blocked on the GPU or on guest submissions.
+		static uint64_t last_cpu_100ns = 0;
+		FILETIME        created {}, exited {}, kernel {}, user {};
+		if (GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user) != 0) {
+			const auto as_u64 = [](const FILETIME& t) {
+				return (static_cast<uint64_t>(t.dwHighDateTime) << 32u) | t.dwLowDateTime;
+			};
+			const uint64_t cpu   = as_u64(kernel) + as_u64(user);
+			const double   cpu_ms = static_cast<double>(cpu - last_cpu_100ns) / 1e4;
+			last_cpu_100ns        = cpu;
+			const auto flips      = events[static_cast<size_t>(PerfEvent::Flip)];
+			std::printf("NHL27PERF: frame flips=%llu wall_ms/frame=%.1f gpu_thread_cpu_ms/frame=%.1f "
+			            "(busy %.0f%%)\n",
+			            static_cast<unsigned long long>(flips),
+			            flips != 0 ? seconds * 1000.0 / static_cast<double>(flips) : 0.0,
+			            flips != 0 ? cpu_ms / static_cast<double>(flips) : 0.0,
+			            100.0 * cpu_ms / (seconds * 1000.0));
+		}
+	}
+#endif
 	{
 		static uint64_t last[5] {};
 		uint64_t        now[5] {};
