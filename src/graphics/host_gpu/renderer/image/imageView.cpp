@@ -4,6 +4,9 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 
+#include <cstdio>
+#include <cstdlib>
+
 namespace Libs::Graphics {
 
 namespace {
@@ -357,6 +360,13 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 		     image.layers);
 	}
 
+	if (is_storage && !(image.usage & vk::ImageUsageFlagBits::eStorage) &&
+	    std::getenv("KYTY_DEBUG_BLOCK_STORAGE") != nullptr) {
+		std::printf("BlockStorage: storage view format %d on image format %d without storage "
+		            "usage (%ux%u)\n",
+		            static_cast<int>(normalized.format), static_cast<int>(image.format),
+		            image.extent.width, image.extent.height);
+	}
 	vk::ImageViewUsageCreateInfo usage {};
 	usage.usage = is_storage ? vk::ImageUsageFlagBits::eStorage
 	                         : image.usage & ~vk::ImageUsageFlagBits::eStorage;

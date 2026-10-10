@@ -201,6 +201,13 @@ struct StreamBufferTestAccess {
 };
 
 struct ImageTestAccess {
+  static VulkanImage& StorageShadow(Image& image, uint32_t level) {
+    return image.ShadowLevelAt(level).image;
+  }
+  static void ShadowTransferWrite(Image& image, uint32_t level, vk::CommandBuffer command) {
+    image.ShadowBarrier(image.ShadowLevelAt(level), command,
+        vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
+  }
   static uint32_t CopyRows(uint64_t row_size, uint32_t rows,
                            uint64_t capacity) {
     return Image::CopyRows(row_size, rows, capacity);
@@ -1977,6 +1984,8 @@ public:
     EnsureRuntimeContext();
     return Renderer();
   }
+
+  #include "BlockStorageShadowTests.inc"
 
   void CheckHostImageAllocation() {
     constexpr const char *name = "HostImageAllocation";
@@ -41595,6 +41604,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--wave-reduction-only") == 0) {
     VulkanHarness vulkan;
     CheckWaveReduction(vulkan);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--block-storage-shadow-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckBlockStorageShadow();
     return 0;
   }
   if (renderdoc_smoke) {

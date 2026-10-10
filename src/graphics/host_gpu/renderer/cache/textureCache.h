@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
+#include <atomic>
 #include <map>
 #include <type_traits>
 #include <unordered_map>
@@ -56,6 +57,9 @@ public:
 		return image;
 	}
 	void MarkGpuWritten(ImageId id);
+	// Copies storage writes made through block-image shadows back into the block images.
+	// Call after recording each draw or dispatch.
+	void FlushStorageShadows();
 
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
@@ -169,6 +173,8 @@ private:
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
 	TrackingSpinLock                                  m_lock;
+	std::vector<ImageId>                              m_shadowed_images;
+	std::atomic_bool                                 m_storage_shadows_pending {false};
 	PageManager&                                      m_page_manager;
 	BlitHelper                                        m_blit_helper;
 	TileManager                                       m_tiler;

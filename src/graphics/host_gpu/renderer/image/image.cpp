@@ -14,6 +14,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <xxhash.h>
 
@@ -66,9 +67,18 @@ namespace {
 				static std::atomic_flag warned = ATOMIC_FLAG_INIT;
 				if (!warned.test_and_set(std::memory_order_relaxed)) {
 					Log::WriteToConsoleAndLog(fmt::format(
-					    "Warning: format {} does not support storage access; block-compressed "
-					    "textures written by the guest will not render.\n",
+					    "Warning: format {} does not support storage access; compatible "
+					    "uncompressed writes will use storage shadows.\n",
 					    vk::to_string(info.pixel_format)));
+				}
+				if (std::getenv("KYTY_DEBUG_BLOCK_STORAGE") != nullptr) {
+					Log::WriteToConsoleAndLog(fmt::format(
+					    "BlockStorage: no storage for {} type={} {}x{}x{} levels={} layers={} "
+					    "addr=0x{:x} flags=0x{:x}\n",
+					    vk::to_string(info.pixel_format), static_cast<int>(info.type),
+					    info.extent.width, info.extent.height, info.extent.depth,
+					    info.resources.levels, info.resources.layers, info.data.address,
+					    static_cast<uint32_t>(ImageCreateFlags(graphics, info))));
 				}
 			}
 		}
@@ -753,11 +763,197 @@ uint64_t Image::HashGuestEdges() const {
 	return XXH3_64bits(bytes.data(), static_cast<size_t>(head_size + tail_size));
 }
 
+Image::ShadowLevel& Image::ShadowLevelAt(uint32_t level) {
+	EXIT_IF(level >= backing.mip_levels);
+	if (m_shadow == nullptr) {
+		m_shadow = std::make_unique<StorageShadow>();
+		m_shadow->levels.resize(backing.mip_levels);
+	}
+	auto& slot = m_shadow->levels[level];
+	if (slot != nullptr) {
+		return *slot;
+	}
+	EXIT_IF(info.bytes_per_block != 16 && info.bytes_per_block != 8);
+	const bool          volume = backing.image_type == vk::ImageType::e3D;
+	const auto          blocks = [level](uint32_t texels) {
+		return (std::max(texels >> level, 1u) + 3u) / 4u;
+	};
+	vk::ImageCreateInfo create {};
+	create.flags = vk::ImageCreateFlagBits::eMutableFormat;
+	if (volume) {
+		create.flags |= vk::ImageCreateFlagBits::e2DArrayCompatible;
+	}
+	create.imageType     = backing.image_type;
+	create.extent        = {blocks(backing.extent.width), blocks(backing.extent.height),
+	                        volume ? std::max(backing.extent.depth >> level, 1u) : 1u};
+	create.mipLevels     = 1;
+	create.arrayLayers   = backing.layers;
+	create.format        = info.bytes_per_block == 16 ? vk::Format::eR32G32B32A32Uint
+	                                                  : vk::Format::eR32G32Uint;
+	create.tiling        = vk::ImageTiling::eOptimal;
+	create.initialLayout = vk::ImageLayout::eUndefined;
+	create.usage         = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled |
+	               vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
+	create.samples = vk::SampleCountFlagBits::e1;
+	if (std::getenv("KYTY_DEBUG_BLOCK_STORAGE") != nullptr) {
+		std::printf("BlockStorage: shadow for format %d level %u %ux%ux%u layers=%u addr=0x%llx\n",
+		            static_cast<int>(info.pixel_format), level, create.extent.width,
+		            create.extent.height, create.extent.depth, backing.layers,
+		            static_cast<unsigned long long>(info.data.address));
+	}
+	slot = std::make_unique<ShadowLevel>();
+	if (!m_graphics.CreateImage(create, slot->image)) {
+		EXIT("failed to create block storage shadow: extent=%ux%ux%u layers=%u level=%u\n",
+		     create.extent.width, create.extent.height, create.extent.depth, create.arrayLayers,
+		     level);
+	}
+	SetVulkanObjectNameF(m_graphics.device, slot->image.image,
+	                     "Kyty.BlockStorageShadow[guest=0x{:016x} format={} level={}]",
+	                     info.data.address, static_cast<uint32_t>(info.pixel_format), level);
+	return *slot;
+}
+
+void Image::ShadowBarrier(ShadowLevel& shadow, vk::CommandBuffer command,
+                          vk::PipelineStageFlags2 destination_stage,
+                          vk::AccessFlags2        destination_access) {
+	vk::ImageMemoryBarrier2 barrier {};
+	barrier.srcStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.srcAccessMask       = vk::AccessFlagBits2::eMemoryWrite;
+	barrier.dstStageMask        = destination_stage;
+	barrier.dstAccessMask       = destination_access;
+	barrier.oldLayout           = shadow.initialized ? vk::ImageLayout::eGeneral
+	                                                 : vk::ImageLayout::eUndefined;
+	barrier.newLayout           = vk::ImageLayout::eGeneral;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.image               = shadow.image.image;
+	barrier.subresourceRange    = {vk::ImageAspectFlagBits::eColor, 0, 1, 0,
+	                               VK_REMAINING_ARRAY_LAYERS};
+	vk::DependencyInfo dependency {};
+	dependency.imageMemoryBarrierCount = 1;
+	dependency.pImageMemoryBarriers    = &barrier;
+	command.pipelineBarrier2(dependency);
+	shadow.initialized = true;
+}
+
+void Image::CopyStorageShadow(const ImageSubresourceRange& range, bool to_shadow,
+                              vk::CommandBuffer command) {
+	const bool volume = backing.image_type == vk::ImageType::e3D;
+	for (uint32_t level = range.base_level;
+	     level < range.base_level + range.level_count && level < backing.mip_levels; level++) {
+		auto&                       shadow      = ShadowLevelAt(level);
+		const ImageSubresourceRange image_range = volume
+		    ? ImageSubresourceRange {level, 1, 0, 1}
+		    : ImageSubresourceRange {level, 1, range.base_layer, range.layer_count};
+		Transit(to_shadow ? vk::ImageLayout::eTransferSrcOptimal
+		                  : vk::ImageLayout::eTransferDstOptimal,
+		        to_shadow ? vk::AccessFlagBits2::eTransferRead : vk::AccessFlagBits2::eTransferWrite,
+		        image_range, command);
+		ShadowBarrier(shadow, command, vk::PipelineStageFlagBits2::eTransfer,
+		              to_shadow ? vk::AccessFlagBits2::eTransferWrite
+		                        : vk::AccessFlagBits2::eTransferRead);
+		const auto  width  = std::max(backing.extent.width >> level, 1u);
+		const auto  height = std::max(backing.extent.height >> level, 1u);
+		const auto  depth  = volume ? std::max(backing.extent.depth >> level, 1u) : 1u;
+		vk::ImageCopy copy {};
+		copy.srcSubresource = {vk::ImageAspectFlagBits::eColor, level, image_range.base_layer,
+		                       image_range.layer_count};
+		copy.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, image_range.base_layer,
+		                       image_range.layer_count};
+		// Extents are in source texels: the whole compressed level, or its block grid.
+		if (to_shadow) {
+			copy.extent = {width, height, depth};
+			command.copyImage(backing.image, vk::ImageLayout::eTransferSrcOptimal,
+			                  shadow.image.image, vk::ImageLayout::eGeneral, 1, &copy);
+		} else {
+			std::swap(copy.srcSubresource, copy.dstSubresource);
+			copy.extent = {(width + 3u) / 4u, (height + 3u) / 4u, depth};
+			command.copyImage(shadow.image.image, vk::ImageLayout::eGeneral, backing.image,
+			                  vk::ImageLayout::eTransferDstOptimal, 1, &copy);
+		}
+	}
+}
+
+vk::ImageView Image::PrepareShadowStorage(const ImageViewInfo& view_info) {
+	EXIT_IF(!NeedsStorageShadow() || view_info.level_count != 1);
+	m_scheduler.EndRendering();
+	const auto command = m_scheduler.Current().Handle();
+	const ImageSubresourceRange range {view_info.base_level, 1, view_info.base_layer,
+	                                   view_info.layer_count};
+	if (std::getenv("KYTY_DEBUG_BLOCK_STORAGE") != nullptr) {
+		std::printf("BlockStorage: shadow write format %d type %d level %u layer %u+%u\n",
+		            static_cast<int>(view_info.format), static_cast<int>(view_info.type),
+		            view_info.base_level, view_info.base_layer, view_info.layer_count);
+	}
+	auto& shadow = ShadowLevelAt(view_info.base_level);
+	if (std::find(m_shadow->pending.begin(), m_shadow->pending.end(), range) ==
+	    m_shadow->pending.end()) {
+		// Writes may cover part of the range; start from the image's current contents.
+		CopyStorageShadow(range, true, command);
+		m_shadow->pending.push_back(range);
+	}
+	ShadowBarrier(shadow, command,
+	              vk::PipelineStageFlagBits2::eComputeShader | vk::PipelineStageFlagBits2::eAllGraphics,
+	              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+
+	auto normalized       = view_info;
+	normalized.usage      = vk::ImageUsageFlagBits::eStorage;
+	normalized.base_level = 0;
+	for (const auto& cached: shadow.views) {
+		if (cached.info == normalized) {
+			return cached.view;
+		}
+	}
+	vk::ImageViewUsageCreateInfo usage {};
+	usage.usage = vk::ImageUsageFlagBits::eStorage;
+	vk::ImageViewCreateInfo create {};
+	create.pNext                           = &usage;
+	create.image                           = shadow.image.image;
+	create.viewType                        = normalized.type;
+	create.format                          = normalized.format;
+	create.components                      = normalized.mapping;
+	create.subresourceRange.aspectMask     = vk::ImageAspectFlagBits::eColor;
+	create.subresourceRange.baseMipLevel   = 0;
+	create.subresourceRange.levelCount     = 1;
+	create.subresourceRange.baseArrayLayer = normalized.base_layer;
+	create.subresourceRange.layerCount     = normalized.layer_count;
+	vk::ImageView view;
+	if (m_graphics.device.createImageView(&create, nullptr, &view) != vk::Result::eSuccess) {
+		EXIT("failed to create block storage shadow view: format=%d\n",
+		     static_cast<int>(normalized.format));
+	}
+	shadow.views.push_back({normalized, view});
+	return view;
+}
+
+void Image::FlushShadowStorage() {
+	if (m_shadow == nullptr || m_shadow->pending.empty()) {
+		return;
+	}
+	m_scheduler.EndRendering();
+	const auto command = m_scheduler.Current().Handle();
+	for (const auto& range: m_shadow->pending) {
+		CopyStorageShadow(range, false, command);
+	}
+	m_shadow->pending.clear();
+}
+
 Image::~Image() {
 	KYTY_PROFILER_FUNCTION();
 	for (const auto& cached: views) {
 		if (cached.view != nullptr) {
 			m_graphics.device.destroyImageView(cached.view, nullptr);
+		}
+	}
+	if (m_shadow != nullptr) {
+		for (const auto& level: m_shadow->levels) {
+			if (level == nullptr) {
+				continue;
+			}
+			for (const auto& cached: level->views) {
+				m_graphics.device.destroyImageView(cached.view, nullptr);
+			}
+			m_graphics.DeleteImage(level->image);
 		}
 	}
 	if (backing.image != nullptr) {

@@ -1656,7 +1656,30 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 			break;
 		default: EXIT("TextureCache: invalid texture binding\n");
 	}
+	if (desc.type == BindingType::Storage && image.NeedsStorageShadow() &&
+	    desc.view_info.level_count == 1 && vk::blockExtent(desc.view_info.format)[0] == 1 &&
+	    vk::blockSize(desc.view_info.format) == image.info.bytes_per_block) {
+		if (std::find(m_shadowed_images.begin(), m_shadowed_images.end(), id) ==
+		    m_shadowed_images.end()) {
+			m_shadowed_images.push_back(id);
+			m_storage_shadows_pending.store(true, std::memory_order_release);
+		}
+		return image.PrepareShadowStorage(desc.view_info);
+	}
 	return image.FindView(desc.view_info);
+}
+
+void TextureCache::FlushStorageShadows() {
+	// Most draws have no block-storage writes; avoid taking the cache lock for them.
+	if (!m_storage_shadows_pending.load(std::memory_order_acquire)) return;
+	std::scoped_lock lock {m_lock};
+	for (const auto id: m_shadowed_images) {
+		if (auto* image = m_slot_images.try_get(id); image != nullptr) {
+			image->FlushShadowStorage();
+		}
+	}
+	m_shadowed_images.clear();
+	m_storage_shadows_pending.store(false, std::memory_order_release);
 }
 
 vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) {

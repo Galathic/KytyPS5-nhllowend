@@ -568,6 +568,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	                                       thread_group_z);
 	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 	BreadcrumbEnd(m_context.GetGraphics(), vk_buffer, crumb);
+	m_context.GetTextureCache().FlushStorageShadows();
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
@@ -679,6 +680,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	                                   program.shader_hash, args_addr);
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	BreadcrumbEnd(m_context.GetGraphics(), vk_buffer, crumb);
+	m_context.GetTextureCache().FlushStorageShadows();
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
 }

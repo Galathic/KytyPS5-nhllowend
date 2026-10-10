@@ -1532,6 +1532,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		log.ps_bindings = state.ps_active && bindings.pixel ? &*bindings.pixel : nullptr;
 		FrameDump::OnDraw(m_context, log);
 	}
+	m_context.GetTextureCache().FlushStorageShadows();
 
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x600u);
