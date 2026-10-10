@@ -3,6 +3,7 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/host_gpu/renderer/pipeline/resourceMemo.h"
 
+#include <array>
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
@@ -568,6 +569,73 @@ void TestUniformVectorDescriptorRead() {
         "varying vector address was treated as a uniform descriptor read");
 }
 
+void TestGuardedVectorReadTapeFallback() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  ResourcePlan plan;
+  plan.stage = Libs::Graphics::ShaderType::Compute;
+  plan.user_data_base = 8;
+  plan.srt_plan_complete = plan.resource_tracking_complete = true;
+  plan.requires_specialization_memory = true;
+  plan.memory_info.push_back({.kind = ResourceKind::Buffer});
+  auto &condition = plan.value_storage.emplace_back(ValueOpcode::GetUserData);
+  condition.SetArg(0, Value(static_cast<ScalarReg>(8)));
+  auto &guard = plan.value_storage.emplace_back(ValueOpcode::INotEqual32);
+  guard.SetArg(0, Value(&condition));
+  guard.SetArg(1, Value(0u));
+  auto &handle = plan.value_storage.emplace_back(
+      ValueOpcode::GetBufferResource);
+  handle.SetArg(0, Value(0x1000u));
+  handle.SetArg(1, Value(4u << 16u));
+  handle.SetArg(2, Value(1u));
+  handle.SetArg(3, Value(0x16204u));
+  auto &load = plan.value_storage.emplace_back(ValueOpcode::LoadBufferU32);
+  load.SetFlags(MemoryFlags{.index = 0});
+  load.SetArg(0, Value(&handle));
+  load.SetArg(1, Value(0u));
+  load.SetArg(2, Value(0u));
+  load.SetArg(3, Value(0u));
+  load.SetArg(4, Value(&guard));
+  plan.srt_reads.push_back({Value(&load), 0});
+  plan.clean_flat_slots.resize(1u);
+
+  struct ReadState {
+    uint32_t calls = 0;
+    uint32_t value = 0x76543210u;
+  } reads;
+  const auto reader = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+    auto &state = *static_cast<ReadState *>(data);
+    ++state.calls;
+    if (address != 0x1000u || words.size() != 1u) return false;
+    words[0] = state.value;
+    return true;
+  };
+  const SrtRuntime runtime{
+      .user_data = {},
+      .read_memory = reader,
+      .userdata = &reads,
+      .read_specialization_memory = reader,
+  };
+  std::array<uint32_t, 1> user_data{};
+  auto guarded_runtime = runtime;
+  guarded_runtime.user_data = user_data;
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+
+  user_data[0] = 0;
+  const bool false_ok = MaterializeResources(plan, guarded_runtime, snapshot, specialization);
+  Check(false_ok &&
+            snapshot.flattened_srt.size() == 1u && snapshot.flattened_srt[0] == 0u &&
+            reads.calls == 0u,
+        "false vector-load guard touched memory or returned a nonzero value");
+
+  user_data[0] = 1;
+  const bool true_ok = MaterializeResources(plan, guarded_runtime, snapshot, specialization);
+  Check(true_ok &&
+            snapshot.flattened_srt.size() == 1u &&
+            snapshot.flattened_srt[0] == reads.value && reads.calls == 1u,
+        "true vector-load guard did not read the descriptor exactly once");
+}
+
 void TestExactReciprocalDescriptorArithmetic() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   Program program;
@@ -853,6 +921,7 @@ int main() {
   TestFailedRuntimeReadIsMemoizedPerRefresh();
   TestCyclicRuntimeFailureCanRecover();
   TestUniformVectorDescriptorRead();
+  TestGuardedVectorReadTapeFallback();
   TestExactReciprocalDescriptorArithmetic();
   TestUnbasedFlatCacheHitMaterializes();
   TestWrittenDescriptorUsesStrictReaderOnce();

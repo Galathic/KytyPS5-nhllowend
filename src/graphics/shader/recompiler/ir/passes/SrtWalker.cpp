@@ -1186,6 +1186,16 @@ bool BuildTapeForPlan(const ResourcePlan& plan, bool with_clean,
 		if (opcode == ValueOpcode::LoadAddressU32 || opcode == ValueOpcode::ReadConstBuffer ||
 		    opcode == ValueOpcode::LoadBufferU32) {
 			if (!IsRawRead(plan, *inst)) return -1;
+			// The recursive evaluator checks the vector-load guard before evaluating
+			// its address or touching memory. The tape currently cannot express that
+			// conditional dependency, so keep only statically enabled vector reads.
+			if (opcode == ValueOpcode::LoadBufferU32) {
+				const auto guard = inst->Arg(4).Resolve();
+				if (!guard.IsImmediate() || guard.GetType() != Type::U1 || !guard.U1()) {
+					reject_reason = 4;
+					return -1;
+				}
+			}
 			op.kind = ResourcePlan::SrtTape::Kind::RawRead;
 			op.aux = inst->Flags<MemoryFlags>().index;
 
