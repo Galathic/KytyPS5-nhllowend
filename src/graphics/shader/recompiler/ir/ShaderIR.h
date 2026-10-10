@@ -579,6 +579,10 @@ struct ResourcePlan {
 		// Keep the vector identity, not its data pointer: indirect materialization
 		// can append mappings and reallocate its storage after a successful refresh.
 		const std::vector<uint32_t>* refreshed_flat = nullptr;
+		// Reused demand-tape scratch; scoped to an evaluator session, never a draw cache.
+		std::vector<uint64_t> tape_values;
+		std::vector<uint8_t> tape_marks;
+		std::vector<std::pair<uint32_t, uint8_t>> tape_pending;
 	};
 
 	ResourcePlan() = default;
@@ -628,15 +632,18 @@ struct ResourcePlan {
 			uint8_t                 clean      = 0;
 			uint32_t                aux        = 0;
 			uint32_t                memo_index = UINT32_MAX;
+			uint8_t                 dependency_count = 0;
 			std::array<uint32_t, 5> args {};
 			uint64_t                imm = 0;
 		};
 		std::vector<Op>       ops;
 		std::vector<uint32_t> slot_ops;
+		std::vector<uint32_t> condition_ops;
 		bool                  clean_root = false;
 		State                 state      = State::Unbuilt;
 	};
 	mutable std::array<SrtTape, 2> srt_tapes;
+	mutable std::array<SrtTape, 2> cfg_srt_tapes;
 	mutable std::vector<uint64_t>  srt_tape_values;
 };
 

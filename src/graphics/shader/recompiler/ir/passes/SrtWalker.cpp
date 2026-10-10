@@ -106,6 +106,20 @@ struct TapeInstKeyHash {
 	}
 };
 
+struct GlobalTapeStats {
+	std::atomic<uint64_t> runs {0}, failed {0}, walker {0}, built {0}, unsupported {0}, ops {0};
+	std::atomic<uint64_t> cfg_runs {0}, cfg_fallback {0};
+	std::array<std::atomic<uint64_t>, 8> reject {};
+} g_tape_stats;
+
+bool CfgTapeEnabled() {
+	static const bool enabled = [] {
+		const char* val = std::getenv("KYTY_SRT_CFG_TAPE");
+		return val != nullptr && val[0] == '1';
+	}();
+	return enabled;
+}
+
 enum class TapeVerifyLogKind : uint8_t {
 	UnstableReads,
 	UnmatchedReplay,
@@ -1150,6 +1164,7 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	m_context.refreshed_flat = nullptr;
 	if (!m_program.srt_plan_complete) return false;
+	if (!m_program.control_flow.empty()) PrepareCfgTape();
 	const auto refresh = [&](uint32_t slot) {
 		if (slot >= m_program.srt_reads.size()) return false;
 		const auto& read = m_program.srt_reads[slot];
@@ -1158,6 +1173,13 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		if (clean && (m_clean_evaluator == nullptr || m_runtime.read_specialization_memory == nullptr))
 			return false;
 		auto& evaluator = clean ? *m_clean_evaluator : *this;
+		if (!m_program.control_flow.empty() && read.flat_offset < flat.size()) {
+			const auto& tape = m_program.cfg_srt_tapes[m_clean_evaluator != nullptr ? 1 : 0];
+			const uint32_t root = tape.state == ResourcePlan::SrtTape::State::Ready
+			                          ? tape.slot_ops[slot] : UINT32_MAX;
+			const int done = RunCfgRoot(root, flat[read.flat_offset]);
+			if (done >= 0) return done != 0;
+		}
 		return read.flat_offset < flat.size() && evaluator.Evaluate(read.value, flat[read.flat_offset]);
 	};
 	auto& active = m_program.active_sources;
@@ -1422,8 +1444,14 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		}
 		uint32_t condition = 0;
 		auto& predicate = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
+		int predicate_done = -1;
+		if (!block.condition.IsEmpty() && m_runtime.read_specialization_memory != nullptr) {
+			const auto& tape = m_program.cfg_srt_tapes[m_clean_evaluator != nullptr ? 1 : 0];
+			predicate_done = RunCfgRoot(tape.state == ResourcePlan::SrtTape::State::Ready
+			                               ? tape.condition_ops[index] : UINT32_MAX, condition);
+		}
 		if (!block.condition.IsEmpty() && m_runtime.read_specialization_memory != nullptr &&
-		    predicate.Evaluate(block.condition, condition)) {
+		    (predicate_done >= 0 ? predicate_done != 0 : predicate.Evaluate(block.condition, condition))) {
 			pending.push_back(block.successors[condition != 0u ? 0u : 1u]);
 		} else {
 			pending.insert(pending.end(), block.successors.begin(), block.successors.end());
@@ -1433,15 +1461,6 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 }
 
 namespace {
-struct GlobalTapeStats {
-	std::atomic<uint64_t> runs {0};
-	std::atomic<uint64_t> failed {0};
-	std::atomic<uint64_t> walker {0};
-	std::atomic<uint64_t> built {0};
-	std::atomic<uint64_t> unsupported {0};
-	std::atomic<uint64_t> ops {0};
-	std::array<std::atomic<uint64_t>, 8> reject {};
-} g_tape_stats;
 
 const char* const kRejectNames[] = {
 	"ok",
@@ -1468,6 +1487,8 @@ SrtTapeStats GetSrtTapeStats() {
 	s.built = g_tape_stats.built.load(std::memory_order_relaxed);
 	s.unsupported = g_tape_stats.unsupported.load(std::memory_order_relaxed);
 	s.ops = g_tape_stats.ops.load(std::memory_order_relaxed);
+	s.cfg_runs = g_tape_stats.cfg_runs.load(std::memory_order_relaxed);
+	s.cfg_fallback = g_tape_stats.cfg_fallback.load(std::memory_order_relaxed);
 	for (size_t i = 0; i < s.reject.size(); ++i) {
 		s.reject[i] = g_tape_stats.reject[i].load(std::memory_order_relaxed);
 	}
@@ -1477,8 +1498,8 @@ SrtTapeStats GetSrtTapeStats() {
 namespace {
 bool BuildTapeForPlan(const ResourcePlan& plan, bool with_clean,
                       std::span<const uint8_t> clean_flat_slots,
-                      ResourcePlan::SrtTape& tape, size_t& reject_reason) {
-	if (!plan.control_flow.empty()) {
+                      ResourcePlan::SrtTape& tape, size_t& reject_reason, bool cfg = false) {
+	if (!cfg && !plan.control_flow.empty()) {
 		reject_reason = 1;
 		return false;
 	}
@@ -1493,6 +1514,7 @@ bool BuildTapeForPlan(const ResourcePlan& plan, bool with_clean,
 	tape.clean_root = with_clean;
 
 	std::unordered_map<TapeInstKey, uint32_t, TapeInstKeyHash> inst_to_op;
+	std::unordered_set<TapeInstKey, TapeInstKeyHash> compiling;
 
 	auto get_value_u64 = [](Value val, uint64_t& out) -> bool {
 		val = val.Resolve();
@@ -1510,6 +1532,8 @@ bool BuildTapeForPlan(const ResourcePlan& plan, bool with_clean,
 
 	std::function<int(Value, bool)> emit_val;
 	emit_val = [&](Value val, bool is_clean) -> int {
+		// Bound hostile/cyclic graphs before recursion or op-vector growth.
+		if (compiling.size() >= 256u || tape.ops.size() >= 65536u) return -1;
 		val = val.Resolve();
 		if (val.IsImmediate()) {
 			uint64_t imm = 0;
@@ -1529,6 +1553,12 @@ bool BuildTapeForPlan(const ResourcePlan& plan, bool with_clean,
 		if (auto it = inst_to_op.find(key); it != inst_to_op.end()) {
 			return static_cast<int>(it->second);
 		}
+		if (!compiling.insert(key).second) return -1;
+		struct CompilationGuard {
+			decltype(compiling)& pending;
+			TapeInstKey key;
+			~CompilationGuard() { pending.erase(key); }
+		} guard {compiling, key};
 
 		const auto opcode = inst->GetOpcode();
 		ResourcePlan::SrtTape::Op op;
@@ -1563,11 +1593,31 @@ bool BuildTapeForPlan(const ResourcePlan& plan, bool with_clean,
 			if (slot < clean_flat_slots.size() && clean_flat_slots[slot] != 0u && with_clean) {
 				target_clean = true;
 			}
-			return emit_val(plan.srt_reads[slot].value, target_clean);
+			const int alias = emit_val(plan.srt_reads[slot].value, target_clean);
+			if (!cfg || alias < 0) return alias;
+			op.kind = ResourcePlan::SrtTape::Kind::Inst;
+			op.args[0] = static_cast<uint32_t>(alias);
+			op.dependency_count = 1;
+			const auto index = static_cast<uint32_t>(tape.ops.size());
+			tape.ops.push_back(op);
+			inst_to_op[key] = index;
+			return static_cast<int>(index);
 		}
 
 		if (opcode == ValueOpcode::LoadAddressU32 || opcode == ValueOpcode::ReadConstBuffer ||
 		    opcode == ValueOpcode::LoadBufferU32) {
+			if (cfg && opcode == ValueOpcode::LoadBufferU32 && with_clean && !is_clean) {
+				const int alias = emit_val(val, true);
+				if (alias < 0) return -1;
+				op.opcode = ValueOpcode::ReadConst;
+				op.kind = ResourcePlan::SrtTape::Kind::Inst;
+				op.args[0] = static_cast<uint32_t>(alias);
+				op.dependency_count = 1;
+				const auto index = static_cast<uint32_t>(tape.ops.size());
+				tape.ops.push_back(op);
+				inst_to_op[key] = index;
+				return static_cast<int>(index);
+			}
 			if (!IsRawRead(plan, *inst)) return -1;
 			// The recursive evaluator checks the vector-load guard before evaluating
 			// its address or touching memory. The tape currently cannot express that
@@ -1596,6 +1646,7 @@ bool BuildTapeForPlan(const ResourcePlan& plan, bool with_clean,
 			op.args[0] = static_cast<uint32_t>(low_idx);
 			op.args[1] = static_cast<uint32_t>(high_idx);
 			op.args[2] = static_cast<uint32_t>(off_idx);
+			op.dependency_count = 3;
 
 			if (opcode == ValueOpcode::ReadConstBuffer || opcode == ValueOpcode::LoadBufferU32) {
 				if (handle->NumArgs() != 4u) return -1;
@@ -1604,6 +1655,7 @@ bool BuildTapeForPlan(const ResourcePlan& plan, bool with_clean,
 				if (rec_idx < 0 || w3_idx < 0) return -1;
 				op.args[3] = static_cast<uint32_t>(rec_idx);
 				op.args[4] = static_cast<uint32_t>(w3_idx);
+				op.dependency_count = 5;
 			}
 
 			uint32_t op_idx = static_cast<uint32_t>(tape.ops.size());
@@ -1625,6 +1677,7 @@ bool BuildTapeForPlan(const ResourcePlan& plan, bool with_clean,
 				if (a < 0) return -1;
 				op.kind = ResourcePlan::SrtTape::Kind::Inst;
 				op.args[0] = static_cast<uint32_t>(a);
+				op.dependency_count = 1;
 				break;
 			}
 			case ValueOpcode::CompositeConstructU64:
@@ -1662,6 +1715,7 @@ bool BuildTapeForPlan(const ResourcePlan& plan, bool with_clean,
 				op.kind = ResourcePlan::SrtTape::Kind::Inst;
 				op.args[0] = static_cast<uint32_t>(a);
 				op.args[1] = static_cast<uint32_t>(b);
+				op.dependency_count = 2;
 				break;
 			}
 			case ValueOpcode::CompositeExtractU64: {
@@ -1671,6 +1725,7 @@ bool BuildTapeForPlan(const ResourcePlan& plan, bool with_clean,
 				op.kind = ResourcePlan::SrtTape::Kind::Inst;
 				op.args[0] = static_cast<uint32_t>(a);
 				op.imm = idx_val.U32();
+				op.dependency_count = 1;
 				break;
 			}
 			case ValueOpcode::CompositeExtractU32x2: {
@@ -1680,7 +1735,13 @@ bool BuildTapeForPlan(const ResourcePlan& plan, bool with_clean,
 				uint32_t comp = idx_val.U32();
 				if (comp >= 2u) return -1;
 				if (src->GetOpcode() == ValueOpcode::CompositeConstructU32x2) {
-					return emit_val(src->Arg(comp), is_clean);
+					const int alias = emit_val(src->Arg(comp), is_clean);
+					if (!cfg || alias < 0) return alias;
+					op.opcode = ValueOpcode::ReadConst; // scalar alias, with its own memo index
+					op.kind = ResourcePlan::SrtTape::Kind::Inst;
+					op.args[0] = static_cast<uint32_t>(alias);
+					op.dependency_count = 1;
+					break;
 				}
 				if (src->GetOpcode() == ValueOpcode::IAddCarry32) {
 					int a = emit_val(src->Arg(0), is_clean);
@@ -1690,6 +1751,7 @@ bool BuildTapeForPlan(const ResourcePlan& plan, bool with_clean,
 					op.args[0] = static_cast<uint32_t>(a);
 					op.args[1] = static_cast<uint32_t>(b);
 					op.imm = comp;
+					op.dependency_count = 2;
 					break;
 				}
 				return -1;
@@ -1704,6 +1766,7 @@ bool BuildTapeForPlan(const ResourcePlan& plan, bool with_clean,
 				op.args[0] = static_cast<uint32_t>(a);
 				op.args[1] = static_cast<uint32_t>(b);
 				op.args[2] = static_cast<uint32_t>(c);
+				op.dependency_count = 3;
 				break;
 			}
 			case ValueOpcode::BitFieldInsert: {
@@ -1717,6 +1780,7 @@ bool BuildTapeForPlan(const ResourcePlan& plan, bool with_clean,
 				op.args[1] = static_cast<uint32_t>(b);
 				op.args[2] = static_cast<uint32_t>(c);
 				op.args[3] = static_cast<uint32_t>(d);
+				op.dependency_count = 4;
 				break;
 			}
 		default:
@@ -1736,20 +1800,105 @@ bool BuildTapeForPlan(const ResourcePlan& plan, bool with_clean,
 		const auto& read = plan.srt_reads[slot];
 		bool clean = read.flat_offset < clean_flat_slots.size() && clean_flat_slots[read.flat_offset] != 0u;
 		if (clean && !with_clean) {
+			if (cfg) { tape.slot_ops.push_back(UINT32_MAX); continue; }
 			reject_reason = 7;
 			return false;
 		}
 		int emitted = emit_val(read.value, clean && with_clean);
 		if (emitted < 0) {
+			if (cfg) { tape.slot_ops.push_back(UINT32_MAX); continue; }
 			if (reject_reason == 0) reject_reason = 6;
 			return false;
 		}
 		tape.slot_ops.push_back(static_cast<uint32_t>(emitted));
 	}
+	if (cfg) {
+		for (const auto& block: plan.control_flow) {
+			const auto root = block.condition.IsEmpty() ? -1 : emit_val(block.condition, with_clean);
+			tape.condition_ops.push_back(root < 0 ? UINT32_MAX : static_cast<uint32_t>(root));
+		}
+	}
 
 	return true;
 }
 } // namespace
+
+void SrtWalker::PrepareCfgTape() {
+	if (m_skip_tape || !CfgTapeEnabled() || !m_active_mask.IsEmpty() ||
+	    (m_clean_evaluator != nullptr && !m_clean_evaluator->m_active_mask.IsEmpty())) {
+		g_tape_stats.walker.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	auto& tape = m_program.cfg_srt_tapes[m_clean_evaluator != nullptr ? 1 : 0];
+	if (tape.state == ResourcePlan::SrtTape::State::Unbuilt) {
+		size_t reason = 0;
+		const bool built = BuildTapeForPlan(m_program, m_clean_evaluator != nullptr,
+		                                    m_clean_flat_slots, tape, reason, true);
+		tape.state = built ? ResourcePlan::SrtTape::State::Ready
+		                   : ResourcePlan::SrtTape::State::Unsupported;
+	}
+	if (tape.state != ResourcePlan::SrtTape::State::Ready) return;
+	m_context.tape_values.resize(tape.ops.size());
+	m_context.tape_marks.assign(tape.ops.size(), 0u);
+	m_context.tape_pending.clear();
+}
+
+int SrtWalker::RunCfgRoot(uint32_t root, uint32_t& result) {
+	if (m_skip_tape || !CfgTapeEnabled() || root == UINT32_MAX || !m_active_mask.IsEmpty() ||
+	    (m_clean_evaluator != nullptr && !m_clean_evaluator->m_active_mask.IsEmpty())) {
+		g_tape_stats.cfg_fallback.fetch_add(1, std::memory_order_relaxed);
+		return -1;
+	}
+	const auto& tape = m_program.cfg_srt_tapes[m_clean_evaluator != nullptr ? 1 : 0];
+	if (root >= tape.ops.size()) return -1;
+	g_tape_stats.cfg_runs.fetch_add(1, std::memory_order_relaxed);
+	auto& values = m_context.tape_values;
+	auto& marks = m_context.tape_marks;
+	auto& pending = m_context.tape_pending;
+	pending.clear();
+	pending.emplace_back(root, 0u);
+	while (!pending.empty()) {
+		const auto index = pending.back().first;
+		const auto& op = tape.ops[index];
+		auto& context = op.clean && m_clean_evaluator != nullptr ? m_clean_evaluator->m_context : m_context;
+		// Check the recursive evaluator's domain-specific memo before descending.
+		// Failed reads remain failed; an in-progress memo retains cycle semantics.
+		if (op.memo_index != UINT32_MAX && op.memo_index < context.values.size()) {
+			const auto& memo = context.values[op.memo_index];
+			if (memo.generation == context.generation) {
+				values[index] = memo.value;
+				marks[index] = 1u;
+				pending.pop_back();
+				continue;
+			}
+			if (memo.generation == (context.generation | 1u)) {
+				if (op.clean && m_clean_evaluator != nullptr) ++m_clean_evaluator->m_cycle_count;
+				else ++m_cycle_count;
+				return 0;
+			}
+			if (memo.generation == (context.generation | 2u)) return 0;
+		}
+		if (marks[index] == 1u) { pending.pop_back(); continue; }
+		if (marks[index] == 2u) return 0;
+		if (pending.back().second < op.dependency_count) {
+			const auto dependency = op.args[pending.back().second++];
+			pending.emplace_back(dependency, 0u);
+			continue;
+		}
+		if (!ExecuteTapeOp(op, values, index)) {
+			marks[index] = 2u;
+			if (op.memo_index != UINT32_MAX) {
+				context.values.resize(m_program.evaluation_value_count);
+				context.values[op.memo_index].generation = context.generation | 2u;
+			}
+			return 0;
+		}
+		marks[index] = 1u;
+		pending.pop_back();
+	}
+	result = static_cast<uint32_t>(values[root]);
+	return 1;
+}
 
 int SrtWalker::RunTape(std::vector<uint32_t>& flat) {
 	static const bool tape_enabled = [] {
@@ -1789,273 +1938,8 @@ int SrtWalker::RunTape(std::vector<uint32_t>& flat) {
 	vals.resize(tape.ops.size());
 
 	for (size_t i = 0; i < tape.ops.size(); ++i) {
-		const auto& op = tape.ops[i];
-		uint64_t result = 0;
-		switch (op.kind) {
-			case ResourcePlan::SrtTape::Kind::Immediate:
-				result = op.imm;
-				break;
-			case ResourcePlan::SrtTape::Kind::UserData: {
-				const uint32_t reg = op.args[0];
-				if (reg < m_program.user_data_base ||
-				    reg - m_program.user_data_base >= m_runtime.user_data.size()) {
-					g_tape_stats.failed.fetch_add(1, std::memory_order_relaxed);
-					return 0;
-				}
-				result = m_runtime.user_data[reg - m_program.user_data_base];
-				break;
-			}
-			case ResourcePlan::SrtTape::Kind::ShaderBase:
-				result = m_runtime.shader_base;
-				break;
-			case ResourcePlan::SrtTape::Kind::RawRead: {
-				const auto& mem = m_program.memory_info[op.aux];
-				const uint64_t low = vals[op.args[0]];
-				const uint64_t high = vals[op.args[1]];
-				const uint64_t offset = vals[op.args[2]];
-				const auto base = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
-				const auto immediate = static_cast<int64_t>(static_cast<int32_t>(mem.offset));
-				uint64_t address = 0;
-
-				if (op.opcode == ValueOpcode::ReadConstBuffer || op.opcode == ValueOpcode::LoadBufferU32) {
-					const uint64_t records = vals[op.args[3]];
-					const uint64_t word3 = vals[op.args[4]];
-					if (immediate < 0) {
-						g_tape_stats.failed.fetch_add(1, std::memory_order_relaxed);
-						return 0;
-					}
-					const auto byte_offset =
-					    (static_cast<uint64_t>(immediate) & ~uint64_t{3}) + (static_cast<uint32_t>(offset) & ~3u);
-					const auto stride = (static_cast<uint32_t>(high) >> 16u) & 0x3fffu;
-					if (op.opcode == ValueOpcode::LoadBufferU32) {
-						if ((high & (1u << 31u)) != 0u || (word3 & ((1u << 23u) | 0xf0000000u)) != 0u) {
-							g_tape_stats.failed.fetch_add(1, std::memory_order_relaxed);
-							return 0;
-						}
-						if (stride == 0u || records == 0u || ((word3 >> 12u) & 0x7fu) == 0u) {
-							vals[i] = 0;
-							continue;
-						}
-					}
-					const auto size = stride == 0u
-					                      ? static_cast<uint64_t>(static_cast<uint32_t>(records))
-					                      : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
-					if (byte_offset > size || size - byte_offset < sizeof(uint32_t)) {
-						g_tape_stats.failed.fetch_add(1, std::memory_order_relaxed);
-						return 0;
-					}
-					address = (base & ~uint64_t{3}) + byte_offset;
-				} else {
-					const auto relative = (immediate & ~int64_t{3}) +
-					                      static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
-					if (!AddSignedAddress(base & ~uint64_t{3}, relative, address)) {
-						g_tape_stats.failed.fetch_add(1, std::memory_order_relaxed);
-						return 0;
-					}
-				}
-
-				if (op.clean && (m_clean_evaluator == nullptr || m_runtime.read_specialization_memory == nullptr)) {
-					g_tape_stats.failed.fetch_add(1, std::memory_order_relaxed);
-					return 0;
-				}
-				uint32_t word = 0;
-				const bool is_vector = op.opcode == ValueOpcode::LoadBufferU32;
-				const auto reader = (is_vector || op.clean) ? m_runtime.read_specialization_memory
-				                                            : m_runtime.read_memory;
-				if (reader != nullptr) {
-					if (!reader(m_runtime.userdata, address, {&word, 1})) {
-						g_tape_stats.failed.fetch_add(1, std::memory_order_relaxed);
-						return 0;
-					}
-				} else {
-					if (is_vector) {
-						g_tape_stats.failed.fetch_add(1, std::memory_order_relaxed);
-						return 0;
-					}
-					std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
-				}
-				result = word;
-				break;
-			}
-			case ResourcePlan::SrtTape::Kind::Inst: {
-				const uint64_t a = vals[op.args[0]];
-				const uint64_t b = vals[op.args[1]];
-				const uint64_t c = vals[op.args[2]];
-				switch (op.opcode) {
-					case ValueOpcode::BitCastU32F32:
-					case ValueOpcode::BitCastF32U32: result = a; break;
-					case ValueOpcode::ConvertF32U32:
-						result = std::bit_cast<uint32_t>(static_cast<float>(static_cast<uint32_t>(a)));
-						break;
-					case ValueOpcode::ConvertU32F32: {
-						const auto v = Float32(a);
-						if (!std::isfinite(v) || v < 0.0f || static_cast<double>(v) > UINT32_MAX) {
-							g_tape_stats.failed.fetch_add(1, std::memory_order_relaxed);
-							return 0;
-						}
-						result = static_cast<uint32_t>(v);
-						break;
-					}
-					case ValueOpcode::FPTrunc32:
-						result = std::bit_cast<uint32_t>(std::trunc(Float32(a)));
-						break;
-					case ValueOpcode::FPRecipIFlag32: {
-						const auto exp = (a >> 23u) & 0xffu;
-						if ((a & 0x807fffffu) != 0u || exp == 0u || exp >= 254u) {
-							g_tape_stats.failed.fetch_add(1, std::memory_order_relaxed);
-							return 0;
-						}
-						result = (254u - exp) << 23u;
-						break;
-					}
-					case ValueOpcode::FPIsNan32: result = std::isnan(Float32(a)); break;
-					case ValueOpcode::BitwiseNot32: result = ~static_cast<uint32_t>(a); break;
-					case ValueOpcode::CompositeConstructU64:
-						result = static_cast<uint32_t>(a) |
-						         (static_cast<uint64_t>(static_cast<uint32_t>(b)) << 32u);
-						break;
-					case ValueOpcode::CompositeExtractU64:
-						result = static_cast<uint32_t>(a >> (op.imm * 32u));
-						break;
-					case ValueOpcode::CompositeExtractU32x2: { // used for IAddCarry32
-						const auto sum = static_cast<uint64_t>(static_cast<uint32_t>(a)) +
-						                 static_cast<uint32_t>(b);
-						result = op.imm == 0u ? static_cast<uint32_t>(sum)
-						                      : static_cast<uint32_t>(sum >> 32u);
-						break;
-					}
-					case ValueOpcode::IAdd32: result = static_cast<uint32_t>(a + b); break;
-					case ValueOpcode::IAdd64: result = a + b; break;
-					case ValueOpcode::ISub32: result = static_cast<uint32_t>(a - b); break;
-					case ValueOpcode::ISub64: result = a - b; break;
-					case ValueOpcode::IMul32: result = static_cast<uint32_t>(a * b); break;
-					case ValueOpcode::IMul64: result = a * b; break;
-					case ValueOpcode::UMulHi:
-						result = (static_cast<uint64_t>(static_cast<uint32_t>(a)) * static_cast<uint32_t>(b)) >> 32u;
-						break;
-					case ValueOpcode::UMin32:
-						result = std::min(static_cast<uint32_t>(a), static_cast<uint32_t>(b));
-						break;
-					case ValueOpcode::FPMul32:
-						result = std::bit_cast<uint32_t>(Float32(a) * Float32(b));
-						break;
-					case ValueOpcode::FPOrdLessThanEqual32:
-						result = Float32(a) <= Float32(b);
-						break;
-					case ValueOpcode::FPOrdGreaterThanEqual32:
-						result = Float32(a) >= Float32(b);
-						break;
-					case ValueOpcode::BitwiseAnd32: result = static_cast<uint32_t>(a & b); break;
-					case ValueOpcode::BitwiseAnd64: result = a & b; break;
-					case ValueOpcode::BitwiseOr32: result = static_cast<uint32_t>(a | b); break;
-					case ValueOpcode::BitwiseXor32: result = static_cast<uint32_t>(a ^ b); break;
-					case ValueOpcode::ShiftLeftLogical32:
-						result = static_cast<uint32_t>(a) << (b & 31u);
-						break;
-					case ValueOpcode::ShiftLeftLogical64: result = a << (b & 63u); break;
-					case ValueOpcode::ShiftRightLogical32:
-						result = static_cast<uint32_t>(a) >> (b & 31u);
-						break;
-					case ValueOpcode::ShiftRightLogical64: result = a >> (b & 63u); break;
-					case ValueOpcode::ShiftRightArithmetic32:
-						result = static_cast<uint32_t>(
-						    std::bit_cast<int32_t>(static_cast<uint32_t>(a)) >> (b & 31u));
-						break;
-					case ValueOpcode::ShiftRightArithmetic64:
-						result = static_cast<uint64_t>(std::bit_cast<int64_t>(a) >> (b & 63u));
-						break;
-					case ValueOpcode::IEqual32:
-						result = static_cast<uint32_t>(a) == static_cast<uint32_t>(b);
-						break;
-					case ValueOpcode::INotEqual32:
-						result = static_cast<uint32_t>(a) != static_cast<uint32_t>(b);
-						break;
-					case ValueOpcode::ULessThan32:
-						result = static_cast<uint32_t>(a) < static_cast<uint32_t>(b);
-						break;
-					case ValueOpcode::ULessThanEqual32:
-						result = static_cast<uint32_t>(a) <= static_cast<uint32_t>(b);
-						break;
-					case ValueOpcode::UGreaterThan32:
-						result = static_cast<uint32_t>(a) > static_cast<uint32_t>(b);
-						break;
-					case ValueOpcode::SGreaterThanEqual32:
-						result = std::bit_cast<int32_t>(static_cast<uint32_t>(a)) >=
-						         std::bit_cast<int32_t>(static_cast<uint32_t>(b));
-						break;
-					case ValueOpcode::LogicalXor: result = (a != 0u) != (b != 0u); break;
-					case ValueOpcode::BitFieldUExtract: {
-						const auto offset = static_cast<uint32_t>(b);
-						const auto width = static_cast<uint32_t>(c);
-						if (offset > 32u || width > 32u - offset) {
-							g_tape_stats.failed.fetch_add(1, std::memory_order_relaxed);
-							return 0;
-						}
-						const auto mask = width == 32u ? UINT32_MAX : (width == 0u ? 0u : (1u << width) - 1u);
-						result = width == 0u ? 0u : (static_cast<uint32_t>(a) >> offset) & mask;
-						break;
-					}
-					case ValueOpcode::BitFieldSExtract: {
-						const auto offset = static_cast<uint32_t>(b);
-						const auto width = static_cast<uint32_t>(c);
-						if (offset > 32u || width > 32u - offset) {
-							g_tape_stats.failed.fetch_add(1, std::memory_order_relaxed);
-							return 0;
-						}
-						if (width == 0u) {
-							result = 0;
-						} else {
-							const auto mask = width == 32u ? UINT32_MAX : (1u << width) - 1u;
-							auto bits = (static_cast<uint32_t>(a) >> offset) & mask;
-							if (width < 32u && (bits & (1u << (width - 1u))) != 0u) bits |= ~mask;
-							result = bits;
-						}
-						break;
-					}
-					case ValueOpcode::BitFieldInsert: {
-						const uint64_t d = vals[op.args[3]];
-						const auto offset = static_cast<uint32_t>(c);
-						const auto width = static_cast<uint32_t>(d);
-						if (offset > 32u || width > 32u - offset) {
-							g_tape_stats.failed.fetch_add(1, std::memory_order_relaxed);
-							return 0;
-						}
-						if (width == 0u) {
-							result = static_cast<uint32_t>(a);
-						} else {
-							const auto mask = width == 32u ? UINT32_MAX : ((1u << width) - 1u) << offset;
-							result = (static_cast<uint32_t>(a) & ~mask) |
-							         ((static_cast<uint32_t>(b) << offset) & mask);
-						}
-						break;
-					}
-					default:
-						g_tape_stats.failed.fetch_add(1, std::memory_order_relaxed);
-						return 0;
-				}
-				break;
-			}
-		}
-
-		vals[i] = result;
-		// A clean op belongs to the clean walker context only. The same IR instruction
-		// may have a separate ordinary op with a different memory-reader domain.
-		if (op.memo_index != UINT32_MAX && op.clean && m_clean_evaluator != nullptr) {
-			auto& clean_context = m_clean_evaluator->m_context;
-			if (op.memo_index >= clean_context.values.size()) {
-				clean_context.values.resize(m_program.evaluation_value_count);
-			}
-			clean_context.values[op.memo_index].value = result;
-			clean_context.values[op.memo_index].generation = clean_context.generation;
-		} else if (op.memo_index != UINT32_MAX) {
-			if (op.memo_index >= m_context.values.size()) {
-				m_context.values.resize(m_program.evaluation_value_count);
-			}
-			m_context.values[op.memo_index].value = result;
-			m_context.values[op.memo_index].generation = m_context.generation;
-		}
+		if (!ExecuteTapeOp(tape.ops[i], vals, static_cast<uint32_t>(i))) return 0;
 	}
-
 	for (size_t slot = 0; slot < m_program.srt_reads.size(); ++slot) {
 		const auto& read = m_program.srt_reads[slot];
 		if (read.flat_offset >= flat.size()) {
@@ -2074,6 +1958,276 @@ int SrtWalker::RunTape(std::vector<uint32_t>& flat) {
 	return 1;
 }
 
+
+bool SrtWalker::ExecuteTapeOp(const ResourcePlan::SrtTape::Op& op,
+                              std::vector<uint64_t>& values, uint32_t index) {
+	uint64_t result = 0;
+	switch (op.kind) {
+		case ResourcePlan::SrtTape::Kind::Immediate:
+			result = op.imm;
+			break;
+		case ResourcePlan::SrtTape::Kind::UserData: {
+			const uint32_t reg = op.args[0];
+			if (reg < m_program.user_data_base ||
+			    reg - m_program.user_data_base >= m_runtime.user_data.size()) {
+				g_tape_stats.failed.fetch_add(1, std::memory_order_relaxed);
+				return false;
+			}
+			result = m_runtime.user_data[reg - m_program.user_data_base];
+			break;
+		}
+		case ResourcePlan::SrtTape::Kind::ShaderBase:
+			result = m_runtime.shader_base;
+			break;
+		case ResourcePlan::SrtTape::Kind::RawRead: {
+			const auto& mem = m_program.memory_info[op.aux];
+			const uint64_t low = values[op.args[0]];
+			const uint64_t high = values[op.args[1]];
+			const uint64_t offset = values[op.args[2]];
+			const auto base = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
+			const auto immediate = static_cast<int64_t>(static_cast<int32_t>(mem.offset));
+			uint64_t address = 0;
+
+			if (op.opcode == ValueOpcode::ReadConstBuffer || op.opcode == ValueOpcode::LoadBufferU32) {
+				const uint64_t records = values[op.args[3]];
+				const uint64_t word3 = values[op.args[4]];
+				if (immediate < 0) {
+					g_tape_stats.failed.fetch_add(1, std::memory_order_relaxed);
+					return false;
+				}
+				const auto byte_offset =
+				    (static_cast<uint64_t>(immediate) & ~uint64_t{3}) + (static_cast<uint32_t>(offset) & ~3u);
+				const auto stride = (static_cast<uint32_t>(high) >> 16u) & 0x3fffu;
+				if (op.opcode == ValueOpcode::LoadBufferU32) {
+					if ((high & (1u << 31u)) != 0u || (word3 & ((1u << 23u) | 0xf0000000u)) != 0u) {
+						g_tape_stats.failed.fetch_add(1, std::memory_order_relaxed);
+						return false;
+					}
+					if (stride == 0u || records == 0u || ((word3 >> 12u) & 0x7fu) == 0u) {
+						result = 0;
+						break;
+					}
+				}
+				const auto size = stride == 0u
+				                      ? static_cast<uint64_t>(static_cast<uint32_t>(records))
+				                      : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
+				if (byte_offset > size || size - byte_offset < sizeof(uint32_t)) {
+					g_tape_stats.failed.fetch_add(1, std::memory_order_relaxed);
+					return false;
+				}
+				address = (base & ~uint64_t{3}) + byte_offset;
+			} else {
+				const auto relative = (immediate & ~int64_t{3}) +
+				                      static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
+				if (!AddSignedAddress(base & ~uint64_t{3}, relative, address)) {
+					g_tape_stats.failed.fetch_add(1, std::memory_order_relaxed);
+					return false;
+				}
+			}
+
+			if (op.clean && (m_clean_evaluator == nullptr || m_runtime.read_specialization_memory == nullptr)) {
+				g_tape_stats.failed.fetch_add(1, std::memory_order_relaxed);
+				return false;
+			}
+			uint32_t word = 0;
+			const bool is_vector = op.opcode == ValueOpcode::LoadBufferU32;
+			const auto reader = (is_vector || op.clean) ? m_runtime.read_specialization_memory
+			                                            : m_runtime.read_memory;
+			if (reader != nullptr) {
+				if (!reader(m_runtime.userdata, address, {&word, 1})) {
+					g_tape_stats.failed.fetch_add(1, std::memory_order_relaxed);
+					return false;
+				}
+			} else {
+				if (is_vector) {
+					g_tape_stats.failed.fetch_add(1, std::memory_order_relaxed);
+					return false;
+				}
+				std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+			}
+			result = word;
+			break;
+		}
+		case ResourcePlan::SrtTape::Kind::Inst: {
+			const uint64_t a = values[op.args[0]];
+			const uint64_t b = values[op.args[1]];
+			const uint64_t c = values[op.args[2]];
+			switch (op.opcode) {
+				case ValueOpcode::ReadConst: result = a; break; // CFG scalar aliases
+				case ValueOpcode::BitCastU32F32:
+				case ValueOpcode::BitCastF32U32: result = a; break;
+				case ValueOpcode::ConvertF32U32:
+					result = std::bit_cast<uint32_t>(static_cast<float>(static_cast<uint32_t>(a)));
+					break;
+				case ValueOpcode::ConvertU32F32: {
+					const auto v = Float32(a);
+					if (!std::isfinite(v) || v < 0.0f || static_cast<double>(v) > UINT32_MAX) {
+						g_tape_stats.failed.fetch_add(1, std::memory_order_relaxed);
+						return false;
+					}
+					result = static_cast<uint32_t>(v);
+					break;
+				}
+				case ValueOpcode::FPTrunc32:
+					result = std::bit_cast<uint32_t>(std::trunc(Float32(a)));
+					break;
+				case ValueOpcode::FPRecipIFlag32: {
+					const auto exp = (a >> 23u) & 0xffu;
+					if ((a & 0x807fffffu) != 0u || exp == 0u || exp >= 254u) {
+						g_tape_stats.failed.fetch_add(1, std::memory_order_relaxed);
+						return false;
+					}
+					result = (254u - exp) << 23u;
+					break;
+				}
+				case ValueOpcode::FPIsNan32: result = std::isnan(Float32(a)); break;
+				case ValueOpcode::BitwiseNot32: result = ~static_cast<uint32_t>(a); break;
+				case ValueOpcode::CompositeConstructU64:
+					result = static_cast<uint32_t>(a) |
+					         (static_cast<uint64_t>(static_cast<uint32_t>(b)) << 32u);
+					break;
+				case ValueOpcode::CompositeExtractU64:
+					result = static_cast<uint32_t>(a >> (op.imm * 32u));
+					break;
+				case ValueOpcode::CompositeExtractU32x2: { // used for IAddCarry32
+					const auto sum = static_cast<uint64_t>(static_cast<uint32_t>(a)) +
+					                 static_cast<uint32_t>(b);
+					result = op.imm == 0u ? static_cast<uint32_t>(sum)
+					                      : static_cast<uint32_t>(sum >> 32u);
+					break;
+				}
+				case ValueOpcode::IAdd32: result = static_cast<uint32_t>(a + b); break;
+				case ValueOpcode::IAdd64: result = a + b; break;
+				case ValueOpcode::ISub32: result = static_cast<uint32_t>(a - b); break;
+				case ValueOpcode::ISub64: result = a - b; break;
+				case ValueOpcode::IMul32: result = static_cast<uint32_t>(a * b); break;
+				case ValueOpcode::IMul64: result = a * b; break;
+				case ValueOpcode::UMulHi:
+					result = (static_cast<uint64_t>(static_cast<uint32_t>(a)) * static_cast<uint32_t>(b)) >> 32u;
+					break;
+				case ValueOpcode::UMin32:
+					result = std::min(static_cast<uint32_t>(a), static_cast<uint32_t>(b));
+					break;
+				case ValueOpcode::FPMul32:
+					result = std::bit_cast<uint32_t>(Float32(a) * Float32(b));
+					break;
+				case ValueOpcode::FPOrdLessThanEqual32:
+					result = Float32(a) <= Float32(b);
+					break;
+				case ValueOpcode::FPOrdGreaterThanEqual32:
+					result = Float32(a) >= Float32(b);
+					break;
+				case ValueOpcode::BitwiseAnd32: result = static_cast<uint32_t>(a & b); break;
+				case ValueOpcode::BitwiseAnd64: result = a & b; break;
+				case ValueOpcode::BitwiseOr32: result = static_cast<uint32_t>(a | b); break;
+				case ValueOpcode::BitwiseXor32: result = static_cast<uint32_t>(a ^ b); break;
+				case ValueOpcode::ShiftLeftLogical32:
+					result = static_cast<uint32_t>(a) << (b & 31u);
+					break;
+				case ValueOpcode::ShiftLeftLogical64: result = a << (b & 63u); break;
+				case ValueOpcode::ShiftRightLogical32:
+					result = static_cast<uint32_t>(a) >> (b & 31u);
+					break;
+				case ValueOpcode::ShiftRightLogical64: result = a >> (b & 63u); break;
+				case ValueOpcode::ShiftRightArithmetic32:
+					result = static_cast<uint32_t>(
+					    std::bit_cast<int32_t>(static_cast<uint32_t>(a)) >> (b & 31u));
+					break;
+				case ValueOpcode::ShiftRightArithmetic64:
+					result = static_cast<uint64_t>(std::bit_cast<int64_t>(a) >> (b & 63u));
+					break;
+				case ValueOpcode::IEqual32:
+					result = static_cast<uint32_t>(a) == static_cast<uint32_t>(b);
+					break;
+				case ValueOpcode::INotEqual32:
+					result = static_cast<uint32_t>(a) != static_cast<uint32_t>(b);
+					break;
+				case ValueOpcode::ULessThan32:
+					result = static_cast<uint32_t>(a) < static_cast<uint32_t>(b);
+					break;
+				case ValueOpcode::ULessThanEqual32:
+					result = static_cast<uint32_t>(a) <= static_cast<uint32_t>(b);
+					break;
+				case ValueOpcode::UGreaterThan32:
+					result = static_cast<uint32_t>(a) > static_cast<uint32_t>(b);
+					break;
+				case ValueOpcode::SGreaterThanEqual32:
+					result = std::bit_cast<int32_t>(static_cast<uint32_t>(a)) >=
+					         std::bit_cast<int32_t>(static_cast<uint32_t>(b));
+					break;
+				case ValueOpcode::LogicalXor: result = (a != 0u) != (b != 0u); break;
+				case ValueOpcode::BitFieldUExtract: {
+					const auto offset = static_cast<uint32_t>(b);
+					const auto width = static_cast<uint32_t>(c);
+					if (offset > 32u || width > 32u - offset) {
+						g_tape_stats.failed.fetch_add(1, std::memory_order_relaxed);
+						return false;
+					}
+					const auto mask = width == 32u ? UINT32_MAX : (width == 0u ? 0u : (1u << width) - 1u);
+					result = width == 0u ? 0u : (static_cast<uint32_t>(a) >> offset) & mask;
+					break;
+				}
+				case ValueOpcode::BitFieldSExtract: {
+					const auto offset = static_cast<uint32_t>(b);
+					const auto width = static_cast<uint32_t>(c);
+					if (offset > 32u || width > 32u - offset) {
+						g_tape_stats.failed.fetch_add(1, std::memory_order_relaxed);
+						return false;
+					}
+					if (width == 0u) {
+						result = 0;
+					} else {
+						const auto mask = width == 32u ? UINT32_MAX : (1u << width) - 1u;
+						auto bits = (static_cast<uint32_t>(a) >> offset) & mask;
+						if (width < 32u && (bits & (1u << (width - 1u))) != 0u) bits |= ~mask;
+						result = bits;
+					}
+					break;
+				}
+				case ValueOpcode::BitFieldInsert: {
+					const uint64_t d = values[op.args[3]];
+					const auto offset = static_cast<uint32_t>(c);
+					const auto width = static_cast<uint32_t>(d);
+					if (offset > 32u || width > 32u - offset) {
+						g_tape_stats.failed.fetch_add(1, std::memory_order_relaxed);
+						return false;
+					}
+					if (width == 0u) {
+						result = static_cast<uint32_t>(a);
+					} else {
+						const auto mask = width == 32u ? UINT32_MAX : ((1u << width) - 1u) << offset;
+						result = (static_cast<uint32_t>(a) & ~mask) |
+						         ((static_cast<uint32_t>(b) << offset) & mask);
+					}
+					break;
+				}
+				default:
+					g_tape_stats.failed.fetch_add(1, std::memory_order_relaxed);
+					return false;
+			}
+			break;
+		}
+	}
+
+	values[index] = result;
+	// A clean op belongs to the clean walker context only. The same IR instruction
+	// may have a separate ordinary op with a different memory-reader domain.
+	if (op.memo_index != UINT32_MAX && op.clean && m_clean_evaluator != nullptr) {
+		auto& clean_context = m_clean_evaluator->m_context;
+		if (op.memo_index >= clean_context.values.size()) {
+			clean_context.values.resize(m_program.evaluation_value_count);
+		}
+		clean_context.values[op.memo_index].value = result;
+		clean_context.values[op.memo_index].generation = clean_context.generation;
+	} else if (op.memo_index != UINT32_MAX) {
+		if (op.memo_index >= m_context.values.size()) {
+			m_context.values.resize(m_program.evaluation_value_count);
+		}
+		m_context.values[op.memo_index].value = result;
+		m_context.values[op.memo_index].generation = m_context.generation;
+	}
+	return true;
+}
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValueType type) {
 	return RuntimeValidator(program, type).Run(value);
 }

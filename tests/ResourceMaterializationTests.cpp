@@ -786,7 +786,7 @@ void TestTapeVerifyMismatchFallbackAndUnmatchedReplay() {
         "unmatched replay was treated as a mismatch or reread live memory");
 }
 
-void TestTapeSeparatesCleanAndOrdinaryReadDomains() {
+void TestTapeSeparatesCleanAndOrdinaryReadDomains(bool cfg = false) {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   ResourcePlan plan;
   plan.stage = Libs::Graphics::ShaderType::Compute;
@@ -804,6 +804,10 @@ void TestTapeSeparatesCleanAndOrdinaryReadDomains() {
   plan.srt_reads.push_back({Value(&read), 0u});
   plan.srt_reads.push_back({Value(&read), 1u});
   plan.clean_flat_slots = {0u, 1u};
+  if (cfg) {
+    plan.control_flow.emplace_back();
+    plan.control_flow[0].srt_reads = {0u, 1u};
+  }
 
   struct Reads { uint32_t ordinary = 0; uint32_t strict = 0; } reads;
   const SrtRuntime runtime{
@@ -836,7 +840,7 @@ void TestTapeSeparatesCleanAndOrdinaryReadDomains() {
         "Tape published a read result into the wrong evaluator memo domain");
 }
 
-void TestVectorLoadUsesCleanDependencies(bool through_read_const) {
+void TestVectorLoadUsesCleanDependencies(bool through_read_const, bool cfg = false) {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   ResourcePlan plan;
   plan.stage = Libs::Graphics::ShaderType::Compute;
@@ -877,6 +881,10 @@ void TestVectorLoadUsesCleanDependencies(bool through_read_const) {
   vector_read.SetArg(4, Value(true));
   plan.srt_reads.push_back({Value(&address_word), 0u});
   plan.srt_reads.push_back({Value(&vector_read), 1u});
+  if (cfg) {
+    plan.control_flow.emplace_back();
+    plan.control_flow[0].srt_reads = {0u, 1u};
+  }
 
   struct Reads { uint32_t ordinary = 0; uint32_t strict = 0; } reads;
   const SrtRuntime runtime{
@@ -905,6 +913,131 @@ void TestVectorLoadUsesCleanDependencies(bool through_read_const) {
         through_read_const
             ? "clean vector-load ReadConst dependency used the ordinary reader"
             : "clean vector-load address dependency used the ordinary reader");
+}
+
+void TestCfgTapeDemandRoots() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  ResourcePlan plan;
+  plan.stage = Libs::Graphics::ShaderType::Compute;
+  plan.srt_plan_complete = plan.resource_tracking_complete = true;
+  plan.memory_info.push_back({.kind = ResourceKind::ScalarAddress, .planning_only = true});
+  const auto user = [&](uint32_t reg) {
+    auto &inst = plan.value_storage.emplace_back(ValueOpcode::GetUserData);
+    inst.SetArg(0, Value(static_cast<ScalarReg>(reg)));
+    return Value(&inst);
+  };
+  const auto raw = [&](Value address) {
+    auto &handle = plan.value_storage.emplace_back(ValueOpcode::GetAddressResource);
+    handle.SetArg(0, address); handle.SetArg(1, Value(0u));
+    auto &read = plan.value_storage.emplace_back(ValueOpcode::LoadAddressU32);
+    read.SetFlags(MemoryFlags{.index = 0});
+    read.SetArg(0, Value(&handle)); read.SetArg(1, Value(0u));
+    read.SetArg(2, Value(0u)); read.SetArg(3, Value(true));
+    return Value(&read);
+  };
+  const auto shared = raw(user(0));
+  const auto poisoned = raw(Value(0xdead0000u));
+  auto &selection = plan.value_storage.emplace_back(ValueOpcode::SelectU32);
+  selection.SetArg(0, Value(true)); selection.SetArg(1, shared); selection.SetArg(2, poisoned);
+  // Unsupported lazy root follows supported shared roots; never execute its poison arm.
+  plan.srt_reads = {{shared, 0u}, {poisoned, 1u}, {shared, 2u}, {Value(&selection), 3u}};
+  plan.clean_flat_slots = {0u, 0u, 1u, 0u};
+  plan.control_flow.resize(3);
+  plan.control_flow[0].condition = user(1);
+  plan.control_flow[0].successors = {1u, 2u};
+  plan.control_flow[1].srt_reads = {0u, 2u, 3u};
+  plan.control_flow[1].sources = {0u};
+  plan.control_flow[2].srt_reads = {1u};
+  plan.control_flow[2].sources = {1u};
+  plan.descriptor_sources.resize(2);
+  struct Reads {
+    std::vector<uint64_t> order;
+    uint32_t value = 7;
+    bool allow_poison = false;
+  } reads;
+  const auto ordinary = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+    auto &s = *static_cast<Reads *>(data);
+    s.order.push_back(address);
+    if (words.size() != 1u || (address == 0xdead0000u && !s.allow_poison)) return false;
+    words[0] = s.value;
+    return true;
+  };
+  const auto strict = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+    auto &s = *static_cast<Reads *>(data);
+    s.order.push_back(address | (1ull << 63u));
+    if (words.size() != 1u) return false;
+    words[0] = s.value + 100u;
+    return true;
+  };
+  std::array<uint32_t, 2> sgpr {0x1000u, 1u};
+  const SrtRuntime runtime {.user_data = sgpr, .read_memory = ordinary, .userdata = &reads,
+                            .read_specialization_memory = strict};
+  std::vector<uint32_t> flat;
+  const auto stats_before = GetSrtTapeStats();
+  for (uint32_t generation = 0; generation < 2u; ++generation) {
+    reads.order.clear();
+    SrtWalker clean(plan, CleanRuntime(runtime));
+    SrtWalker walker(plan, runtime, plan.clean_flat_slots, &clean);
+    uint32_t preloaded = 0;
+    Check(walker.Evaluate(shared, preloaded), "CFG memo warmup failed");
+    Check(walker.RefreshFlatBuffer(flat) &&
+              flat == std::vector<uint32_t>{reads.value, 0u, reads.value + 100u, reads.value} &&
+              reads.order == std::vector<uint64_t>{sgpr[0], sgpr[0] | (1ull << 63u)} &&
+              plan.active_sources == std::vector<uint8_t>{1u, 0u},
+          "CFG demand tape eagerly read poison, merged domains, or ignored recursive memo");
+    sgpr[0] += 0x1000u;
+    ++reads.value;
+  }
+  const char *cfg_flag = std::getenv("KYTY_SRT_CFG_TAPE");
+  if (cfg_flag != nullptr && cfg_flag[0] == '1') {
+    const auto &tape = plan.cfg_srt_tapes[1];
+    Check(tape.state == ResourcePlan::SrtTape::State::Ready &&
+              tape.slot_ops[0] != UINT32_MAX && tape.slot_ops[3] == UINT32_MAX &&
+              GetSrtTapeStats().cfg_runs > stats_before.cfg_runs &&
+              GetSrtTapeStats().cfg_fallback > stats_before.cfg_fallback,
+          "CFG test silently bypassed supported or independently unsupported roots");
+  }
+  // A runtime-unknown condition must preserve traversal of both successors.
+  auto &unknown = plan.value_storage.emplace_back(ValueOpcode::GetBuiltin);
+  unknown.SetArg(0, Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)));
+  unknown.SetArg(1, Value(0u));
+  plan.control_flow[0].condition = Value(&unknown);
+  // A new plan graph requires a fresh compiled aggregate, as in extracted shader variants.
+  for (auto &tape: plan.cfg_srt_tapes) tape = {};
+  reads.allow_poison = true;
+  reads.order.clear();
+  {
+    SrtWalker clean(plan, CleanRuntime(runtime));
+    SrtWalker walker(plan, runtime, plan.clean_flat_slots, &clean);
+    Check(walker.RefreshFlatBuffer(flat) && flat[1] == reads.value &&
+              plan.active_sources == std::vector<uint8_t>{1u, 1u} &&
+              reads.order == std::vector<uint64_t>{0xdead0000u, sgpr[0], sgpr[0] | (1ull << 63u)},
+          "unknown CFG predicate did not traverse both successors in original read order");
+  }
+  reads.allow_poison = false;
+  reads.order.clear();
+  {
+    SrtWalker clean(plan, CleanRuntime(runtime));
+    SrtWalker walker(plan, runtime, plan.clean_flat_slots, &clean);
+    uint32_t ignored = 0;
+    Check(!walker.Evaluate(poisoned, ignored) && !walker.RefreshFlatBuffer(flat) &&
+              reads.order == std::vector<uint64_t>{0xdead0000u},
+          "CFG tape retried a memoized failed read");
+  }
+}
+
+void TestCfgTapeCompilationCycleFallsBack() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  ResourcePlan plan;
+  plan.srt_plan_complete = plan.resource_tracking_complete = true;
+  auto &cycle = plan.value_storage.emplace_back(ValueOpcode::IAdd32);
+  cycle.SetArg(0, Value(&cycle)); cycle.SetArg(1, Value(1u));
+  plan.srt_reads = {{Value(4u), 0u}, {Value(&cycle), 1u}};
+  plan.control_flow.resize(1);
+  plan.control_flow[0].srt_reads = {0u, 1u};
+  std::vector<uint32_t> flat;
+  Check(!SrtWalker(plan, {}).RefreshFlatBuffer(flat) && flat[0] == 4u,
+        "cyclic CFG compilation did not leave supported sibling root usable");
 }
 
 void TestTapeUnsupportedRootFallsBack() {
@@ -1238,6 +1371,11 @@ void DbgExit(int) { std::abort(); }
 } // namespace Common
 
 int main() {
+  TestCfgTapeDemandRoots();
+  TestCfgTapeCompilationCycleFallsBack();
+  TestVectorLoadUsesCleanDependencies(false, true);
+  TestVectorLoadUsesCleanDependencies(true, true);
+  TestTapeSeparatesCleanAndOrdinaryReadDomains(true);
   TestTapePreservesWideMemoryIndex();
   TestTapeUnsupportedRootFallsBack();
   TestVectorLoadUsesCleanDependencies(false);

@@ -585,13 +585,15 @@ struct PipelineCache::ProgramCache {
 			    static_cast<unsigned long long>(resource_misses[static_cast<size_t>(ResourceMemo::Miss::ReadFailed)]),
 			    static_cast<unsigned long long>(resource_misses[static_cast<size_t>(ResourceMemo::Miss::MemoryChanged)]));
 			const auto tape = ShaderRecompiler::IR::GetSrtTapeStats();
-			std::printf("NHL27SRTTAPE: runs=%llu failed=%llu walker=%llu built=%llu unsupported=%llu ops=%llu\n",
+			std::printf("NHL27SRTTAPE: runs=%llu failed=%llu walker=%llu built=%llu unsupported=%llu ops=%llu cfg_roots=%llu cfg_fallback=%llu\n",
 			    static_cast<unsigned long long>(tape.runs),
 			    static_cast<unsigned long long>(tape.failed),
 			    static_cast<unsigned long long>(tape.walker),
 			    static_cast<unsigned long long>(tape.built),
 			    static_cast<unsigned long long>(tape.unsupported),
-			    static_cast<unsigned long long>(tape.ops));
+			    static_cast<unsigned long long>(tape.ops),
+			    static_cast<unsigned long long>(tape.cfg_runs),
+			    static_cast<unsigned long long>(tape.cfg_fallback));
 		}
 		last_stats = now;
 	}

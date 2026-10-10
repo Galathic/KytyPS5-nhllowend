@@ -35,6 +35,8 @@ struct SrtTapeStats {
 	uint64_t built = 0;         // tapes built
 	uint64_t unsupported = 0;   // plans rejected by the tape builder
 	uint64_t ops = 0;           // total ops executed
+	uint64_t cfg_runs = 0;      // supported CFG roots demanded (including memo hits)
+	uint64_t cfg_fallback = 0;  // roots evaluated recursively; unsupported or flag off
 	std::array<uint64_t, 8> reject {}; // rejection reasons, see SrtTapeRejectName
 };
 SrtTapeStats GetSrtTapeStats();
@@ -66,6 +68,10 @@ private:
 	bool EvaluateInst(const Inst& inst, uint64_t& result);
 	// 1 = refreshed, 0 = failed (same as walker), -1 = tape not applicable.
 	int  RunTape(std::vector<uint32_t>& flat);
+	void PrepareCfgTape();
+	int RunCfgRoot(uint32_t root, uint32_t& result);
+	bool ExecuteTapeOp(const ResourcePlan::SrtTape::Op& op, std::vector<uint64_t>& values,
+	                   uint32_t index);
 
 	const ResourcePlan&              m_program;
 	SrtRuntime                      m_runtime;
