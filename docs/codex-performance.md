@@ -65,6 +65,11 @@ Game files and saved profiles, caches, captures and logs must stay outside Git.
 - `KYTY_PERF_RESOURCE_TIMING=1` reports CPU resource-refresh cost per shader
   source, with calls, hits and plan sizes. It is off by default and must be off
   for final gameplay FPS measurements.
+- With resource timing enabled, `KYTY_RESOURCE_CACHE_CONTROL_FILE` can name a
+  diagnostic text file containing `1` or `16`. The GPU thread applies capacity
+  changes between lookups, invalidating resource memos while retaining compiled
+  pipelines. New shader sources inherit the active policy. This allows comparisons
+  within one warmed match; exclude transitions from measured intervals.
 
 ## Verification and baseline
 
@@ -78,6 +83,8 @@ Hardware: AMD Ryzen 7 5800X3D, Radeon RX 9070 XT, Windows. Isolated test window:
   and concurrent queue producers/consumer.
 - Renderer `--bda-dirty-cache-only`: passes with dirty regions both off and on.
 - `resource_materialization_tests`: all cases pass with retained allocations.
+- Resource memo tests also cover output changes and repeated capacity transitions.
+- Renderer `--lds-limit-only` passes with the single-state resource memo enabled.
 - `--wave-reduction-only`: SPIR-V validation and GPU results pass for all cases.
 - `--flat-d16-only`: all targeted D16/subword GPU cases pass.
 - `--block-storage-shadow-only`: both block sizes pass on the GPU.
@@ -110,6 +117,13 @@ Hardware: AMD Ryzen 7 5800X3D, Radeon RX 9070 XT, Windows. Isolated test window:
   returning null. NHL's ATTRIBUTE3 is 138412032 (resolution-detection bit 4
   is clear). The unvalidated display override was removed from the working
   source; the isolated experiment patch and logs remain outside Git.
+- A separate 2160p control using the compressed-storage and warm-up repairs,
+  with all profiling disabled, advanced from frame 9999 to 10520 in 80.6875
+  seconds: **6.457 FPS**. The clock advanced from 17:24 to 7:02 with white ice
+  and moving players. Process CPU usage averaged 2.634 cores and eight Windows
+  3D-engine samples averaged 49.10%. Some shaders were still compiling; this
+  is not a fully warmed result. The 1280x720 host window does not establish
+  the game's internal render resolution. The 60 FPS objective remains unmet.
 
 User-provided reference: RX 6800 XT / Ryzen 5 5600 / 32 GB DDR4-3200 reports
 14-19 FPS in the main menu, 26-29 in franchise menus (30 FPS cap), 7-12 in team

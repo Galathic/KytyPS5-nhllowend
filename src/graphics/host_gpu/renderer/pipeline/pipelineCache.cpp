@@ -31,6 +31,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
+#include <fstream>
 #include <limits>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
@@ -395,6 +396,8 @@ struct PipelineCache::ProgramCache {
         }
         const bool memo_enabled = reuse_enabled && replaying == nullptr;
         const auto refresh = [&](SourceEntry& source, bool& reused) {
+            // Newly encountered shaders must use the current diagnostic policy too.
+            if (cache_control_capacity != 0) source.resource_memo.SetCapacity(cache_control_capacity);
             const auto begin = resource_timing ? std::chrono::steady_clock::now()
                                                : std::chrono::steady_clock::time_point {};
             const bool ok = source.resource_memo.Refresh(source.resource_plan, runtime,
@@ -617,6 +620,19 @@ struct PipelineCache::ProgramCache {
 			for (const auto& item: measured) {
 				item.second->refresh_ns = item.second->refresh_calls = item.second->refresh_hits = 0;
 			}
+			// Diagnostic A/B control runs on the sole cache-owning GPU thread. Changing
+			// policy invalidates memo states and retains compiled shaders/pipelines.
+			if (!cache_control_file.empty()) {
+				unsigned capacity = 0;
+				std::ifstream control(cache_control_file);
+				if (control >> capacity && (capacity == 1 || capacity == 16) &&
+				    capacity != cache_control_capacity) {
+					size_t changed = 0;
+					for (auto& [key, source]: programs) changed += source.resource_memo.SetCapacity(capacity);
+					cache_control_capacity = capacity;
+					std::printf("NHL27RESOURCE: cache_capacity=%u changed=%zu\n", capacity, changed);
+				}
+			}
 		}
 		last_stats = now;
 	}
@@ -625,6 +641,9 @@ struct PipelineCache::ProgramCache {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 		const char* timing = std::getenv("KYTY_PERF_RESOURCE_TIMING");
 		resource_timing = timing != nullptr && timing[0] == '1';
+		if (resource_timing) {
+			if (const char* path = std::getenv("KYTY_RESOURCE_CACHE_CONTROL_FILE")) cache_control_file = path;
+		}
 	}
 	~ProgramCache() {
 		for (const auto& [key, entry]: programs) {
@@ -641,6 +660,8 @@ struct PipelineCache::ProgramCache {
 	std::array<LastSource, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> last_sources {};
 	uint64_t lookups = 0, source_hits = 0, resource_hits = 0, materializations = 0, permutation_hits = 0;
 	bool resource_timing = false;
+	std::string cache_control_file;
+	unsigned cache_control_capacity = 0;
 	std::array<uint64_t, static_cast<size_t>(ResourceMemo::Miss::Count)> resource_misses {};
 	std::chrono::steady_clock::time_point last_stats = std::chrono::steady_clock::now();
 	vk::Device                                                  device;

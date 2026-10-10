@@ -167,6 +167,17 @@ public:
     }
     using Miss = ResourceMemoEntry::Miss;
     Miss LastMiss() const { return m_last_miss; }
+    bool SetCapacity(size_t capacity) {
+        capacity = std::clamp(capacity, size_t{1}, size_t{16});
+        if (m_capacity == capacity) return false;
+        m_entries.clear();
+        m_capacity = capacity;
+        m_last_hit = SIZE_MAX;
+        m_next = 0;
+        m_output = m_specialization = nullptr;
+        m_last_miss = Miss::Cold;
+        return true;
+    }
     bool Refresh(const ShaderRecompiler::IR::ResourcePlan& plan,
                  const ShaderRecompiler::IR::SrtRuntime& runtime,
                  ShaderRecompiler::IR::ResourceSnapshot& snapshot,

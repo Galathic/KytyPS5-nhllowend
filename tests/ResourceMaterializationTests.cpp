@@ -250,6 +250,18 @@ void TestSingleResourceMemoChangesOutput() {
   Check(memo.Refresh(plan, runtime, first, first_specialization, true, reused) && !reused &&
             first.buffers[0].dwords[0] == 0x9000 && second.buffers[0].dwords[0] == 0x8000,
         "single memo refreshed the wrong output or reused a changed resource register");
+  Check(memo.SetCapacity(16) && !memo.SetCapacity(16),
+        "memo capacity transition or repeated policy failed");
+  Check(memo.Refresh(plan, runtime, first, first_specialization, true, reused) && !reused &&
+            first.buffers[0].dwords[0] == registers[0],
+        "multi-entry transition reused a stale single-entry state");
+  Check(memo.Refresh(plan, runtime, first, first_specialization, true, reused) && reused,
+        "multi-entry transition did not retain its new snapshot");
+  Check(memo.SetCapacity(1) &&
+            memo.Refresh(plan, runtime, first, first_specialization, true, reused) && !reused,
+        "single-entry transition reused a stale multi-entry state");
+  Check(memo.Refresh(plan, runtime, first, first_specialization, true, reused) && reused,
+        "single-entry transition did not retain its new snapshot");
 }
 
 void TestMappedSrtUsesDirectReaderByDefault() {
