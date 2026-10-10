@@ -915,6 +915,119 @@ void TestVectorLoadUsesCleanDependencies(bool through_read_const, bool cfg = fal
             : "clean vector-load address dependency used the ordinary reader");
 }
 
+void TestCfgTapeVerifierRejectsCorruption() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  const char *cfg = std::getenv("KYTY_SRT_CFG_TAPE");
+  const char *verify = std::getenv("KYTY_SRT_TAPE_VERIFY");
+  if (cfg == nullptr || cfg[0] != '1' || verify == nullptr || verify[0] != '1') return;
+  const auto verifier_before = GetSrtTapeStats();
+  auto plan = SrtPlan(0x2000u);
+  const Value raw = plan.srt_reads[0].value;
+  auto &sum = plan.value_storage.emplace_back(ValueOpcode::IAdd32);
+  sum.SetArg(0, raw); sum.SetArg(1, Value(1u));
+  plan.srt_reads = {{Value(&sum), 0u}, {raw, 1u}};
+  plan.clean_flat_slots = {0u, 1u};
+  plan.control_flow.resize(1);
+  plan.control_flow[0].srt_reads = {0u, 1u};
+  plan.control_flow[0].sources = {0u};
+  struct Reads { uint32_t ordinary = 0; uint32_t strict = 0; } reads;
+  const SrtRuntime runtime {
+      .read_memory = +[](void *data, uint64_t, std::span<uint32_t> words) {
+        ++static_cast<Reads *>(data)->ordinary; words[0] = 10u; return true;
+      }, .userdata = &reads,
+      .read_specialization_memory = +[](void *data, uint64_t, std::span<uint32_t> words) {
+        ++static_cast<Reads *>(data)->strict; words[0] = 20u; return true;
+      }};
+  std::vector<uint32_t> flat;
+  {
+    SrtWalker clean(plan, CleanRuntime(runtime));
+    SrtWalker walker(plan, runtime, plan.clean_flat_slots, &clean);
+    Check(walker.RefreshFlatBuffer(flat) && flat == std::vector<uint32_t>{11u, 20u},
+          "CFG verifier warmup failed");
+  }
+  auto &tape = plan.cfg_srt_tapes[1];
+  bool corrupted = false;
+  for (const auto &op: tape.ops) {
+    if (op.source == &sum) {
+      tape.ops[op.args[1]].imm = 8u; // Invalid compiled arithmetic, original IR unchanged.
+      corrupted = true;
+      break;
+    }
+  }
+  Check(corrupted, "CFG verifier fixture did not corrupt a supported compiled root");
+  reads = {};
+  {
+    SrtWalker clean(plan, CleanRuntime(runtime));
+    SrtWalker walker(plan, runtime, plan.clean_flat_slots, &clean);
+    uint32_t value = 0;
+    // This live read predates the capture; replay must receive its initial memo.
+    Check(walker.Evaluate(raw, value) && value == 10u, "CFG verifier preloaded input failed");
+    Check(walker.RefreshFlatBuffer(flat) && flat == std::vector<uint32_t>{11u, 20u} &&
+              reads.ordinary == 1u && reads.strict == 1u &&
+              tape.state == ResourcePlan::SrtTape::State::Unsupported,
+          "CFG verifier accepted corrupt arithmetic, reread inputs, or failed to disable plan");
+    Check(walker.Evaluate(Value(&sum), value) && value == 11u &&
+              clean.Evaluate(raw, value) && value == 20u &&
+              reads.ordinary == 1u && reads.strict == 1u,
+          "CFG mismatch fallback did not restore both validated memo domains");
+  }
+
+  ResourcePlan activation;
+  activation.srt_plan_complete = activation.resource_tracking_complete = true;
+  activation.descriptor_sources.resize(2);
+  activation.control_flow.resize(3);
+  activation.control_flow[0].condition = Value(true);
+  activation.control_flow[0].successors = {1u, 2u};
+  activation.control_flow[1].sources = {0u};
+  activation.control_flow[2].sources = {1u};
+  Check(SrtWalker(activation, runtime).RefreshFlatBuffer(flat), "CFG activation warmup failed");
+  auto &activation_tape = activation.cfg_srt_tapes[0];
+  activation_tape.ops[activation_tape.condition_ops[0]].imm = 0u;
+  reads = {};
+  Check(SrtWalker(activation, runtime).RefreshFlatBuffer(flat) &&
+            activation.active_sources == std::vector<uint8_t>{1u, 0u} &&
+            activation_tape.state == ResourcePlan::SrtTape::State::Unsupported &&
+            reads.ordinary == 0u && reads.strict == 0u,
+        "CFG verifier ignored an activation-only mismatch");
+
+  auto unmatched = SrtPlan(0x2000u);
+  unmatched.control_flow.resize(1);
+  unmatched.control_flow[0].srt_reads = {0u};
+  Check(SrtWalker(unmatched, runtime).RefreshFlatBuffer(flat), "CFG unmatched warmup failed");
+  auto &unmatched_tape = unmatched.cfg_srt_tapes[0];
+  for (const auto &op: unmatched_tape.ops) {
+    if (op.kind == ResourcePlan::SrtTape::Kind::RawRead) {
+      unmatched_tape.ops[op.args[0]].imm = 0x3000u;
+      break;
+    }
+  }
+  reads = {};
+  flat = {0x55u};
+  Check(!SrtWalker(unmatched, runtime).RefreshFlatBuffer(flat) && flat == std::vector<uint32_t>{0x55u} &&
+            reads.ordinary == 1u && unmatched_tape.state == ResourcePlan::SrtTape::State::Unsupported,
+        "unmatched CFG replay reread live memory or published an unvalidated result");
+
+  auto unusual = SrtPlan(0x2000u);
+  unusual.clean_flat_slots = {1u};
+  unusual.control_flow.resize(1);
+  unusual.control_flow[0].srt_reads = {0u};
+  reads = {};
+  {
+    // Deliberately not CleanRuntime(runtime): its ordinary callback is distinct.
+    SrtWalker different_clean(unusual, runtime);
+    SrtWalker walker(unusual, runtime, unusual.clean_flat_slots, &different_clean);
+    Check(!walker.RefreshFlatBuffer(flat) && reads.ordinary == 0u && reads.strict == 0u &&
+              unusual.cfg_srt_tapes[1].state == ResourcePlan::SrtTape::State::Unsupported,
+          "CFG verifier accepted a distinct clean runtime as the same capture domain");
+  }
+  const auto verifier_after = GetSrtTapeStats();
+  Check(verifier_after.cfg_checked - verifier_before.cfg_checked == 7u &&
+            verifier_after.cfg_matched - verifier_before.cfg_matched == 3u &&
+            verifier_after.cfg_mismatch - verifier_before.cfg_mismatch == 2u &&
+            verifier_after.cfg_inconclusive - verifier_before.cfg_inconclusive == 2u,
+        "CFG verifier counters did not report matching, mismatched and rejected refreshes");
+}
+
 void TestCfgTapeDemandRoots() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   ResourcePlan plan;
@@ -1371,6 +1484,7 @@ void DbgExit(int) { std::abort(); }
 } // namespace Common
 
 int main() {
+  TestCfgTapeVerifierRejectsCorruption();
   TestCfgTapeDemandRoots();
   TestCfgTapeCompilationCycleFallsBack();
   TestVectorLoadUsesCleanDependencies(false, true);

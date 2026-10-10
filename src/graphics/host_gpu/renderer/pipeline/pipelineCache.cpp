@@ -585,7 +585,7 @@ struct PipelineCache::ProgramCache {
 			    static_cast<unsigned long long>(resource_misses[static_cast<size_t>(ResourceMemo::Miss::ReadFailed)]),
 			    static_cast<unsigned long long>(resource_misses[static_cast<size_t>(ResourceMemo::Miss::MemoryChanged)]));
 			const auto tape = ShaderRecompiler::IR::GetSrtTapeStats();
-			std::printf("NHL27SRTTAPE: runs=%llu failed=%llu walker=%llu built=%llu unsupported=%llu ops=%llu cfg_roots=%llu cfg_fallback=%llu\n",
+			std::printf("NHL27SRTTAPE: runs=%llu failed=%llu walker=%llu built=%llu unsupported=%llu ops=%llu cfg_roots=%llu cfg_fallback=%llu cfg_checked=%llu cfg_matched=%llu cfg_mismatch=%llu cfg_inconclusive=%llu\n",
 			    static_cast<unsigned long long>(tape.runs),
 			    static_cast<unsigned long long>(tape.failed),
 			    static_cast<unsigned long long>(tape.walker),
@@ -593,7 +593,11 @@ struct PipelineCache::ProgramCache {
 			    static_cast<unsigned long long>(tape.unsupported),
 			    static_cast<unsigned long long>(tape.ops),
 			    static_cast<unsigned long long>(tape.cfg_runs),
-			    static_cast<unsigned long long>(tape.cfg_fallback));
+			    static_cast<unsigned long long>(tape.cfg_fallback),
+			    static_cast<unsigned long long>(tape.cfg_checked),
+			    static_cast<unsigned long long>(tape.cfg_matched),
+			    static_cast<unsigned long long>(tape.cfg_mismatch),
+			    static_cast<unsigned long long>(tape.cfg_inconclusive));
 		}
 		last_stats = now;
 	}

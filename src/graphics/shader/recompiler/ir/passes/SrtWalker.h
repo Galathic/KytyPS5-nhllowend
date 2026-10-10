@@ -37,6 +37,10 @@ struct SrtTapeStats {
 	uint64_t ops = 0;           // total ops executed
 	uint64_t cfg_runs = 0;      // supported CFG roots demanded (including memo hits)
 	uint64_t cfg_fallback = 0;  // roots evaluated recursively; unsupported or flag off
+	uint64_t cfg_checked = 0;  // CFG refreshes entering immutable-read verification
+	uint64_t cfg_matched = 0;  // fully covered matching recursive refreshes
+	uint64_t cfg_mismatch = 0; // fully covered mismatch; validated recursive fallback
+	uint64_t cfg_inconclusive = 0; // rejected refresh: no safe captured-only comparison
 	std::array<uint64_t, 8> reject {}; // rejection reasons, see SrtTapeRejectName
 };
 SrtTapeStats GetSrtTapeStats();
@@ -69,6 +73,7 @@ private:
 	// 1 = refreshed, 0 = failed (same as walker), -1 = tape not applicable.
 	int  RunTape(std::vector<uint32_t>& flat);
 	void PrepareCfgTape();
+	bool VerifyCfgRefresh(std::vector<uint32_t>& flat);
 	int RunCfgRoot(uint32_t root, uint32_t& result);
 	bool ExecuteTapeOp(const ResourcePlan::SrtTape::Op& op, std::vector<uint64_t>& values,
 	                   uint32_t index);
@@ -79,6 +84,7 @@ private:
 	SrtWalker*                      m_clean_evaluator = nullptr;
 	Value                           m_active_mask;
 	bool                            m_skip_tape = false;
+	bool                            m_cfg_verifying = false;
 	uint64_t                        m_cycle_count = 0;
 	ResourcePlan::EvaluationContext& m_context;
 };

@@ -45,7 +45,21 @@ struct TapeReadRecord {
 struct TapeReadCapture {
 	SrtRuntime source;
 	std::vector<TapeReadRecord> reads;
+	SrtRuntime clean_source;
 };
+
+template <bool specialization>
+bool CaptureCleanTapeRead(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	auto& capture = *static_cast<TapeReadCapture*>(userdata);
+	const auto& source = capture.clean_source;
+	TapeReadRecord read {.address = address, .strict = true};
+	read.values.resize(values.size());
+	const auto reader = specialization ? source.read_specialization_memory : source.read_memory;
+	read.valid = reader != nullptr && reader(source.userdata, address, values);
+	std::ranges::copy(values, read.values.begin());
+	capture.reads.push_back(std::move(read));
+	return capture.reads.back().valid;
+}
 
 template <bool strict>
 bool CaptureTapeRead(void* userdata, uint64_t address, std::span<uint32_t> values) {
@@ -109,6 +123,7 @@ struct TapeInstKeyHash {
 struct GlobalTapeStats {
 	std::atomic<uint64_t> runs {0}, failed {0}, walker {0}, built {0}, unsupported {0}, ops {0};
 	std::atomic<uint64_t> cfg_runs {0}, cfg_fallback {0};
+	std::atomic<uint64_t> cfg_checked {0}, cfg_matched {0}, cfg_mismatch {0}, cfg_inconclusive {0};
 	std::array<std::atomic<uint64_t>, 8> reject {};
 } g_tape_stats;
 
@@ -1161,7 +1176,185 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 	return true;
 }
 
+bool SrtWalker::VerifyCfgRefresh(std::vector<uint32_t>& flat) {
+	g_tape_stats.cfg_checked.fetch_add(1, std::memory_order_relaxed);
+	const auto disable = [&](const char* reason, bool fallback) {
+		(fallback ? g_tape_stats.cfg_mismatch : g_tape_stats.cfg_inconclusive).fetch_add(1, std::memory_order_relaxed);
+		for (auto& tape: m_program.cfg_srt_tapes) tape.state = ResourcePlan::SrtTape::State::Unsupported;
+		std::fprintf(stderr,
+		             "SRT CFG verify disabled shader=0x%016llx stage=%u reason=%s recursive_fallback=%u\n",
+		             static_cast<unsigned long long>(m_program.shader_hash),
+		             static_cast<unsigned>(m_program.stage), reason, fallback ? 1u : 0u);
+		std::fflush(stderr);
+	};
+	// Op.clean names the strict domain of this runtime. A caller-supplied clean
+	// evaluator with different inputs/readers cannot share that capture domain.
+	// Reject it rather than treating one callback's values as another's evidence.
+	if (m_clean_evaluator != nullptr) {
+		const auto expected = CleanRuntime(m_runtime);
+		const auto& actual = m_clean_evaluator->m_runtime;
+		if (actual.userdata != expected.userdata || actual.read_memory != expected.read_memory ||
+		    actual.read_specialization_memory != expected.read_specialization_memory ||
+		    actual.shader_base != expected.shader_base ||
+		    actual.user_data.data() != expected.user_data.data() || actual.user_data.size() != expected.user_data.size() ||
+		    actual.workgroup_counts.data() != expected.workgroup_counts.data() ||
+		    actual.workgroup_counts.size() != expected.workgroup_counts.size()) {
+			disable("distinct_clean_runtime", false);
+			return false;
+		}
+	}
+	ResourcePlan::EvaluationContext initial;
+	initial.values = m_context.values;
+	initial.generation = m_context.generation;
+	initial.refreshed_flat = m_context.refreshed_flat;
+	ResourcePlan::EvaluationContext initial_clean;
+	if (m_clean_evaluator != nullptr) {
+		initial_clean.values = m_clean_evaluator->m_context.values;
+		initial_clean.generation = m_clean_evaluator->m_context.generation;
+		initial_clean.refreshed_flat = m_clean_evaluator->m_context.refreshed_flat;
+	}
+	const auto original_flat = flat;
+	const auto original_active = m_program.active_sources;
+	const auto original_cycles = m_cycle_count;
+	const auto original_clean_cycles = m_clean_evaluator != nullptr ? m_clean_evaluator->m_cycle_count : 0;
+	const auto restore_inputs = [&] {
+		m_context.values = initial.values;
+		m_context.refreshed_flat = initial.refreshed_flat;
+		m_cycle_count = original_cycles;
+		if (m_clean_evaluator != nullptr) {
+			m_clean_evaluator->m_context.values = initial_clean.values;
+			m_clean_evaluator->m_context.refreshed_flat = initial_clean.refreshed_flat;
+			m_clean_evaluator->m_cycle_count = original_clean_cycles;
+		}
+	};
+	TapeReadCapture capture {.source = m_runtime};
+	auto observed = m_runtime;
+	observed.userdata = &capture;
+	observed.read_memory = CaptureTapeRead<false>;
+	observed.read_specialization_memory = m_runtime.read_specialization_memory != nullptr
+	                                         ? CaptureTapeRead<true> : nullptr;
+	const auto original_runtime = m_runtime;
+	SrtRuntime original_clean_runtime;
+	if (m_clean_evaluator != nullptr) {
+		original_clean_runtime = m_clean_evaluator->m_runtime;
+		capture.clean_source = original_clean_runtime;
+		auto observed_clean = original_clean_runtime;
+		observed_clean.userdata = &capture;
+		observed_clean.read_memory = CaptureCleanTapeRead<false>;
+		observed_clean.read_specialization_memory = original_clean_runtime.read_specialization_memory != nullptr
+		                                              ? CaptureCleanTapeRead<true> : nullptr;
+		m_clean_evaluator->m_runtime = observed_clean;
+	}
+	m_runtime = observed;
+	m_cfg_verifying = true;
+	const bool tape_ok = RefreshFlatBuffer(flat);
+	m_cfg_verifying = false;
+	m_runtime = original_runtime;
+	if (m_clean_evaluator != nullptr) m_clean_evaluator->m_runtime = original_clean_runtime;
+	const auto tape_active = m_program.active_sources;
+	// Observed readers are always callbacks, even when the original reader is
+	// absent, so capture can never fall through to direct-pointer memory. Pure
+	// arithmetic CFGs still verify without a reader; attempted opaque reads fail.
+	if (original_runtime.read_memory == nullptr &&
+	    std::ranges::any_of(capture.reads, [](const auto& read) { return !read.strict; })) {
+		restore_inputs();
+		flat = original_flat;
+		m_program.active_sources = original_active;
+		disable("missing_capture_reader", false);
+		return false;
+	}
+	if (!HasStableTapeReads(capture.reads)) {
+		restore_inputs();
+		flat = original_flat;
+		m_program.active_sources = original_active;
+		disable("unstable_capture", false);
+		return false;
+	}
+
+	TapeReadReplay replay {.reads = capture.reads};
+	auto replay_runtime = original_runtime;
+	replay_runtime.userdata = &replay;
+	// Even an absent reader is represented by a rejecting replay callback: there
+	// must never be a direct-pointer fallback inside this verifier.
+	replay_runtime.read_memory = ReplayTapeRead<false>;
+	replay_runtime.read_specialization_memory = original_runtime.read_specialization_memory != nullptr
+	                                            ? ReplayTapeRead<true> : nullptr;
+	SrtWalker replay_clean(m_program, CleanRuntime(replay_runtime), {}, nullptr,
+	                       m_clean_evaluator != nullptr ? m_clean_evaluator->m_active_mask : Value{}, true);
+	SrtWalker replay_walker(m_program, replay_runtime, m_clean_flat_slots,
+	                        m_clean_evaluator != nullptr ? &replay_clean : nullptr, m_active_mask, true);
+	// Values evaluated before RefreshFlatBuffer are inputs, not evidence newly
+	// produced by the tape. Seed their exact domains into fresh replay sessions.
+	TransferCurrentEvaluationValues(initial, replay_walker.m_context);
+	if (m_clean_evaluator != nullptr) TransferCurrentEvaluationValues(initial_clean, replay_clean.m_context);
+	const auto seed_in_progress = [](const auto& source, auto& destination) {
+		if (destination.values.size() < source.values.size()) destination.values.resize(source.values.size());
+		for (size_t index = 0; index < source.values.size(); ++index) {
+			if (source.values[index].generation == (source.generation | 1u)) {
+				destination.values[index] = {.value = source.values[index].value,
+				                             .generation = destination.generation | 1u};
+			}
+		}
+	};
+	seed_in_progress(initial, replay_walker.m_context);
+	if (m_clean_evaluator != nullptr) seed_in_progress(initial_clean, replay_clean.m_context);
+	std::vector<uint32_t> recursive_flat;
+	const bool recursive_ok = replay_walker.RefreshFlatBuffer(recursive_flat);
+	const auto recursive_active = m_program.active_sources;
+	bool mismatch = tape_ok != recursive_ok || flat != recursive_flat || tape_active != recursive_active;
+	const auto& tape = m_program.cfg_srt_tapes[m_clean_evaluator != nullptr ? 1 : 0];
+	if (!replay.inconclusive && tape_ok && recursive_ok) {
+		for (size_t index = 0; index < tape.ops.size(); ++index) {
+			const auto& op = tape.ops[index];
+			if (op.source == nullptr || op.memo_index == UINT32_MAX) continue;
+			const auto& context = op.clean && m_clean_evaluator != nullptr ? m_clean_evaluator->m_context : m_context;
+			if (op.memo_index >= context.values.size() ||
+			    context.values[op.memo_index].generation != context.generation) continue;
+			auto& evaluator = op.clean && m_clean_evaluator != nullptr ? replay_clean : replay_walker;
+			uint64_t recursive_value = 0;
+			const bool evaluated = evaluator.EvaluateWide(Value(const_cast<Inst*>(op.source)), recursive_value);
+			if (!evaluated || recursive_value != context.values[op.memo_index].value) {
+				mismatch = true;
+				std::fprintf(stderr,
+				             "SRT CFG verify op shader=0x%016llx index=%zu opcode=%u clean=%u tape=0x%016llx recursive=%s0x%016llx\n",
+				             static_cast<unsigned long long>(m_program.shader_hash), index,
+				             static_cast<unsigned>(op.opcode), op.clean,
+				             static_cast<unsigned long long>(context.values[op.memo_index].value),
+				             evaluated ? "" : "failed/", static_cast<unsigned long long>(recursive_value));
+				break;
+			}
+		}
+	}
+	if (replay.inconclusive) {
+		restore_inputs();
+		flat = original_flat;
+		m_program.active_sources = original_active;
+		disable("unmatched_replay", false);
+		return false;
+	}
+	if (mismatch) {
+		restore_inputs();
+		TransferCurrentEvaluationValues(replay_walker.m_context, m_context);
+		if (m_clean_evaluator != nullptr) TransferCurrentEvaluationValues(replay_clean.m_context, m_clean_evaluator->m_context);
+		flat = std::move(recursive_flat);
+		m_context.refreshed_flat = nullptr;
+		if (m_clean_evaluator != nullptr) m_clean_evaluator->m_context.refreshed_flat = nullptr;
+		m_program.active_sources = recursive_active;
+		disable("value_or_activation_mismatch", true);
+		return recursive_ok;
+	}
+	m_program.active_sources = tape_active;
+	g_tape_stats.cfg_matched.fetch_add(1, std::memory_order_relaxed);
+	return tape_ok;
+}
+
 bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
+	if (!m_program.control_flow.empty() && !m_skip_tape && !m_cfg_verifying &&
+	    CfgTapeEnabled() && SrtTapeVerifyEnabled() &&
+	    m_program.cfg_srt_tapes[m_clean_evaluator != nullptr ? 1 : 0].state !=
+	        ResourcePlan::SrtTape::State::Unsupported) {
+		return VerifyCfgRefresh(flat);
+	}
 	m_context.refreshed_flat = nullptr;
 	if (!m_program.srt_plan_complete) return false;
 	if (!m_program.control_flow.empty()) PrepareCfgTape();
@@ -1489,6 +1682,10 @@ SrtTapeStats GetSrtTapeStats() {
 	s.ops = g_tape_stats.ops.load(std::memory_order_relaxed);
 	s.cfg_runs = g_tape_stats.cfg_runs.load(std::memory_order_relaxed);
 	s.cfg_fallback = g_tape_stats.cfg_fallback.load(std::memory_order_relaxed);
+	s.cfg_checked = g_tape_stats.cfg_checked.load(std::memory_order_relaxed);
+	s.cfg_matched = g_tape_stats.cfg_matched.load(std::memory_order_relaxed);
+	s.cfg_mismatch = g_tape_stats.cfg_mismatch.load(std::memory_order_relaxed);
+	s.cfg_inconclusive = g_tape_stats.cfg_inconclusive.load(std::memory_order_relaxed);
 	for (size_t i = 0; i < s.reject.size(); ++i) {
 		s.reject[i] = g_tape_stats.reject[i].load(std::memory_order_relaxed);
 	}
