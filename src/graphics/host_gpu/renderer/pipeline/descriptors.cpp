@@ -951,11 +951,12 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 			if (IsSrtTapeVerifyEnabled() && !m_context.IsMapped(address, size) &&
 			    ShouldLogUnmappedBuffer({program.shader_hash, address, size, resource, program.stage})) {
 				const auto& raw = snapshot.buffers[resource];
-				LOGF("GPU buffer descriptor range not fully mapped stage=%u shader=0x%016" PRIx64
+				std::fprintf(stderr, "GPU buffer descriptor range not fully mapped stage=%u shader=0x%016" PRIx64
 				     " resource=%u addr=0x%016" PRIx64 " size=0x%016" PRIx64
 				     " records=%u dwords=%08x,%08x,%08x,%08x\n",
 				     static_cast<unsigned>(program.stage), program.shader_hash, resource, address, size,
 				     descriptor.NumRecords(), raw.dwords[0], raw.dwords[1], raw.dwords[2], raw.dwords[3]);
+				std::fflush(stderr);
 			}
 			size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
 			prepared.buffer_sources.push_back({address, size, cache.FindBuffer(address, size)});

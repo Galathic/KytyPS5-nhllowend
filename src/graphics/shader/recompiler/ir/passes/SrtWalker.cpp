@@ -106,7 +106,13 @@ struct TapeInstKeyHash {
 	}
 };
 
-enum class TapeVerifyLogKind : uint8_t { UnstableReads, UnmatchedReplay, Mismatch };
+enum class TapeVerifyLogKind : uint8_t {
+	UnstableReads,
+	UnmatchedReplay,
+	Mismatch,
+	OpUnmatchedReplay,
+	OpMismatch
+};
 
 struct TapeVerifyLogKey {
 	const ResourcePlan* plan;
@@ -1186,9 +1192,90 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 						             "SRT tape verify inconclusive shader=0x%016llx stage=%u base=0x%016llx: captured reads changed during tape\n",
 						             static_cast<unsigned long long>(m_program.shader_hash),
 						             static_cast<unsigned>(m_program.stage),
-						             static_cast<unsigned long long>(m_runtime.shader_base));
+					             static_cast<unsigned long long>(m_runtime.shader_base));
 					}
 				} else {
+					// Compare each compiled op against the recursive evaluator using only
+					// the immutable reads captured by this Tape execution. Keep these fresh
+					// contexts separate from the production contexts and from whole-plan replay.
+					TapeReadReplay op_replay {.reads = capture.reads};
+					auto op_runtime = m_runtime;
+					op_runtime.userdata = &op_replay;
+					op_runtime.read_memory = ReplayTapeRead<false>;
+					op_runtime.read_specialization_memory = ReplayTapeRead<true>;
+					SrtWalker op_clean(m_program, CleanRuntime(op_runtime), {}, nullptr, {}, true);
+					SrtWalker op_walker(m_program, op_runtime, m_clean_flat_slots,
+					                    m_clean_evaluator != nullptr ? &op_clean : nullptr, {}, true);
+					auto saved_op_active_sources = m_program.active_sources;
+					const auto& tape_values = m_program.srt_tape_values;
+					for (size_t op_index = 0; op_index < tape.ops.size() && op_index < tape_values.size();
+					     ++op_index) {
+						const auto& op = tape.ops[op_index];
+						if (op.source == nullptr) continue;
+						uint64_t walker_value = 0;
+						auto& evaluator = op.clean != 0u ? op_clean : op_walker;
+						const bool walker_ok = evaluator.EvaluateWide(
+						    Value(const_cast<Inst*>(op.source)), walker_value);
+						if (op_replay.inconclusive) {
+							if (ShouldLogTapeVerify(m_program, TapeVerifyLogKind::OpUnmatchedReplay)) {
+								std::fprintf(stderr,
+								             "SRT tape op verify inconclusive shader=0x%016llx stage=%u base=0x%016llx op=%zu opcode=%u memo=%u request=%s:0x%016llx words=%zu captured=%zu\n",
+								             static_cast<unsigned long long>(m_program.shader_hash),
+								             static_cast<unsigned>(m_program.stage),
+								             static_cast<unsigned long long>(m_runtime.shader_base), op_index,
+								             static_cast<unsigned>(op.opcode), op.memo_index,
+								             op_replay.unmatched_strict ? "strict" : "ordinary",
+								             static_cast<unsigned long long>(op_replay.unmatched_address),
+								             op_replay.unmatched_words, capture.reads.size());
+								std::array<size_t, 3> nearest {SIZE_MAX, SIZE_MAX, SIZE_MAX};
+								std::array<uint64_t, 3> distances {UINT64_MAX, UINT64_MAX, UINT64_MAX};
+								for (size_t read_index = 0; read_index < capture.reads.size(); ++read_index) {
+									const auto& read = capture.reads[read_index];
+									const auto distance = read.address > op_replay.unmatched_address
+									                         ? read.address - op_replay.unmatched_address
+									                         : op_replay.unmatched_address - read.address;
+									for (size_t near_index = 0; near_index < nearest.size(); ++near_index) {
+										if (distance >= distances[near_index]) continue;
+										for (size_t move = nearest.size() - 1; move > near_index; --move) {
+											distances[move] = distances[move - 1];
+											nearest[move] = nearest[move - 1];
+										}
+										distances[near_index] = distance;
+										nearest[near_index] = read_index;
+										break;
+									}
+								}
+								for (size_t near_index = 0; near_index < nearest.size(); ++near_index) {
+									if (nearest[near_index] == SIZE_MAX) continue;
+									const auto& read = capture.reads[nearest[near_index]];
+									std::fprintf(stderr,
+									             "SRT tape op verify captured domain=%s addr=0x%016llx words=%zu valid=%u first=0x%08x distance=0x%llx\n",
+									             read.strict ? "strict" : "ordinary",
+									             static_cast<unsigned long long>(read.address), read.values.size(),
+									             read.valid ? 1u : 0u,
+									             read.values.empty() ? 0u : read.values[0],
+									             static_cast<unsigned long long>(distances[near_index]));
+								}
+							}
+							break;
+						}
+						if (!walker_ok || walker_value != tape_values[op_index]) {
+							if (ShouldLogTapeVerify(m_program, TapeVerifyLogKind::OpMismatch)) {
+								std::fprintf(stderr,
+								             "SRT tape op mismatch shader=0x%016llx stage=%u base=0x%016llx op=%zu opcode=%u memo=%u tape=0x%016llx walker=%s0x%016llx\n",
+								             static_cast<unsigned long long>(m_program.shader_hash),
+								             static_cast<unsigned>(m_program.stage),
+								             static_cast<unsigned long long>(m_runtime.shader_base), op_index,
+								             static_cast<unsigned>(op.opcode), op.memo_index,
+								             static_cast<unsigned long long>(tape_values[op_index]),
+								             walker_ok ? "" : "failed/",
+								             static_cast<unsigned long long>(walker_value));
+							}
+							break;
+						}
+					}
+					m_program.active_sources = std::move(saved_op_active_sources);
+
 					TapeReadReplay replay {.reads = capture.reads};
 					auto saved_active_sources = m_program.active_sources;
 					auto replay_runtime = m_runtime;
@@ -1446,6 +1533,7 @@ bool BuildTapeForPlan(const ResourcePlan& plan, bool with_clean,
 		const auto opcode = inst->GetOpcode();
 		ResourcePlan::SrtTape::Op op;
 		op.opcode = opcode;
+		op.source = inst;
 		op.clean = is_clean ? 1 : 0;
 		op.memo_index = inst->EvaluationIndex(const_cast<ResourcePlan&>(plan).evaluation_value_count);
 
@@ -1471,7 +1559,7 @@ bool BuildTapeForPlan(const ResourcePlan& plan, bool with_clean,
 			uint32_t slot = slot_val.U32();
 			if (slot >= plan.srt_reads.size()) return -1;
 
-			bool target_clean = false;
+			bool target_clean = is_clean;
 			if (slot < clean_flat_slots.size() && clean_flat_slots[slot] != 0u && with_clean) {
 				target_clean = true;
 			}
@@ -1493,12 +1581,17 @@ bool BuildTapeForPlan(const ResourcePlan& plan, bool with_clean,
 			}
 			op.kind = ResourcePlan::SrtTape::Kind::RawRead;
 			op.aux = inst->Flags<MemoryFlags>().index;
+			// Recursive LoadBufferU32 evaluation delegates the whole node to the
+			// clean evaluator when available. Keep this op's memo domain as requested,
+			// but evaluate all of its dependencies in that same clean domain.
+			const bool dependencies_clean =
+			    is_clean || (opcode == ValueOpcode::LoadBufferU32 && with_clean);
 
 			const auto* handle = inst->Arg(0).ResolveInstruction();
 			if (handle == nullptr) return -1;
-			int low_idx = emit_val(handle->Arg(0), is_clean);
-			int high_idx = emit_val(handle->Arg(1), is_clean);
-			int off_idx = emit_val(inst->Arg(1), is_clean);
+			int low_idx = emit_val(handle->Arg(0), dependencies_clean);
+			int high_idx = emit_val(handle->Arg(1), dependencies_clean);
+			int off_idx = emit_val(inst->Arg(1), dependencies_clean);
 			if (low_idx < 0 || high_idx < 0 || off_idx < 0) return -1;
 			op.args[0] = static_cast<uint32_t>(low_idx);
 			op.args[1] = static_cast<uint32_t>(high_idx);
@@ -1506,8 +1599,8 @@ bool BuildTapeForPlan(const ResourcePlan& plan, bool with_clean,
 
 			if (opcode == ValueOpcode::ReadConstBuffer || opcode == ValueOpcode::LoadBufferU32) {
 				if (handle->NumArgs() != 4u) return -1;
-				int rec_idx = emit_val(handle->Arg(2), is_clean);
-				int w3_idx = emit_val(handle->Arg(3), is_clean);
+				int rec_idx = emit_val(handle->Arg(2), dependencies_clean);
+				int w3_idx = emit_val(handle->Arg(3), dependencies_clean);
 				if (rec_idx < 0 || w3_idx < 0) return -1;
 				op.args[3] = static_cast<uint32_t>(rec_idx);
 				op.args[4] = static_cast<uint32_t>(w3_idx);
@@ -1663,7 +1756,8 @@ int SrtWalker::RunTape(std::vector<uint32_t>& flat) {
 		const char* val = std::getenv("KYTY_SRT_TAPE");
 		return val == nullptr || val[0] != '0';
 	}();
-	if (!tape_enabled || !m_active_mask.IsEmpty()) {
+	if (!tape_enabled || !m_active_mask.IsEmpty() ||
+	    (m_clean_evaluator != nullptr && !m_clean_evaluator->m_active_mask.IsEmpty())) {
 		g_tape_stats.walker.fetch_add(1, std::memory_order_relaxed);
 		return -1;
 	}

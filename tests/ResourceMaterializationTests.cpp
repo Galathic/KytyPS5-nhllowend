@@ -694,6 +694,14 @@ void TestTapeVerifyReplaysReaderDomains() {
             flat == std::vector<uint32_t>{0x12345678u, 0x87654321u} &&
             reads.ordinary == 1u && reads.strict == 1u,
         "tape verifier reread memory or crossed ordinary/strict reader domains");
+  bool has_scalar_source = false;
+  bool has_vector_source = false;
+  for (const auto &op : plan.srt_tapes[0].ops) {
+    has_scalar_source |= op.source == &scalar_read;
+    has_vector_source |= op.source == &vector_read;
+  }
+  Check(has_scalar_source && has_vector_source,
+        "Tape verifier lost source instruction provenance");
 
   reads = {};
   auto failed_runtime = runtime;
@@ -828,6 +836,77 @@ void TestTapeSeparatesCleanAndOrdinaryReadDomains() {
         "Tape published a read result into the wrong evaluator memo domain");
 }
 
+void TestVectorLoadUsesCleanDependencies(bool through_read_const) {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  ResourcePlan plan;
+  plan.stage = Libs::Graphics::ShaderType::Compute;
+  plan.srt_plan_complete = plan.resource_tracking_complete = true;
+  plan.memory_info.push_back({.kind = ResourceKind::ScalarAddress, .planning_only = true});
+  plan.memory_info.push_back({.kind = ResourceKind::Buffer, .data_dwords = 1,
+                              .data_bits = 32});
+
+  auto &scalar_handle = plan.value_storage.emplace_back(ValueOpcode::GetAddressResource);
+  scalar_handle.SetArg(0, Value(0x2000u));
+  scalar_handle.SetArg(1, Value(0u));
+  auto &address_word = plan.value_storage.emplace_back(ValueOpcode::LoadAddressU32);
+  address_word.SetFlags(MemoryFlags{.index = 0});
+  address_word.SetArg(0, Value(&scalar_handle));
+  address_word.SetArg(1, Value(0u));
+  address_word.SetArg(2, Value(0u));
+  address_word.SetArg(3, Value(true));
+  Value low(&address_word);
+  if (through_read_const) {
+    auto &srt = plan.value_storage.emplace_back(ValueOpcode::GetSrtResource);
+    auto &read_const = plan.value_storage.emplace_back(ValueOpcode::ReadConst);
+    read_const.SetArg(0, Value(&srt));
+    read_const.SetArg(1, Value(0u));
+    low = Value(&read_const);
+  }
+
+  auto &buffer_handle = plan.value_storage.emplace_back(ValueOpcode::GetBufferResource);
+  buffer_handle.SetArg(0, low);
+  buffer_handle.SetArg(1, Value(4u << 16u));
+  buffer_handle.SetArg(2, Value(1u));
+  buffer_handle.SetArg(3, Value(0x16204u));
+  auto &vector_read = plan.value_storage.emplace_back(ValueOpcode::LoadBufferU32);
+  vector_read.SetFlags(MemoryFlags{.index = 1});
+  vector_read.SetArg(0, Value(&buffer_handle));
+  vector_read.SetArg(1, Value(0u));
+  vector_read.SetArg(2, Value(0u));
+  vector_read.SetArg(3, Value(0u));
+  vector_read.SetArg(4, Value(true));
+  plan.srt_reads.push_back({Value(&address_word), 0u});
+  plan.srt_reads.push_back({Value(&vector_read), 1u});
+
+  struct Reads { uint32_t ordinary = 0; uint32_t strict = 0; } reads;
+  const SrtRuntime runtime{
+      .read_memory = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+        ++static_cast<Reads *>(data)->ordinary;
+        if (address != 0x2000u || words.size() != 1u) return false;
+        words[0] = 0x3000u;
+        return true;
+      },
+      .userdata = &reads,
+      .read_specialization_memory = +[](void *data, uint64_t address,
+                                        std::span<uint32_t> words) {
+        ++static_cast<Reads *>(data)->strict;
+        if (words.size() != 1u) return false;
+        if (address == 0x2000u) words[0] = 0x4000u;
+        else if (address == 0x3000u) words[0] = 0xaaaaaaaau;
+        else if (address == 0x4000u) words[0] = 0xbbbbbbbbu;
+        else return false;
+        return true;
+      }};
+  SrtWalker clean(plan, CleanRuntime(runtime));
+  SrtWalker walker(plan, runtime, {}, &clean);
+  std::vector<uint32_t> flat;
+  Check(walker.RefreshFlatBuffer(flat) &&
+            flat == std::vector<uint32_t>{0x3000u, 0xbbbbbbbbu},
+        through_read_const
+            ? "clean vector-load ReadConst dependency used the ordinary reader"
+            : "clean vector-load address dependency used the ordinary reader");
+}
+
 void TestTapeUnsupportedRootFallsBack() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   ResourcePlan plan;
@@ -846,6 +925,41 @@ void TestTapeUnsupportedRootFallsBack() {
   Check(SrtWalker(plan, {}).RefreshFlatBuffer(flat) &&
             flat == std::vector<uint32_t>{0x11111111u, 0x22222222u},
         "unsupported Tape root did not fall back to the recursive evaluator");
+}
+
+void TestTapePreservesWideMemoryIndex() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  ResourcePlan plan;
+  plan.stage = Libs::Graphics::ShaderType::Compute;
+  plan.srt_plan_complete = plan.resource_tracking_complete = true;
+  plan.memory_info.resize(257);
+  plan.memory_info[0] = {.kind = ResourceKind::ScalarAddress, .offset = 0,
+                        .planning_only = true};
+  plan.memory_info[256] = {.kind = ResourceKind::ScalarAddress, .offset = 4,
+                           .planning_only = true};
+  auto &handle = plan.value_storage.emplace_back(ValueOpcode::GetAddressResource);
+  handle.SetArg(0, Value(0x2000u));
+  handle.SetArg(1, Value(0u));
+  auto &read = plan.value_storage.emplace_back(ValueOpcode::LoadAddressU32);
+  read.SetFlags(MemoryFlags{.index = 256});
+  read.SetArg(0, Value(&handle));
+  read.SetArg(1, Value(0u));
+  read.SetArg(2, Value(0u));
+  read.SetArg(3, Value(true));
+  plan.srt_reads.push_back({Value(&read), 0u});
+
+  const SrtRuntime runtime{
+      .read_memory = +[](void *, uint64_t address, std::span<uint32_t> words) {
+        if (words.size() != 1u) return false;
+        if (address == 0x2000u) words[0] = 0x11111111u;
+        else if (address == 0x2004u) words[0] = 0x22222222u;
+        else return false;
+        return true;
+      }};
+  std::vector<uint32_t> flat;
+  Check(SrtWalker(plan, runtime).RefreshFlatBuffer(flat) &&
+            flat == std::vector<uint32_t>{0x22222222u},
+        "Tape truncated a 32-bit memory-info index");
 }
 
 void TestExactReciprocalDescriptorArithmetic() {
@@ -1124,7 +1238,10 @@ void DbgExit(int) { std::abort(); }
 } // namespace Common
 
 int main() {
+  TestTapePreservesWideMemoryIndex();
   TestTapeUnsupportedRootFallsBack();
+  TestVectorLoadUsesCleanDependencies(false);
+  TestVectorLoadUsesCleanDependencies(true);
   TestTapeSeparatesCleanAndOrdinaryReadDomains();
   TestTapeVerifyReplaysReaderDomains();
   TestTapeVerifyMismatchFallbackAndUnmatchedReplay();

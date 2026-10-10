@@ -623,9 +623,10 @@ struct ResourcePlan {
 		enum class Kind : uint8_t { Immediate, UserData, ShaderBase, Inst, RawRead };
 		struct Op {
 			ValueOpcode             opcode {};
+			const Inst*             source = nullptr;
 			Kind                    kind       = Kind::Immediate;
 			uint8_t                 clean      = 0;
-			uint8_t                 aux        = 0;
+			uint32_t                aux        = 0;
 			uint32_t                memo_index = UINT32_MAX;
 			std::array<uint32_t, 5> args {};
 			uint64_t                imm = 0;
