@@ -141,6 +141,10 @@ void RenderContext::PrepareBda() {
 		const char* value = std::getenv("KYTY_PERF_STATS");
 		return value != nullptr && value[0] == '1';
 	}();
+	static const bool dirty_regions = [] {
+		const char* value = std::getenv("KYTY_BDA_DIRTY_REGIONS");
+		return value != nullptr && value[0] == '1' && value[1] == '\0';
+	}();
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	const auto cpu = m_buffer_cache.CpuModificationGeneration();
 	const auto registrations = m_buffer_cache.RegistrationGeneration();
@@ -151,9 +155,16 @@ void RenderContext::PrepareBda() {
 		++m_bda_stats.reused;
 	} else {
 		++m_bda_stats.scans;
-		m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
-			m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
-		});
+		if (cache_enabled && dirty_regions) {
+			const bool full = m_mapping_generation != m_bda_mapping_generation;
+			m_bda_stats.full_scans += full;
+			m_bda_stats.dirty_regions += m_buffer_cache.SynchronizeBuffersInRanges(m_mapped_ranges, full);
+		} else {
+			++m_bda_stats.full_scans;
+			m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
+				m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
+			});
+		}
 		// Save the pre-scan stamps: a CPU write concurrent with the scan must force
 		// another scan, even if it targets a range we already visited.
 		m_bda_cpu_generation = cpu;
@@ -166,9 +177,11 @@ void RenderContext::PrepareBda() {
 		static auto last = std::chrono::steady_clock::now();
 		const auto now = std::chrono::steady_clock::now();
 		if (now - last >= std::chrono::seconds(5)) {
-			std::printf("NHL27BDA: cache=%d scans=%llu reused=%llu\n", cache_enabled,
+			std::printf("NHL27BDA: cache=%d regions=%d scans=%llu reused=%llu full_scans=%llu dirty_regions=%llu\n", cache_enabled, dirty_regions,
 			            static_cast<unsigned long long>(m_bda_stats.scans),
-			            static_cast<unsigned long long>(m_bda_stats.reused));
+			            static_cast<unsigned long long>(m_bda_stats.reused),
+			            static_cast<unsigned long long>(m_bda_stats.full_scans),
+			            static_cast<unsigned long long>(m_bda_stats.dirty_regions));
 			last = now;
 		}
 	}

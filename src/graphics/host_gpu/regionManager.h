@@ -132,6 +132,9 @@ public:
 	}
 
 	TrackingSpinLock lock;
+	// Intrusive pending-upload list: fault handlers never allocate or take a queue mutex.
+	std::atomic_bool cpu_dirty_queued {false};
+	RegionManager* cpu_dirty_next = nullptr;
 
 private:
 	template <bool track, bool is_read>

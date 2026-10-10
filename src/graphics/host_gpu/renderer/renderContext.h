@@ -54,7 +54,10 @@ public:
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               PrepareBda();
-	struct BdaPreparationStats { uint64_t scans = 0; uint64_t reused = 0; };
+	struct BdaPreparationStats {
+		uint64_t scans = 0; uint64_t reused = 0;
+		uint64_t full_scans = 0; uint64_t dirty_regions = 0;
+	};
 	// Access only on the serialized GPU command lane.
 	[[nodiscard]] BdaPreparationStats GetBdaPreparationStats() const noexcept { return m_bda_stats; }
 	void               RunGarbageCollector();

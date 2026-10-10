@@ -47,6 +47,7 @@ using Libs::Graphics::MemoryTracker;
 using Libs::Graphics::PageManager;
 using Libs::Graphics::RangeSet;
 using Libs::Graphics::TRACKER_ADDRESS_SIZE;
+using Libs::Graphics::TRACKER_REGION_SIZE;
 
 void Check(bool value, const char *text) {
   if (!value) {
@@ -404,6 +405,75 @@ void TestCpuModificationGeneration() {
   Check(tracker.CpuModificationGeneration() != generation,
         "untracking did not invalidate preparation");
   Release(memory);
+}
+
+void TestCpuDirtyRegionQueue() {
+  TrackerHarness harness;
+  auto& tracker = harness.tracker;
+  const auto size = harness.page_manager.GetPageSize();
+  auto* memory = Allocate(harness.page_manager, 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto region = address - address % TRACKER_REGION_SIZE;
+  auto drain = [&] {
+    return tracker.DrainCpuDirtyRegions([&](uint64_t base, uint64_t bytes) {
+      Check(base == region && bytes == TRACKER_REGION_SIZE, "wrong dirty region");
+    });
+  };
+  tracker.QueueCpuDirtyRange(address, size);
+  tracker.QueueCpuDirtyRange(address + size, size);
+  Check(drain() == 1 && drain() == 0, "initial region was lost or queued twice");
+  tracker.ForEachUploadRange(address, size * 2, false,
+      [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+  tracker.MarkRegionAsGpuModified(address, size);
+  tracker.UnmarkRegionAsGpuModified(address, size);
+  Check(drain() == 0, "GPU-only ownership queued a CPU upload");
+  tracker.InvalidateRegion(address, size, [] { Check(false, "clean invalidation flushed"); });
+  Check(tracker.DrainCpuDirtyRegions([&](uint64_t, uint64_t) {
+    // Simulate a write concurrent with a consumer processing this region.
+    std::thread writer([&] { tracker.MarkRegionAsCpuModified(address + size, size); });
+    writer.join();
+  }) == 1, "write fault did not queue its region");
+  Check(drain() == 1 && drain() == 0, "write during drain was lost");
+  tracker.UntrackMemory(address, size * 2);
+  Check(drain() == 1, "untracking did not queue CPU ownership");
+  tracker.QueueCpuDirtyRange(address, size);
+  Check(drain() == 1, "registration in an existing region was lost");
+  Release(memory);
+}
+
+void TestCpuDirtyQueueConcurrentProducers() {
+  TrackerHarness harness;
+  auto& tracker = harness.tracker;
+  // Queue-only operations do not touch host protection. Distinct guest regions
+  // exercise intrusive links as well as duplicate producers for the same node.
+  constexpr uint64_t base = 0x0000000200000000ull;
+  constexpr size_t count = 64;
+  std::atomic_bool done {false};
+  std::thread producer([&] {
+    for (size_t round = 0; round < 200; ++round)
+      for (size_t index = 0; index < count; ++index)
+        tracker.QueueCpuDirtyRange(base + index * TRACKER_REGION_SIZE, 4);
+    done.store(true, std::memory_order_release);
+  });
+  uint64_t seen = 0;
+  auto consume = [&] {
+    uint64_t batch = 0;
+    tracker.DrainCpuDirtyRegions([&](uint64_t address, uint64_t bytes) {
+      Check(bytes == TRACKER_REGION_SIZE && address >= base, "invalid queued region");
+      const auto index = (address - base) / TRACKER_REGION_SIZE;
+      Check(index < count && !(batch & (uint64_t{1} << index)), "duplicate or corrupt queue node");
+      batch |= uint64_t{1} << index;
+    });
+    seen |= batch;
+  };
+  while (!done.load(std::memory_order_acquire)) {
+    for (size_t index = 0; index < count; ++index)
+      tracker.QueueCpuDirtyRange(base + index * TRACKER_REGION_SIZE, 4);
+    consume();
+  }
+  producer.join();
+  consume();
+  Check(seen == UINT64_MAX, "concurrent drain lost a published region");
 }
 
 void TestCpuDirtyUpload() {
@@ -1166,6 +1236,8 @@ int main(int argc, char **argv) {
   TestQueriesDoNotRequireMappedOwnership();
   TestConcurrentRegionPublication();
   TestCpuModificationGeneration();
+  TestCpuDirtyRegionQueue();
+  TestCpuDirtyQueueConcurrentProducers();
   TestCpuDirtyUpload();
   TestCleanUploadPreservesOwnership();
   TestRangeInvalidation();
