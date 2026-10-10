@@ -96,6 +96,10 @@ bool VulkanValidationEnabled() {
 	return g_config->vulkan_validation_enabled;
 }
 
+bool PreGenEnabled() {
+	return g_config->pre_gen_enabled;
+}
+
 bool ShaderValidationEnabled() {
 	return g_config->shader_validation_enabled;
 }

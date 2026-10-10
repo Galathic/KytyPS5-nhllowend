@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineRecord.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
@@ -33,6 +34,8 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
+#include <filesystem>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -14388,6 +14391,104 @@ void TestNewShaderRecompilerStageInputInfo() {
   CheckSpirvBinaryValidates(ps_pos_y_result.spirv);
 }
 
+void TestSportsPixelQuad() {
+  const uint32_t shader[] = {
+      EncodeVop1(0x01, 1, 250), EncodeVop1Dpp(0, 0x1b),
+      EncodeExp0(0x00, 0x1), EncodeExp1(1, 0, 0, 0), EncodeSopp(0x01),
+  };
+  ShaderPixelInputInfo pixel{};
+  pixel.ps_pos_x = true;
+  pixel.ps_system_input_base = 0;
+  pixel.target_output_mode[0] = 1;
+  std::vector<uint32_t> previous_key;
+  for (bool enabled: {false, true}) {
+    pixel.pixel_quad_correct = enabled;
+    auto options = MakeCompileOptions(ShaderType::Pixel);
+    options.input_info.pixel = &pixel;
+    const auto result = RecompileForTest(shader, options);
+    CheckSpirvBinaryValidates(result.spirv);
+    size_t quads = 0;
+    for (size_t word = 5; word < result.spirv.size();) {
+      const auto count = result.spirv[word] >> 16;
+      Check(count != 0, "invalid quad test SPIR-V word count");
+      if ((result.spirv[word] & 0xffffu) == spv::OpGroupNonUniformQuadBroadcast) ++quads;
+      word += count;
+    }
+    Check(enabled ? quads >= 4 : quads == 0, "pixel quad path not controlled by static state");
+    const auto key = MakeStageStaticKey(pixel);
+    if (!enabled) previous_key = key;
+    else Check(previous_key != key, "pixel quad mode aliases old shader permutations");
+  }
+}
+
+void TestSportsRecordRoundTrip() {
+  const auto path = std::filesystem::temp_directory_path() /
+      ("kyty-sports-record-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+  {
+    PipelineRecord::RecordFile file;
+    PipelineRecord::Records records;
+    Check(file.Open(path, records), "cannot create shader record test file");
+    PipelineRecord::Program program;
+    program.stage = ShaderType::Pixel;
+    program.hash = 0x12345678;
+    program.code = {0xbf810000u};
+    program.raw_reads = {{0xdead0000, 7, 1}};
+    program.reads = {{0xbeef0000, 0, 0}};
+    program.pixel.ps_front_face_all_bits = true;
+    program.pixel.pixel_quad_correct = true;
+    program.pixel.target_shader_mask = 0x1234;
+    Check(file.AppendProgram(program) == 0, "shader ordinal is incorrect");
+    program = {};
+    program.stage = ShaderType::Compute;
+    program.compute.float_mode = 0x24;
+    program.compute.workgroup_counts[0] = 19;
+    program.compute.lds_storage = true;
+    Check(file.AppendProgram(program) == 1, "compute ordinal is incorrect");
+    program = {};
+    program.stage = ShaderType::Vertex;
+    program.vertex.wave_size = 32;
+    program.vertex.native_draw.registers = {8, 9, 10};
+    program.vertex.native_draw.indexed = true;
+    Check(file.AppendProgram(program) == 2, "vertex ordinal is incorrect");
+    PipelineRecord::GraphicsPipeline graphics;
+    graphics.vertex_program = 2;
+    graphics.pixel_program = 0;
+    file.AppendGraphicsPipeline(graphics);
+    file.AppendComputePipeline({1, {}});
+  }
+  {
+    // A crash during append must preserve the valid prefix.
+    auto* tail = std::fopen(path.string().c_str(), "ab");
+    Check(tail != nullptr, "cannot add incomplete shader record tail");
+    std::fputc(1, tail); std::fclose(tail);
+    PipelineRecord::RecordFile file;
+    PipelineRecord::Records records;
+    Check(file.Open(path, records) && records.programs.size() == 3 &&
+          records.graphics.size() == 1 && records.compute.size() == 1,
+          "shader record did not recover its complete prefix");
+    const auto& program = records.programs[0];
+    uint32_t value = 0;
+    Check(PipelineRecord::ReplayWords(program, 0xdead0000, {&value, 1}, false) && value == 7 &&
+          !PipelineRecord::ReplayWords(program, 0xbeef0000, {&value, 1}, true) &&
+          !PipelineRecord::ReplayWords(program, 0x1234567890, {&value, 1}, false) &&
+          !PipelineRecord::ReplayWords(program, 0xdead0000, {&value, 1}, true),
+          "warm-up accessed missing guest memory or mixed raw and strict readers");
+    Check(program.raw_reads.size() == 1 && program.raw_reads[0].value == 7 &&
+          program.reads.size() == 1 && program.reads[0].valid == 0 &&
+          program.pixel.ps_front_face_all_bits && program.pixel.pixel_quad_correct &&
+          program.pixel.target_shader_mask == 0x1234,
+          "warm-up record lost raw reads, validity or NHL-specific pixel state");
+    Check(records.programs[1].compute.float_mode == 0x24 &&
+          records.programs[1].compute.workgroup_counts[0] == 19 &&
+          records.programs[1].compute.lds_storage &&
+          records.programs[2].vertex.wave_size == 32 &&
+          records.programs[2].vertex.native_draw.registers[2] == 10 &&
+          records.programs[2].vertex.native_draw.indexed,
+          "warm-up record lost workgroup or native indirect shader metadata");
+  }
+  std::filesystem::remove(path);
+}
+
 void TestPixelFrontFaceEncoding() {
   // RDNA SPI_BARYC_CNTL.FRONT_FACE_ALL_BITS (bit 24) selects integer
   // 1/0. In float mode the same guest VGPR contains +1.0/-1.0 bits.
@@ -15188,6 +15289,13 @@ int main(int argc, char **argv) {
   EnsureConfigInitialized();
   if (argc == 2 && std::strcmp(argv[1], "--front-face-only") == 0) {
     TestPixelFrontFaceEncoding();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--sports-only") == 0) {
+    TestSportsPixelQuad();
+    TestSportsRecordRoundTrip();
+    TestPixelFrontFaceEncoding();
+    std::puts("Sports integration tests passed");
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--setpc-dword-only") == 0) {

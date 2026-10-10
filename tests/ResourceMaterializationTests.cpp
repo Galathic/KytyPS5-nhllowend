@@ -198,6 +198,33 @@ void TestResourceMemoTracksMemoryAndRuntime() {
         "non-resource register update failed to reuse resources or update push data");
 }
 
+void TestResourceMemoAlternatingObjects() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  // Alternating objects must reuse both entries, and still reject changed memory.
+  auto alternating_plan = UserDataBufferPlan();
+  ResourceSnapshot alternating_snapshot;
+  ResourceSpecialization alternating_specialization;
+  Libs::Graphics::ResourceMemo alternating_memo(16);
+  std::array<uint32_t, 2> registers{0x8000, 7};
+  SrtRuntime alternating_runtime{.user_data = registers};
+  bool alternating_reused = false;
+  for (uint32_t address: {0x8000u, 0x9000u, 0x8000u, 0x9000u}) {
+    registers[0] = address;
+    Check(alternating_memo.Refresh(alternating_plan, alternating_runtime,
+          alternating_snapshot, alternating_specialization, true, alternating_reused),
+          "alternating memo refresh failed");
+    Check(alternating_snapshot.buffers[0].dwords[0] == address,
+          "multi-entry memo restored the wrong object's descriptor");
+  }
+  Check(alternating_reused, "alternating objects did not reuse multiple entries");
+  registers[1] = 13;
+  Check(alternating_memo.Refresh(alternating_plan, alternating_runtime,
+        alternating_snapshot, alternating_specialization, true, alternating_reused) &&
+        alternating_reused && alternating_snapshot.user_data[1] == 13,
+        "multi-entry hit failed to refresh non-resource push registers");
+
+}
+
 void TestMappedSrtUsesDirectReaderByDefault() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   const uint32_t dword = 0x12345678;
@@ -678,6 +705,7 @@ void DbgExit(int) { std::abort(); }
 
 int main() {
   TestResourceMemoTracksMemoryAndRuntime();
+  TestResourceMemoAlternatingObjects();
   TestMappedSrtUsesDirectReaderByDefault();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestFailedRuntimeReadIsMemoizedPerRefresh();

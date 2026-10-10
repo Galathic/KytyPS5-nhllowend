@@ -744,6 +744,59 @@ uint32_t EmitUndefU1(EmitterState& state, const IR::Inst& inst) {
 uint32_t EmitDppMoveU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&      state    = ctx.state;
 	const auto flags    = inst.Flags<IR::DppMoveFlags>();
+	if (state.program.stage == ShaderType::Pixel && state.lane_count == 1 &&
+	    state.input_info.pixel != nullptr && state.input_info.pixel->pixel_quad_correct &&
+	    flags.control <= 0xffu) {
+		// Fragment quad IDs describe actual pixel neighbours, unlike subgroup lane IDs.
+		// Broadcast all four constant IDs so the operand is uniform even when the DPP
+		// permutation chooses a different source for each pixel. Preserve U32 bits exactly.
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniformQuad);
+		const auto frag = InputVariableForKind(state, IR::StageInputKind::FragCoord);
+		if (frag == 0) ctx.Fail(inst, "pixel quad move requires gl_FragCoord");
+		const auto axis = [&](uint32_t component) {
+			const auto ptr = state.builder.AllocateId();
+			const auto value = state.builder.AllocateId();
+			const auto floored = state.builder.AllocateId();
+			const auto integer = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpAccessChain,
+			    TypePointer(state, spv::StorageClassInput, TypeF32(state)), ptr, frag,
+			    ConstantU32(state, component));
+			state.builder.AddFunction(spv::OpLoad, TypeF32(state), value, ptr);
+			state.builder.AddFunction(spv::OpExtInst, TypeF32(state), floored,
+			    GlslStd450(state), GLSLstd450Floor, value);
+			state.builder.AddFunction(spv::OpConvertFToU, TypeU32(state), integer, floored);
+			return EmitBinaryU32(state, spv::OpBitwiseAnd, integer, ConstantU32(state, 1));
+		};
+		const auto x = axis(0), y = axis(1);
+		const auto own = EmitBinaryU32(state, spv::OpBitwiseOr, x,
+		    EmitBinaryU32(state, spv::OpShiftLeftLogical, y, ConstantU32(state, 1)));
+		const auto shift = EmitBinaryU32(state, spv::OpShiftLeftLogical, own, ConstantU32(state, 1));
+		const auto source = EmitBinaryU32(state, spv::OpBitwiseAnd,
+		    EmitBinaryU32(state, spv::OpShiftRightLogical, ConstantU32(state, flags.control), shift),
+		    ConstantU32(state, 3));
+		uint32_t selected = ConstantU32(state, 0);
+		for (uint32_t lane = 0; lane < 4; ++lane) {
+			const auto fetched = state.builder.AllocateId();
+			const auto matches = state.builder.AllocateId();
+			const auto result = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpGroupNonUniformQuadBroadcast, TypeU32(state),
+			    fetched, ConstantU32(state, spv::ScopeSubgroup), ctx.Arg(inst, 0), ConstantU32(state, lane));
+			uint32_t value = fetched;
+			if (!flags.fetch_inactive) {
+				const auto active = state.builder.AllocateId();
+				value = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpGroupNonUniformQuadBroadcast, TypeBool(state), active,
+				    ConstantU32(state, spv::ScopeSubgroup), ctx.Arg(inst, 1), ConstantU32(state, lane));
+				state.builder.AddFunction(spv::OpSelect, TypeU32(state), value, active,
+				    fetched, ConstantU32(state, 0));
+			}
+			state.builder.AddFunction(spv::OpIEqual, TypeBool(state), matches, source, ConstantU32(state, lane));
+			state.builder.AddFunction(spv::OpSelect, TypeU32(state), result, matches, value, selected);
+			selected = result;
+		}
+		return selected;
+	}
 	const auto target   = EmitDppTargetLane(state, flags);
 	const auto shuffled = ctx.Shuffle(inst, 0, target.lane);
 	if (flags.fetch_inactive) {

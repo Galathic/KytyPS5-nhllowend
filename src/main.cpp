@@ -75,6 +75,7 @@ static void PrintUsage() {
 	::printf("  --shader-optimization-type <value>   None, Size, or Performance.\n");
 	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
 	::printf("  --shader-log-folder <path>           Shader log output folder.\n");
+	::printf("  --pre-gen <true|false>               Record and warm shaders/pipelines before play.\n");
 	::printf("  --command-buffer-dump <true|false>   Enable command buffer dumps.\n");
 	::printf("  --command-buffer-dump-folder <path>  Command buffer dump folder.\n");
 	::printf("  --graphics-debug-dump <true|false>   Enable graphics debug dumps.\n");
@@ -379,6 +380,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--gpu-assisted-validation") {
 			if (!ParseBool(value, options.config.gpu_assisted_validation_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--pre-gen") {
+			if (!ParseBool(value, options.config.pre_gen_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}

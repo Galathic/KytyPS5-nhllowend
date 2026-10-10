@@ -594,6 +594,9 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	physical_device.getProperties2(&properties2);
 
 	graphics.subgroup_size                 = properties11.subgroupSize;
+	graphics.pixel_quad_supported =
+	    bool(properties11.subgroupSupportedStages & vk::ShaderStageFlagBits::eFragment) &&
+	    bool(properties11.subgroupSupportedOperations & vk::SubgroupFeatureFlagBits::eQuad);
 	graphics.min_subgroup_size             = subgroup_size_control.minSubgroupSize;
 	graphics.max_subgroup_size             = subgroup_size_control.maxSubgroupSize;
 	graphics.required_subgroup_size_stages = subgroup_size_control.requiredSubgroupSizeStages;

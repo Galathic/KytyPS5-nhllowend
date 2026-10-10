@@ -206,7 +206,14 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 		return;
 	}
 	auto& cache = context.GetBufferCache();
-	if (indirect_args != 0) {
+	// KYTY_LDS_NO_READBACK=1 (experiment): an indirect dispatch does not read its GPU-written
+	// arguments back to size the LDS buffer. Default OFF keeps the readback below.
+	static const bool no_readback = [] {
+		const char* v = std::getenv("KYTY_LDS_NO_READBACK");
+		return v != nullptr && v[0] == '1';
+	}();
+	const bool skip_readback = no_readback && indirect_args != 0;
+	if (indirect_args != 0 && !skip_readback) {
 		cache.ReadMemory(indirect_args, sizeof(vk::DispatchIndirectCommand));
 		std::memcpy(input.workgroup_counts, reinterpret_cast<const void*>(indirect_args),
 		            sizeof(input.workgroup_counts));
@@ -217,7 +224,31 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 	const auto limit = std::min<uint64_t>(storage.Size(),
 	    context.GetGraphics().GetPhysicalDeviceProperties().limits.maxStorageBufferRange);
 	uint64_t size = sizeof(uint32_t);
-	if (std::ranges::find(input.workgroup_counts, 0u) == std::end(input.workgroup_counts)) {
+	if (skip_readback) {
+		// The shader addresses LDS with its own gl_WorkGroupID and gl_NumWorkGroups (GPU builtins),
+		// so the CPU only has to bind the largest whole number of LDS slots that fits.
+		const uint64_t stride = uint64_t {input.lds_size_dwords} * sizeof(uint32_t);
+		EXIT_IF(stride == 0 || stride > limit);
+		size = limit / stride * stride;
+		const uint64_t max_groups = size / stride;
+		static std::atomic<bool> announced {false};
+		if (!announced.exchange(true, std::memory_order_relaxed)) {
+			std::printf("NHL27PERF: LDS no-readback active (lds_bytes=%llu buffer=%llu "
+			            "max_groups=%llu)\n",
+			            static_cast<unsigned long long>(stride),
+			            static_cast<unsigned long long>(size),
+			            static_cast<unsigned long long>(max_groups));
+			std::fflush(stdout);
+		}
+		static std::atomic<bool> warned {false};
+		if (max_groups < 4096 && !warned.exchange(true, std::memory_order_relaxed)) {
+			std::printf("NHL27PERF: WARNING LDS no-readback buffer holds only %llu workgroups "
+			            "(lds_bytes=%llu); larger indirect dispatches overrun it\n",
+			            static_cast<unsigned long long>(max_groups),
+			            static_cast<unsigned long long>(stride));
+			std::fflush(stdout);
+		}
+	} else if (std::ranges::find(input.workgroup_counts, 0u) == std::end(input.workgroup_counts)) {
 		size = uint64_t {input.lds_size_dwords} * sizeof(uint32_t);
 		EXIT_IF(size == 0 || size > limit);
 		for (const auto count: input.workgroup_counts) {

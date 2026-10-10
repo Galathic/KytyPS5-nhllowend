@@ -471,6 +471,10 @@ void DefineInputs(EmitterState& state) {
 		state.builder.RequireCapability(spv::CapabilityDrawParameters);
 		add_builtin(IR::StageInputKind::DrawIndex, 1, "gl_DrawID");
 	}
+	if (state.program.stage == ShaderType::Pixel && state.input_info.pixel != nullptr &&
+	    state.input_info.pixel->pixel_quad_correct) {
+		add_builtin(IR::StageInputKind::FragCoord, 4, "gl_FragCoord");
+	}
 	if (state.lane_count == 2) {
 		add_builtin(IR::StageInputKind::LocalInvocationIndex, 1, "gl_LocalInvocationIndex");
 		if (std::ranges::any_of(state.inputs, [](const InputBinding& input) {
