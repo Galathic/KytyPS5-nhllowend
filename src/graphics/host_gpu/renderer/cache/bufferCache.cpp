@@ -44,12 +44,12 @@ constexpr size_t PerfBuckets = 4; // color clear, fault, invalidate (CPU write),
 struct PerfStats {
 	std::atomic<uint64_t> waits[PerfBuckets] {};
 	std::atomic<uint64_t> wait_ns[PerfBuckets] {};
-	std::atomic<uint64_t> events[2] {};
+	std::atomic<uint64_t> events[static_cast<size_t>(BufferCache::PerfEvent::Count)] {};
 	std::atomic<uint32_t> pm4_op {0};
 	// Only touched from the GPU thread.
 	uint64_t                              last_waits[PerfBuckets] {};
 	uint64_t                              last_wait_ns[PerfBuckets] {};
-	uint64_t                              last_events[2] {};
+	uint64_t last_events[static_cast<size_t>(BufferCache::PerfEvent::Count)] {};
 	std::chrono::steady_clock::time_point last_print {};
 };
 PerfStats g_perf;
@@ -74,6 +74,11 @@ bool PerfStatsEnabled() {
 }
 
 } // namespace
+
+bool BufferCache::GuestSyncOnly() {
+	static const bool enabled = EnvFlag("KYTY_GUEST_SYNC");
+	return enabled;
+}
 
 bool BufferCache::PerfNoSyncReadback() {
 	static const bool enabled = EnvFlag("KYTY_PERF_NO_SYNC_READBACK");
@@ -120,8 +125,9 @@ void BufferCache::PerfMaybePrint() {
 		total_waits += waits[i];
 		total_ms += ms[i];
 	}
-	uint64_t events[2] {};
-	for (size_t i = 0; i < 2; ++i) {
+	constexpr size_t EventCount = static_cast<size_t>(PerfEvent::Count);
+	uint64_t         events[EventCount] {};
+	for (size_t i = 0; i < EventCount; ++i) {
 		const auto now_count = g_perf.events[i].load(std::memory_order_relaxed);
 		events[i]            = now_count - g_perf.last_events[i];
 		g_perf.last_events[i] = now_count;
@@ -136,6 +142,13 @@ void BufferCache::PerfMaybePrint() {
 	            static_cast<unsigned long long>(waits[3]), ms[3],
 	            static_cast<unsigned long long>(events[0]),
 	            static_cast<unsigned long long>(events[1]), PerfNoSyncReadback() ? 1 : 0);
+	std::printf("NHL27PERF: work dispatches=%llu draws=%llu auto_dispatch_barriers=%llu "
+	            "guest_barriers=%llu acquire_mem=%llu guest_sync=%d\n",
+	            static_cast<unsigned long long>(events[2]),
+	            static_cast<unsigned long long>(events[3]),
+	            static_cast<unsigned long long>(events[4]),
+	            static_cast<unsigned long long>(events[5]),
+	            static_cast<unsigned long long>(events[6]), GuestSyncOnly() ? 1 : 0);
 	std::vector<std::pair<uint64_t, FaultPageStat>> pages(g_fault_pages.begin(), g_fault_pages.end());
 	std::sort(pages.begin(), pages.end(),
 	          [](const auto& a, const auto& b) { return a.second.count > b.second.count; });

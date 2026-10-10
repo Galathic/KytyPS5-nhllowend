@@ -440,10 +440,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		                           ShaderRecompiler::IR::ImageResourceClass::Storage;
 	                }) ||
 	    has_storage_writes;
-	if (has_storage_writes) {
+	BufferCache::PerfCount(BufferCache::PerfEvent::Dispatch);
+	if (has_storage_writes && !BufferCache::GuestSyncOnly()) {
 		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
 		// while allowing the queue to execute asynchronously.
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		BufferCache::PerfCount(BufferCache::PerfEvent::AutoDispatchBarrier);
 	}
 	if (Config::GraphicsDebugDumpEnabled()) {
 		const auto sampled_images = std::count_if(
@@ -571,7 +573,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	m_context.GetTextureCache().FlushStorageShadows();
 
 	// The removed host fence also ordered read-only dispatches before later writers.
-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	if (!BufferCache::GuestSyncOnly()) {
+		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		BufferCache::PerfCount(BufferCache::PerfEvent::AutoDispatchBarrier);
+	}
 	if (FrameDump::TraceEnabled()) {
 		for (size_t i = 0; i < bindings.images.size() && i < program.info.images.size(); i++) {
 			if (!program.info.images[i].written) continue;
@@ -664,8 +669,10 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		    return image.written && image.resource_class ==
 		                                ShaderRecompiler::IR::ImageResourceClass::Storage;
 	    });
-	if (has_storage_writes) {
+	BufferCache::PerfCount(BufferCache::PerfEvent::Dispatch);
+	if (has_storage_writes && !BufferCache::GuestSyncOnly()) {
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		BufferCache::PerfCount(BufferCache::PerfEvent::AutoDispatchBarrier);
 	}
 	vk::MemoryBarrier barrier {};
 	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
@@ -681,7 +688,10 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	BreadcrumbEnd(m_context.GetGraphics(), vk_buffer, crumb);
 	m_context.GetTextureCache().FlushStorageShadows();
-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	if (!BufferCache::GuestSyncOnly()) {
+		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		BufferCache::PerfCount(BufferCache::PerfEvent::AutoDispatchBarrier);
+	}
 	ResetBindings();
 }
 

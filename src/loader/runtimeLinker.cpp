@@ -25,12 +25,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <magic_enum.hpp>
 #include <memory>
+#include <thread>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -53,6 +55,81 @@ void SetProgName(const std::string& name);
 } // namespace Libs::LibKernel
 
 namespace Loader {
+
+namespace {
+
+// KYTY_NHL_RES_SCALE=<0.25..1.0> (NHL 27 PPSA34063 v01.003.001 experiment): keep Frostbite's
+// GameRenderSettings.ResolutionScale and ResolutionScaleMin at the given value, so the game
+// renders below its 4K-display preset. The NHL preset applier rewrites both whenever a preset is
+// (re)selected, so the values are re-applied periodically. Offsets come from static analysis of
+// this eboot: the settings pointer slot is at eboot+0xf1ef808, the floats at +0x170 and +0xc0.
+void StartNhlResolutionScale(uint64_t eboot_base) {
+	const char* env = std::getenv("KYTY_NHL_RES_SCALE");
+	if (env == nullptr || eboot_base == 0) {
+		return;
+	}
+	const float scale = std::strtof(env, nullptr);
+	if (!(scale >= 0.25f && scale <= 1.0f)) {
+		::printf("NHL27RES: ignoring KYTY_NHL_RES_SCALE=%s (expected 0.25..1.0)\n", env);
+		return;
+	}
+	std::thread([eboot_base, scale] {
+		constexpr uint64_t SlotOffset     = 0xf1ef808;
+		constexpr uint64_t ScaleOffset    = 0x170;
+		constexpr uint64_t ScaleMinOffset = 0xc0;
+		uint64_t           announced      = 0;
+		uint32_t           writes         = 0;
+		for (;;) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(50));
+			uint64_t settings = 0;
+			if (!Libs::LibKernel::Memory::TryReadBacking(eboot_base + SlotOffset, &settings,
+			                                            sizeof(settings)) ||
+			    settings == 0 || (settings & 0xfu) != 0) {
+				continue;
+			}
+			float current = 0.0f;
+			float current_min = 0.0f;
+			if (!Libs::LibKernel::Memory::TryReadBacking(settings + ScaleOffset, &current,
+			                                            sizeof(current)) ||
+			    !Libs::LibKernel::Memory::TryReadBacking(settings + ScaleMinOffset, &current_min,
+			                                            sizeof(current_min))) {
+				continue;
+			}
+			// Only touch what looks like the expected fields: ResolutionScale in (0, 2], and the
+			// minimum either -1 ("90% of scale") or a scale.
+			if (!(current > 0.0f && current <= 2.0f) ||
+			    !(current_min == -1.0f || (current_min > 0.0f && current_min <= 2.0f))) {
+				if (announced != settings) {
+					announced = settings;
+					::printf("NHL27RES: settings at 0x%016llx look wrong (scale=%g min=%g); "
+					         "not patching\n",
+					         static_cast<unsigned long long>(settings), current, current_min);
+				}
+				continue;
+			}
+			if (announced != settings) {
+				announced = settings;
+				uint8_t drs = 0;
+				(void)Libs::LibKernel::Memory::TryReadBacking(settings + 0x211, &drs, 1);
+				::printf("NHL27RES: settings at 0x%016llx scale=%g min=%g drs=%u -> %g\n",
+				         static_cast<unsigned long long>(settings), current, current_min,
+				         static_cast<unsigned>(drs), scale);
+			}
+			if (current != scale || current_min != scale) {
+				(void)Libs::LibKernel::Memory::TryWriteBacking(settings + ScaleOffset, &scale,
+				                                              sizeof(scale));
+				(void)Libs::LibKernel::Memory::TryWriteBacking(settings + ScaleMinOffset, &scale,
+				                                              sizeof(scale));
+				if (++writes <= 8) {
+					::printf("NHL27RES: applied scale %g (was %g, min %g)\n", scale, current,
+					         current_min);
+				}
+			}
+		}
+	}).detach();
+}
+
+} // namespace
 
 Program::Program() = default;
 
@@ -1312,6 +1389,7 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 			EXIT("Failed to apply game cheat\n");
 		}
 	}
+	StartNhlResolutionScale(m_programs.empty() ? 0 : m_programs.front()->base_vaddr);
 	if (libc != nullptr && libc->dynamic_info->init_vaddr != 0) {
 		StartModule(libc, 0, nullptr, nullptr);
 	}

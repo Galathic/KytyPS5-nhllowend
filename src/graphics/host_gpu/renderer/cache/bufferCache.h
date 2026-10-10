@@ -55,7 +55,19 @@ public:
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 	// Only used to attribute synchronous readbacks in the KYTY_PERF_STATS output.
 	enum class ReadCaller : uint8_t { Other, ColorClear, Fault };
-	enum class PerfEvent : uint8_t { ColorClearShadowHit, WaitRegMemBackingRead };
+	enum class PerfEvent : uint8_t {
+		ColorClearShadowHit,
+		WaitRegMemBackingRead,
+		Dispatch,
+		Draw,
+		AutoDispatchBarrier,
+		GuestBarrier,
+		AcquireMem,
+		Count
+	};
+	// KYTY_GUEST_SYNC=1 (experiment): compute dispatches rely on the guest's own partial-flush,
+	// cache and ACQUIRE_MEM packets for ordering instead of a full barrier around each dispatch.
+	[[nodiscard]] static bool GuestSyncOnly();
 	// KYTY_PERF_NO_SYNC_READBACK=1 enables the readback-avoidance paths (default: off).
 	[[nodiscard]] static bool PerfNoSyncReadback();
 	static void               PerfCount(PerfEvent event);
