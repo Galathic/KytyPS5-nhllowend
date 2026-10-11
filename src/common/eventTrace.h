@@ -22,7 +22,8 @@ namespace Common::EventTrace {
 	X(GUEST_FLIP_REQ) X(GUEST_EQ_WAIT_BEGIN) X(GUEST_EQ_WAIT_END) X(GUEST_SEMA_WAIT_BEGIN) \
 	X(GUEST_SEMA_WAIT_END) X(EOP_TRIGGER) X(LABEL_WRITE) X(FLIP_EVENT) X(VBLANK_EVENT) \
 	X(NATIVE_SUBMIT) X(NATIVE_DONE) X(SUSPEND_ACQ_BEGIN) X(SUSPEND_ACQ_END) X(SUSPEND_RELEASE) \
-	X(FLIP_READY) X(PRESENT) X(FAULT_PARSE) X(GPU_BEGIN) X(GPU_END)
+	X(FLIP_READY) X(PRESENT) X(FAULT_PARSE) X(GPU_BEGIN) X(GPU_END) \
+	X(GPU_DRAW) X(GPU_DRAW_END) X(GPU_DISPATCH) X(GPU_DISPATCH_END)
 
 enum Type : uint32_t {
 #define X(n) n,
@@ -103,9 +104,13 @@ inline void Record(uint32_t type, uint64_t a = 0, uint64_t b = 0) {
 	}
 }
 
+// Called after the CSV was written with the unix time used in its file name (side files reuse it).
+inline void (*g_csv_written_hook)(long long unix_s) = nullptr;
+
 inline void WriteCsv(uint32_t count) {
 	char name[64];
-	std::snprintf(name, sizeof(name), "idle-trace-%lld.csv", static_cast<long long>(std::time(nullptr)));
+	const auto unix_s = static_cast<long long>(std::time(nullptr));
+	std::snprintf(name, sizeof(name), "idle-trace-%lld.csv", unix_s);
 	FILE* f = std::fopen(name, "w");
 	if (f == nullptr) {
 		return;
@@ -121,6 +126,9 @@ inline void WriteCsv(uint32_t count) {
 	std::fclose(f);
 	std::printf("NHL27 idle-trace wrote %s (%u events)\n", name, count);
 	std::fflush(stdout);
+	if (g_csv_written_hook != nullptr) {
+		g_csv_written_hook(unix_s);
+	}
 }
 
 // Call from a submit/frame safe point after RuntimeFlags::Refresh().

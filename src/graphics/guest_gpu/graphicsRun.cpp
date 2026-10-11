@@ -699,6 +699,72 @@ void GuestGpu::ThreadRun(void* data) {
 	}
 }
 
+// KYTY_SUBMIT_SPLIT: while recording one large guest command buffer, submit the native command
+// buffer after enough draws/dispatches or recording time so the host GPU can start earlier.
+// GPU-thread only. Policy (kept simple): split at packet boundaries right after a draw/dispatch
+// packet completes, regardless of render-pass state. Submit() ends dynamic rendering and the next
+// draw re-begins it, exactly like the existing Flip()/WaitFlipDone()/slice-end flushes.
+struct SubmitSplitState {
+	bool                                  enabled = false;
+	uint32_t                              work    = 0;
+	std::chrono::steady_clock::time_point since {};
+};
+static thread_local SubmitSplitState g_submit_split;
+static std::atomic<uint64_t>         g_submit_split_count {0};
+
+static uint32_t SubmitSplitDraws() {
+	static const uint32_t v = [] {
+		const char* s = std::getenv("KYTY_SUBMIT_SPLIT_DRAWS");
+		const long  n = s != nullptr ? std::atol(s) : 0;
+		return n > 0 ? static_cast<uint32_t>(n) : 48u;
+	}();
+	return v;
+}
+
+static int64_t SubmitSplitUs() {
+	static const int64_t v = [] {
+		const char* s = std::getenv("KYTY_SUBMIT_SPLIT_US");
+		const long  n = s != nullptr ? std::atol(s) : 0;
+		return n > 0 ? static_cast<int64_t>(n) : int64_t {750};
+	}();
+	return v;
+}
+
+static bool SubmitSplitIsWorkOpcode(uint32_t op) {
+	switch (op) {
+		case Pm4::IT_DISPATCH_DIRECT:
+		case Pm4::IT_DISPATCH_INDIRECT:
+		case Pm4::IT_DRAW_INDIRECT:
+		case Pm4::IT_DRAW_INDEX_INDIRECT:
+		case Pm4::IT_DRAW_INDEX_2:
+		case Pm4::IT_DRAW_INDIRECT_MULTI:
+		case Pm4::IT_DRAW_INDEX_AUTO:
+		case Pm4::IT_DRAW_INDEX_OFFSET_2:
+		case Pm4::IT_DRAW_INDEX_INDIRECT_MULTI: return true;
+		default: return false;
+	}
+}
+
+static void SubmitSplitMaybePrint() {
+	static const bool stats = [] {
+		const char* s = std::getenv("KYTY_PERF_STATS");
+		return s != nullptr && s[0] == '1';
+	}();
+	if (!stats) return;
+	static auto     last = std::chrono::steady_clock::now();
+	static uint64_t last_count = 0;
+	const auto      now = std::chrono::steady_clock::now();
+	if (now - last < std::chrono::seconds(5)) return;
+	const auto count = g_submit_split_count.load(std::memory_order_relaxed);
+	std::printf("NHL27SPLIT: splits=%llu delta=%llu draws_thr=%u us_thr=%lld\n",
+	            static_cast<unsigned long long>(count),
+	            static_cast<unsigned long long>(count - last_count), SubmitSplitDraws(),
+	            static_cast<long long>(SubmitSplitUs()));
+	std::fflush(stdout);
+	last = now;
+	last_count = count;
+}
+
 bool GuestGpu::Process(Submission& submission) {
 	const bool first_slice = !submission.started;
 	auto&      cp          = GetProcessor(submission.queue_id);
@@ -711,6 +777,9 @@ bool GuestGpu::Process(Submission& submission) {
 	}
 
 	cp.BufferInit();
+	g_submit_split.enabled = Common::RuntimeFlags::Current().submit_split;
+	g_submit_split.work    = 0;
+	g_submit_split.since   = {};
 	bool complete = true;
 
 	switch (submission.type) {
@@ -790,6 +859,8 @@ bool GuestGpu::Process(Submission& submission) {
 			break;
 	}
 
+	g_submit_split.enabled = false;
+	SubmitSplitMaybePrint();
 	return complete;
 }
 
@@ -943,6 +1014,20 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		}
 		cursor.offset_dw += packet_dw;
 		execution.m_made_progress = true;
+		if (g_submit_split.enabled && SubmitSplitIsWorkOpcode(opcode)) {
+			// Packet fully handled and cursor advanced: a flush here cannot separate a
+			// draw/dispatch from any later EOP/label packet in the stream.
+			const auto now = std::chrono::steady_clock::now();
+			if (g_submit_split.work++ == 0) {
+				g_submit_split.since = now;
+			} else if (g_submit_split.work >= SubmitSplitDraws() ||
+			           std::chrono::duration_cast<std::chrono::microseconds>(now - g_submit_split.since)
+			                   .count() >= SubmitSplitUs()) {
+				BufferFlush();
+				g_submit_split.work = 0;
+				g_submit_split_count.fetch_add(1, std::memory_order_relaxed);
+			}
+		}
 		if (!execution.m_next_buffer.empty()) {
 			// Chains and taken branches reuse the fetcher; only calls retain a return cursor.
 			if (execution.m_chain) {

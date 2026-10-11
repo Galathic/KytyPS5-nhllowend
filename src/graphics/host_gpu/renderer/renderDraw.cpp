@@ -1456,6 +1456,14 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	                                                 : 0;
 	const uint64_t crumb_info = (static_cast<uint64_t>(draw.index_count) << 32u) |
 	                            draw.instance_count;
+	// KYTY_IDLE_TRACE side-file info: first colour target (format << 32 | width << 16 | height).
+	uint64_t crumb_aux = 0;
+	if (state.color_count != 0) {
+		const auto& rt0 = state.color_info[0];
+		const auto  ext = rt0.Extent();
+		crumb_aux = (static_cast<uint64_t>(rt0.desc.info.pixel_format) << 32u) |
+		            (static_cast<uint64_t>(ext.width & 0xffffu) << 16u) | (ext.height & 0xffffu);
+	}
 	DbgLogSmallTextureDraw(state.ps_active ? &*bindings.pixel : nullptr, state, draw, crumb_vs,
 	                       crumb_ps);
 	// Debugging: KYTY_DBG_SKIP_PS=<hex hash>[,<hex hash>...] skips matching pixel shaders.
@@ -1487,7 +1495,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	} else {
 		const auto crumb =
 		    BreadcrumbBegin(m_context.GetGraphics(), vk_buffer, mesh_active ? "draw-mesh" : "draw",
-		                    crumb_vs, crumb_ps, crumb_info);
+		                    crumb_vs, crumb_ps, crumb_info, crumb_aux);
 		if (mesh_active) {
 			vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 		} else {

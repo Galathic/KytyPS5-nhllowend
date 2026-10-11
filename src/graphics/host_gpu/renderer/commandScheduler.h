@@ -24,9 +24,10 @@ struct GraphicContext;
 //
 // The same hooks also drive the KYTY_PERF_GPU_TIMING=1 per-draw/dispatch GPU timing profiler
 // (timestamp queries, summarised every few seconds as NHL27GPU lines). The returned handle packs the
-// breadcrumb id and the timing slot; pass it unchanged to BreadcrumbEnd.
+// breadcrumb id and the timing slots; pass it unchanged to BreadcrumbEnd. While KYTY_IDLE_TRACE is
+// capturing they also write per-command trace timestamps. aux = render target (format << 32 | width << 16 | height).
 uint64_t BreadcrumbBegin(GraphicContext& graphics, vk::CommandBuffer cmd, const char* kind,
-                         uint64_t hash_a, uint64_t hash_b, uint64_t info = 0);
+                         uint64_t hash_a, uint64_t hash_b, uint64_t info = 0, uint64_t aux = 0);
 void     BreadcrumbEnd(GraphicContext& graphics, vk::CommandBuffer cmd, uint64_t id);
 // Reads back finished GPU timing samples without waiting; called after every queue submit.
 void     GpuTimingPoll();
