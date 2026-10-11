@@ -894,6 +894,17 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
+bool TryReadCleanBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
+	if (g_gpu_resources == nullptr || !Graphics::GuestGpu::IsGpuThread() || data == nullptr ||
+	    !Graphics::GuestRange {vaddr, size}.Valid()) {
+		return false;
+	}
+	if (GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size)) return false;
+	// TryReadBacking validates every mapping before transferring any bytes, under
+	// its mapping lock. A unavailable/cross-gap span leaves output untouched.
+	return TryReadBacking(vaddr, data, size);
+}
+
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(g_virtual_ranges == nullptr);
 

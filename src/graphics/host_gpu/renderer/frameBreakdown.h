@@ -7,6 +7,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include <string>
+
+#include "common/runtimeFlags.h"
 
 // KYTY_PERF_STATS=1 frame time breakdown. Prints one line about once per second:
 //   NHL27FRAME fps=... frame=... gpu_thread_busy=... wait_gpu=... readback=... faults=...
@@ -184,6 +187,9 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 	            ms(wait_ns), per(wait_count), ms(readback_ns), per(readback_n), ms(fault_ns),
 	            per(fault_n), ms(compile_ns), per(compile_n), ms(draw_prep_ns), draw_us,
 	            per(draws), per(dispatches));
+	// Flush every line: when stdout is a pipe (the launcher pipes into
+	// Tee-Object) libc uses a block buffer, so without this the window lines
+	// arrive minutes late and an automated collector cannot attribute them.
 	std::fflush(stdout);
 	if (DetailEnabled()) {
 		std::printf("NHL27PREP frames=%" PRIu64
@@ -199,6 +205,12 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 
 // Called on every presented flip (guest PM4 EOP flip and CPU flip both end here).
 inline void OnPresentedFlip() {
+	// Refresh runtime experiment flags at the frame boundary. This is a safe point,
+	// and it keeps the published snapshot live even when no probe site on this
+	// frame's path runs, so a collector always sees the NHL27CFG tag it waits for.
+	// Throttled internally: a timestamp compare per flip.
+	Common::RuntimeFlags::Refresh();
+
 	if (!Enabled()) {
 		return;
 	}

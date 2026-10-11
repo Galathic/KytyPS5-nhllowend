@@ -3,13 +3,52 @@
 
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
+#include "common/runtimeFlags.h"
+
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cstring>
 #include <cstdlib>
 #include <span>
 #include <vector>
 
 namespace Libs::Graphics {
+
+struct ResourceReuseTraceStats {
+    uint64_t evictions = 0, checked = 0, matched = 0;
+    uint64_t distance16 = 0, distance32 = 0, distance64 = 0, distance128 = 0;
+};
+
+struct ResourceHashFilterStats {
+    uint64_t eligible = 0, rejected = 0, matched = 0;
+};
+
+namespace ResourceHashFilterDetail {
+struct Counters { uint64_t eligible = 0, rejected = 0, matched = 0; };
+inline thread_local Counters counters;
+} // namespace ResourceHashFilterDetail
+
+inline ResourceHashFilterStats GetResourceHashFilterStats() {
+    const auto& c = ResourceHashFilterDetail::counters;
+    return {c.eligible, c.rejected, c.matched};
+}
+
+namespace ResourceReuseTraceDetail {
+struct Counters {
+    std::atomic<uint64_t> evictions{0}, checked{0}, matched{0};
+    std::atomic<uint64_t> distance16{0}, distance32{0}, distance64{0}, distance128{0};
+};
+inline Counters& GetCounters() { static Counters counters; return counters; }
+} // namespace ResourceReuseTraceDetail
+
+inline ResourceReuseTraceStats GetResourceReuseTraceStats() {
+    auto& c = ResourceReuseTraceDetail::GetCounters();
+    return {c.evictions.load(std::memory_order_relaxed), c.checked.load(std::memory_order_relaxed),
+            c.matched.load(std::memory_order_relaxed), c.distance16.load(std::memory_order_relaxed),
+            c.distance32.load(std::memory_order_relaxed), c.distance64.load(std::memory_order_relaxed),
+            c.distance128.load(std::memory_order_relaxed)};
+}
 
 // A resource snapshot depends on register inputs AND guest memory. Validate the
 // actual reads with their original readers; unchanged pointers alone are insufficient.
@@ -35,19 +74,12 @@ class ResourceMemoEntry {
         bool inconclusive = false;
     };
 
+    // Safe points publish one atomic flag value; no clock, lock or file poll here.
     static bool DynamicDependenciesEnabled() {
-        static const bool enabled = [] {
-            const char* flag = std::getenv("KYTY_RESOURCE_DYNAMIC_DEPS");
-            return flag != nullptr && flag[0] == '1';
-        }();
-        return enabled;
+        return ::Common::RuntimeFlags::Current().resource_dynamic_deps;
     }
     static bool VerifyHitsEnabled() {
-        static const bool enabled = [] {
-            const char* flag = std::getenv("KYTY_RESOURCE_MEMO_VERIFY");
-            return flag != nullptr && flag[0] == '1';
-        }();
-        return enabled;
+        return ::Common::RuntimeFlags::Current().resource_memo_verify;
     }
     static void ObserveUserData(void* userdata, uint32_t index) {
         auto& capture = *static_cast<UserDataCapture*>(userdata);
@@ -61,32 +93,45 @@ class ResourceMemoEntry {
 
     static bool ReadValues(const Runtime& runtime, bool strict, uint64_t address,
                            std::span<uint32_t> values) {
+        const auto span_reader = strict ? runtime.try_read_specialization_span
+                                        : runtime.try_read_memory_span;
+        if (values.size() > 1 && span_reader != nullptr &&
+            span_reader(runtime.userdata, address, values)) return true;
         const auto reader = strict ? runtime.read_specialization_memory : runtime.read_memory;
         if (reader != nullptr) return reader(runtime.userdata, address, values);
         if (strict) return false;
         std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
         return true;
     }
+    static void CaptureValues(Capture& capture, bool strict, uint64_t address,
+                              std::span<uint32_t> values, bool valid) {
+        auto& reads = capture.memo.m_reads;
+        // Preserve each successful reader call's width. Only an explicitly
+        // successful span capability may introduce a wider capture; adjacent
+        // scalar calls can have width-sensitive or lazy failure behavior.
+        if (capture.memo.m_read_count == reads.size()) reads.emplace_back();
+        auto& read = reads[capture.memo.m_read_count++];
+        read.address = address;
+        read.strict = strict;
+        read.valid = valid;
+        if (valid) read.values.assign(values.begin(), values.end());
+        else read.values.assign(values.size(), 0u);
+    }
     template <bool strict>
     static bool CaptureRead(void* userdata, uint64_t address, std::span<uint32_t> values) {
         auto& capture = *static_cast<Capture*>(userdata);
         const bool valid = ReadValues(capture.source, strict, address, values);
-        auto& reads = capture.memo.m_reads;
-        auto* previous = capture.memo.m_read_count == 0 ? nullptr
-            : &reads[capture.memo.m_read_count - 1];
-        if (valid && previous != nullptr && previous->valid && previous->strict == strict &&
-            previous->address + previous->values.size() * sizeof(uint32_t) == address) {
-            previous->values.insert(previous->values.end(), values.begin(), values.end());
-        } else {
-            if (capture.memo.m_read_count == reads.size()) reads.emplace_back();
-            auto& read = reads[capture.memo.m_read_count++];
-            read.address = address;
-            read.strict = strict;
-            read.valid = valid;
-            if (valid) read.values.assign(values.begin(), values.end());
-            else read.values.assign(values.size(), 0u);
-        }
+        CaptureValues(capture, strict, address, values, valid);
         return valid;
+    }
+    template <bool strict>
+    static bool CaptureSpan(void* userdata, uint64_t address, std::span<uint32_t> values) {
+        auto& capture = *static_cast<Capture*>(userdata);
+        const auto reader = strict ? capture.source.try_read_specialization_span
+                                    : capture.source.try_read_memory_span;
+        if (reader == nullptr || !reader(capture.source.userdata, address, values)) return false;
+        CaptureValues(capture, strict, address, values, true);
+        return true;
     }
     template <bool strict>
     static bool ReplayRead(void* userdata, uint64_t address, std::span<uint32_t> values) {
@@ -120,12 +165,45 @@ class ResourceMemoEntry {
         }
         return valid;
     }
+    template <bool strict>
+    static bool ReplaySpan(void* userdata, uint64_t address, std::span<uint32_t> values) {
+        // A declined optional peek must not make verification inconclusive.
+        // Successful wide captures also satisfy recursive DWORD subreads.
+        const auto& replay = *static_cast<const ReadReplay*>(userdata);
+        ReadReplay probe{replay.reads};
+        std::vector<uint32_t> words(values.size());
+        if (!ReplayRead<strict>(&probe, address, words)) return false;
+        std::ranges::copy(words, values.begin());
+        return true;
+    }
+    static bool SameReadCoverage(const std::vector<std::pair<uint64_t, uint64_t>>& left,
+                                 const std::vector<std::pair<uint64_t, uint64_t>>& right) {
+        // Batch and scalar reads can cover the same bytes with different range
+        // segmentation. Reader values are verified separately in their domains.
+        const auto normalize = [](const auto& ranges, auto& output) {
+            for (const auto& [address, size] : ranges) {
+                if (size == 0 || size > UINT64_MAX - address) return false;
+                output.emplace_back(address, address + size);
+            }
+            std::ranges::sort(output);
+            size_t count = 0;
+            for (const auto range : output) {
+                if (count != 0 && range.first <= output[count - 1].second) {
+                    output[count - 1].second = std::max(output[count - 1].second, range.second);
+                } else output[count++] = range;
+            }
+            output.resize(count);
+            return true;
+        };
+        std::vector<std::pair<uint64_t, uint64_t>> a, b;
+        return normalize(left, a) && normalize(right, b) && a == b;
+    }
     static bool SameSnapshot(const ShaderRecompiler::IR::ResourceSnapshot& left,
                              const ShaderRecompiler::IR::ResourceSnapshot& right) {
         return left.buffers == right.buffers && left.images == right.images &&
                left.samplers == right.samplers && left.flattened_srt == right.flattened_srt &&
                left.user_data == right.user_data &&
-               left.specialization_reads == right.specialization_reads &&
+               SameReadCoverage(left.specialization_reads, right.specialization_reads) &&
                left.uniform_fill == right.uniform_fill;
     }
     bool VerifyCachedHit(const ShaderRecompiler::IR::ResourcePlan& plan, const Runtime& runtime,
@@ -138,6 +216,10 @@ class ResourceMemoEntry {
         replay_runtime.userdata = &replay;
         replay_runtime.read_memory = ReplayRead<false>;
         replay_runtime.read_specialization_memory = ReplayRead<true>;
+        replay_runtime.try_read_memory_span = runtime.try_read_memory_span != nullptr
+            ? ReplaySpan<false> : nullptr;
+        replay_runtime.try_read_specialization_span = runtime.try_read_specialization_span != nullptr
+            ? ReplaySpan<true> : nullptr;
         // Verification must not replay dependency notifications to an outer collector.
         replay_runtime.observe_user_data = nullptr;
         replay_runtime.user_data_observer_userdata = nullptr;
@@ -166,6 +248,63 @@ class ResourceMemoEntry {
     }
 
 public:
+    struct RegisterTraceState {
+        const ShaderRecompiler::IR::ResourcePlan* plan = nullptr;
+        uint64_t shader_base = 0;
+        size_t user_data_size = 0;
+        bool dynamic_dependencies = false;
+        std::vector<uint32_t> workgroups;
+        std::vector<std::pair<uint32_t, uint32_t>> registers;
+        bool operator==(const RegisterTraceState&) const = default;
+    };
+    RegisterTraceState CaptureRegisterTraceState() const {
+        RegisterTraceState state;
+        state.plan = m_plan;
+        state.shader_base = m_shader_base;
+        state.user_data_size = m_user_data.size();
+        state.dynamic_dependencies = m_dynamic_dependencies;
+        state.workgroups = m_workgroups;
+        if (m_plan == nullptr) return state;
+        state.registers.reserve(m_register_inputs.size());
+        for (const auto index: m_register_inputs) {
+            if (index >= m_user_data.size()) return {};
+            state.registers.emplace_back(index, m_user_data[index]);
+        }
+        std::ranges::sort(state.registers, {}, &std::pair<uint32_t, uint32_t>::first);
+        return state;
+    }
+    // The hash is a rejection-only prefilter. A match always falls through to
+    // RegisterInputsEqual and the original reader validation path.
+    bool CanHashFilter(const ShaderRecompiler::IR::ResourcePlan& plan, const Runtime& runtime,
+                       bool dynamic_dependencies) const {
+        return m_valid && m_hash_metadata_ready && m_register_inputs_valid &&
+               m_plan == &plan && m_shader_base == runtime.shader_base &&
+               m_user_data.size() == runtime.user_data.size() &&
+               m_dynamic_dependencies == dynamic_dependencies &&
+               std::ranges::equal(m_workgroups, runtime.workgroup_counts);
+    }
+    uint64_t CurrentRegisterStateHash(std::span<const uint32_t> current) const {
+        return HashRegisterState(m_register_inputs, current);
+    }
+    uint64_t StoredRegisterStateHash() const { return m_register_state_hash; }
+    bool SameRegisterDependencySet(const ResourceMemoEntry& other) const {
+        return m_register_dependency_hash == other.m_register_dependency_hash &&
+               m_register_inputs == other.m_register_inputs;
+    }
+    bool HashFilterPolicyValid(bool dynamic_dependencies) const {
+        return m_valid && m_hash_metadata_ready && m_dynamic_dependencies == dynamic_dependencies;
+    }
+    bool ValidForDependencyPolicy(bool dynamic_dependencies) const {
+        return m_valid && m_dynamic_dependencies == dynamic_dependencies;
+    }
+    bool UsesDynamicDependencies() const { return m_dynamic_dependencies; }
+    void PrepareHashFilterMetadata() {
+        m_register_inputs_valid = std::ranges::all_of(
+            m_register_inputs, [&](uint32_t index) { return index < m_user_data.size(); });
+        m_register_dependency_hash = HashDependencySet(m_register_inputs);
+        m_register_state_hash = HashRegisterState(m_register_inputs, m_user_data);
+        m_hash_metadata_ready = true;
+    }
     enum class Miss {
         None, Cold, ShaderBase, Registers, Workgroups, ReadFailed, MemoryChanged,
         VerifyMismatch, VerifyInconclusive, Count
@@ -187,10 +326,18 @@ public:
     bool Refresh(const ShaderRecompiler::IR::ResourcePlan& plan, const Runtime& runtime,
                  ShaderRecompiler::IR::ResourceSnapshot& snapshot,
                  ShaderRecompiler::IR::ResourceSpecialization& specialization,
-                 bool enabled, bool& reused, bool probe_only = false) {
+                 bool enabled, bool& reused, bool probe_only = false,
+                 bool update_push_data = true) {
         reused = false;
         m_last_miss = Miss::None;
         const bool dynamic_dependencies = DynamicDependenciesEnabled();
+        // A control-file switch must not reuse a dependency list collected under
+        // the previous policy. Rebuild each entry once; subsequent probes use the
+        // same selected policy for both register validation and notifications.
+        if (m_valid && m_dynamic_dependencies != dynamic_dependencies) {
+            m_valid = false;
+            if (!dynamic_dependencies) m_register_inputs = m_static_register_inputs;
+        }
         bool inputs_equal = enabled;
         if (enabled) {
             if (!m_valid || m_plan != &plan) m_last_miss = Miss::Cold;
@@ -228,7 +375,8 @@ public:
             if (equal && inputs_equal) {
                 // Non-resource SGPRs can vary per draw. They still feed push data,
                 // but do not require walking the descriptor graph again.
-                snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
+                if (update_push_data) snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
+                plan.active_sources = m_active_sources;
                 // A caller may be collecting dependencies around this memo. Replay
                 // the validated dependency set on hits so it sees the same roots.
                 if (runtime.observe_user_data != nullptr) {
@@ -251,6 +399,10 @@ public:
         observed.userdata = &capture;
         observed.read_memory = CaptureRead<false>;
         observed.read_specialization_memory = CaptureRead<true>;
+        observed.try_read_memory_span = runtime.try_read_memory_span != nullptr
+            ? CaptureSpan<false> : nullptr;
+        observed.try_read_specialization_span = runtime.try_read_specialization_span != nullptr
+            ? CaptureSpan<true> : nullptr;
         UserDataCapture user_data_capture{*this, runtime.observe_user_data,
                                           runtime.user_data_observer_userdata};
         if (dynamic_dependencies) {
@@ -282,20 +434,53 @@ public:
                 m_static_register_inputs.end());
             m_static_register_count = m_static_register_inputs.size();
         }
-        if (!dynamic_dependencies && m_plan != &plan) {
-            m_register_inputs.clear();
+        if (!dynamic_dependencies) {
             m_register_inputs = m_static_register_inputs;
         }
         m_plan = &plan;
         m_shader_base = runtime.shader_base;
         m_user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
         m_workgroups.assign(runtime.workgroup_counts.begin(), runtime.workgroup_counts.end());
-        if (VerifyHitsEnabled()) m_active_sources = plan.active_sources;
+        // Verification can be enabled after this entry was captured. Activity
+        // also belongs to this cached state, not the last alternating material.
+        m_active_sources = plan.active_sources;
+        m_dynamic_dependencies = dynamic_dependencies;
+        m_register_state_hash = HashRegisterState(m_register_inputs, m_user_data);
         m_valid = true;
         return true;
     }
 
 private:
+    static uint64_t HashRegisterState(std::span<const uint32_t> indices,
+                                      std::span<const uint32_t> values) {
+        uint64_t hash = 14695981039346656037ull;
+        const auto mix = [&](uint32_t value, uint64_t& target) {
+            for (unsigned shift = 0; shift != 32; shift += 8) {
+                target ^= static_cast<uint8_t>(value >> shift);
+                target *= 1099511628211ull;
+            }
+        };
+        mix(static_cast<uint32_t>(indices.size()), hash);
+        for (const auto index: indices) {
+            mix(index, hash);
+            if (index < values.size()) mix(values[index], hash);
+        }
+        return hash;
+    }
+    static uint64_t HashDependencySet(std::span<const uint32_t> indices) {
+        uint64_t hash = 14695981039346656037ull;
+        for (unsigned shift = 0; shift != 32; shift += 8) {
+            hash ^= static_cast<uint8_t>(static_cast<uint32_t>(indices.size()) >> shift);
+            hash *= 1099511628211ull;
+        }
+        for (const auto index: indices) {
+            for (unsigned shift = 0; shift != 32; shift += 8) {
+                hash ^= static_cast<uint8_t>(index >> shift);
+                hash *= 1099511628211ull;
+            }
+        }
+        return hash;
+    }
     Miss m_last_miss = Miss::None;
     bool RegisterInputsEqual(std::span<const uint32_t> current) const {
         if (current.size() != m_user_data.size()) return false;
@@ -307,6 +492,7 @@ private:
     const ShaderRecompiler::IR::ResourcePlan* m_plan = nullptr;
     uint64_t m_shader_base = 0;
     bool m_valid = false;
+    bool m_dynamic_dependencies = false;
     std::vector<uint32_t> m_user_data;
     std::vector<uint32_t> m_workgroups;
     std::vector<uint8_t> m_active_sources;
@@ -322,18 +508,23 @@ private:
     uint64_t m_verify_matches = 0;
     uint64_t m_verify_mismatches = 0;
     uint64_t m_verify_inconclusive = 0;
+    uint64_t m_register_state_hash = 0;
+    uint64_t m_register_dependency_hash = 0;
+    bool m_hash_metadata_ready = false, m_register_inputs_valid = false;
 };
 
 // Keep multiple validated states so alternating materials do not evict each other.
 // Never cache solely by pointer: each candidate still replays its dependency reads.
 class ResourceMemo {
 public:
-    explicit ResourceMemo(size_t capacity = 0) : m_capacity(capacity) {
+    explicit ResourceMemo(size_t capacity = 0) : ResourceMemo(capacity, TraceFromEnvironment()) {}
+    ResourceMemo(size_t capacity, bool trace_enabled) : m_capacity(capacity), m_trace_enabled(trace_enabled) {
         if (m_capacity == 0) {
             const char* flag = std::getenv("KYTY_RESOURCE_MULTI_CACHE");
             m_capacity = flag != nullptr && flag[0] == '1' ? 16 : 1;
         }
         m_capacity = std::clamp(m_capacity, size_t{1}, size_t{16});
+        m_entries.reserve(m_capacity);
     }
     using Miss = ResourceMemoEntry::Miss;
     Miss LastMiss() const { return m_last_miss; }
@@ -342,8 +533,20 @@ public:
                  ShaderRecompiler::IR::ResourceSnapshot& snapshot,
                  ShaderRecompiler::IR::ResourceSpecialization& specialization,
                  bool enabled, bool& reused) {
+        reused = false;
+        const auto flags = Common::RuntimeFlags::Current();
+        const bool hash_filter = flags.resource_hash_filter;
+        if (m_trace_enabled && !m_trace_policy_valid) {
+            m_trace_policy = Common::RuntimeFlags::Current().resource_dynamic_deps;
+            m_trace_policy_valid = true;
+        } else if (m_trace_enabled && m_trace_policy != Common::RuntimeFlags::Current().resource_dynamic_deps) {
+            m_trace_policy = Common::RuntimeFlags::Current().resource_dynamic_deps;
+            m_trace_records.clear(); m_trace_next = 0;
+        }
         if (!enabled) {
             m_entries.clear();
+            m_trace_records.clear(); m_trace_next = 0;
+            m_dependency_groups_ready = false;
             m_last_hit = SIZE_MAX;
             reused = false;
             return ShaderRecompiler::IR::MaterializeResources(plan, runtime, snapshot, specialization);
@@ -365,20 +568,63 @@ public:
             return ok;
         }
         const auto count = m_entries.size();
+        if (hash_filter && !m_dependency_groups_ready) {
+            for (auto& entry: m_entries) entry.dependency_group = UINT8_MAX;
+            for (auto& entry: m_entries) {
+                if (entry.memo.ValidForDependencyPolicy(flags.resource_dynamic_deps)) {
+                    entry.memo.PrepareHashFilterMetadata();
+                }
+            }
+            for (size_t i = 0; i < count; ++i) {
+                if (m_entries[i].memo.ValidForDependencyPolicy(flags.resource_dynamic_deps)) {
+                    AssignDependencyGroup(i, flags.resource_dynamic_deps);
+                }
+            }
+            m_dependency_groups_ready = true;
+        } else if (!hash_filter) {
+            m_dependency_groups_ready = false;
+        }
+        if (m_trace_enabled) {
+            m_trace_resident.clear();
+            for (const auto& resident: m_entries) m_trace_resident.push_back(resident.memo.CaptureRegisterTraceState());
+        }
+        size_t index = m_last_hit < count ? m_last_hit : 0;
+        std::array<uint64_t, 16> group_hashes;
+        uint16_t ready_groups = 0;
         for (size_t step = 0; step < count; ++step) {
-            const size_t index = m_last_hit < count ? (m_last_hit + step) % count : step;
             auto& entry = m_entries[index];
+            if (hash_filter && entry.dependency_group < group_hashes.size() &&
+                entry.memo.CanHashFilter(plan, runtime, flags.resource_dynamic_deps)) {
+                auto& stats = ResourceHashFilterDetail::counters;
+                ++stats.eligible;
+                const auto group = entry.dependency_group;
+                const auto mask = static_cast<uint16_t>(1u << group);
+                if ((ready_groups & mask) == 0) {
+                    group_hashes[group] = entry.memo.CurrentRegisterStateHash(runtime.user_data);
+                    ready_groups |= mask;
+                }
+                if (group_hashes[group] != entry.memo.StoredRegisterStateHash()) {
+                    ++stats.rejected;
+                    if (step == 0) m_last_miss = Miss::Registers;
+                    if (++index == count) index = 0;
+                    continue;
+                }
+                ++stats.matched; // Hash match only; exact checks/read validation still follow.
+            }
             if (!entry.memo.Refresh(plan, runtime, entry.snapshot, entry.specialization,
-                                    true, reused, true)) {
+                                    true, reused, true, false)) {
                 if (step == 0) m_last_miss = entry.memo.LastMiss();
+                if (++index == count) index = 0;
                 continue;
             }
+            if (!reused && hash_filter) AssignDependencyGroup(index, flags.resource_dynamic_deps);
             if (m_last_hit != index || m_output != &snapshot || m_specialization != &specialization) {
                 snapshot = entry.snapshot;
                 specialization = entry.specialization;
-            } else {
-                snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
             }
+            // Probe leaves cached push data alone: update the caller once rather
+            // than copying all SGPRs into both the entry and output on every hit.
+            snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
             m_last_hit = index;
             m_output = &snapshot;
             m_specialization = &specialization;
@@ -391,11 +637,16 @@ public:
         const size_t selected = count < m_capacity ? count : m_next++ % m_capacity;
         if (count < m_capacity) m_entries.emplace_back();
         auto& entry = m_entries[selected];
+        if (m_trace_enabled && count == m_capacity) {
+            ++m_trace_sequence; // Distance bins count intervening eviction events only.
+            RecordEvicted(entry.memo.CaptureRegisterTraceState());
+        }
         if (!entry.memo.Refresh(plan, runtime, entry.snapshot, entry.specialization, true, reused)) {
             m_entries.clear();
             m_last_hit = SIZE_MAX;
             return false;
         }
+        if (m_trace_enabled && count == m_capacity) TraceMaterialized(entry.memo.CaptureRegisterTraceState());
         if (entry.memo.RecordedWords() > 4096) {
             snapshot = std::move(entry.snapshot);
             specialization = std::move(entry.specialization);
@@ -403,6 +654,7 @@ public:
             m_last_hit = SIZE_MAX;
             return true;
         }
+        if (hash_filter) AssignDependencyGroup(selected, flags.resource_dynamic_deps);
         snapshot = entry.snapshot;
         specialization = entry.specialization;
         m_last_hit = selected;
@@ -411,16 +663,76 @@ public:
         return true;
     }
 private:
+    void AssignDependencyGroup(size_t selected, bool dynamic_dependencies) {
+        auto& entry = m_entries[selected];
+        entry.memo.PrepareHashFilterMetadata();
+        dynamic_dependencies = entry.memo.UsesDynamicDependencies();
+        std::array<bool, 16> used{};
+        for (size_t i = 0; i < m_entries.size(); ++i) {
+            if (i == selected) continue;
+            const auto& other = m_entries[i];
+            if (!other.memo.HashFilterPolicyValid(dynamic_dependencies) ||
+                other.dependency_group >= used.size()) continue;
+            if (entry.memo.SameRegisterDependencySet(other.memo)) {
+                entry.dependency_group = other.dependency_group;
+                return;
+            }
+            used[other.dependency_group] = true;
+        }
+        for (size_t i = 0; i < used.size(); ++i) {
+            if (!used[i]) { entry.dependency_group = static_cast<uint8_t>(i); return; }
+        }
+        entry.dependency_group = 0; // Unreachable while the bank is capped at 16.
+    }
+    struct TraceRecord { ResourceMemoEntry::RegisterTraceState state; uint64_t sequence = 0; };
+    static bool TraceFromEnvironment() {
+        static const bool enabled = [] { const char* value = std::getenv("KYTY_RESOURCE_REUSE_TRACE");
+            return value != nullptr && value[0] == '1' && value[1] == '\0'; }();
+        return enabled;
+    }
+    void RecordEvicted(ResourceMemoEntry::RegisterTraceState state) {
+        if (state.plan == nullptr || state.dynamic_dependencies != m_trace_policy) return;
+        auto& counters = ResourceReuseTraceDetail::GetCounters();
+        counters.evictions.fetch_add(1, std::memory_order_relaxed);
+        for (auto& record: m_trace_records) {
+            if (record.state == state) { record.sequence = m_trace_sequence; return; }
+        }
+        if (m_trace_records.size() < 128) m_trace_records.push_back({std::move(state), m_trace_sequence});
+        else { m_trace_records[m_trace_next] = {std::move(state), m_trace_sequence}; m_trace_next = (m_trace_next + 1) % 128; }
+    }
+    void TraceMaterialized(ResourceMemoEntry::RegisterTraceState state) {
+        if (state.plan == nullptr || state.dynamic_dependencies != m_trace_policy) return;
+        auto& counters = ResourceReuseTraceDetail::GetCounters();
+        counters.checked.fetch_add(1, std::memory_order_relaxed);
+        if (std::ranges::find(m_trace_resident, state) != m_trace_resident.end()) return;
+        uint64_t newest = 0;
+        for (const auto& record: m_trace_records) if (record.state == state) newest = std::max(newest, record.sequence);
+        if (newest == 0) return;
+        counters.matched.fetch_add(1, std::memory_order_relaxed);
+        const uint64_t distance = m_trace_sequence - newest;
+        // Disjoint bins count intervening eviction events, not LRU reuse distance.
+        if (distance <= 16) counters.distance16.fetch_add(1, std::memory_order_relaxed);
+        else if (distance <= 32) counters.distance32.fetch_add(1, std::memory_order_relaxed);
+        else if (distance <= 64) counters.distance64.fetch_add(1, std::memory_order_relaxed);
+        else if (distance <= 128) counters.distance128.fetch_add(1, std::memory_order_relaxed);
+    }
     struct Entry {
         ResourceMemoEntry memo;
         ShaderRecompiler::IR::ResourceSnapshot snapshot;
         ShaderRecompiler::IR::ResourceSpecialization specialization;
+        uint8_t dependency_group = UINT8_MAX;
     };
     std::vector<Entry> m_entries;
     size_t m_capacity;
     size_t m_last_hit = SIZE_MAX, m_next = 0;
     const void* m_output = nullptr;
     const void* m_specialization = nullptr;
+    bool m_dependency_groups_ready = false;
+    bool m_trace_enabled = false, m_trace_policy_valid = false, m_trace_policy = false;
+    uint64_t m_trace_sequence = 0;
+    size_t m_trace_next = 0;
+    std::vector<TraceRecord> m_trace_records;
+    std::vector<ResourceMemoEntry::RegisterTraceState> m_trace_resident;
     Miss m_last_miss = Miss::None;
 };
 

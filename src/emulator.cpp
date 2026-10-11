@@ -6,6 +6,7 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/runtimeFlags.h"
 #include "common/singleton.h"
 #include "common/stringUtils.h"
 #include "common/subsystems.h"
@@ -194,6 +195,10 @@ void Run(const RunOptions& options) {
 	Init(options.config, param_json, subsystems);
 
 	ClearDebugTextureFolder();
+
+	// Publish the initial runtime flag snapshot before anything reads it, so a
+	// control file can drive flags from the first frame. See common/runtimeFlags.h.
+	Common::RuntimeFlags::Refresh(true);
 
 	PrintSystemInfo();
 	std::string title_id;

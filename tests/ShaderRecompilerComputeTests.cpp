@@ -2,6 +2,7 @@
 #include "common/emulatorConfig.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
+#include "common/runtimeFlags.h"
 #include "common/subsystems.h"
 #include "common/threads.h"
 #include "gpu_test_shaders/gpu_test_ms_depth_spv.h"
@@ -3988,6 +3989,7 @@ public:
   }
 
   void CheckInlineLabelWrites() {
+    Common::RuntimeFlags::Refresh(true);
     constexpr const char *name = "InlineLabelWrites";
     constexpr uintptr_t base = 0x0000000200900000ull;
     constexpr uint64_t size = 0x10000;
@@ -4260,6 +4262,9 @@ public:
           !processor.GetCtx().GetDepthControl().stencil_enable &&
           !processor.GetCtx().GetDepthControl().z_write_enable,
           "direct register backing read ignored overlapping GPU writes");
+#include "Pm4WriteDataFastTests.inc"
+#include "ShaderCleanReadTests.inc"
+#include "ScalarBatchBackingTests.inc"
     });
     scheduler.Finish();
     context.UnmapMemory(base, size);
@@ -41803,8 +41808,13 @@ int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
 #ifdef _WIN32
   _putenv_s("KYTY_DPP_PRESERVE_INACTIVE", "1");
+  // EVENT_WRITE payload peeking shares TryPeekGuest's own KYTY_PERF_NO_SYNC_READBACK
+  // requirement. Set it so the PM4 event-clean coverage runs by default rather than
+  // depending on the caller's environment.
+  _putenv_s("KYTY_PERF_NO_SYNC_READBACK", "1");
 #else
   setenv("KYTY_DPP_PRESERVE_INACTIVE", "1", 1);
+  setenv("KYTY_PERF_NO_SYNC_READBACK", "1", 1);
 #endif
   const bool renderdoc_smoke =
       argc == 2 && std::strcmp(argv[1], "--renderdoc-only") == 0;

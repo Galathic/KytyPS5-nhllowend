@@ -563,6 +563,8 @@ struct ResourcePlan {
 			enum class Kind { Literal, UserData, Flat };
 			uint32_t value = 0;
 			Kind kind = Kind::Literal;
+			// Derived at plan compilation/load; deliberately excluded from the fixture archive.
+			uint32_t read_slot = UINT32_MAX;
 		};
 		std::array<Word, 8> words {};
 		bool valid = false;
@@ -576,6 +578,8 @@ struct ResourcePlan {
 
 		std::vector<Entry> values;
 		uint64_t           generation = 0;
+		uint64_t           cfg_gather_epoch = 0;
+		std::vector<uint64_t> cfg_gather_slot_epochs;
 		// Keep the vector identity, not its data pointer: indirect materialization
 		// can append mappings and reallocate its storage after a successful refresh.
 		const std::vector<uint32_t>* refreshed_flat = nullptr;
@@ -639,6 +643,14 @@ struct ResourcePlan {
 		std::vector<Op>       ops;
 		std::vector<uint32_t> slot_ops;
 		std::vector<uint32_t> condition_ops;
+		// Cached per-demand-root DFS programs. Enter skips the whole subtree on
+		// a memo hit; exit executes the op after its ordered dependencies.
+		struct DemandStep { uint32_t op = 0; uint32_t next = UINT32_MAX; };
+		struct DemandSchedule {
+			std::vector<DemandStep> steps;
+			State state = State::Unbuilt;
+		};
+		std::vector<DemandSchedule> demand_schedules;
 		bool                  clean_root = false;
 		State                 state      = State::Unbuilt;
 	};

@@ -86,6 +86,7 @@ struct BufReq {
 	uint32_t    seq = 0;
 	std::string label;
 	uint64_t    addr = 0;
+	std::shared_ptr<Buffer> retained;
 };
 struct BufPending {
 	vk::Buffer      buffer = nullptr;
@@ -176,7 +177,7 @@ void QueueBuffer(vk::Buffer buf, uint64_t offset, uint64_t range, uint64_t addr,
                  uint32_t seq, const std::string& label) {
 	if (!buf || range == 0 || range == VK_WHOLE_SIZE) return;
 	char key[96];
-	std::snprintf(key, sizeof(key), "%" PRIx64 ":%" PRIx64, addr, guest_size);
+	std::snprintf(key, sizeof(key), "%" PRIx64 ":%" PRIx64 ":%u", addr, guest_size, seq);
 	if (!g_seen_buf.insert(key).second) {
 		char b[160];
 		std::snprintf(b, sizeof(b), "    (%s addr=0x%" PRIx64 " size=%" PRIu64 " already dumped for an earlier draw)\n",
@@ -792,6 +793,26 @@ void ProcessOne(Pending& p) {
 	if (p.mapped == nullptr) return;
 	vmaInvalidateAllocation(p.graphics->allocator, p.alloc, 0, VK_WHOLE_SIZE);
 	const auto& t = p.target;
+	static const bool raw_enabled = [] {
+		const char* value = std::getenv("KYTY_DBG_FRAME_DUMP_RAW");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (raw_enabled) {
+		char path[640];
+		std::snprintf(path, sizeof(path), "%s/%05u_%s_%s_%ux%ux%u_%s.raw", g_dir.c_str(),
+		    p.seq, p.label.c_str(), Hex(t.addr).c_str(), t.w, t.h, t.slices,
+		    vk::to_string(t.format).c_str());
+		if (FILE* output = std::fopen(path, "wb")) {
+			const auto written = std::fwrite(p.mapped, 1, static_cast<size_t>(p.size), output);
+			std::fclose(output);
+			g_log += "RAW seq=" + std::to_string(p.seq) + " bytes=" + std::to_string(written) +
+			    " expected=" + std::to_string(p.size) + " mip=" + std::to_string(t.mip) +
+			    " layer=" + std::to_string(t.layer) + " -> " +
+			    std::filesystem::path(path).filename().string() + "\n";
+		} else {
+			g_log += "RAW seq=" + std::to_string(p.seq) + " file_open_failed\n";
+		}
+	}
 	if (t.slices > 1) {
 		ProcessVolume(p);
 		return;
@@ -1142,6 +1163,26 @@ void OnDraw(RenderContext& context, const DrawLog& draw) {
 	              draw.ps_active ? 1 : 0, draw.depth_test ? 1 : 0, draw.depth_write ? 1 : 0,
 	              vk::to_string(draw.depth_compare).c_str());
 	std::string s = b;
+	s += draw.state_text;
+	s += std::string("    emitted=") + (draw.skipped ? "0 (shader skip)\n" : "1\n");
+	if (draw.indirect_snapshot != nullptr && WantBuffers(draw.ps_hash)) {
+		// Copy the frozen bytes actually consumed by vkCmdDraw*Indirect, not a CPU view
+		// of the guest argument page. Every draw is captured even when guest addresses repeat.
+		BufReq req;
+		req.buf = draw.indirect_snapshot->Handle();
+		req.size = draw.indirect_args_size + sizeof(uint32_t);
+		req.seq = seq;
+		req.addr = draw.indirect_guest_addr;
+		req.label = "indirect";
+		req.retained = draw.indirect_snapshot;
+		if (req.size <= (4ull << 20)) g_bufreq.push_back(std::move(req));
+		std::snprintf(b, sizeof(b), "    indirect_gpu: args_addr=0x%" PRIx64 " args_bytes=%" PRIu64
+		    " stride=%u max_count=%u count_offset=%" PRIu64 " indexed=%u capture=%s\n",
+		    draw.indirect_guest_addr, draw.indirect_args_size, draw.indirect_stride,
+		    draw.indirect_max_count, draw.indirect_args_size, unsigned(draw.indexed),
+		    draw.indirect_args_size + sizeof(uint32_t) <= (4ull << 20) ? "queued" : "over_limit");
+		s += b;
+	}
 	for (const auto& c : draw.colors) {
 		if (c.desc == nullptr) continue;
 		s += "    rt" + std::to_string(c.slot) + ": " + DescribeImage(*c.desc) + " target_mip=" +
@@ -1221,13 +1262,18 @@ void OnEndRendering(const CommandBuffer& buffer, const RenderState& pass) {
 }
 
 void OnDispatch(RenderContext& context, CommandBuffer& buffer, uint64_t cs_hash, uint32_t gx,
-                uint32_t gy, uint32_t gz, bool indirect, std::span<const StorageUse> images) {
+                uint32_t gy, uint32_t gz, bool indirect, std::span<const StorageUse> images,
+                const PreparedBindings* bindings) {
 	std::lock_guard lock(g_mutex);
 	if (!g_capturing) return;
 	const uint32_t seq = g_seq++;
 	char b[256];
 	std::snprintf(b, sizeof(b), "#%05u dispatch cs=0x%016" PRIx64 " groups=%ux%ux%u%s\n", seq, cs_hash, gx,
 	              gy, gz, indirect ? " INDIRECT" : "");
+	if (bindings != nullptr && TraceCsEnabled(cs_hash)) {
+		g_buflog += "# compute bindings captured AFTER dispatch\n";
+		CaptureBindings(*bindings, seq, cs_hash);
+	}
 	FlushRequests(buffer.GetGraphics(), buffer.Handle());
 	std::string s = b;
 	for (size_t i = 0; i < images.size(); i++) {

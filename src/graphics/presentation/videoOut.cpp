@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
+#include "common/lightingTrace.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -12,8 +13,8 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/tile.h"
-#include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
+#include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/presenter.h"
@@ -559,6 +560,9 @@ Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer
 	if (!Graphics::DecodeVideoOutPixelFormat(attribute.pixel_format, pixel_format)) {
 		EXIT("unsupported video-out pixel format: 0x%016" PRIx64 "\n", attribute.pixel_format);
 	}
+	Common::LightingApiTrace("VideoOut surface format=0x%016llx width=%u height=%u pq=%u",
+	    static_cast<unsigned long long>(attribute.pixel_format), attribute.width, attribute.height,
+	    unsigned(attribute.pixel_format == Graphics::VIDEO_OUT_PIXEL_FORMAT_R10_G10_B10_A2_BT2100_PQ));
 	if (attribute.pixel_format == Graphics::VIDEO_OUT_PIXEL_FORMAT_R10_G10_B10_A2_BT2100_PQ) {
 		static std::atomic_flag warned = ATOMIC_FLAG_INIT;
 		if (!warned.test_and_set(std::memory_order_relaxed)) {
@@ -1282,12 +1286,12 @@ bool FlipQueue::Flip(uint32_t micros) {
 		requests[i - 1].cfg->mutex.Unlock();
 	}
 	if (due) {
+		// KYTY_PERF_STATS: frame boundary for the NHL27FRAME breakdown (every presented flip).
+		Graphics::FrameBreakdown::OnPresentedFlip();
 		Graphics::RenderDocOnGuestFlip(m_presenter.Renderer());
 		if (Config::GraphicsDebugDumpEnabled() &&
 		    Config::GetPrintfDirection() != Config::LogDirection::Silent) {
 			LOGF("Flip done: %d\n", requests[0].index);
-		// KYTY_PERF_STATS: frame boundary for the NHL27FRAME breakdown (every presented flip).
-		Graphics::FrameBreakdown::OnPresentedFlip();
 		}
 	}
 	return due;
@@ -1812,6 +1816,9 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 	status->reserved[0] = 0;
 	status->reserved[1] = 0;
 	status->reserved[2] = 0;
+	Common::LightingApiTrace("VideoOutGetOutputStatus handle=%d resolution=%u range=%u refresh=%llu flags=%llu result=0",
+	    handle, status->resolution, status->dynamicRange,
+	    static_cast<unsigned long long>(status->refreshRate), static_cast<unsigned long long>(status->flags));
 	ctx->mutex.Unlock();
 
 	return OK;
@@ -1894,6 +1901,8 @@ KYTY_SYSV_ABI int VideoOutIsOutputSupported(int handle, uint64_t mode,
 	LOGF("\t mode = 0x%016" PRIx64 "\n", mode);
 
 	int result = ValidateOutputConfig(handle, mode, options, reserved_ptr, reserved);
+	Common::LightingApiTrace("VideoOutIsOutputSupported handle=%d mode=0x%llx validation=0x%x vblank=%u",
+	    handle, static_cast<unsigned long long>(mode), result, unsigned(Config::GetVblankFrequency()));
 	if (result != OK) {
 		return result;
 	}
@@ -1927,6 +1936,8 @@ KYTY_SYSV_ABI int VideoOutConfigureOutput(int handle, uint64_t mode,
 
 	ctx->mutex.Lock();
 	ctx->output_mode = mode;
+	Common::LightingApiTrace("VideoOutConfigureOutput handle=%d mode=0x%llx result=0",
+	    handle, static_cast<unsigned long long>(mode));
 	TriggerVideoOutEvents(*ctx, VideoOutEventKind::OutputMode,
 	                      reinterpret_cast<void*>(ctx->output_mode));
 	ctx->mutex.Unlock();
@@ -1985,6 +1996,7 @@ KYTY_SYSV_ABI int VideoOutColorSettingsSetGamma(VideoOutColorSettings* settings,
 	}
 
 	settings->gamma = gamma;
+	Common::LightingApiTrace("VideoOutColorSettingsSetGamma gamma=%g result=0", gamma);
 	return OK;
 }
 
@@ -2005,6 +2017,7 @@ KYTY_SYSV_ABI int VideoOutAdjustColor(int handle, const VideoOutColorSettings* s
 	}
 	ctx->mutex.Lock();
 	ctx->gamma = settings->gamma;
+	Common::LightingApiTrace("VideoOutAdjustColor handle=%d gamma=%g result=0", handle, settings->gamma);
 	ctx->mutex.Unlock();
 
 	return OK;

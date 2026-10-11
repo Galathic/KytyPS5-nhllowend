@@ -1,3 +1,4 @@
+#include "common/runtimeFlags.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -1756,25 +1757,26 @@ KYTY_CP_OP_PARSER(CpOpDumpConstRam) {
 }
 
 KYTY_CP_OP_PARSER(CpOpEventWrite) {
-	KYTY_PROFILER_FUNCTION();
-
-	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_EVENT_WRITE);
-
-	const auto packet_size_dw = KYTY_PM4_LEN(cmd_id);
-	uint32_t   event_index    = (buffer[0] >> 8u) & 0x7u;
-	uint32_t   event_type     = (buffer[0]) & 0x3fu;
-	uint64_t   event_address  = 0;
-
-	if (event_type == 0x39u) {
-		EXIT_NOT_IMPLEMENTED(packet_size_dw != 4u);
-		event_address = buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u);
-	}
-
-	cp.TriggerEvent(event_type, event_index, event_address);
-
-	return packet_size_dw - 1u;
+ KYTY_PROFILER_FUNCTION();
+ EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_EVENT_WRITE);
+ const auto packet_size_dw=KYTY_PM4_LEN(cmd_id);
+ EXIT_NOT_IMPLEMENTED(packet_size_dw < 2u);
+ const bool clean=Common::RuntimeFlags::Current().pm4_event_clean;
+ uint32_t event=0;
+ if (!clean || !cp.TryPeekCleanBackingBytes(buffer,&event,sizeof(event))) event=buffer[0];
+ const uint32_t event_index=(event>>8u)&7u, event_type=event&0x3fu;
+ uint64_t event_address=0;
+ if (event_type==0x39u) {
+  EXIT_NOT_IMPLEMENTED(packet_size_dw != 4u);
+  std::array<uint32_t,2> address{};
+  if (!clean || !cp.TryPeekCleanBackingBytes(buffer+1,address.data(),sizeof(address))) {
+   address[0]=buffer[1]; address[1]=buffer[2];
+  }
+  event_address=address[0]|(static_cast<uint64_t>(address[1])<<32u);
+ }
+ cp.TriggerEvent(event_type,event_index,event_address);
+ return packet_size_dw-1u;
 }
-
 KYTY_CP_OP_PARSER(CpOpEventWriteEop) {
 	KYTY_PROFILER_FUNCTION();
 

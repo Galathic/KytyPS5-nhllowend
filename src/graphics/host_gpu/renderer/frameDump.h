@@ -13,7 +13,9 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -67,6 +69,13 @@ struct DrawLog {
 	const std::vector<TextureBinding>* ps_images = nullptr;
 	// Resource tables of the draw (for the lighting-buffer content dump, see FrameDump::OnDraw).
 	const PreparedBindings*            ps_bindings = nullptr;
+	std::string                       state_text;
+	std::shared_ptr<Buffer>            indirect_snapshot;
+	uint64_t                          indirect_args_size = 0;
+	uint64_t                          indirect_guest_addr = 0;
+	uint32_t                          indirect_stride = 0;
+	uint32_t                          indirect_max_count = 0;
+	bool                              skipped = false;
 };
 
 // Registers the draw's render targets (so the end of the render pass can read them back) and logs it.
@@ -83,7 +92,8 @@ struct StorageUse {
 
 // Called after a dispatch was recorded; logs it and reads back the storage images it wrote.
 void OnDispatch(RenderContext& context, CommandBuffer& buffer, uint64_t cs_hash, uint32_t gx,
-                uint32_t gy, uint32_t gz, bool indirect, std::span<const StorageUse> images);
+                uint32_t gy, uint32_t gz, bool indirect, std::span<const StorageUse> images,
+                const PreparedBindings* bindings = nullptr);
 
 // KYTY_DBG_TRACE_WRITES=<hexaddr>[,<hexaddr>...]: print a line whenever a GPU write (buffer cache write
 // log, color/depth target of a draw, storage image of a dispatch) overlaps one of the addresses. Works

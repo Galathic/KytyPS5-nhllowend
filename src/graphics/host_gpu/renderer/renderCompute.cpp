@@ -597,7 +597,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			                  ShaderRecompiler::IR::ImageResourceClass::Storage;
 		}
 		FrameDump::OnDispatch(m_context, buffer, program.shader_hash, thread_group_x, thread_group_y,
-		                      thread_group_z, false, uses);
+		                      thread_group_z, false, uses, &bindings);
 	}
 	if (known_fill_size != 0) {
 		// Recorded after the bindings marked the range GPU-written, which clears older records.

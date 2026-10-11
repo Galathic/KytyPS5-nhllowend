@@ -1,4 +1,6 @@
+#include "common/runtimeFlags.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "graphics/shader/recompiler/ir/passes/ResourcePlanFixture.h"
 
 #include "common/assert.h"
 #include "graphics/guest_gpu/gpu_format.h"
@@ -7,6 +9,8 @@
 #include "graphics/shader/shaderBindings.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <array>
 #include <bit>
 #include <cstdio>
@@ -156,12 +160,32 @@ bool CaptureStrictRead(void* userdata, uint64_t address, std::span<uint32_t> val
 	return true;
 }
 
+bool CaptureStrictSpan(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	auto& capture = *static_cast<ReadCapture*>(userdata);
+	if (capture.source.try_read_specialization_span == nullptr ||
+	    !capture.source.try_read_specialization_span(capture.source.userdata, address, values)) {
+		return false;
+	}
+	capture.ranges.emplace_back(address, values.size_bytes());
+	return true;
+}
+
 bool CaptureOrdinaryRead(void* userdata, uint64_t address, std::span<uint32_t> values) {
 	auto& capture = *static_cast<ReadCapture*>(userdata);
 	if (capture.source.read_memory != nullptr) {
 		if (!capture.source.read_memory(capture.source.userdata, address, values)) return false;
 	} else {
 		std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
+	}
+	capture.ranges.emplace_back(address, values.size_bytes());
+	return true;
+}
+
+bool CaptureOrdinarySpan(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	auto& capture = *static_cast<ReadCapture*>(userdata);
+	if (capture.source.try_read_memory_span == nullptr ||
+	    !capture.source.try_read_memory_span(capture.source.userdata, address, values)) {
+		return false;
 	}
 	capture.ranges.emplace_back(address, values.size_bytes());
 	return true;
@@ -1028,6 +1052,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 				} else {
 					target.kind = ResourcePlan::DescriptorGather::Word::Kind::Flat;
 					target.value = program.srt_reads[slot.U32()].flat_offset;
+					target.read_slot = slot.U32();
 					// Each cached slot must name one read, not a slot overwritten by
 					// a different read during the refresh.
 					gather.valid = target.value < program.srt_reads.size() &&
@@ -1128,8 +1153,9 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	return plan;
 }
 
-bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
+static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+	const Common::RuntimeFlags::EvaluationScope flags_scope;
 	if (!program.resource_tracking_complete ||
 	    (program.requires_specialization_memory && runtime.read_specialization_memory == nullptr)) {
 		return false;
@@ -1144,6 +1170,10 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		observed.read_specialization_memory = runtime.read_specialization_memory != nullptr
 		                                         ? CaptureStrictRead : nullptr;
 		observed.read_memory = CaptureOrdinaryRead;
+		observed.try_read_specialization_span = runtime.try_read_specialization_span != nullptr
+		                                           ? CaptureStrictSpan : nullptr;
+		observed.try_read_memory_span = runtime.try_read_memory_span != nullptr
+		                                   ? CaptureOrdinarySpan : nullptr;
 	}
 	SrtWalker clean(program, CleanRuntime(observed));
 	SrtWalker walker(program, observed, program.clean_flat_slots,
@@ -1288,6 +1318,60 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	return BuildResourceSpecialization(program, snapshot, specialization);
 }
 
+bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+ // Separate opt-in from the legacy process-wide .arb recorder: those files lack
+ // plan identity and combine changing memory from many evaluations.
+ static const std::string directory = [] {
+  const char* p = std::getenv("KYTY_RESOURCE_PLAN_RECORD");
+  return std::string(p ? p : "");
+ }();
+ if (directory.empty() || program.srt_reads.empty())
+  return MaterializeResourcesImpl(program,runtime,snapshot,specialization);
+ // Optional scene gate. Touch this file after reaching the intended scene;
+ // no navigation, restart or capture of startup plans is required.
+ static const std::string trigger = [] {
+  const char* p = std::getenv("KYTY_RESOURCE_PLAN_TRIGGER");
+  return std::string(p ? p : "");
+ }();
+ if (!trigger.empty()) {
+  static thread_local auto next_poll = std::chrono::steady_clock::time_point{};
+  static thread_local bool armed = false;
+  if (!armed) {
+   const auto now = std::chrono::steady_clock::now();
+   if (now >= next_poll) {
+    next_poll = now + std::chrono::milliseconds(250);
+    std::error_code ec;
+    armed = std::filesystem::exists(trigger,ec) && !ec;
+   }
+   if (!armed) return MaterializeResourcesImpl(program,runtime,snapshot,specialization);
+  }
+ }
+ static std::atomic<bool> exhausted{false};
+ if (exhausted.load(std::memory_order_relaxed)) return MaterializeResourcesImpl(program,runtime,snapshot,specialization);
+ static std::mutex mutex;
+ static std::set<std::pair<uint64_t,uint32_t>> recorded;
+ static const uint64_t selected_hash = [] {
+  const char* p = std::getenv("KYTY_RESOURCE_PLAN_HASH");
+  return p ? std::strtoull(p,nullptr,16) : uint64_t{0};
+ }();
+ if (selected_hash && program.shader_hash != selected_hash)
+  return MaterializeResourcesImpl(program,runtime,snapshot,specialization);
+ bool capture = false;
+ {
+  std::lock_guard<std::mutex> lock(mutex);
+  if (recorded.size() < 32)
+   capture = recorded.emplace(program.shader_hash,static_cast<uint32_t>(program.stage)).second;
+  if (recorded.size()>=32) exhausted.store(true,std::memory_order_relaxed);
+ }
+ if (!capture) return MaterializeResourcesImpl(program,runtime,snapshot,specialization);
+ std::error_code ec;
+ std::filesystem::create_directories(directory,ec);
+ if (ec) return MaterializeResourcesImpl(program,runtime,snapshot,specialization);
+ const auto name = fmt::format("{:016x}-{}.rpf",program.shader_hash,static_cast<uint32_t>(program.stage));
+ return CaptureResourcePlan(program,runtime,snapshot,specialization,
+  (std::filesystem::path(directory)/name).string(),MaterializeResourcesImpl);
+}
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {
 	EXIT_IF(!program.resource_tracking_complete || program.shader_info_complete ||
 	        program.binding_layout_complete);

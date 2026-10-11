@@ -1,7 +1,9 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include "common/assert.h"
+#include "common/runtimeFlags.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceFixture.h"
 
 #include <algorithm>
 #include <bit>
@@ -9,7 +11,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <functional>
+#include <mutex>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -17,6 +22,7 @@
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
 SrtRuntime CleanRuntime(SrtRuntime runtime) {
+	runtime.try_read_memory_span = runtime.try_read_specialization_span;
 	runtime.read_memory = runtime.read_specialization_memory != nullptr
 	                          ? runtime.read_specialization_memory
 	                          : +[](void*, uint64_t, std::span<uint32_t>) { return false; };
@@ -24,6 +30,178 @@ SrtRuntime CleanRuntime(SrtRuntime runtime) {
 }
 
 namespace {
+
+// --- resource fixture recording ------------------------------------------------
+// Opt-in recording of the memory access trace the SRT walker performs, so a real
+// plan's workload can be replayed offline with no emulator run. Off unless
+// KYTY_SRT_FIXTURE_RECORD names an output path.
+//
+// This wraps the runtime readers and calls straight through to the original reader,
+// so enabling it cannot change evaluation results. The trace is the memory access
+// stream; which reader issued a given read is a property of the plan, not of the
+// bytes, so replay is keyed per address rather than per reader.
+namespace FixtureRecord {
+
+inline bool Enabled() {
+	static const bool enabled = [] {
+		const char* path = std::getenv("KYTY_SRT_FIXTURE_RECORD");
+		return path != nullptr && path[0] != '\0';
+	}();
+	return enabled;
+}
+
+inline std::string& Path() {
+	static std::string path = [] {
+		const char* value = std::getenv("KYTY_SRT_FIXTURE_RECORD");
+		return std::string(value != nullptr ? value : "");
+	}();
+	return path;
+}
+
+// Flush after this many newly accumulated reads. A flush appends only the new
+// records, so its cost is proportional to the batch, not to the whole fixture.
+// An earlier version rewrote the entire file every 20k reads while holding a global
+// mutex on every read; at ~26 MB per rewrite that stalled the walk path and the
+// emulator stopped consuming CPU entirely.
+inline constexpr uint64_t kFlushEveryReads = 20000;
+
+inline std::mutex& FlushMutex() {
+	static std::mutex mutex;
+	return mutex;
+}
+
+inline ResourceFixture& Fixture() {
+	static ResourceFixture fixture;
+	return fixture;
+}
+
+// Records accumulated on walk threads and not yet written. Thread-local so the walk
+// path takes no lock at all: readers only append to their own vector.
+struct PendingReads {
+	std::vector<FixtureRead> reads;
+	std::vector<uint64_t>    registered;
+};
+
+inline std::vector<PendingReads*>& RegisteredPending() {
+	static std::vector<PendingReads*> pending;
+	return pending;
+}
+
+inline PendingReads& Pending() {
+	static thread_local PendingReads pending;
+	static thread_local bool        registered = false;
+	if (!registered) {
+		registered = true;
+		std::lock_guard<std::mutex> lock(FlushMutex());
+		RegisteredPending().push_back(&pending);
+	}
+	return pending;
+}
+
+inline uint64_t& FlushCount() {
+	static uint64_t flushes = 0;
+	return flushes;
+}
+
+// Writes everything accumulated on all threads into the shared accumulator and then
+// writes the whole fixture out atomically. Runs inside the flush lock; walk threads are
+// not blocked by it because they never take that lock.
+//
+// The accumulator is word-deduplicated, so its size is bounded by distinct addresses
+// touched rather than by read count, which is what makes a whole-file write acceptable
+// here. An incremental append path was tried and removed: delta tracking across merges
+// was wrong three times in a row and silently dropped words.
+inline void MergeAndFlush() {
+	std::lock_guard<std::mutex> lock(FlushMutex());
+	auto&                       fixture = Fixture();
+
+	for (PendingReads* pending : RegisteredPending()) {
+		for (auto& read : pending->reads) {
+			fixture.AddRead(std::move(read));
+		}
+		pending->reads.clear();
+	}
+	fixture.Rebuild();
+
+	if (!fixture.SaveAtomic(Path())) {
+		return;
+	}
+	++FlushCount();
+	std::printf("NHL27FIXTURE: reads=%llu records=%zu words_added=%llu words_kept=%llu "
+	            "coalesced=%llu flush=%llu -> %s\n",
+	            static_cast<unsigned long long>(fixture.TotalReads()), fixture.DistinctReads(),
+	            static_cast<unsigned long long>(fixture.WordsAdded()),
+	            static_cast<unsigned long long>(fixture.WordsRetained()),
+	            static_cast<unsigned long long>(fixture.CoalescedRecords()),
+	            static_cast<unsigned long long>(FlushCount()), Path().c_str());
+	std::fflush(stdout);
+}
+
+inline void NoteRead(uint64_t address, std::span<const uint32_t> values, bool valid) {
+	// No lock here on purpose: this is the per-read walk path.
+	PendingReads& pending = Pending();
+	FixtureRead   read;
+	read.address = address;
+	read.valid   = valid;
+	read.values.assign(values.begin(), values.end());
+	pending.reads.push_back(std::move(read));
+	if (pending.reads.size() >= kFlushEveryReads) {
+		MergeAndFlush();
+	}
+}
+
+inline bool RecordRead(void* userdata, uint64_t address, std::span<uint32_t> values,
+                       SrtMemoryReader reader) {
+	// Pass through first, exactly as the unwrapped runtime would.
+	const bool valid = reader != nullptr && reader(userdata, address, values);
+	NoteRead(address, values, valid);
+	return valid;
+}
+
+} // namespace FixtureRecord
+
+bool RecordOrdinaryRead(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	const auto* state = static_cast<const SrtRuntime*>(userdata);
+	return FixtureRecord::RecordRead(state->userdata, address, values, state->read_memory);
+}
+
+bool RecordSpecializationRead(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	const auto* state = static_cast<const SrtRuntime*>(userdata);
+	return FixtureRecord::RecordRead(state->userdata, address, values,
+	                                 state->read_specialization_memory);
+}
+
+// Wraps both readers in place. The runtime passed here is the walker's own copy, so
+// the wrapper is correctly scoped to this evaluation.
+//
+// The original reader and its userdata are kept in a per-call holder rather than one
+// shared thread_local: SRT walkers nest (a walker can own a clean evaluator), and a
+// shared holder would redirect an outer walker's live readers to the inner one.
+void AttachFixtureRecording(SrtRuntime& runtime) {
+	if (!FixtureRecord::Enabled()) {
+		return;
+	}
+	{
+		std::lock_guard<std::mutex> lock(FixtureRecord::FlushMutex());
+		auto&                       fixture = FixtureRecord::Fixture();
+		fixture.SetUserData(runtime.user_data);
+		fixture.SetShaderBase(runtime.shader_base);
+	}
+	// Heap-allocated so the address stays stable, and never freed: a walker's readers
+	// may be used after the attaching frame returns. One small allocation per walker
+	// is irrelevant next to the recording itself, and growing this linearly would
+	// need a matching detach to be safe.
+	auto* holder = new SrtRuntime(runtime);
+	if (runtime.read_memory != nullptr) {
+		holder->read_memory = runtime.read_memory;
+		runtime.read_memory = RecordOrdinaryRead;
+	}
+	if (runtime.read_specialization_memory != nullptr) {
+		holder->read_specialization_memory = runtime.read_specialization_memory;
+		runtime.read_specialization_memory = RecordSpecializationRead;
+	}
+	runtime.userdata = holder;
+}
 
 constexpr uint64_t AddressMask = 0x0000ffffffffffffull;
 
@@ -123,17 +301,10 @@ struct TapeInstKeyHash {
 struct GlobalTapeStats {
 	std::atomic<uint64_t> runs {0}, failed {0}, walker {0}, built {0}, unsupported {0}, ops {0};
 	std::atomic<uint64_t> cfg_runs {0}, cfg_fallback {0};
+	std::atomic<uint64_t> cfg_scheduled {0};
 	std::atomic<uint64_t> cfg_checked {0}, cfg_matched {0}, cfg_mismatch {0}, cfg_inconclusive {0};
 	std::array<std::atomic<uint64_t>, 8> reject {};
 } g_tape_stats;
-
-bool CfgTapeEnabled() {
-	static const bool enabled = [] {
-		const char* val = std::getenv("KYTY_SRT_CFG_TAPE");
-		return val != nullptr && val[0] == '1';
-	}();
-	return enabled;
-}
 
 enum class TapeVerifyLogKind : uint8_t {
 	UnstableReads,
@@ -539,7 +710,21 @@ SrtWalker::SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
                      Value active_mask, bool skip_tape)
     : m_program(program), m_runtime(runtime), m_clean_flat_slots(clean_flat_slots),
       m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()),
-      m_skip_tape(skip_tape), m_context(AcquireContext(program)) {}
+      m_skip_tape(skip_tape), m_context(AcquireContext(program)) {
+	// Shader memory reads can submit work and publish new runtime flags. Latch
+	// evaluator choices before preparing any scratch, so a root cannot switch to
+	// an unprepared CFG tape midway through this walker. The ordinary evaluator
+	// inherits its clean partner's choices for the complete materialization.
+	const auto flags = Common::RuntimeFlags::Current();
+	m_cfg_tape_enabled = clean_evaluator != nullptr ? clean_evaluator->m_cfg_tape_enabled : flags.srt_cfg_tape;
+	m_cfg_schedule_enabled = clean_evaluator != nullptr ? clean_evaluator->m_cfg_schedule_enabled : flags.srt_cfg_schedule;
+	m_scalar_batch_enabled = clean_evaluator != nullptr ? clean_evaluator->m_scalar_batch_enabled : flags.srt_scalar_batch;
+	m_cfg_gather_enabled = clean_evaluator != nullptr ? clean_evaluator->m_cfg_gather_enabled : flags.srt_cfg_gather;
+	// Opt-in: record the memory access trace this walker performs so the workload can
+	// be replayed offline. Wraps readers on the walker's own copy only, and calls
+	// straight through, so results are unchanged when it is off or on.
+	AttachFixtureRecording(m_runtime);
+}
 
 SrtWalker::~SrtWalker() { --m_program.evaluation_depth; }
 
@@ -673,6 +858,103 @@ bool SrtWalker::EvaluateExtract(const Inst& inst, uint64_t& result) {
 	return false;
 }
 
+size_t SrtWalker::TryScalarReadBatch(std::span<const Value> values, bool strict,
+                                    std::span<uint32_t> output) {
+	// Existing diagnostic readers replace userdata. Until their optional-span
+	// wrappers can capture/replay the same observations, retain scalar execution.
+	if (!m_scalar_batch_enabled || FixtureRecord::Enabled() ||
+	    SrtTapeVerifyEnabled() || !m_active_mask.IsEmpty() || values.size() < 2u) return 0;
+	const auto peek = strict ? m_runtime.try_read_specialization_span : m_runtime.try_read_memory_span;
+	if (peek == nullptr || (strict && m_clean_evaluator == nullptr)) return 0;
+	auto& evaluator = strict ? *m_clean_evaluator : *this;
+	if (!evaluator.m_active_mask.IsEmpty()) return 0;
+	std::array<const Inst*, 16> reads {};
+	std::array<uint32_t, 16> memo_indices {};
+	const Inst* handle = nullptr;
+	Value offset;
+	uint32_t first_offset = 0, first_component = 0, pc = 0;
+	size_t count = 0;
+	for (; count < std::min({values.size(), output.size(), reads.size()}); ++count) {
+		const auto* inst = values[count].ResolveInstruction();
+		if (inst == nullptr || inst->GetOpcode() != ValueOpcode::LoadAddressU32 ||
+		    inst->NumArgs() != 4u || !IsRawRead(m_program, *inst)) break;
+		const auto guard = inst->Arg(3).Resolve();
+		if (!guard.IsImmediate() || guard.GetType() != Type::U1 || !guard.U1()) break;
+		const auto flags = inst->Flags<MemoryFlags>();
+		if (flags.index >= m_program.memory_info.size()) break;
+		const auto& memory = m_program.memory_info[flags.index];
+		if (memory.kind != ResourceKind::ScalarAddress) break;
+		const auto* candidate_handle = inst->Arg(0).ResolveInstruction();
+		if (candidate_handle == nullptr || candidate_handle->GetOpcode() != ValueOpcode::GetAddressResource ||
+		    candidate_handle->NumArgs() != 2u) break;
+		if (count == 0) {
+			handle = candidate_handle; offset = inst->Arg(1).Resolve();
+			first_offset = memory.offset; first_component = memory.component_index; pc = flags.pc;
+		} else if (candidate_handle != handle || inst->Arg(1).Resolve() != offset || flags.pc != pc ||
+		           uint64_t(memory.offset) != uint64_t(first_offset) + count * sizeof(uint32_t) ||
+		           uint64_t(memory.component_index) != uint64_t(first_component) + count) break;
+		const auto index = inst->EvaluationIndex(m_program.evaluation_value_count);
+		if (index < evaluator.m_context.values.size()) {
+			const auto generation = evaluator.m_context.values[index].generation;
+			if ((generation & ~uint64_t{3}) == evaluator.m_context.generation) break;
+		}
+		reads[count] = inst; memo_indices[count] = index;
+	}
+	if (count < 2u) return 0;
+	// Only evaluate the first word's shared dependencies, in its normal order.
+	// Later words introduce no dependency, guard, or bounds evaluation at all.
+	uint64_t low = 0, high = 0, byte_offset = 0;
+	if (!evaluator.Arg(*handle, 0, low) || !evaluator.Arg(*handle, 1, high) ||
+	    !evaluator.EvaluateWide(offset, byte_offset)) return 0;
+	const auto base = (((high << 32u) | static_cast<uint32_t>(low)) & AddressMask) & ~uint64_t{3};
+	const auto relative = (int64_t(static_cast<int32_t>(first_offset)) & ~int64_t{3}) +
+	                      int64_t(static_cast<uint32_t>(byte_offset) & ~3u);
+	uint64_t address = 0;
+	if (!AddSignedAddress(base, relative, address) ||
+	    count * sizeof(uint32_t) > UINT64_MAX - address) return 0;
+	// A negative signed offset may cross the signed boundary between components.
+	// Check exact scalar address equivalence before asking the capability to read.
+	for (size_t i = 1; i < count; ++i) {
+		const auto scalar_offset = m_program.memory_info[reads[i]->Flags<MemoryFlags>().index].offset;
+		const auto scalar_relative = (int64_t(static_cast<int32_t>(scalar_offset)) & ~int64_t{3}) +
+		                             int64_t(static_cast<uint32_t>(byte_offset) & ~3u);
+		uint64_t scalar_address = 0;
+		if (!AddSignedAddress(base, scalar_relative, scalar_address) || scalar_address != address + i * 4u) return 0;
+	}
+	if (!peek(m_runtime.userdata, address, output.first(count))) return 0;
+	evaluator.m_context.values.resize(m_program.evaluation_value_count);
+	for (size_t i = 0; i < count; ++i) {
+		auto& memo = evaluator.m_context.values[memo_indices[i]];
+		memo.value = output[i]; memo.generation = evaluator.m_context.generation;
+	}
+	if (m_runtime.evaluation_counts) m_runtime.evaluation_counts->scalar_batch_words += count;
+	return count;
+}
+
+size_t SrtWalker::TryFlatScalarBatch(std::span<const uint32_t> slots, uint32_t sequential_slot,
+                                    std::vector<uint32_t>& flat) {
+	if (!m_scalar_batch_enabled) return 0;
+	std::array<Value, 16> values {};
+	std::array<uint32_t, 16> offsets {};
+	std::array<uint32_t, 16> words {};
+	size_t count = 0;
+	bool strict = false;
+	const size_t available = slots.empty() ? m_program.srt_reads.size() - sequential_slot : slots.size();
+	for (; count < std::min(available, values.size()); ++count) {
+		const auto slot = slots.empty() ? sequential_slot + static_cast<uint32_t>(count) : slots[count];
+		if (slot >= m_program.srt_reads.size()) break;
+		const auto& read = m_program.srt_reads[slot];
+		if (read.flat_offset >= flat.size()) break;
+		const bool clean = read.flat_offset < m_clean_flat_slots.size() && m_clean_flat_slots[read.flat_offset] != 0u;
+		if (count == 0) strict = clean;
+		else if (strict != clean) break;
+		values[count] = read.value; offsets[count] = read.flat_offset;
+	}
+	count = TryScalarReadBatch(std::span(values).first(count), strict, words);
+	for (size_t i = 0; i < count; ++i) flat[offsets[i]] = words[i];
+	return count;
+}
+
 bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 	const auto flags = inst.Flags<MemoryFlags>();
 	if (flags.index >= m_program.memory_info.size()) {
@@ -752,6 +1034,7 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 }
 
 bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
+	if (m_runtime.evaluation_counts) ++m_runtime.evaluation_counts->recursive_ops;
 	uint64_t   a       = 0;
 	uint64_t   b       = 0;
 	uint64_t   c       = 0;
@@ -1148,7 +1431,10 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 		const auto& gather = m_program.descriptor_gathers[source];
 		const auto* flat = m_context.refreshed_flat;
 		bool ready = gather.valid && m_active_mask.IsEmpty() &&
-		             (!gather.needs_flat || (flat != nullptr && m_program.control_flow.empty()));
+		             (!gather.needs_flat || (flat != nullptr &&
+	              (m_program.control_flow.empty() ||
+	               (m_cfg_gather_enabled && source < m_cfg_gather_ready_sources.size() &&
+	                m_cfg_gather_ready_sources[source] != 0u))));
 		if (ready && gather.needs_flat) {
 			for (uint32_t index = 0; index < descriptor.dword_count; ++index) {
 				const auto& word = gather.words[index];
@@ -1157,23 +1443,60 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 			}
 		}
 		if (ready) {
-			for (uint32_t index = 0; index < descriptor.dword_count; ++index) {
-				const auto& word = gather.words[index];
-				if (word.kind == ResourcePlan::DescriptorGather::Word::Kind::UserData) {
-					if (word.value < m_program.user_data_base ||
-					    word.value - m_program.user_data_base >= m_runtime.user_data.size()) return false;
-					const auto user_data_index = word.value - m_program.user_data_base;
-					if (m_runtime.observe_user_data != nullptr) {
-						m_runtime.observe_user_data(m_runtime.user_data_observer_userdata, user_data_index);
+			bool cfg_gather = gather.needs_flat && !m_program.control_flow.empty();
+			if (cfg_gather) {
+				// The CFG gather is only a shortcut for recursive lookup of values that
+				// this exact evaluator already computed successfully in this generation.
+				for (uint32_t index = 0; index < descriptor.dword_count && cfg_gather; ++index) {
+					const auto& word = gather.words[index];
+					if (word.kind == ResourcePlan::DescriptorGather::Word::Kind::UserData) {
+						cfg_gather = false; break; // preserve the observer callback sequence
 					}
-					result.dwords[index] = m_runtime.user_data[user_data_index];
-				} else if (word.kind == ResourcePlan::DescriptorGather::Word::Kind::Flat) {
-					result.dwords[index] = (*flat)[word.value];
-				} else {
-					result.dwords[index] = word.value;
+					if (word.kind != ResourcePlan::DescriptorGather::Word::Kind::Flat) continue;
+					const auto slot = word.read_slot;
+					if (slot >= m_program.srt_reads.size() ||
+					    m_program.srt_reads[slot].flat_offset != word.value) { cfg_gather = false; break; }
+					const auto& read = m_program.srt_reads[slot];
+					const bool clean = read.flat_offset < m_clean_flat_slots.size() &&
+					                   m_clean_flat_slots[read.flat_offset] != 0u;
+					auto* evaluator = clean ? m_clean_evaluator : this;
+					if (evaluator == nullptr || !evaluator->m_active_mask.IsEmpty() ||
+					    slot >= m_program.srt_reads.size()) { cfg_gather = false; break; }
+					auto value = read.value.Resolve();
+					auto* inst = value.TryInstruction();
+					if (inst == nullptr) { cfg_gather = false; break; }
+					const auto memo_index = inst->EvaluationIndex(m_program.evaluation_value_count);
+					if (memo_index >= evaluator->m_context.values.size() ||
+					    evaluator->m_context.values[memo_index].generation != evaluator->m_context.generation ||
+					    word.value >= flat->size() ||
+					    static_cast<uint32_t>(evaluator->m_context.values[memo_index].value) != (*flat)[word.value])
+						cfg_gather = false;
 				}
+				if (!cfg_gather) ready = false;
 			}
-			return true;
+			if (ready && cfg_gather && m_runtime.evaluation_counts != nullptr) {
+				++m_runtime.evaluation_counts->cfg_gather_eligible;
+				++m_runtime.evaluation_counts->cfg_gather_hits;
+			}
+			if (ready) {
+				for (uint32_t index = 0; index < descriptor.dword_count; ++index) {
+					const auto& word = gather.words[index];
+					if (word.kind == ResourcePlan::DescriptorGather::Word::Kind::UserData) {
+						if (word.value < m_program.user_data_base ||
+						    word.value - m_program.user_data_base >= m_runtime.user_data.size()) return false;
+						const auto user_data_index = word.value - m_program.user_data_base;
+						if (m_runtime.observe_user_data != nullptr) {
+							m_runtime.observe_user_data(m_runtime.user_data_observer_userdata, user_data_index);
+						}
+						result.dwords[index] = m_runtime.user_data[user_data_index];
+					} else if (word.kind == ResourcePlan::DescriptorGather::Word::Kind::Flat) {
+						result.dwords[index] = (*flat)[word.value];
+					} else {
+						result.dwords[index] = word.value;
+					}
+				}
+				return true;
+			}
 		}
 	}
 	for (uint32_t index = 0; index < descriptor.dword_count; ++index) {
@@ -1359,8 +1682,13 @@ bool SrtWalker::VerifyCfgRefresh(std::vector<uint32_t>& flat) {
 }
 
 bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
+	if (m_cfg_gather_enabled) {
+		m_cfg_gather_ready_sources.assign(m_program.descriptor_sources.size(), 0u);
+		if (m_clean_evaluator != nullptr)
+			m_clean_evaluator->m_cfg_gather_ready_sources.assign(m_program.descriptor_sources.size(), 0u);
+	}
 	if (!m_program.control_flow.empty() && !m_skip_tape && !m_cfg_verifying &&
-	    CfgTapeEnabled() && SrtTapeVerifyEnabled() &&
+	    m_cfg_tape_enabled && SrtTapeVerifyEnabled() &&
 	    m_program.cfg_srt_tapes[m_clean_evaluator != nullptr ? 1 : 0].state !=
 	        ResourcePlan::SrtTape::State::Unsupported) {
 		return VerifyCfgRefresh(flat);
@@ -1619,8 +1947,11 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 
 		active.clear();
 		flat.resize(m_program.srt_reads.size());
-		for (uint32_t slot = 0; slot < m_program.srt_reads.size(); ++slot) {
+		for (uint32_t slot = 0; slot < m_program.srt_reads.size();) {
+			const auto batched = TryFlatScalarBatch({}, slot, flat);
+			if (batched != 0) { slot += static_cast<uint32_t>(batched); continue; }
 			if (!refresh(slot)) return false;
+			++slot;
 		}
 		m_context.refreshed_flat = &flat;
 		return true;
@@ -1641,9 +1972,87 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		if (visited.at(index)) continue;
 		visited[index] = 1u;
 		const auto& block = m_program.control_flow[index];
+		uint64_t block_epoch = 0u;
+		if (m_cfg_gather_enabled) {
+			block_epoch = ++m_context.cfg_gather_epoch;
+			if (block_epoch == 0u) {
+				std::fill(m_context.cfg_gather_slot_epochs.begin(), m_context.cfg_gather_slot_epochs.end(), 0u);
+				if (m_clean_evaluator != nullptr)
+					std::fill(m_clean_evaluator->m_context.cfg_gather_slot_epochs.begin(),
+					          m_clean_evaluator->m_context.cfg_gather_slot_epochs.end(), 0u);
+				block_epoch = ++m_context.cfg_gather_epoch;
+			}
+			if (m_context.cfg_gather_slot_epochs.size() < m_program.srt_reads.size())
+				m_context.cfg_gather_slot_epochs.resize(m_program.srt_reads.size(), 0u);
+		}
+		const auto mark_gather_slot = [&](uint32_t slot) {
+			if (slot >= m_program.srt_reads.size()) return;
+			const auto& read = m_program.srt_reads[slot];
+			const bool clean = read.flat_offset < m_clean_flat_slots.size() &&
+			                   m_clean_flat_slots[read.flat_offset] != 0u;
+			auto* evaluator = clean ? m_clean_evaluator : this;
+			if (evaluator == nullptr) return;
+			auto& epochs = evaluator->m_context.cfg_gather_slot_epochs;
+			if (epochs.size() < m_program.srt_reads.size()) epochs.resize(m_program.srt_reads.size(), 0u);
+			epochs[slot] = block_epoch;
+		};
 		for (const auto source: block.sources) active[source] = 1u;
-		for (const auto slot: block.srt_reads) {
-			if (!refresh(slot)) return false;
+		for (size_t read_index = 0; read_index < block.srt_reads.size();) {
+			const auto batched = TryFlatScalarBatch(std::span(block.srt_reads).subspan(read_index), 0u, flat);
+			if (batched != 0) {
+				if (m_cfg_gather_enabled) {
+					for (size_t i = 0; i < batched; ++i) mark_gather_slot(block.srt_reads[read_index + i]);
+				}
+				read_index += batched; continue;
+			}
+			if (!refresh(block.srt_reads[read_index])) return false;
+			if (m_cfg_gather_enabled) mark_gather_slot(block.srt_reads[read_index]);
+			++read_index;
+		}
+		if (m_cfg_gather_enabled) {
+			for (const auto source: block.sources) {
+				if (source >= m_program.descriptor_gathers.size()) continue;
+				const auto& gather = m_program.descriptor_gathers[source];
+				if (!gather.valid || !gather.needs_flat) continue;
+				bool eligible = true;
+				for (uint32_t word_index = 0;
+				     word_index < m_program.descriptor_sources[source].dword_count && eligible; ++word_index) {
+					const auto& word = gather.words[word_index];
+					if (word.kind == ResourcePlan::DescriptorGather::Word::Kind::UserData) {
+						eligible = false; // do not alter user-data observer calls
+						break;
+					}
+					if (word.kind != ResourcePlan::DescriptorGather::Word::Kind::Flat) continue;
+					const auto slot = word.read_slot;
+					if (slot >= m_program.srt_reads.size() ||
+					    m_program.srt_reads[slot].flat_offset != word.value) {
+						eligible = false;
+						break;
+					}
+					const bool clean = m_program.srt_reads[slot].flat_offset < m_clean_flat_slots.size() &&
+					                   m_clean_flat_slots[m_program.srt_reads[slot].flat_offset] != 0u;
+					auto* evaluator = clean ? m_clean_evaluator : this;
+					auto* inst = m_program.srt_reads[slot].value.ResolveInstruction();
+					if (evaluator == nullptr || !evaluator->m_active_mask.IsEmpty() || inst == nullptr) {
+						eligible = false; break;
+					}
+					if (slot >= evaluator->m_context.cfg_gather_slot_epochs.size() ||
+					    evaluator->m_context.cfg_gather_slot_epochs[slot] != block_epoch) {
+						eligible = false; break;
+					}
+					const auto memo_index = inst->EvaluationIndex(m_program.evaluation_value_count);
+					if (memo_index >= evaluator->m_context.values.size() ||
+					    evaluator->m_context.values[memo_index].generation != evaluator->m_context.generation ||
+					    word.value >= flat.size() ||
+					    static_cast<uint32_t>(evaluator->m_context.values[memo_index].value) != flat[word.value])
+						eligible = false;
+				}
+				if (eligible) {
+					m_cfg_gather_ready_sources[source] = 1u;
+					if (m_clean_evaluator != nullptr && source < m_clean_evaluator->m_cfg_gather_ready_sources.size())
+						m_clean_evaluator->m_cfg_gather_ready_sources[source] = 1u;
+				}
+			}
 		}
 		uint32_t condition = 0;
 		auto& predicate = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
@@ -1660,6 +2069,8 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 			pending.insert(pending.end(), block.successors.begin(), block.successors.end());
 		}
 	}
+	m_context.refreshed_flat = &flat;
+	if (m_clean_evaluator != nullptr) m_clean_evaluator->m_context.refreshed_flat = &flat;
 	return true;
 }
 
@@ -1692,6 +2103,7 @@ SrtTapeStats GetSrtTapeStats() {
 	s.ops = g_tape_stats.ops.load(std::memory_order_relaxed);
 	s.cfg_runs = g_tape_stats.cfg_runs.load(std::memory_order_relaxed);
 	s.cfg_fallback = g_tape_stats.cfg_fallback.load(std::memory_order_relaxed);
+	s.cfg_scheduled = g_tape_stats.cfg_scheduled.load(std::memory_order_relaxed);
 	s.cfg_checked = g_tape_stats.cfg_checked.load(std::memory_order_relaxed);
 	s.cfg_matched = g_tape_stats.cfg_matched.load(std::memory_order_relaxed);
 	s.cfg_mismatch = g_tape_stats.cfg_mismatch.load(std::memory_order_relaxed);
@@ -2037,8 +2449,109 @@ bool BuildTapeForPlan(const ResourcePlan& plan, bool with_clean,
 }
 } // namespace
 
+int SrtWalker::RunCfgSchedule(uint32_t root, uint32_t& result) {
+	auto& tape = m_program.cfg_srt_tapes[m_clean_evaluator != nullptr ? 1 : 0];
+	if (tape.demand_schedules.size() != tape.ops.size()) {
+		tape.demand_schedules.resize(tape.ops.size());
+	}
+	auto& schedule = tape.demand_schedules[root];
+	if (schedule.state == ResourcePlan::SrtTape::State::Unbuilt) {
+		// Schedules are built once, never per refresh. Bound DAG expansion and
+		// aggregate storage: an unusually shared/large expression uses the existing
+		// demand stack instead of consuming unbounded memory at shader warmup.
+		constexpr size_t MaxRootSteps = 32768;
+		constexpr size_t MaxTapeSteps = 262144;
+		size_t used = 0;
+		for (const auto& cached: tape.demand_schedules) used += cached.steps.size();
+		const size_t budget = std::min(MaxRootSteps, MaxTapeSteps - std::min(used, MaxTapeSteps));
+		struct Pending { uint32_t op; uint8_t dependency; uint32_t enter; };
+		std::vector<Pending> pending;
+		std::vector<uint8_t> seen(tape.ops.size(), 0u);
+		pending.push_back({root, 0, UINT32_MAX});
+		bool supported = true;
+		while (!pending.empty()) {
+			auto& node = pending.back();
+			const auto& op = tape.ops[node.op];
+			if (node.enter == UINT32_MAX) {
+				if (schedule.steps.size() >= budget) { supported = false; break; }
+				node.enter = static_cast<uint32_t>(schedule.steps.size());
+				schedule.steps.push_back({node.op, node.enter + 1u});
+				// The earlier ordered occurrence either completed (mark/memo hit)
+				// or ended the refresh on failure. A repeated DAG edge only needs
+				// its enter check, avoiding exponential schedule expansion.
+				if (seen[node.op] || op.dependency_count == 0) {
+					seen[node.op] = 1u;
+					pending.pop_back();
+					continue;
+				}
+				seen[node.op] = 1u;
+			}
+			if (node.dependency < op.dependency_count) {
+				const auto dependency = op.args[node.dependency++];
+				// Tape compilation is topological. Reject corrupt/cyclic schedules
+				// rather than looping or changing the original fallback behavior.
+				if (dependency >= node.op) { supported = false; break; }
+				pending.push_back({dependency, 0, UINT32_MAX});
+				continue;
+			}
+			if (schedule.steps.size() >= budget) { supported = false; break; }
+			schedule.steps.push_back({node.op, UINT32_MAX});
+			schedule.steps[node.enter].next = static_cast<uint32_t>(schedule.steps.size());
+			pending.pop_back();
+		}
+		schedule.state = supported ? ResourcePlan::SrtTape::State::Ready
+		                           : ResourcePlan::SrtTape::State::Unsupported;
+		if (!supported) std::vector<ResourcePlan::SrtTape::DemandStep>().swap(schedule.steps);
+	}
+	if (schedule.state != ResourcePlan::SrtTape::State::Ready) return -1;
+	g_tape_stats.cfg_scheduled.fetch_add(1, std::memory_order_relaxed);
+	auto& values = m_context.tape_values;
+	auto& marks = m_context.tape_marks;
+	for (uint32_t pc = 0; pc < schedule.steps.size();) {
+		if (m_runtime.evaluation_counts) ++m_runtime.evaluation_counts->cfg_schedule_steps;
+		const auto step = schedule.steps[pc];
+		const auto& op = tape.ops[step.op];
+		auto& context = op.clean && m_clean_evaluator != nullptr ? m_clean_evaluator->m_context : m_context;
+		if (step.next != UINT32_MAX) {
+			// Enter checks precisely the same domain memo before descending.
+			// A successful parent skips its entire subtree, including observers.
+			if (op.memo_index != UINT32_MAX && op.memo_index < context.values.size()) {
+				const auto& memo = context.values[op.memo_index];
+				if (memo.generation == context.generation) {
+					values[step.op] = memo.value;
+					marks[step.op] = 1u;
+					pc = step.next;
+					continue;
+				}
+				if (memo.generation == (context.generation | 1u)) {
+					if (op.clean && m_clean_evaluator != nullptr) ++m_clean_evaluator->m_cycle_count;
+					else ++m_cycle_count;
+					return 0;
+				}
+				if (memo.generation == (context.generation | 2u)) return 0;
+			}
+			if (marks[step.op] == 1u) { pc = step.next; continue; }
+			if (marks[step.op] == 2u) return 0;
+			// Leaves have one step; interior nodes execute at their exit.
+			if (step.next != pc + 1u) { ++pc; continue; }
+		}
+		if (!ExecuteTapeOp(op, values, step.op)) {
+			marks[step.op] = 2u;
+			if (op.memo_index != UINT32_MAX) {
+				context.values.resize(m_program.evaluation_value_count);
+				context.values[op.memo_index].generation = context.generation | 2u;
+			}
+			return 0;
+		}
+		marks[step.op] = 1u;
+		++pc;
+	}
+	result = static_cast<uint32_t>(values[root]);
+	return 1;
+}
+
 void SrtWalker::PrepareCfgTape() {
-	if (m_skip_tape || !CfgTapeEnabled() || !m_active_mask.IsEmpty() ||
+	if (m_skip_tape || !m_cfg_tape_enabled || !m_active_mask.IsEmpty() ||
 	    (m_clean_evaluator != nullptr && !m_clean_evaluator->m_active_mask.IsEmpty())) {
 		g_tape_stats.walker.fetch_add(1, std::memory_order_relaxed);
 		return;
@@ -2058,7 +2571,7 @@ void SrtWalker::PrepareCfgTape() {
 }
 
 int SrtWalker::RunCfgRoot(uint32_t root, uint32_t& result) {
-	if (m_skip_tape || !CfgTapeEnabled() || root == UINT32_MAX || !m_active_mask.IsEmpty() ||
+	if (m_skip_tape || !m_cfg_tape_enabled || root == UINT32_MAX || !m_active_mask.IsEmpty() ||
 	    (m_clean_evaluator != nullptr && !m_clean_evaluator->m_active_mask.IsEmpty())) {
 		g_tape_stats.cfg_fallback.fetch_add(1, std::memory_order_relaxed);
 		return -1;
@@ -2066,6 +2579,10 @@ int SrtWalker::RunCfgRoot(uint32_t root, uint32_t& result) {
 	const auto& tape = m_program.cfg_srt_tapes[m_clean_evaluator != nullptr ? 1 : 0];
 	if (root >= tape.ops.size()) return -1;
 	g_tape_stats.cfg_runs.fetch_add(1, std::memory_order_relaxed);
+	if (m_cfg_schedule_enabled) {
+		const int scheduled = RunCfgSchedule(root, result);
+		if (scheduled >= 0) return scheduled;
+	}
 	auto& values = m_context.tape_values;
 	auto& marks = m_context.tape_marks;
 	auto& pending = m_context.tape_pending;
@@ -2151,8 +2668,29 @@ int SrtWalker::RunTape(std::vector<uint32_t>& flat) {
 	auto& vals = m_program.srt_tape_values;
 	vals.resize(tape.ops.size());
 
-	for (size_t i = 0; i < tape.ops.size(); ++i) {
+	for (size_t i = 0; i < tape.ops.size();) {
+		if (m_scalar_batch_enabled &&
+		    tape.ops[i].kind == ResourcePlan::SrtTape::Kind::RawRead &&
+		    tape.ops[i].opcode == ValueOpcode::LoadAddressU32) {
+			std::array<Value, 16> candidates {};
+			std::array<uint32_t, 16> words {};
+			size_t count = 0;
+			const auto& first = tape.ops[i];
+			for (; count < candidates.size() && i + count < tape.ops.size(); ++count) {
+				const auto& op = tape.ops[i + count];
+				if (op.kind != ResourcePlan::SrtTape::Kind::RawRead || op.opcode != first.opcode ||
+				    op.clean != first.clean || op.args != first.args || op.source == nullptr) break;
+				candidates[count] = Value(const_cast<Inst*>(op.source));
+			}
+			const auto batched = TryScalarReadBatch(std::span(candidates).first(count), first.clean != 0, words);
+			if (batched != 0) {
+				for (size_t word = 0; word < batched; ++word) vals[i + word] = words[word];
+				i += batched;
+				continue;
+			}
+		}
 		if (!ExecuteTapeOp(tape.ops[i], vals, static_cast<uint32_t>(i))) return 0;
+		++i;
 	}
 	for (size_t slot = 0; slot < m_program.srt_reads.size(); ++slot) {
 		const auto& read = m_program.srt_reads[slot];
@@ -2175,6 +2713,7 @@ int SrtWalker::RunTape(std::vector<uint32_t>& flat) {
 
 bool SrtWalker::ExecuteTapeOp(const ResourcePlan::SrtTape::Op& op,
                               std::vector<uint64_t>& values, uint32_t index) {
+	if (m_runtime.evaluation_counts) ++m_runtime.evaluation_counts->tape_ops;
 	uint64_t result = 0;
 	switch (op.kind) {
 		case ResourcePlan::SrtTape::Kind::Immediate:

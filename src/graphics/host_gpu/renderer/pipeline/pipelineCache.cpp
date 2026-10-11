@@ -5,8 +5,10 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/runtimeFlags.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
@@ -115,6 +117,48 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
 }
 
+bool ReadShaderOrdinaryBacking(void*, uint64_t address, std::span<uint32_t> values) {
+	// Ordinary scalar loads previously dereferenced the protected guest mapping.
+	// Read only the requested bytes through its alias, synchronizing actual GPU
+	// writes rather than unrelated bytes sharing the protection page. Non-backed
+	// pointers retain the original memcpy/fault behavior; strict reads still fail.
+	if (!values.empty() && Libs::LibKernel::Memory::TryReadBufferBacking(
+	        address, values.data(), values.size_bytes())) {
+		return true;
+	}
+	std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
+	return true;
+}
+
+bool PeekShaderCleanSpan(void*, uint64_t address, std::span<uint32_t> values) {
+	// This capability declines dirty or unavailable ranges without synchronizing
+	// them. The walker then performs its original ordered scalar reads.
+	return !values.empty() && Libs::LibKernel::Memory::TryReadCleanBufferBacking(
+	    address, values.data(), values.size_bytes());
+}
+
+bool ReadShaderNativeSpan(void*, uint64_t address, std::span<uint32_t> values) {
+	if (!GuestGpu::IsGpuThread() || values.empty() ||
+	    !GuestRange{address, values.size_bytes()}.Valid()) return false;
+	// This completes the original ordinary native reads; it does not certify the
+	// range clean. Protected GPU-owned bytes follow existing fault/readback handling.
+	// After access begins, failures keep native fault behavior rather than returning false.
+	std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
+	return true;
+}
+
+template <bool strict, bool native = false>
+bool CaptureShaderSpan(void* data, uint64_t address, std::span<uint32_t> values) {
+	const auto reader = native ? ReadShaderNativeSpan : PeekShaderCleanSpan;
+	if (!reader(nullptr, address, values)) return false;
+	auto& record = *static_cast<PipelineRecord::Program*>(data);
+	auto& reads = strict ? record.reads : record.raw_reads;
+	for (size_t index = 0; index < values.size(); ++index) {
+		reads.push_back({address + index * sizeof(uint32_t), values[index], 1u});
+	}
+	return true;
+}
+
 
 bool ReplayRecordedWords(void* data, uint64_t address, std::span<uint32_t> values, bool strict) {
     const auto& record = *static_cast<const PipelineRecord::Program*>(data);
@@ -126,10 +170,14 @@ bool ReplayRawWords(void* data, uint64_t address, std::span<uint32_t> values) {
 bool ReplayCleanWords(void* data, uint64_t address, std::span<uint32_t> values) {
     return ReplayRecordedWords(data, address, values, true);
 }
-bool CaptureRecordedWords(void* data, uint64_t address, std::span<uint32_t> values, bool strict) {
+bool CaptureRecordedWords(void* data, uint64_t address, std::span<uint32_t> values, bool strict,
+                          bool ordinary_backing = false) {
     auto& record = *static_cast<PipelineRecord::Program*>(data);
     const bool valid = strict ? ReadShaderGuestMemory(nullptr, address, values) : true;
-    if (!strict) std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
+    if (!strict) {
+        if (ordinary_backing) ReadShaderOrdinaryBacking(nullptr, address, values);
+        else std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
+    }
     auto& reads = strict ? record.reads : record.raw_reads;
     for (size_t index = 0; index < values.size(); ++index)
         reads.push_back({address + index * 4, valid ? values[index] : 0u, valid ? 1u : 0u});
@@ -137,6 +185,9 @@ bool CaptureRecordedWords(void* data, uint64_t address, std::span<uint32_t> valu
 }
 bool CaptureRawWords(void* data, uint64_t address, std::span<uint32_t> values) {
     return CaptureRecordedWords(data, address, values, false);
+}
+bool CaptureOrdinaryBackingWords(void* data, uint64_t address, std::span<uint32_t> values) {
+    return CaptureRecordedWords(data, address, values, false, true);
 }
 bool CaptureCleanWords(void* data, uint64_t address, std::span<uint32_t> values) {
     return CaptureRecordedWords(data, address, values, true);
@@ -381,10 +432,18 @@ struct PipelineCache::ProgramCache {
 			entry = &found->second;
 			last = {&found->first, entry};
 		}
+		const auto runtime_flags = Common::RuntimeFlags::Current();
 		ShaderRecompiler::IR::SrtRuntime             runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
+		    .read_memory = runtime_flags.shader_clean_reads
+		                       ? ReadShaderOrdinaryBacking : nullptr,
 		    .read_specialization_memory = ReadShaderGuestMemory,
+		    .try_read_memory_span = runtime_flags.srt_scalar_batch
+		                                ? (runtime_flags.shader_clean_reads
+		                                       ? PeekShaderCleanSpan : ReadShaderNativeSpan) : nullptr,
+		    .try_read_specialization_span = runtime_flags.srt_scalar_batch
+		                                        ? PeekShaderCleanSpan : nullptr,
 		};
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			runtime.workgroup_counts = input_info.workgroup_counts;
@@ -393,8 +452,12 @@ struct PipelineCache::ProgramCache {
             runtime.read_memory = ReplayRawWords;
             runtime.read_specialization_memory = ReplayCleanWords;
             runtime.userdata = const_cast<PipelineRecord::Program*>(replaying);
+            // Frozen PipelineRecords replay through their domain readers. Never
+            // retain a live-memory capability after replacing its userdata.
+            runtime.try_read_memory_span = nullptr;
+            runtime.try_read_specialization_span = nullptr;
         }
-        const bool memo_enabled = reuse_enabled && replaying == nullptr;
+        const bool memo_enabled = reuse_enabled && replaying == nullptr && !runtime_flags.resource_memo_bypass;
         const auto refresh = [&](SourceEntry& source, bool& reused) {
             const bool ok = source.resource_memo.Refresh(source.resource_plan, runtime,
                 source.resources, source.specialization, memo_enabled, reused);
@@ -429,7 +492,7 @@ struct PipelineCache::ProgramCache {
 			if (!refresh(*entry, reused)) return {};
 			resource_hits += reused;
 			materializations += !reused;
-			if (reuse_enabled && !reused) ++resource_misses[static_cast<size_t>(entry->resource_memo.LastMiss())];
+			if (memo_enabled && !reused) ++resource_misses[static_cast<size_t>(entry->resource_memo.LastMiss())];
 			if (reuse_enabled && entry->last_permutation < entry->permutations.size()) {
 				const auto& candidate = entry->permutations[entry->last_permutation];
 				const auto& layout = candidate.program.bindings;
@@ -533,8 +596,14 @@ struct PipelineCache::ProgramCache {
             else recorded.compute = input_info;
             auto capture_runtime = runtime;
             capture_runtime.userdata = &recorded;
-            capture_runtime.read_memory = CaptureRawWords;
+            capture_runtime.read_memory = runtime.read_memory == ReadShaderOrdinaryBacking
+                ? CaptureOrdinaryBackingWords : CaptureRawWords;
             capture_runtime.read_specialization_memory = CaptureCleanWords;
+            capture_runtime.try_read_memory_span = runtime.try_read_memory_span != nullptr
+                ? (runtime.try_read_memory_span == ReadShaderNativeSpan
+                       ? CaptureShaderSpan<false, true> : CaptureShaderSpan<false>) : nullptr;
+            capture_runtime.try_read_specialization_span = runtime.try_read_specialization_span != nullptr
+                ? CaptureShaderSpan<true> : nullptr;
             ShaderRecompiler::IR::ResourceSnapshot captured;
             ShaderRecompiler::IR::ResourceSpecialization captured_specialization;
             recording = ShaderRecompiler::IR::MaterializeResources(entry->resource_plan, capture_runtime,
@@ -584,7 +653,22 @@ struct PipelineCache::ProgramCache {
 			    static_cast<unsigned long long>(resource_misses[static_cast<size_t>(ResourceMemo::Miss::Workgroups)]),
 			    static_cast<unsigned long long>(resource_misses[static_cast<size_t>(ResourceMemo::Miss::ReadFailed)]),
 			    static_cast<unsigned long long>(resource_misses[static_cast<size_t>(ResourceMemo::Miss::MemoryChanged)]));
+			const auto reuse_trace = GetResourceReuseTraceStats();
+			if (reuse_trace.checked != 0 || reuse_trace.evictions != 0) {
+				std::printf("NHL27REUSETRACE: evictions=%llu checked=%llu register_recur=%llu distance16=%llu distance32=%llu distance64=%llu distance128=%llu\n",
+				    static_cast<unsigned long long>(reuse_trace.evictions), static_cast<unsigned long long>(reuse_trace.checked),
+				    static_cast<unsigned long long>(reuse_trace.matched), static_cast<unsigned long long>(reuse_trace.distance16),
+				    static_cast<unsigned long long>(reuse_trace.distance32), static_cast<unsigned long long>(reuse_trace.distance64),
+				    static_cast<unsigned long long>(reuse_trace.distance128));
+			}
 			const auto tape = ShaderRecompiler::IR::GetSrtTapeStats();
+			const auto filter = GetResourceHashFilterStats();
+			if (filter.eligible != 0) {
+				std::printf("NHL27RESOURCEFILTER: eligible=%llu rejected=%llu hash_match=%llu\n",
+				    static_cast<unsigned long long>(filter.eligible),
+				    static_cast<unsigned long long>(filter.rejected),
+				    static_cast<unsigned long long>(filter.matched));
+			}
 			std::printf("NHL27SRTTAPE: runs=%llu failed=%llu walker=%llu built=%llu unsupported=%llu ops=%llu cfg_roots=%llu cfg_fallback=%llu cfg_checked=%llu cfg_matched=%llu cfg_mismatch=%llu cfg_inconclusive=%llu\n",
 			    static_cast<unsigned long long>(tape.runs),
 			    static_cast<unsigned long long>(tape.failed),

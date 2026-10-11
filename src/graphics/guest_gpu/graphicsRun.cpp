@@ -4,6 +4,7 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/runtimeFlags.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
@@ -349,13 +350,27 @@ bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t f
 	return false;
 }
 
+bool CommandProcessor::TryPeekCleanBackingBytes(const volatile void* addr, void* out, uint64_t size) {
+	// Read current bytes without a GPU->CPU download when they are not GPU-dirty. The
+	// backing copy is authoritative for CPU-written bytes: a guest computation writes
+	// its command stream, submits it, and only then does the CP consume it, so the CP
+	// cannot be reading bytes a concurrent GPU write is still producing. Any exact-range
+	// GPU write still refuses the peek, so the fault path keeps the final say. This is
+	// the property that makes a false-sharing read cheap: a dirty neighbour on the same
+	// 4 KiB page must not drag a whole-page download and queue drain behind it.
+	const auto vaddr = reinterpret_cast<uint64_t>(addr);
+	if (!GuestRange {vaddr, size}.Valid() || m_renderer.GetBufferCache().HasGpuDirtyBytes(vaddr, size) ||
+	    !LibKernel::Memory::TryReadBacking(vaddr, out, size)) {
+		return false;
+	}
+	return true;
+}
+
 bool CommandProcessor::TryPeekGuest(const volatile void* addr, void* out, uint64_t size) {
 	if (!BufferCache::PerfNoSyncReadback() || !GuestGpu::IsGpuThread()) {
 		return false;
 	}
-	const auto vaddr = reinterpret_cast<uint64_t>(addr);
-	if (!GuestRange {vaddr, size}.Valid() || m_renderer.GetBufferCache().HasGpuDirtyBytes(vaddr, size) ||
-	    !LibKernel::Memory::TryReadBacking(vaddr, out, size)) {
+	if (!TryPeekCleanBackingBytes(addr, out, size)) {
 		return false;
 	}
 	BufferCache::PerfCount(BufferCache::PerfEvent::WaitRegMemBackingRead);
@@ -401,6 +416,31 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	}
 	if (dw_num == 0) {
 		return;
+	}
+
+	// Labels commonly share a protected page with GPU-written data. Update both
+	// copies through the existing exact-range label path, without downloading or
+	// unprotecting unrelated bytes. Read each source before its corresponding
+	// repeated-address write: source and destination may alias.
+	if (Common::RuntimeFlags::Current().pm4_write_data_fast && GuestGpu::IsGpuThread()) {
+		auto& cache = m_renderer.GetBufferCache();
+		if (write_one_address) {
+			for (uint32_t i = 0; i < dw_num; i++) {
+				const uint32_t value = src[i];
+				if (!cache.TryWriteLabel(reinterpret_cast<uint64_t>(dst), &value, sizeof(value))) {
+					dst[0] = value;
+				}
+			}
+			return;
+		}
+		if (dw_num <= 2) {
+			std::array<uint32_t, 2> values{};
+			std::memcpy(values.data(), src, static_cast<size_t>(dw_num) * sizeof(uint32_t));
+			if (cache.TryWriteLabel(reinterpret_cast<uint64_t>(dst), values.data(),
+			                        static_cast<uint64_t>(dw_num) * sizeof(uint32_t))) {
+				return;
+			}
+		}
 	}
 
 	if (write_one_address) {

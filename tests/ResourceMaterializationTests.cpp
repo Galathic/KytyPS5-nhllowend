@@ -1,14 +1,22 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "common/runtimeFlags.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/host_gpu/renderer/pipeline/resourceMemo.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceFixture.h"
+#include "graphics/shader/recompiler/ir/passes/ResourcePlanFixture.h"
 
 #include <array>
+#include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <limits>
 #include <memory>
+#include <string>
+#include <vector>
 
 namespace {
 
@@ -1820,6 +1828,375 @@ void TestMixedSamplerVariantsShareRuntimeDescriptor() {
         "sampler variants retained stale or duplicated descriptors after refresh");
 }
 
+// The replay fixture is what lets SrtWalker/resourceMemo iteration happen with no
+// emulator run, so its two load-bearing properties get checked directly: adjacent
+// reads coalesce instead of exploding into one record per word, and an uncaptured
+// read is reported rather than silently answered.
+void TestResourceFixtureRoundTrip() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+
+  const std::string path = "resource_fixture_test.arb";
+  std::remove(path.c_str());
+
+  ResourceFixture writer;
+  const std::array<uint32_t, 3> user_data {0xAAAA0001u, 0xAAAA0002u, 0xAAAA0003u};
+  writer.SetUserData(user_data);
+  writer.SetShaderBase(0x1234'5678'9ABCuLL);
+
+  // Three adjacent ordinary words: must collapse into one record.
+  writer.AddRead(FixtureRead {.address = 0x5000, .strict = false, .valid = true, .values = {0x11u}});
+  writer.AddRead(FixtureRead {.address = 0x5004, .strict = false, .valid = true, .values = {0x22u}});
+  writer.AddRead(FixtureRead {.address = 0x5008, .strict = false, .valid = true, .values = {0x33u}});
+
+  // A gap breaks coalescing.
+  writer.AddRead(FixtureRead {.address = 0x5100, .strict = false, .valid = true, .values = {0x44u}});
+
+  // A read that legitimately failed must be recorded as invalid, not omitted.
+  writer.AddRead(FixtureRead {.address = 0x5200, .strict = false, .valid = false, .values = {0u}});
+
+  Check(writer.TotalReads() == 5u, "fixture counted the raw reads");
+  Check(writer.DistinctReads() == 3u, "adjacent reads coalesced into one record");
+  Check(writer.Save(path), "fixture saved");
+
+  ResourceFixture reader;
+  Check(reader.Load(path), "fixture loaded");
+  Check(reader.ShaderBase() == 0x1234'5678'9ABCuLL, "shader base survived the round trip");
+  Check(reader.UserData().size() == user_data.size() &&
+            reader.UserData()[2] == user_data[2],
+        "user data survived the round trip");
+
+  // Replay serves exactly what was captured.
+  std::array<uint32_t, 3> out {0u, 0u, 0u};
+  bool missing = false;
+  Check(reader.Read(nullptr, 0x5000, out, false, &missing) && !missing &&
+            out[0] == 0x11u && out[1] == 0x22u && out[2] == 0x33u,
+        "a coalesced record serves the full span it covered");
+
+  // Lookup is reader-agnostic: the fixture records the memory access trace, so the
+  // same bytes are served whichever reader the plan uses. Recording a strict label
+  // would be wrong for a runtime whose ordinary reader is the specialization reader.
+  bool again_missing = false;
+  std::array<uint32_t, 1> again_out {0u};
+  Check(reader.Read(nullptr, 0x5000, again_out, true, &again_missing) && !again_missing &&
+            again_out[0] == 0x11u,
+        "the same bytes are served whichever reader asks");
+
+  // A width that was never captured at a captured address is missing, not a
+  // truncated or over-read answer.
+  std::array<uint32_t, 4> wrong_width {0u, 0u, 0u, 0u};
+  bool width_missing = false;
+  Check(!reader.Read(nullptr, 0x5000, wrong_width, false, &width_missing) && width_missing,
+        "a differently sized request at a captured address is reported as missing");
+
+  // The 1-word record at 0x5100 must not be extended to 2 words by the coalesced
+  // neighbour at 0x5000.
+  std::array<uint32_t, 2> gap_overread {0u, 0u};
+  bool gap_missing = false;
+  Check(!reader.Read(nullptr, 0x5100, gap_overread, false, &gap_missing) && gap_missing,
+        "a record is not extended past the span it captured");
+
+  // An uncaptured request must be reported, never invented or read from live memory.
+  std::array<uint32_t, 1> absent {0u};
+  bool absent_missing = false;
+  Check(!reader.Read(nullptr, 0xDEAD'0000, absent, false, &absent_missing) && absent_missing,
+        "an uncaptured read is reported as missing");
+
+  // A recorded-invalid read must report "the fixture knows this read failed", which
+  // is NOT the same as "the fixture lacks the record". A partial fixture that
+  // reported the latter as the former would look complete when it is not.
+  std::array<uint32_t, 1> invalid_out {0u};
+  bool invalid_missing = false;
+  bool invalid_failed  = false;
+  Check(!reader.Read(nullptr, 0x5200, invalid_out, false, &invalid_missing, &invalid_failed) &&
+            invalid_failed && !invalid_missing,
+        "a recorded-invalid read reports failed, not missing");
+
+  // Version mismatch must be refused rather than misinterpreted.
+  {
+    std::fstream f(path, std::ios::binary | std::ios::in | std::ios::out);
+    f.seekp(8);
+    const uint32_t bad_version = 0xFFFF'FFFFu;
+    f.write(reinterpret_cast<const char*>(&bad_version), sizeof(bad_version));
+    f.close();
+  }
+  ResourceFixture bad;
+  Check(!bad.Load(path), "a fixture with an unknown version is refused");
+  std::remove(path.c_str());
+}
+
+// A fixture is only useful if it can actually drive a runtime, so this exercises the
+// replay callbacks the way a plan would: every captured read must be served back
+// identically, and anything uncaptured must be reported rather than invented.
+void TestResourceFixtureDrivesRuntime() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+
+  ResourceFixture fixture;
+  fixture.SetUserData(std::array<uint32_t, 2> {0x1111u, 0x2222u});
+  fixture.SetShaderBase(0x9000'0000u);
+  fixture.AddRead(FixtureRead {.address = 0x2000, .strict = false, .valid = true, .values = {0xA1u}});
+  fixture.AddRead(FixtureRead {.address = 0x2004, .strict = false, .valid = true, .values = {0xB2u}});
+  fixture.AddRead(FixtureRead {.address = 0x2100, .strict = true, .valid = true, .values = {0xC3u}});
+
+  // Replay callback bound to the fixture, as a plan's reader would be.
+  struct Replay {
+    ResourceFixture *fixture;
+    uint32_t served = 0;
+    uint32_t missing = 0;
+    uint32_t failed = 0;
+  };
+  static Replay replay;
+  replay = Replay {.fixture = &fixture};
+
+  auto reader = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+    auto &state = *static_cast<Replay *>(data);
+    bool missing = false;
+    bool failed = false;
+    const bool ok = state.fixture->Read(nullptr, address, words, false, &missing, &failed);
+    if (ok) ++state.served;
+    if (missing) ++state.missing;
+    if (failed) ++state.failed;
+    return ok;
+  };
+
+  SrtRuntime runtime {};
+  runtime.user_data = fixture.UserData();
+  runtime.shader_base = fixture.ShaderBase();
+  runtime.read_memory = reader;
+  runtime.userdata = &replay;
+
+  // A read spanning two coalesced words must come back byte-identical.
+  std::array<uint32_t, 2> span {0u, 0u};
+  Check(runtime.read_memory(runtime.userdata, 0x2000, span) && span[0] == 0xA1u && span[1] == 0xB2u,
+        "the replay runtime serves a captured span unchanged");
+  Check(replay.served == 1u, "the replay runtime counted the served read");
+
+  // A wider request that runs past the captured span must be refused, not truncated.
+  std::array<uint32_t, 4> over {0u, 0u, 0u, 0u};
+  Check(!runtime.read_memory(runtime.userdata, 0x2000, over) && replay.missing == 1u,
+        "a read running past the captured span is refused and reported missing");
+
+  // An uncaptured address must never be answered.
+  std::array<uint32_t, 1> absent {0u};
+  Check(!runtime.read_memory(runtime.userdata, 0x7777'0000u, absent),
+        "an uncaptured address is refused by the replay runtime");
+  Check(fixture.ShaderBase() == runtime.shader_base && runtime.user_data.size() == 2u,
+        "the replay runtime keeps the recorded base and user data");
+}
+
+// The live recorder writes append-only batches rather than rewriting the file, so the
+// append path needs its own coverage: Save() alone would not have caught a header
+// count written at the wrong offset, which is a bug this test now pins down.
+void TestResourceFixtureAppendPath() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+
+  const std::string path = "resource_fixture_append_test.arb";
+  std::remove(path.c_str());
+
+  ResourceFixture writer;
+  writer.SetUserData(std::array<uint32_t, 1> {0x5A5A5A5Au});
+  writer.SetShaderBase(0xDEAD'BEEFu);
+  Check(writer.BeginFile(path), "append path: header written");
+
+  // Two batches, derived the same way the live recorder derives them: add, rebuild so
+  // coalescing is applied, then append only the records beyond the previous count.
+  auto append_batch = [&](std::vector<FixtureRead> reads, const char *what) {
+    const size_t before = writer.DistinctReads();
+    for (auto &read : reads) writer.AddRead(read);
+    writer.Rebuild();
+    const auto &all = writer.Reads();
+    std::vector<FixtureRead> tail;
+    for (size_t i = before; i < all.size(); ++i) tail.push_back(all[i]);
+    Check(writer.AppendReads(path, tail), what);
+    return tail.size();
+  };
+
+  // Adjacent words coalesce into one record, so this batch writes a single record.
+  const size_t written_one = append_batch(
+      {FixtureRead {.address = 0x1000, .strict = false, .valid = true, .values = {0x01u}},
+       FixtureRead {.address = 0x1004, .strict = false, .valid = true, .values = {0x02u}}},
+      "append path: first batch appended");
+  Check(written_one == 1u, "append path: adjacent reads coalesced into one appended record");
+
+  const size_t written_two = append_batch(
+      {FixtureRead {.address = 0x2000, .strict = false, .valid = true, .values = {0x03u}}},
+      "append path: second batch appended");
+  Check(written_two == 1u, "append path: second batch appended one record");
+
+  // The file must load after appends, with both batches present.
+  ResourceFixture reader;
+  Check(reader.Load(path), "append path: file loads after appends");
+  Check(reader.ShaderBase() == 0xDEAD'BEEFu, "append path: shader base intact");
+  Check(reader.UserData().size() == 1u && reader.UserData()[0] == 0x5A5A5A5Au,
+        "append path: user data intact");
+  Check(reader.Reads().size() == 2u, "append path: both appended records survived");
+
+  std::vector<uint32_t> out(2, 0u);
+  bool missing = false;
+  bool failed = false;
+  Check(reader.Read(nullptr, 0x1000, out, false, &missing, &failed) && out[0] == 0x01u && out[1] == 0x02u,
+        "append path: the coalesced first batch replays whole");
+  out.assign(1, 0u);
+  Check(reader.Read(nullptr, 0x2000, out, false, &missing, &failed) && out[0] == 0x03u,
+        "append path: second batch replays");
+
+  std::remove(path.c_str());
+}
+
+// The accumulator merges overlapping records word by word, so this checks the property
+// that matters: after a rebuild, every word that was ever added is still there. An
+// earlier record-level dedup silently dropped words beyond a wider kept span.
+void TestResourceFixturePreservesEveryWord() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+
+  const std::string path = "resource_fixture_words_test.arb";
+  std::remove(path.c_str());
+
+  ResourceFixture writer;
+  Check(writer.BeginFile(path), "word preservation: header written");
+
+  // Batch 1: a three-word record.
+  writer.AddRead(FixtureRead {.address = 0x8000, .strict = false, .valid = true, .values = {0x11u, 0x22u, 0x33u}});
+  writer.Rebuild();
+  uint64_t appended = 0;
+  std::vector<FixtureRead> batch_one;
+  for (const auto &read : writer.Reads()) {
+    batch_one.push_back(read);
+  }
+  Check(writer.AppendReads(path, batch_one), "word preservation: batch 1 appended");
+  appended = batch_one.size();
+  Check(appended == 1u, "word preservation: batch 1 wrote one record");
+
+  // Batch 2: a record that overlaps an already-captured word, plus a word that extends
+  // past the end of the wide record. Neither may be lost.
+  writer.AddRead(FixtureRead {.address = 0x8004, .strict = false, .valid = true, .values = {0x77u}});
+  writer.AddRead(FixtureRead {.address = 0x800C, .strict = false, .valid = true, .values = {0x99u}});
+  writer.Rebuild();
+
+  std::vector<uint32_t> out(1, 0u);
+  bool missing = false;
+  bool failed = false;
+  Check(writer.Read(nullptr, 0x8000, out, false, &missing, &failed) && out[0] == 0x11u,
+        "word preservation: first word of the wide record survived");
+  // Overlap keeps the FIRST captured value: a later record must not rewrite what the
+  // guest actually returned at that address, or replay would no longer match the run.
+  out.assign(1, 0u);
+  Check(writer.Read(nullptr, 0x8004, out, false, &missing, &failed) && out[0] == 0x22u,
+        "word preservation: overlapping word keeps the first captured value");
+  out.assign(1, 0u);
+  Check(writer.Read(nullptr, 0x8008, out, false, &missing, &failed) && out[0] == 0x33u,
+        "word preservation: word beyond the overlap survived");
+  out.assign(1, 0u);
+  Check(writer.Read(nullptr, 0x800C, out, false, &missing, &failed) && out[0] == 0x99u,
+        "word preservation: extending word survived");
+
+  // Conservation: distinct addresses are 0x8000, 0x8004, 0x8008, 0x800C = 4 words.
+  // The overlapping 0x8004 is a genuine duplicate and must not be double counted, so
+  // the retained count staying at exactly 4 is the dedup proof.
+  Check(writer.WordsRetained() == 4u,
+        "word preservation: retained word count equals the distinct words added");
+
+  std::remove(path.c_str());
+}
+
+// The live recorder flushes repeatedly, appending only words the file does not have
+// yet. This replays that shape offline: de-coalesced records so each append is
+// predictable, several flushes, then assert the file accounts for every word.
+void TestResourceFixtureRepeatedFlush() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+
+  const std::string path = "resource_fixture_flush_test.arb";
+  std::remove(path.c_str());
+
+  ResourceFixture writer;
+  writer.EnableCoalescing(false); // one record per read, so appends are countable
+  Check(writer.BeginFile(path), "repeated flush: header written");
+
+  std::vector<FixtureRead> batch;
+  // Expected pieces, derived with the same word-splitting rule the recorder uses: a
+  // record is split so only its genuinely new words are written. Mirrors MergeAndFlush.
+  std::vector<FixtureRead> expected_pieces;
+  auto word_written = [&](uint64_t address) {
+    for (const auto &r : expected_pieces) {
+      if (address >= r.address && address < r.address + r.values.size() * sizeof(uint32_t)) return true;
+    }
+    return false;
+  };
+
+  auto flush = [&]() {
+    writer.Rebuild();
+    batch.clear();
+    for (const auto &read : writer.Reads()) {
+      auto new_piece = [&]() {
+        FixtureRead piece;
+        piece.strict = read.strict;
+        piece.valid  = read.valid;
+        return piece;
+      };
+      FixtureRead piece;
+      bool started = false;
+      uint64_t cursor = read.address;
+      for (const uint32_t value : read.values) {
+        if (!word_written(cursor)) {
+          if (!started) {
+            piece = new_piece();
+            piece.address = cursor;
+            started = true;
+          }
+          piece.values.push_back(value);
+        } else if (started) {
+          batch.push_back(piece);
+          piece = FixtureRead {};
+          started = false;
+        }
+        cursor += sizeof(uint32_t);
+      }
+      if (started) batch.push_back(piece);
+    }
+    Check(writer.AppendReads(path, batch), "repeated flush: append succeeded");
+    for (const auto &piece : batch) expected_pieces.push_back(piece);
+  };
+
+  for (int round = 0; round < 5; ++round) {
+    const uint32_t base = 0x10000u + static_cast<uint32_t>(round) * 0x1000u;
+    for (uint32_t i = 0; i < 8; ++i) {
+      writer.AddRead(FixtureRead {.address = base + i * 4u,
+                                  .strict = false,
+                                  .valid = true,
+                                  .values = {0xAA00u + i}});
+    }
+    if (round >= 1) {
+      // Introduce overlapping values, the case that tripped the earlier cursor logic.
+      writer.AddRead(FixtureRead {.address = 0x10004u, .strict = false, .valid = true, .values = {0xDEADu}});
+    }
+    flush();
+  }
+
+  ResourceFixture reader;
+  Check(reader.Load(path), "repeated flush: file loads");
+  std::printf("  [diag] writer.WordsRetained=%llu expected_pieces=%zu file_records=%zu\n",
+              static_cast<unsigned long long>(writer.WordsRetained()), expected_pieces.size(),
+              reader.Reads().size());
+  // The file may hold fewer pieces than were appended, because appending two adjacent
+  // pieces leaves them as two records on disk. What must hold is that the file accounts
+  // for every word the accumulator holds: no word lost, none invented.
+  uint64_t file_words = 0;
+  for (const auto &read : reader.Reads()) file_words += read.values.size();
+  Check(file_words == writer.WordsRetained(),
+        "repeated flush: file accounts for every retained word");
+
+  // A sample of the earliest and latest rounds must be readable.
+  std::vector<uint32_t> out(1, 0u);
+  bool missing = false;
+  bool failed = false;
+  Check(reader.Read(nullptr, 0x10000, out, false, &missing, &failed) && out[0] == 0xAA00u,
+        "repeated flush: first round is readable");
+  out.assign(1, 0u);
+  Check(reader.Read(nullptr, 0x14000, out, false, &missing, &failed) && out[0] == 0xAA00u,
+        "repeated flush: last round is readable");
+
+  std::remove(path.c_str());
+}
+
 } // namespace
 
 namespace Common {
@@ -1836,7 +2213,528 @@ void DbgExit(int) { std::abort(); }
 
 } // namespace Common
 
-int main() {
+// Inspect a recorded fixture without a game run. This is the reader half of the
+// record/replay loop: point it at a .arb produced by KYTY_SRT_FIXTURE_RECORD to see
+// what was captured, and use it to confirm a recording actually contains a usable
+// workload before spending an emulator run on replaying it.
+//
+// Usage: resource_materialization_tests.exe --inspect-fixture <path.arb>
+static int InspectFixture(const char *path) {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  ResourceFixture fixture;
+  if (!fixture.Load(path)) {
+    std::fprintf(stderr, "fixture: FAILED to load '%s' (missing, wrong magic or wrong version)\n", path);
+    return 1;
+  }
+  uint64_t min_address = UINT64_MAX;
+  uint64_t max_address = 0;
+  uint64_t failed_reads = 0;
+  uint64_t words = 0;
+  for (const auto &read : fixture.Reads()) {
+    if (read.address < min_address) min_address = read.address;
+    const uint64_t end = read.address + read.values.size() * sizeof(uint32_t);
+    if (end > max_address) max_address = end;
+    if (!read.valid) ++failed_reads;
+    words += read.values.size();
+  }
+  std::printf("fixture: %s\n", path);
+  std::printf("  distinct reads : %zu\n", fixture.Reads().size());
+  std::printf("  words captured : %llu\n", static_cast<unsigned long long>(words));
+  std::printf("  failed reads   : %llu\n", static_cast<unsigned long long>(failed_reads));
+  std::printf("  shader base    : 0x%llx\n", static_cast<unsigned long long>(fixture.ShaderBase()));
+  std::printf("  user data words: %zu\n", fixture.UserData().size());
+  if (!fixture.Reads().empty()) {
+    std::printf("  address range  : 0x%llx .. 0x%llx\n",
+                static_cast<unsigned long long>(min_address),
+                static_cast<unsigned long long>(max_address));
+  }
+  // Exercise the replayer against the fixture's own first record so a structurally
+  // valid but unreadable fixture is caught here rather than mid-experiment.
+  if (!fixture.Reads().empty()) {
+    const auto &first = fixture.Reads().front();
+    std::vector<uint32_t> out(first.values.size(), 0u);
+    bool missing = false;
+    bool failed = false;
+    const bool ok = fixture.Read(nullptr, first.address, out, false, &missing, &failed);
+    std::printf("  self-read      : %s (missing=%d failed=%d)\n", ok ? "served" : "NOT SERVED",
+                missing ? 1 : 0, failed ? 1 : 0);
+  }
+  return 0;
+}
+
+static int ReplayPlanFixture(const char* path) {
+ using namespace Libs::Graphics::ShaderRecompiler::IR;
+ ResourcePlanFixture fixture;
+ if (!fixture.Load(path)) {
+  std::fprintf(stderr,"plan fixture: load failed: %s (requires a .rpf; legacy .arb has no plan)\n",path);
+  return 2;
+ }
+ const auto r = fixture.Replay();
+ std::printf("plan fixture: hash=%llx instructions=%zu result=%s success=%d missing=%llu conflicts=%llu "
+             "reads=%llu words=%llu ops=%llu captured_ops=%llu cfg_roots=%llu walker=%llu\n",
+  static_cast<unsigned long long>(fixture.plan.shader_hash),fixture.plan.value_storage.size(),
+  r.matched ? "MATCH" : "FAIL",r.success,
+  static_cast<unsigned long long>(r.missing),static_cast<unsigned long long>(r.conflicts),
+  static_cast<unsigned long long>(r.requests),static_cast<unsigned long long>(r.words),
+  static_cast<unsigned long long>(r.ops),static_cast<unsigned long long>(fixture.captured_ops),
+  static_cast<unsigned long long>(r.cfg_roots),static_cast<unsigned long long>(r.walker));
+ std::printf("  recursive_instructions=%llu tape_operations=%llu\n", static_cast<unsigned long long>(r.recursive_ops), static_cast<unsigned long long>(r.tape_ops));
+ return r.matched ? 0 : 1;
+}
+
+// Load and validate an entire captured workload, then time production materialization
+// while keeping each frozen reader map alive across warm-up and measured iterations.
+static int BenchmarkResourcePlans(const char* directory, uint64_t iterations) {
+ using namespace Libs::Graphics::ShaderRecompiler::IR;
+ if (iterations == 0 || iterations > 1000000) {
+  std::fprintf(stderr, "plan benchmark: iterations must be in 1..1000000\n"); return 2;
+ }
+ std::error_code ec;
+ std::filesystem::path root(directory);
+ if (!std::filesystem::is_directory(root, ec) || ec) {
+  std::fprintf(stderr, "plan benchmark: not a readable directory: %s\n", directory); return 2;
+ }
+ std::vector<std::filesystem::path> paths;
+ for (std::filesystem::directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec))
+  if (it->is_regular_file(ec) && it->path().extension() == ".rpf") paths.push_back(it->path());
+ if (ec) { std::fprintf(stderr, "plan benchmark: directory scan failed: %s\n", directory); return 2; }
+ std::sort(paths.begin(), paths.end());
+ if (paths.empty()) { std::fprintf(stderr, "plan benchmark: no .rpf files in %s\n", directory); return 2; }
+
+ struct Item { std::filesystem::path path; ResourcePlanFixture fixture; ResourcePlanFixture::ReplayBacking backing; };
+ std::vector<std::unique_ptr<Item>> items;
+ items.reserve(paths.size());
+ for (const auto& path : paths) {
+  auto item = std::make_unique<Item>();
+  item->path = path;
+  if (!item->fixture.Load(path.string())) {
+   std::fprintf(stderr, "plan benchmark: failed to load %s\n", path.string().c_str()); return 2;
+  }
+  item->backing = ResourcePlanFixture::ReplayBacking(item->fixture);
+  auto checked = item->fixture.ReplayPrepared(item->backing);
+  if (!checked.matched || checked.missing || checked.conflicts) {
+   std::fprintf(stderr, "plan benchmark: correctness failed for %s (matched=%d missing=%llu conflicts=%llu)\n",
+    path.string().c_str(), checked.matched, static_cast<unsigned long long>(checked.missing),
+    static_cast<unsigned long long>(checked.conflicts)); return 1;
+  }
+  items.push_back(std::move(item));
+ }
+ // Warm each plan once before starting the timer.
+ for (auto& item : items) {
+  const auto warm = item->fixture.ReplayPrepared(item->backing);
+  if (!warm.matched || warm.missing || warm.conflicts) {
+   std::fprintf(stderr, "plan benchmark: warm-up failed for %s\n", item->path.string().c_str()); return 1;
+  }
+ }
+
+ uint64_t total_us = 0, total_ordinary = 0, total_strict = 0, total_recursive = 0, total_tape = 0;
+ uint64_t total_scalar_batch_words = 0, total_gather_eligible = 0, total_gather_hits = 0;
+ uint64_t total_schedule_steps = 0, total_cfg_scheduled = 0;
+ std::printf("plan benchmark: plans=%zu iterations=%llu (correctness passed)\n", items.size(),
+  static_cast<unsigned long long>(iterations));
+ for (auto& item : items) {
+  uint64_t ordinary = 0, strict = 0, recursive = 0, tape = 0, scalar_batch_words = 0;
+  uint64_t gather_eligible = 0, gather_hits = 0;
+  uint64_t schedule_steps = 0, cfg_scheduled = 0;
+  const auto start = std::chrono::steady_clock::now();
+  for (uint64_t i = 0; i < iterations; ++i) {
+   const auto r = item->fixture.ReplayPrepared(item->backing);
+   if (!r.matched || r.missing || r.conflicts) {
+    std::fprintf(stderr, "plan benchmark: iteration failed for %s (missing=%llu conflicts=%llu)\n",
+     item->path.string().c_str(), static_cast<unsigned long long>(r.missing),
+     static_cast<unsigned long long>(r.conflicts)); return 1;
+   }
+   ordinary += r.ordinary_calls; strict += r.strict_calls;
+   recursive += r.recursive_ops; tape += r.tape_ops;
+   scalar_batch_words += r.scalar_batch_words;
+   gather_eligible += r.cfg_gather_eligible; gather_hits += r.cfg_gather_hits;
+   schedule_steps += r.cfg_schedule_steps; cfg_scheduled += r.cfg_scheduled;
+  }
+  const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+   std::chrono::steady_clock::now() - start).count();
+  const uint64_t us = static_cast<uint64_t>(elapsed);
+  total_us += us; total_ordinary += ordinary; total_strict += strict;
+  total_recursive += recursive; total_tape += tape;
+  total_scalar_batch_words += scalar_batch_words;
+  total_gather_eligible += gather_eligible; total_gather_hits += gather_hits;
+  total_schedule_steps += schedule_steps; total_cfg_scheduled += cfg_scheduled;
+  std::printf("  %s avg_us=%.2f ordinary_calls/eval=%llu strict_calls/eval=%llu recursive/eval=%llu tape/eval=%llu scalar_batch_words/eval=%llu cfg_schedule_steps/eval=%llu cfg_scheduled/eval=%llu cfg_gather_eligible/eval=%llu cfg_gather_hits/eval=%llu\n",
+   item->path.filename().string().c_str(), static_cast<double>(us) / iterations,
+   static_cast<unsigned long long>(ordinary / iterations), static_cast<unsigned long long>(strict / iterations),
+   static_cast<unsigned long long>(recursive / iterations), static_cast<unsigned long long>(tape / iterations),
+   static_cast<unsigned long long>(scalar_batch_words / iterations),
+   static_cast<unsigned long long>(schedule_steps / iterations), static_cast<unsigned long long>(cfg_scheduled / iterations),
+   static_cast<unsigned long long>(gather_eligible / iterations), static_cast<unsigned long long>(gather_hits / iterations));
+ }
+ std::printf("aggregate: avg_us_per_plan=%.2f total_us=%llu ordinary_calls/corpus_sweep=%llu strict_calls/corpus_sweep=%llu recursive/corpus_sweep=%llu tape/corpus_sweep=%llu scalar_batch_words/corpus_sweep=%llu cfg_schedule_steps/corpus_sweep=%llu cfg_scheduled/corpus_sweep=%llu cfg_gather_eligible/corpus_sweep=%llu cfg_gather_hits/corpus_sweep=%llu\n",
+  static_cast<double>(total_us) / (items.size() * iterations), static_cast<unsigned long long>(total_us),
+  static_cast<unsigned long long>(total_ordinary / iterations), static_cast<unsigned long long>(total_strict / iterations),
+  static_cast<unsigned long long>(total_recursive / iterations), static_cast<unsigned long long>(total_tape / iterations),
+  static_cast<unsigned long long>(total_scalar_batch_words / iterations),
+  static_cast<unsigned long long>(total_schedule_steps / iterations), static_cast<unsigned long long>(total_cfg_scheduled / iterations),
+  static_cast<unsigned long long>(total_gather_eligible / iterations), static_cast<unsigned long long>(total_gather_hits / iterations));
+ return 0;
+}
+
+// Frozen providers isolate ResourceMemo capture/probe overhead from GPU work.
+// Unique shader bases force misses only when the graph cannot observe that input.
+static int BenchmarkResourceMemo(const char* directory, uint64_t iterations) {
+ using namespace Libs::Graphics::ShaderRecompiler::IR;
+ if (iterations == 0 || iterations > 1000000) {
+  std::fprintf(stderr,"resource memo benchmark: iterations must be in 1..1000000\n"); return 2;
+ }
+ std::error_code ec;
+ const std::filesystem::path root(directory);
+ if (!std::filesystem::is_directory(root,ec) || ec) return 2;
+ std::vector<std::filesystem::path> paths;
+ for (std::filesystem::directory_iterator it(root,ec),end; !ec && it!=end; it.increment(ec)) {
+  if (it->is_regular_file(ec) && it->path().extension()==".rpf") paths.push_back(it->path());
+ }
+ if (ec || paths.empty()) return 2;
+ std::sort(paths.begin(),paths.end());
+ struct Arm {
+  Libs::Graphics::ResourceMemo memo{16};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  uint64_t sequence=0, ns=0, evaluations=0, hits=0, reads=0, words=0;
+  uint64_t ordinary=0, strict=0;
+ };
+ struct Item {
+  std::filesystem::path path;
+  ResourcePlanFixture fixture;
+  ResourcePlanFixture::ReplayBacking backing;
+  std::array<Arm,3> arms;
+ };
+ std::vector<std::unique_ptr<Item>> items;
+ uint64_t skipped_base=0, skipped_failure=0, skipped_uncacheable=0;
+ const auto runtime_for=[](Item& item) {
+  auto& f=item.fixture;
+  SrtRuntime runtime{.user_data=f.user_data,.shader_base=f.shader_base,
+      .userdata=&item.backing,.workgroup_counts=f.workgroups};
+  if (f.ordinary_reader) runtime.read_memory=+[](void* p,uint64_t address,std::span<uint32_t> words) {
+   return static_cast<ResourcePlanFixture::ReplayBacking*>(p)->Read(false,address,words);
+  };
+  else runtime.read_memory=+[](void* p,uint64_t,std::span<uint32_t>) {
+   auto& result=static_cast<ResourcePlanFixture::ReplayBacking*>(p)->result;
+   ++result.ordinary_calls; ++result.missing; return false;
+  };
+  if (f.strict_reader) runtime.read_specialization_memory=+[](void* p,uint64_t address,std::span<uint32_t> words) {
+   return static_cast<ResourcePlanFixture::ReplayBacking*>(p)->Read(true,address,words);
+  };
+  if (f.ordinary_reader) runtime.try_read_memory_span=+[](void* p,uint64_t address,std::span<uint32_t> words) {
+   return static_cast<ResourcePlanFixture::ReplayBacking*>(p)->TryRead(false,address,words);
+  };
+  if (f.strict_reader) runtime.try_read_specialization_span=+[](void* p,uint64_t address,std::span<uint32_t> words) {
+   return static_cast<ResourcePlanFixture::ReplayBacking*>(p)->TryRead(true,address,words);
+  };
+  return runtime;
+ };
+ const auto matches=[](const Item& item,const Arm& arm) {
+  const auto& expected=item.fixture.expected;
+  const auto& actual=arm.snapshot;
+  return !item.backing.result.missing && !item.backing.result.conflicts &&
+   actual.buffers==expected.buffers && actual.images==expected.images && actual.samplers==expected.samplers &&
+   actual.flattened_srt==expected.flattened_srt && actual.user_data==expected.user_data &&
+   ResourcePlanFixture::SameRangeCoverage(actual.specialization_reads,expected.specialization_reads) &&
+   actual.uniform_fill==expected.uniform_fill && arm.specialization==item.fixture.specialization &&
+   item.fixture.plan.active_sources==item.fixture.active;
+ };
+ const auto run=[&](Item& item,size_t index,bool& reused) {
+  auto& arm=item.arms[index];
+  auto runtime=runtime_for(item);
+  // Both miss arms receive identical changing inputs. Stable-hit calibration
+  // holds the captured base fixed; excluded graphs cannot observe either base.
+  if (index!=2) runtime.shader_base=++arm.sequence;
+  return arm.memo.Refresh(item.fixture.plan,runtime,arm.snapshot,arm.specialization,index!=0,reused);
+ };
+ for (const auto& path:paths) {
+  auto item=std::make_unique<Item>(); item->path=path;
+  if (!item->fixture.Load(path.string())) {
+   std::fprintf(stderr,"resource memo benchmark: load failed %s\n",path.string().c_str()); return 2;
+  }
+  item->backing=ResourcePlanFixture::ReplayBacking(item->fixture);
+  const auto checked=item->fixture.ReplayPrepared(item->backing);
+  if (!checked.matched || checked.missing || checked.conflicts) {
+   std::fprintf(stderr,"resource memo benchmark: fixture mismatch %s\n",path.string().c_str()); return 1;
+  }
+  if (std::ranges::any_of(item->fixture.plan.value_storage,[](const auto& inst) {
+       return inst.GetOpcode()==ValueOpcode::GetShaderBase;
+      })) {
+   ++skipped_base; std::printf("skip %s: graph observes shader_base\n",path.filename().string().c_str()); continue;
+  }
+  if (!item->fixture.success) {
+   ++skipped_failure; std::printf("skip %s: recorded failure cannot calibrate a stable hit\n",path.filename().string().c_str()); continue;
+  }
+  bool cacheable=true;
+  // Fill every miss-bank slot and warm retained vectors before measuring.
+  for (size_t arm=0;arm<3;++arm) for (uint32_t warm=0;warm<17;++warm) {
+   item->backing.Reset(); bool reused=false;
+   if (!run(*item,arm,reused) || !matches(*item,item->arms[arm]) || (arm!=2 && reused)) {
+    std::fprintf(stderr,"resource memo benchmark: arm %zu warm-up mismatch %s\n",arm,path.string().c_str()); return 1;
+   }
+   if (arm==2 && warm!=0 && !reused) cacheable=false;
+  }
+  if (!cacheable) {
+   ++skipped_uncacheable; std::printf("skip %s: stable state is not retained by ResourceMemo\n",path.filename().string().c_str()); continue;
+  }
+  items.push_back(std::move(item));
+ }
+ if (items.empty()) {
+  std::fprintf(stderr,"resource memo benchmark: no eligible cacheable plans (base=%llu failed=%llu uncacheable=%llu)\n",
+   static_cast<unsigned long long>(skipped_base),static_cast<unsigned long long>(skipped_failure),
+   static_cast<unsigned long long>(skipped_uncacheable)); return 2;
+ }
+ std::printf("resource memo benchmark: eligible=%zu loaded=%zu skipped_shader_base=%llu skipped_failure=%llu skipped_uncacheable=%llu iterations=%llu rounds=3 flag_bits=%llu (all arms verified before timing)\n",
+  items.size(),paths.size(),static_cast<unsigned long long>(skipped_base),static_cast<unsigned long long>(skipped_failure),
+  static_cast<unsigned long long>(skipped_uncacheable),static_cast<unsigned long long>(iterations),
+  static_cast<unsigned long long>(Common::RuntimeFlags::Bits(Common::RuntimeFlags::Current())));
+ std::array<uint64_t,3> total_ns{},total_evaluations{};
+ for (auto& item:items) {
+  // Rotate arm order to avoid consistently assigning the earliest window to bypass.
+  for (size_t round=0;round<3;++round) for (size_t order=0;order<3;++order) {
+   const size_t index=(round+order)%3; auto& arm=item->arms[index];
+   item->backing.Reset(); uint64_t hits=0;
+   const auto start=std::chrono::steady_clock::now();
+   for (uint64_t iteration=0;iteration<iterations;++iteration) {
+    bool reused=false;
+    if (!run(*item,index,reused) || (index!=2 && reused) || (index==2 && !reused)) {
+     std::fprintf(stderr,"resource memo benchmark: measured outcome failed %s arm=%zu\n",item->path.string().c_str(),index); return 1;
+    }
+    hits+=reused;
+   }
+   const auto ns=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count();
+   if (!matches(*item,arm)) {
+    std::fprintf(stderr,"resource memo benchmark: measured output mismatch %s arm=%zu\n",item->path.string().c_str(),index); return 1;
+   }
+   arm.ns+=static_cast<uint64_t>(ns); arm.evaluations+=iterations; arm.hits+=hits;
+   arm.reads+=item->backing.result.requests; arm.words+=item->backing.result.words;
+   arm.ordinary+=item->backing.result.ordinary_calls; arm.strict+=item->backing.result.strict_calls;
+  }
+  std::printf("  %s",item->path.filename().string().c_str());
+  const char* names[]={"bypass","forced_miss","stable_hit"};
+  for (size_t index=0;index<3;++index) {
+   const auto& arm=item->arms[index]; total_ns[index]+=arm.ns; total_evaluations[index]+=arm.evaluations;
+   std::printf(" %s_us=%.3f reads/eval=%.2f words/eval=%.2f ordinary/eval=%.2f strict/eval=%.2f hits=%llu/%llu",
+    names[index],static_cast<double>(arm.ns)/arm.evaluations/1000.0,
+    static_cast<double>(arm.reads)/arm.evaluations,static_cast<double>(arm.words)/arm.evaluations,
+    static_cast<double>(arm.ordinary)/arm.evaluations,static_cast<double>(arm.strict)/arm.evaluations,
+    static_cast<unsigned long long>(arm.hits),static_cast<unsigned long long>(arm.evaluations));
+  }
+  std::printf("\n");
+ }
+ std::printf("workload-weighted aggregate (equal iterations per eligible frozen plan):");
+ const char* names[]={"bypass","forced_miss","stable_hit"};
+ for (size_t index=0;index<3;++index) {
+  std::printf(" %s_us=%.3f total_us=%.3f evaluations=%llu",names[index],
+   static_cast<double>(total_ns[index])/total_evaluations[index]/1000.0,
+   static_cast<double>(total_ns[index])/1000.0,static_cast<unsigned long long>(total_evaluations[index]));
+ }
+ std::printf("\nFrozen provider timings include callback/capture/probe/output-copy work; base misses underestimate register-probe costs. Equal plan weights are not live draw frequencies or FPS.\n");
+ return 0;
+}
+
+void TestResourcePlanFixture() {
+ using namespace Libs::Graphics::ShaderRecompiler::IR;
+ // Real extracted graph with a memory load, flattened SRT, descriptor and buffer
+ // specialization. The round trip runs the production materializer, not a mock.
+ auto plan = SrtPlan(0x2000);
+ plan.shader_hash = 0x12345678;
+ plan.descriptor_sources[0].dword_count = 4;
+ plan.descriptor_sources[0].dwords[2] = Value(16u);
+ plan.descriptor_sources[0].dwords[3] = Value(0u);
+ plan.descriptor_gathers.clear();
+ plan.info.buffers.push_back({.source=0});
+ std::array<uint32_t,4> user = {0x2000,0,17,19};
+ std::array<uint32_t,3> groups = {2,3,4};
+ SrtRuntime runtime {.user_data=user,.shader_base=0x100000,.read_memory=
+  +[](void*,uint64_t a,std::span<uint32_t> v) { if (a != 0x2000 || v.size()!=1) return false; v[0]=0x4000; return true; },
+  .read_specialization_memory=+[](void*,uint64_t a,std::span<uint32_t> v) { if (a != 0x2000 || v.size()!=1) return false; v[0]=0x4000; return true; },
+  .workgroup_counts=groups};
+ ResourceSnapshot snapshot; ResourceSpecialization spec;
+ const char* path = "resource-plan-roundtrip.rpf";
+ Check(CaptureResourcePlan(plan,runtime,snapshot,spec,path),"record real materialization");
+ ResourcePlanFixture fixture;
+ Check(fixture.Load(path),"load serialized resource graph");
+ Check(fixture.plan.shader_hash == plan.shader_hash && fixture.user_data == std::vector<uint32_t>(user.begin(),user.end()) &&
+  fixture.workgroups == std::vector<uint32_t>(groups.begin(),groups.end()),"plan identity and runtime preserved");
+ const auto first = fixture.Replay();
+ Check(first.matched && first.success && !first.missing && first.requests > 0,"real plan replay matches snapshot and specialization");
+ Check(first.ops > 0 && first.ops == fixture.captured_ops,"same evaluator operation count is reproducible");
+ Check(fixture.Replay().matched,"replay again with fresh materialization outputs");
+ fixture.expected.buffers[0].dwords[0] ^= 1;
+ Check(!fixture.Replay().matched,"wrong recorded descriptor result rejected");
+ fixture.expected.buffers[0].dwords[0] ^= 1;
+ const auto captured = fixture.reads;
+ fixture.reads.clear();
+ const auto missing = fixture.Replay();
+ Check(!missing.matched && missing.missing,"missing capture never uses live memory");
+ fixture.reads = captured;
+ auto conflict = fixture.reads.front(); conflict.words[0] ^= 1; fixture.reads.push_back(conflict);
+ Check(fixture.Replay().conflicts && !fixture.Replay().matched,"contradictory same-domain memory rejects replay");
+ fixture.reads = captured;
+ auto other = fixture.reads.front(); other.strict = !other.strict; other.words[0] ^= 1; fixture.reads.push_back(other);
+ Check(!fixture.Replay().conflicts,"strict and ordinary memory remain separate");
+ // Conditional graph: an inactive SRT read is intentionally uncaptured, and
+ // the strict reader returns a different word for the same guest address.
+ plan.capture_specialization_reads = true;
+ plan.clean_flat_slots = {0u,1u};
+ plan.srt_reads.push_back({plan.srt_reads[0].value,1u});
+ auto &condition = plan.value_storage.emplace_back(ValueOpcode::GetUserData);
+ condition.SetArg(0,Value(static_cast<ScalarReg>(2)));
+ auto &poison = plan.value_storage.emplace_back(ValueOpcode::LoadAddressU32);
+ poison.SetFlags(MemoryFlags{.index=0});
+ auto &address = plan.value_storage.emplace_back(ValueOpcode::GetAddressResource);
+ address.SetArg(0,Value(0xdead0000u)); address.SetArg(1,Value(0u));
+ poison.SetArg(0,Value(&address)); poison.SetArg(1,Value(0u));
+ poison.SetArg(2,Value(0u)); poison.SetArg(3,Value(true));
+ plan.srt_reads.push_back({Value(&poison),2u});
+ plan.clean_flat_slots.push_back(0);
+ plan.control_flow.resize(3);
+ plan.control_flow[0].condition = Value(&condition);
+ plan.control_flow[0].successors = {1,2};
+ plan.control_flow[1].srt_reads = {0,1}; plan.control_flow[1].sources = {0};
+ plan.control_flow[2].srt_reads = {2};
+ runtime.read_specialization_memory = +[](void*,uint64_t a,std::span<uint32_t> v) {
+  if (a!=0x2000 || v.size()!=1) return false; v[0]=0x8000; return true;
+ };
+ Check(CaptureResourcePlan(plan,runtime,snapshot,spec,"resource-plan-cfg.rpf"),"capture conditional dual-reader materialization");
+ ResourcePlanFixture cfg;
+ Check(cfg.Load("resource-plan-cfg.rpf") && cfg.Replay().matched,"CFG activity and strict reader replay");
+ Check(cfg.reads.size()==2 && cfg.expected.flattened_srt==std::vector<uint32_t>{0x4000,0x8000,0},"inactive poison is not read and domains differ");
+ Check(cfg.Replay().ops>0 && cfg.Replay().ops==cfg.captured_ops,"CFG evaluator operations reproducible");
+ cfg.user_data[2]=0;
+ Check(cfg.Replay().missing && !cfg.Replay().matched,"changed CFG branch reports uncaptured memory");
+ cfg.user_data[2]=17;
+ // A captured failure is distinct from a missing read and faithfully replays.
+ runtime.read_memory = +[](void*,uint64_t,std::span<uint32_t>) { return false; };
+ Check(!CaptureResourcePlan(plan,runtime,snapshot,spec,"resource-plan-failed.rpf"),"record failed materialization");
+ ResourcePlanFixture failed;
+ Check(failed.Load("resource-plan-failed.rpf") && failed.Replay().matched && !failed.Replay().success && !failed.Replay().missing,"known failure replays without treating it as missing");
+ // A truncated archive must not pass as an empty/failed evaluation.
+ std::ifstream original(path,std::ios::binary);
+ std::string bytes((std::istreambuf_iterator<char>(original)),{}); original.close();
+ std::ofstream truncated("resource-plan-truncated.rpf",std::ios::binary); truncated.write(bytes.data(),bytes.size()-1); truncated.close();
+ ResourcePlanFixture bad;
+ Check(!bad.Load("resource-plan-truncated.rpf"),"short plan archive rejected");
+ std::remove("resource-plan-truncated.rpf");
+}
+#include "SrtBatchTests.inc"
+#include "ResourceMemoRuntimeTests.inc"
+#include "ScalarBatchTests.inc"
+#include "ScalarBatchFixtureTests.inc"
+#include "ScalarBatchMemoTests.inc"
+void TestCfgDescriptorGatherMemoShortcut() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  struct Reads { std::vector<uint64_t> addresses; } reads;
+  ResourcePlan plan;
+  plan.srt_plan_complete = plan.resource_tracking_complete = true;
+  plan.memory_info.push_back({.kind = ResourceKind::ScalarAddress, .planning_only = true});
+  auto make_read = [&](uint32_t address) {
+    auto &h = plan.value_storage.emplace_back(ValueOpcode::GetAddressResource);
+    h.SetArg(0, Value(address)); h.SetArg(1, Value(0u));
+    auto &r = plan.value_storage.emplace_back(ValueOpcode::LoadAddressU32);
+    r.SetFlags(MemoryFlags{.index = 0});
+    r.SetArg(0, Value(&h)); r.SetArg(1, Value(0u)); r.SetArg(2, Value(0u)); r.SetArg(3, Value(true));
+    return Value(&r);
+  };
+  const auto selected = make_read(0x1000u);
+  const auto replacement = make_read(0x2000u);
+  const auto poison = make_read(0xdead0000u);
+  auto &select = plan.value_storage.emplace_back(ValueOpcode::SelectU32);
+  select.SetArg(0, Value(true)); select.SetArg(1, selected); select.SetArg(2, poison);
+  plan.srt_reads.push_back({Value(&select), 0u});
+  auto &srt = plan.value_storage.emplace_back(ValueOpcode::GetSrtResource);
+  auto &read_const = plan.value_storage.emplace_back(ValueOpcode::ReadConst);
+  read_const.SetArg(0, Value(&srt)); read_const.SetArg(1, Value(0u));
+  DescriptorSource descriptor;
+  descriptor.dwords[0] = Value(&read_const); descriptor.dword_count = 1u;
+  plan.descriptor_sources.push_back(descriptor);
+  ResourcePlan::DescriptorGather gather;
+  gather.valid = true; gather.needs_flat = true;
+  gather.words[0] = {.value = 0u, .kind = ResourcePlan::DescriptorGather::Word::Kind::Flat,
+                     .read_slot = 0u};
+  plan.descriptor_gathers.push_back(gather);
+  plan.control_flow.resize(1);
+  plan.control_flow[0].srt_reads = {0u}; plan.control_flow[0].sources = {0u};
+
+  const auto reader = +[](void *data, uint64_t address, std::span<uint32_t> values) {
+    auto &state = *static_cast<Reads *>(data);
+    state.addresses.push_back(address);
+    if ((address != 0x1000u && address != 0x2000u) || values.size() != 1u) return false;
+    values[0] = address == 0x1000u ? 0x12345678u : 0xabcdef01u; return true;
+  };
+  struct Outcome { DescriptorValue descriptor; SrtEvaluationCounts counts; std::vector<uint64_t> addresses; bool ok; };
+  const auto run = [&](bool enabled, bool invalidate_after_refresh = false) {
+    Common::RuntimeFlags::FlagSet flags {.srt_cfg_gather = enabled};
+    const auto old = Common::RuntimeFlags::g_published.load(std::memory_order_relaxed);
+    Common::RuntimeFlags::g_published.store((old & ~Common::RuntimeFlags::kFlagMask) |
+      Common::RuntimeFlags::Bits(flags), std::memory_order_relaxed);
+    reads.addresses.clear();
+    Outcome result;
+    SrtRuntime runtime {.read_memory = reader, .userdata = &reads, .evaluation_counts = &result.counts};
+    std::vector<uint32_t> flat;
+    SrtWalker walker(plan, runtime);
+    result.ok = walker.RefreshFlatBuffer(flat);
+    if (result.ok && invalidate_after_refresh) plan.srt_reads[0].value = replacement;
+    if (result.ok) result.ok = walker.EvaluateDescriptor(0u, result.descriptor);
+    if (invalidate_after_refresh) plan.srt_reads[0].value = Value(&select);
+    result.addresses = reads.addresses;
+    return result;
+  };
+  const auto published = Common::RuntimeFlags::g_published.load(std::memory_order_relaxed);
+  const auto pinned = Common::RuntimeFlags::g_evaluation_bits;
+  Common::RuntimeFlags::g_evaluation_bits = Common::RuntimeFlags::kUnpinnedBits;
+  const auto off = run(false);
+  const auto on = run(true);
+  const auto invalidated = run(true, true);
+  Common::RuntimeFlags::g_published.store(published, std::memory_order_relaxed);
+  Common::RuntimeFlags::g_evaluation_bits = pinned;
+  Check(off.ok && on.ok && off.descriptor == on.descriptor &&
+            off.descriptor.dwords[0] == 0x12345678u &&
+            off.addresses == on.addresses && on.addresses == std::vector<uint64_t>{0x1000u} &&
+            on.counts.cfg_gather_eligible != 0u && on.counts.cfg_gather_hits != 0u &&
+            on.counts.recursive_ops < off.counts.recursive_ops && invalidated.ok &&
+            invalidated.descriptor.dwords[0] == 0xabcdef01u &&
+            invalidated.addresses == std::vector<uint64_t>{0x1000u, 0x2000u} &&
+            invalidated.counts.cfg_gather_hits == 0u,
+        "CFG descriptor gather changed reads/results or did not skip successful memo lookup");
+}
+
+int main(int argc, char **argv) {
+  Common::RuntimeFlags::Refresh(true);
+  TestCfgDescriptorGatherMemoShortcut();
+  if ((argc == 3 || argc == 4) && std::strcmp(argv[1], "--benchmark-resource-memo") == 0) {
+    uint64_t iterations = 1000;
+    if (argc == 4) {
+      char* end = nullptr;
+      iterations = std::strtoull(argv[3], &end, 10);
+      if (end == argv[3] || *end != '\0' || iterations == 0 || iterations > 1000000) {
+        std::fprintf(stderr,"resource memo benchmark: invalid iteration count: %s\n",argv[3]); return 2;
+      }
+    }
+    return BenchmarkResourceMemo(argv[2], iterations);
+  }
+  TestCfgScheduleReadFailureAndSharedDag();
+  TestCfgFlagSnapshotSurvivesReaderPublication();
+  TestResourceMemoRuntimeDependencySwitch();
+  TestResourceMemoReuseTrace();
+  TestResourceMemoHashFilterDependencies();
+  TestScalarBatchDomainsFailureAndActivity();
+  TestScalarBatchFixtureCaptureAndReplay();
+  TestScalarBatchMemoCaptureHitAndFlagFlip();
+  if (argc == 3 && std::strcmp(argv[1], "--replay-plan") == 0) return ReplayPlanFixture(argv[2]);
+  if ((argc == 3 || argc == 4) && std::strcmp(argv[1], "--benchmark-plans") == 0) {
+    char* end = nullptr;
+    const uint64_t iterations = argc == 4 ? std::strtoull(argv[3], &end, 10) : 100;
+    if (argc == 4 && (!end || *end != '\0')) {
+      std::fprintf(stderr, "plan benchmark: invalid iteration count: %s\n", argv[3]); return 2;
+    }
+    return BenchmarkResourcePlans(argv[2], iterations);
+  }
+  TestResourcePlanFixture();
+  if (argc >= 3 && std::strcmp(argv[1], "--inspect-fixture") == 0) {
+    return InspectFixture(argv[2]);
+  }
   TestCfgTapeVerifierRejectsCorruption();
   TestCfgTapeDemandRoots();
   TestCfgTapeCompilationCycleFallsBack();
@@ -1871,6 +2769,11 @@ int main() {
   TestFailedMaterializationRejectsStage();
   TestFiniteImageRefreshReusesScalarReads();
   TestMixedSamplerVariantsShareRuntimeDescriptor();
+  TestResourceFixtureRoundTrip();
+  TestResourceFixtureDrivesRuntime();
+  TestResourceFixtureAppendPath();
+  TestResourceFixturePreservesEveryWord();
+  TestResourceFixtureRepeatedFlush();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

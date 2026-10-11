@@ -20,6 +20,7 @@
 #include "graphics/host_gpu/renderer/depthAliasLog.h"
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/host_gpu/renderer/frameDump.h"
+#include <fmt/format.h>
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -612,7 +613,6 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 	}
 	for (uint32_t i = 0; i < color_count; i++) {
 		auto& target = colors[i];
-		EXIT_IF(!target.image_id);
 		if (DepthAliasLog::Enabled() && DepthAliasLog::Filtered() &&
 		    DepthAliasLog::Want(target.desc.info.data.address, target.desc.info.data.size) &&
 		    DepthAliasLog::TakeLine()) {
@@ -626,6 +626,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			            vk::to_string(target.desc.info.pixel_format).c_str(), ext.width, ext.height,
 			            target.guest_mip_level, target.guest_array_layer);
 		}
+		EXIT_IF(!target.image_id);
 		const auto owner = cache.m_slot_images.try_get(target.image_id);
 		if (owner == nullptr || (!owner->registered && !owner->info.data.Empty()) ||
 		    owner->binding.needs_rebind) {
@@ -1111,9 +1112,9 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             uint32_t            render_target_slice_offset,
 	                                        DrawRenderState& state) {
-	const auto& shader_regs       = buffer.GetRegisters().GetShaderRegisters();
 	// KYTY_PERF_STATS: draw prep starts here and ends at the vkCmd draw emit below.
 	FrameBreakdown::DrawPrepBegin();
+	const auto& shader_regs       = buffer.GetRegisters().GetShaderRegisters();
 	const auto  color_output_mask = DrawColorOutputMask(buffer.GetRegisters());
 	state.ps_active = buffer.GetShaders().GetPs().ps_regs.data_addr != 0 &&
 	                  (color_output_mask != 0 ||
@@ -1484,8 +1485,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			}
 		}
 		BreadcrumbEnd(m_context.GetGraphics(), vk_buffer, crumb);
-	}
 		FrameBreakdown::DrawEmitted();
+	}
 
 	if (FrameDump::TraceEnabled()) {
 		for (uint32_t i = 0; i < state.color_count && i < RENDER_COLOR_ATTACHMENTS_MAX; i++) {
@@ -1534,6 +1535,36 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 		log.ps_images = state.ps_active && bindings.pixel ? &bindings.pixel->images : nullptr;
 		log.ps_bindings = state.ps_active && bindings.pixel ? &*bindings.pixel : nullptr;
+		log.skipped = skip_draw;
+		if (emit.indirect != nullptr) {
+			log.indirect_snapshot = emit.indirect->snapshot;
+			log.indirect_args_size = emit.indirect->ArgsSize();
+			log.indirect_guest_addr = emit.indirect->args_addr;
+			log.indirect_stride = emit.indirect->stride;
+			log.indirect_max_count = emit.indirect->max_count;
+		}
+		const auto& regs = buffer.GetRegisters();
+		const auto& dc = regs.GetDepthControl();
+		log.state_text = fmt::format("    guest_state: rt_mask=0x{:08x} shader_mask=0x{:08x} stencil={} front_func={} back_func={}\n",
+		    regs.GetRenderTargetMask(), regs.GetShaderRegisters().m_cbShaderMask,
+		    dc.stencil_enable, dc.stencilfunc, dc.stencilfunc_bf);
+		for (uint32_t i = 0; i < state.color_count; ++i) {
+			const auto slot = state.color_info[i].target_slot;
+			const auto& blend = regs.GetBlendControl(slot);
+			log.state_text += fmt::format("    blend[{}]: enable={} color_src={} color_dst={} color_op={} separate_alpha={} alpha_src={} alpha_dst={} alpha_op={} export_mode={}\n",
+			    slot, blend.enable, blend.color_srcblend, blend.color_destblend, blend.color_comb_fcn,
+			    blend.separate_alpha_blend, blend.alpha_srcblend, blend.alpha_destblend,
+			    blend.alpha_comb_fcn, state.ps_input_info.target_output_mode[slot]);
+		}
+		const auto& viewport = regs.GetScreenViewport();
+		for (uint32_t i = 0; i < std::size(viewport.viewports); ++i) {
+			const auto& v = viewport.viewports[i];
+			const auto sc = calc_final_scissor(viewport, regs.GetScanModeControl(),
+			    vk::Extent2D {rendering.width, rendering.height}, i);
+			log.state_text += fmt::format("    viewport[{}]: x={} y={} w={} h={} scissor=({},{})-({},{})\n",
+			    i, v.xoffset-v.xscale, v.yoffset-v.yscale, 2*v.xscale, 2*v.yscale,
+			    sc.left, sc.top, sc.right, sc.bottom);
+		}
 		FrameDump::OnDraw(m_context, log);
 	}
 
