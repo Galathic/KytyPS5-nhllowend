@@ -720,7 +720,9 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 		Pm4Execution*     previous_execution;
 	} execution_scope(*this, execution);
 
+	BufferCache::PerfTimerScope phase_timer(BufferCache::PerfTimer::Pm4);
 	ProcessPm4(execution);
+	phase_timer.Stop();
 	return execution.m_buffer_stack.empty() ? Pm4ProcessResult::Complete
 	                                        : Pm4ProcessResult::Blocked;
 }
@@ -737,6 +739,53 @@ void CommandProcessor::SuspendPm4() {
 	g_current_execution->m_suspended = true;
 }
 
+// Experiment FalseShareReads: a compute dispatch can write into data embedded in the command
+// buffer itself, which protects the whole page. Reading the following packets on that page
+// would then fault and wait for all queued GPU work. When the page holds GPU-dirty bytes but the
+// packet's own bytes are clean, parse a copy taken from the backing instead.
+const uint32_t* CommandProcessor::ShadowPm4Packet(const uint32_t* packet, uint32_t remaining_dw) {
+	if (!GuestGpu::IsGpuThread() || remaining_dw == 0) {
+		return packet;
+	}
+	auto&          buffers    = m_renderer.GetBufferCache();
+	const auto     address    = reinterpret_cast<uint64_t>(packet);
+	const auto     page       = address & ~uint64_t {0xfff};
+	const uint64_t generation = buffers.GpuDirtyGeneration();
+	if (page != m_pm4_page || generation != m_pm4_page_generation) {
+		m_pm4_page            = page;
+		m_pm4_page_generation = generation;
+		m_pm4_page_dirty = GuestRange {page, 0x1000}.Valid() && buffers.HasGpuDirtyBytes(page, 0x1000);
+	}
+	if (!m_pm4_page_dirty) {
+		return packet;
+	}
+	const auto read = [&](uint64_t offset_dw, uint32_t* out, uint64_t count_dw) {
+		const auto at    = address + offset_dw * 4u;
+		const auto bytes = count_dw * 4u;
+		return !buffers.HasGpuDirtyBytes(at, bytes) &&
+		       LibKernel::Memory::TryReadBacking(at, out, bytes);
+	};
+	uint32_t header[2] {};
+	if (!read(0, header, std::min<uint32_t>(2u, remaining_dw))) {
+		return packet;
+	}
+	uint32_t length = header[0] == 0x80000000u
+	                      ? 1u
+	                      : std::min<uint32_t>(KYTY_PM4_LEN(header[0]), remaining_dw);
+	// A plain NOP wraps embedded data, often the very bytes the GPU writes. Its handler reads
+	// only the first payload dword unless the NOP carries a marker string.
+	if (((header[0] >> 8u) & 0xffu) == Pm4::IT_NOP && KYTY_PM4_R(header[0]) == Pm4::R_ZERO &&
+	    length > 2u && (header[1] & 0xffff0000u) != 0x68750000u) {
+		length = 2u;
+	}
+	m_pm4_shadow.resize(length);
+	if (!read(0, m_pm4_shadow.data(), length)) {
+		return packet;
+	}
+	BufferCache::PerfCount(BufferCache::PerfEvent::Pm4ShadowPacket);
+	return m_pm4_shadow.data();
+}
+
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 	while (!execution.m_buffer_stack.empty()) {
 		if (g_gpu_state != nullptr) {
@@ -749,10 +798,14 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			continue;
 		}
 
-		const auto* const packet        = cursor.commands.data() + cursor.offset_dw;
+		const auto* const guest_packet  = cursor.commands.data() + cursor.offset_dw;
 		const auto        total_dw      = static_cast<uint32_t>(cursor.commands.size());
 		const auto        remaining_dw  = total_dw - cursor.offset_dw;
-		const auto        packet_header = packet[0];
+		const auto* const packet =
+		    Common::Experiments::Enabled(Common::Experiments::FalseShareReads)
+		        ? ShadowPm4Packet(guest_packet, remaining_dw)
+		        : guest_packet;
+		const auto packet_header = packet[0];
 		const auto        opcode        = (packet_header >> 8u) & 0xffu;
 		EXIT_NOT_IMPLEMENTED(remaining_dw > total_dw);
 
@@ -803,11 +856,11 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			const auto offset = total_dw - remaining_dw;
 			LOGF("unknown PM4 packet: data=0x%016" PRIx64 ", num_dw=%" PRIu32
 			     ", offset=0x%05" PRIx32 ", current=0x%016" PRIx64 "\n",
-			     reinterpret_cast<uint64_t>(packet - offset), total_dw, offset,
-			     reinterpret_cast<uint64_t>(packet));
+			     reinterpret_cast<uint64_t>(guest_packet - offset), total_dw, offset,
+			     reinterpret_cast<uint64_t>(guest_packet));
 			const auto  dump_begin = (offset > 8 ? offset - 8 : 0);
 			const auto  dump_end   = std::min<uint32_t>(total_dw, offset + 16);
-			auto* const base       = packet - offset;
+			auto* const base       = guest_packet - offset;
 			for (uint32_t i = dump_begin; i < dump_end; i++) {
 				LOGF("\t%05" PRIx32 "%s %08" PRIx32 "\n", i, (i == offset ? ":" : " "), base[i]);
 			}

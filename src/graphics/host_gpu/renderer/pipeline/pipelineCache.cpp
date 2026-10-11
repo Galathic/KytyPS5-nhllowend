@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
+#include "common/experiments.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -361,6 +362,7 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 
+		ApplyExperiments();
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
 		lookup_key.stage           = stage;
 		lookup_key.hash            = params.hash;
@@ -652,12 +654,36 @@ struct PipelineCache::ProgramCache {
 		std::fflush(stdout);
 	}
 
+	// Runtime experiments SrtBatchReads / ResourceMultiCache (KYTY_EXPERIMENT_FILE) switch
+	// scalar read batching and the 16-state resource memo inside one match. A capacity change
+	// invalidates memo states and keeps compiled shaders and pipelines.
+	void ApplyExperiments() {
+		constexpr uint32_t Bits =
+		    Common::Experiments::SrtBatchReads | Common::Experiments::ResourceMultiCache;
+		const uint32_t mask = Common::Experiments::Mask() & Bits;
+		if (mask == applied_experiments) return;
+		const uint32_t changed = mask ^ applied_experiments;
+		applied_experiments = mask;
+		if ((changed & Common::Experiments::SrtBatchReads) != 0) {
+			batch_reads = env_batch_reads || (mask & Common::Experiments::SrtBatchReads) != 0;
+		}
+		if ((changed & Common::Experiments::ResourceMultiCache) != 0) {
+			const unsigned capacity =
+			    (mask & Common::Experiments::ResourceMultiCache) != 0 ? 16u : 1u;
+			for (auto& [key, source]: programs) (void)source.resource_memo.SetCapacity(capacity);
+			cache_control_capacity = capacity;
+		}
+		std::printf("NHL27RESOURCE: experiments batch_reads=%d capacity=%u\n", batch_reads ? 1 : 0,
+		            cache_control_capacity);
+	}
+
 	explicit ProgramCache(vk::Device device): device(device) {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 		const char* timing = std::getenv("KYTY_PERF_RESOURCE_TIMING");
 		resource_timing = timing != nullptr && timing[0] == '1';
 		const char* batch = std::getenv("KYTY_SRT_BATCH_READS");
 		batch_reads = batch != nullptr && batch[0] == '1';
+		env_batch_reads = batch_reads;
 		if (resource_timing) {
 			if (const char* path = std::getenv("KYTY_RESOURCE_CACHE_CONTROL_FILE")) cache_control_file = path;
 		}
@@ -678,6 +704,8 @@ struct PipelineCache::ProgramCache {
 	uint64_t lookups = 0, source_hits = 0, resource_hits = 0, materializations = 0, permutation_hits = 0;
 	bool resource_timing = false;
 	bool batch_reads = false;
+	bool env_batch_reads = false;
+	uint32_t applied_experiments = 0;
 	bool batch_policy_reported = false;
 	std::string cache_control_file;
 	unsigned cache_control_capacity = 0;

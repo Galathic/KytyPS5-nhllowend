@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
+#include <chrono>
 #include <map>
 #include <span>
 #include <utility>
@@ -66,6 +67,8 @@ public:
 		RenderPassBegin,
 		Flip,
 		BarrierSkipped,
+		FalseShareRead,
+		Pm4ShadowPacket,
 		Count
 	};
 	// KYTY_GUEST_SYNC=1 (experiment): compute dispatches rely on the guest's own partial-flush,
@@ -75,6 +78,46 @@ public:
 	[[nodiscard]] static bool PerfNoSyncReadback();
 	static void               PerfCount(PerfEvent event);
 	static void               PerfSetPm4Op(uint32_t opcode);
+	// KYTY_PERF_STATS: host time spent beginning command buffers, submitting them and waiting
+	// for the GPU on the GPU thread.
+	enum class PerfTimer : uint8_t {
+		CommandBegin,
+		Submit,
+		GpuWait,
+		// GPU-thread phases (inclusive): PM4 processing, then within it draw program lookup and
+		// resource materialization, render-target resolution, draw execution, whole dispatches
+		// and their program lookup.
+		Pm4,
+		DrawPrograms,
+		DrawTargets,
+		DrawExecute,
+		Dispatch,
+		DispatchProgram,
+		Count
+	};
+	[[nodiscard]] static bool PerfTimersEnabled();
+	static void               PerfAddTime(PerfTimer timer, uint64_t ns);
+	class PerfTimerScope {
+	public:
+		explicit PerfTimerScope(PerfTimer timer): m_timer(timer), m_active(PerfTimersEnabled()) {
+			if (m_active) m_start = std::chrono::steady_clock::now();
+		}
+		~PerfTimerScope() { Stop(); }
+		KYTY_CLASS_NO_COPY(PerfTimerScope);
+		void Stop() {
+			if (!m_active) return;
+			m_active = false;
+			PerfAddTime(m_timer, static_cast<uint64_t>(
+			                         std::chrono::duration_cast<std::chrono::nanoseconds>(
+			                             std::chrono::steady_clock::now() - m_start)
+			                             .count()));
+		}
+
+	private:
+		PerfTimer                             m_timer;
+		bool                                  m_active;
+		std::chrono::steady_clock::time_point m_start {};
+	};
 	// Labels the next GPU writes (KYTY_PERF_STATS fault diagnostics only).
 	void SetWriterTag(const char* kind, uint64_t hash) {
 		m_writer_kind = kind;
@@ -117,6 +160,8 @@ public:
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	// Changes whenever new GPU-dirty bytes are recorded (GPU thread).
+	[[nodiscard]] uint64_t GpuDirtyGeneration() const noexcept { return m_gpu_dirty_generation; }
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
@@ -179,6 +224,7 @@ private:
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
+	uint64_t                                          m_gpu_dirty_generation = 0;
 	MemoryTracker                                     m_memory_tracker;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;

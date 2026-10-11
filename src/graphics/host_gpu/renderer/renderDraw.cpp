@@ -1116,7 +1116,11 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	state.ps_active = buffer.GetShaders().GetPs().ps_regs.data_addr != 0 &&
 	                  (color_output_mask != 0 ||
 	                   PixelShaderHasDepthOrCoverageSideEffects(shader_regs));
-	RefreshShaders(buffer, draw, color_output_mask, state);
+	{
+		BufferCache::PerfTimerScope phase_timer(BufferCache::PerfTimer::DrawPrograms);
+		RefreshShaders(buffer, draw, color_output_mask, state);
+	}
+	BufferCache::PerfTimerScope phase_timer(BufferCache::PerfTimer::DrawTargets);
 	if (!state.programs.vertex[0]) {
 		// NHL debugging: a shader failed to build (KYTY_DBG_SKIP_BAD_SHADERS=1); skip the draw.
 		return false;
@@ -1256,6 +1260,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
                                          const DrawIndexBufferSource& index_source,
 	                                     bool primitive_restart_enable) {
+	BufferCache::PerfTimerScope phase_timer(BufferCache::PerfTimer::DrawExecute);
 	auto& ucfg = buffer.GetUserConfig();
 	const auto vertex_stages =
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};

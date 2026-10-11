@@ -15,6 +15,9 @@ enum Bit : uint32_t {
 	SkipRedundantBinds = 1u << 1u, // KYTY_SKIP_REDUNDANT_BINDS
 	DedupBarriers      = 1u << 2u, // KYTY_DEDUP_BARRIERS
 	CpuCopyForward     = 1u << 3u, // KYTY_CPU_COPY_FORWARD
+	FalseShareReads    = 1u << 6u, // KYTY_FALSE_SHARE_READS
+	SrtBatchReads      = 1u << 7u, // KYTY_SRT_BATCH_READS (also read directly by the program cache)
+	ResourceMultiCache = 1u << 8u, // KYTY_RESOURCE_MULTI_CACHE (16-state resource memo)
 };
 
 [[nodiscard]] bool Enabled(Bit bit) noexcept;

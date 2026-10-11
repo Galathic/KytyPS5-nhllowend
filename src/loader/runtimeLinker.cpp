@@ -12,6 +12,9 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
+#include "common/experiments.h"
+#include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
@@ -755,8 +758,12 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		}
 		// KYTY_PERF_FAULT_RIPS=1 (diagnostic): report which host/guest instructions take GPU
 		// tracking faults, so false-sharing reads (no GPU-dirty byte touched) can be found.
-		static const bool fault_rips = std::getenv("KYTY_PERF_FAULT_RIPS") != nullptr;
-		if (fault_rips) {
+		// KYTY_PERF_FAULT_RIPS=gpu limits the report to faults taken by the GPU thread itself.
+		static const char* fault_rips_setting = std::getenv("KYTY_PERF_FAULT_RIPS");
+		static const bool  fault_rips         = fault_rips_setting != nullptr;
+		static const bool  fault_rips_gpu =
+		    fault_rips && std::strcmp(fault_rips_setting, "gpu") == 0;
+		if (fault_rips && (!fault_rips_gpu || Libs::Graphics::GuestGpu::IsGpuThread())) {
 			static std::mutex                         mutex;
 			static std::map<uint64_t, uint64_t>      counts;
 #if defined(_WIN32)
@@ -779,6 +786,16 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 				            static_cast<unsigned long long>(info->access_violation_vaddr),
 				            static_cast<int>(access), static_cast<unsigned long long>(count));
 			}
+		}
+		// Experiment FalseShareReads: the GPU thread's own read of bytes the GPU never wrote, on a
+		// page protected for other GPU-written bytes, is served from the backing instead of
+		// downloading the page, which would wait for all queued GPU work.
+		if (access == GpuAccess::Read && Libs::Graphics::GuestGpu::IsGpuThread() &&
+		    Common::Experiments::Enabled(Common::Experiments::FalseShareReads) &&
+		    Loader::X64InstructionEmulator::TryEmulateLoad(info->native_context,
+		                                                   Libs::LibKernel::Memory::TryReadCleanBacking)) {
+			Libs::Graphics::BufferCache::PerfCount(Libs::Graphics::BufferCache::PerfEvent::FalseShareRead);
+			return true;
 		}
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			return true;

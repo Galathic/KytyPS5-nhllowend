@@ -166,6 +166,7 @@ private:
 	                      void* dst_gpu_addr, T value, uint32_t interrupt_selector,
 	                      uint32_t interrupt_context_id);
 	void ProcessPm4(Pm4Execution& execution);
+	const uint32_t* ShadowPm4Packet(const uint32_t* packet, uint32_t remaining_dw);
 	void SuspendPm4();
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
@@ -204,6 +205,11 @@ private:
 	uint64_t  m_submit_id                   = 0;
 	uint64_t  m_synthetic_occlusion_counter = 0;
 	bool      m_predicate_skip              = false;
+
+	uint64_t              m_pm4_page            = ~uint64_t {0};
+	uint64_t              m_pm4_page_generation = ~uint64_t {0};
+	bool                  m_pm4_page_dirty      = false;
+	std::vector<uint32_t> m_pm4_shadow;
 };
 
 } // namespace Libs::Graphics

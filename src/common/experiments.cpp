@@ -22,6 +22,9 @@ uint32_t EnvironmentMask() {
 	if (EnvOn("KYTY_SKIP_REDUNDANT_BINDS")) mask |= SkipRedundantBinds;
 	if (EnvOn("KYTY_DEDUP_BARRIERS")) mask |= DedupBarriers;
 	if (EnvOn("KYTY_CPU_COPY_FORWARD")) mask |= CpuCopyForward;
+	if (EnvOn("KYTY_FALSE_SHARE_READS")) mask |= FalseShareReads;
+	if (EnvOn("KYTY_SRT_BATCH_READS")) mask |= SrtBatchReads;
+	if (EnvOn("KYTY_RESOURCE_MULTI_CACHE")) mask |= ResourceMultiCache;
 	return mask;
 }
 

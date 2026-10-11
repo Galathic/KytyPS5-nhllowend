@@ -28,6 +28,10 @@ struct GraphicContext;
 uint64_t BreadcrumbBegin(GraphicContext& graphics, vk::CommandBuffer cmd, const char* kind,
                          uint64_t hash_a, uint64_t hash_b, uint64_t info = 0);
 void     BreadcrumbEnd(GraphicContext& graphics, vk::CommandBuffer cmd, uint64_t id);
+// With breadcrumbs on, copies up to 16 bytes the GPU is about to consume for breadcrumb `id`
+// (an indirect dispatch's group counts) into a host-visible ring that the device-loss dump prints.
+void     BreadcrumbCaptureArgs(vk::CommandBuffer cmd, uint64_t id, vk::Buffer source,
+                               uint64_t offset, uint32_t bytes);
 // Reads back finished GPU timing samples without waiting; called after every queue submit.
 void     GpuTimingPoll();
 // Prints breadcrumbs and VK_EXT_device_fault info; call when any Vulkan call reports device loss.
