@@ -712,22 +712,53 @@ struct SubmitSplitState {
 static thread_local SubmitSplitState g_submit_split;
 static std::atomic<uint64_t>         g_submit_split_count {0};
 
-static uint32_t SubmitSplitDraws() {
-	static const uint32_t v = [] {
+// Split thresholds: env KYTY_SUBMIT_SPLIT_DRAWS / KYTY_SUBMIT_SPLIT_US set the defaults; a
+// "split.ctl" file in the working directory (lines "draws=N", "us=T") overrides them and is
+// re-read every 500 ms so the thresholds can be tuned while the game runs.
+static std::atomic<uint32_t> g_split_draws {0};
+static std::atomic<int64_t>  g_split_us {0};
+
+static void SubmitSplitRefresh() {
+	static const uint32_t env_draws = [] {
 		const char* s = std::getenv("KYTY_SUBMIT_SPLIT_DRAWS");
 		const long  n = s != nullptr ? std::atol(s) : 0;
 		return n > 0 ? static_cast<uint32_t>(n) : 48u;
 	}();
-	return v;
-}
-
-static int64_t SubmitSplitUs() {
-	static const int64_t v = [] {
+	static const int64_t env_us = [] {
 		const char* s = std::getenv("KYTY_SUBMIT_SPLIT_US");
 		const long  n = s != nullptr ? std::atol(s) : 0;
 		return n > 0 ? static_cast<int64_t>(n) : int64_t {750};
 	}();
-	return v;
+	static auto last = std::chrono::steady_clock::time_point {};
+	const auto  now  = std::chrono::steady_clock::now();
+	if (last != std::chrono::steady_clock::time_point {} && now - last < std::chrono::milliseconds(500)) {
+		return;
+	}
+	last           = now;
+	uint32_t draws = env_draws;
+	int64_t  us    = env_us;
+	if (FILE* file = std::fopen("split.ctl", "r"); file != nullptr) {
+		char line[64];
+		while (std::fgets(line, sizeof(line), file) != nullptr) {
+			long value = 0;
+			if (std::sscanf(line, "draws=%ld", &value) == 1 && value > 0) {
+				draws = static_cast<uint32_t>(value);
+			} else if (std::sscanf(line, "us=%ld", &value) == 1 && value > 0) {
+				us = value;
+			}
+		}
+		std::fclose(file);
+	}
+	g_split_draws.store(draws, std::memory_order_relaxed);
+	g_split_us.store(us, std::memory_order_relaxed);
+}
+
+static uint32_t SubmitSplitDraws() {
+	return g_split_draws.load(std::memory_order_relaxed);
+}
+
+static int64_t SubmitSplitUs() {
+	return g_split_us.load(std::memory_order_relaxed);
 }
 
 static bool SubmitSplitIsWorkOpcode(uint32_t op) {
@@ -778,6 +809,9 @@ bool GuestGpu::Process(Submission& submission) {
 
 	cp.BufferInit();
 	g_submit_split.enabled = Common::RuntimeFlags::Current().submit_split;
+	if (g_submit_split.enabled) {
+		SubmitSplitRefresh();
+	}
 	g_submit_split.work    = 0;
 	g_submit_split.since   = {};
 	bool complete = true;

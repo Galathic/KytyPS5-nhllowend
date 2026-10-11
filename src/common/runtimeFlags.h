@@ -35,7 +35,7 @@ struct FlagSet {
  bool resource_spec_cache = false;
  bool fault_parse_gate = false;
  bool idle_trace = false;
- bool submit_split = false;
+ bool submit_split = true;
 };
 inline constexpr const char* kSwitchableFlags[] = {
  "KYTY_RESOURCE_DYNAMIC_DEPS", "KYTY_RESOURCE_MEMO_VERIFY", "KYTY_SRT_CFG_TAPE",
@@ -122,7 +122,9 @@ inline FlagSet BuildLocked() {
   // pm4_event_clean is on by default: it is the correctness-preserving fix for
   // EVENT_WRITE payload reads that false-share a 4 KiB page with GPU-written data.
   // Explicitly set KYTY_PM4_EVENT_CLEAN=0 to force the old faulting read.
-  *FieldFor(f,name) = std::strcmp(name,kSwitchableFlags[4])==0 ? !(v && v[0]=='0') : (v && v[0]=='1');
+  // pm4_event_clean and submit_split default on; set the flag to 0 to disable.
+  const bool default_on = std::strcmp(name,kSwitchableFlags[4])==0 || std::strcmp(name,kSwitchableFlags[16])==0;
+  *FieldFor(f,name) = default_on ? !(v && v[0]=='0') : (v && v[0]=='1');
  }
  if (!g_path_set) {
   const char* v=std::getenv("KYTY_FLAG_FILE");
