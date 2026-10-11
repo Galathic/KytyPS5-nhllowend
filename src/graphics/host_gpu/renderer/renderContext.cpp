@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/runtimeFlags.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/presentation/videoOut.h"
@@ -71,6 +72,16 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	if (access == PageFaultAccess::Write) {
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
+		// KYTY_FAULT_AHEAD: streaming writers (ring buffers) fault on every page they touch
+		// each frame, and each page is re-protected after its upload. Unprotect the next
+		// pages of the buffer tracker up front so one fault covers the run.
+		if (Common::RuntimeFlags::Current().fault_ahead) {
+			constexpr uint64_t kAheadBytes = 15 * TRACKER_PAGE_SIZE;
+			const uint64_t next = (fault_vaddr & ~(TRACKER_PAGE_SIZE - 1)) + TRACKER_PAGE_SIZE;
+			if (IsMapped(next, kAheadBytes)) {
+				m_buffer_cache.MarkCpuDirtyAhead(next, kAheadBytes);
+			}
+		}
 	} else {
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size, false, BufferCache::ReadCaller::Fault);
 	}

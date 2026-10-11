@@ -67,6 +67,41 @@ public:
 	void ValidateGpuDirtyPages(const RangeSet&, uint64_t, uint64_t, const char*) const noexcept {}
 	void ValidateGpuDirtyOwnership(const RangeSet&, uint64_t, uint64_t, const char*) {}
 #endif
+	// Marks the CPU-clean pages of a range CPU-modified without flushing anything:
+	// GPU-modified pages are skipped. Used to unprotect pages a sequential CPU writer
+	// is about to reach, so one write fault covers several pages. Marking a page
+	// CPU-modified is always conservative (it is re-uploaded before GPU use).
+	void MarkCpuDirtyAhead(uint64_t vaddr, uint64_t size) noexcept {
+		CheckNotInUploadCallback();
+		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			std::scoped_lock lock(manager->lock);
+			uint64_t run_begin = 0;
+			uint64_t run_bytes = 0;
+			bool     changed   = false;
+			const auto flush_run = [&] {
+				if (run_bytes == 0) return;
+				manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + run_begin, run_bytes);
+				run_bytes = 0;
+				changed   = true;
+			};
+			for (uint64_t page = offset; page < offset + bytes; page += TRACKER_PAGE_SIZE) {
+				const bool eligible = !manager->IsModified<DirtySource::Gpu>(page, TRACKER_PAGE_SIZE) &&
+				                      !manager->IsModified<DirtySource::Cpu>(page, TRACKER_PAGE_SIZE);
+				if (!eligible) {
+					flush_run();
+					continue;
+				}
+				if (run_bytes == 0) run_begin = page;
+				run_bytes += TRACKER_PAGE_SIZE;
+			}
+			flush_run();
+			if (changed) {
+				QueueCpuDirty(manager);
+				m_cpu_generation.fetch_add(1, std::memory_order_release);
+			}
+		});
+	}
+
 	// Single GPU-thread consumer. Read the next link before releasing this node to
 	// producers; writes racing with its upload can then enqueue it for the next pass.
 	template <typename Func>

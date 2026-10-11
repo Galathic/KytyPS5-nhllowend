@@ -53,6 +53,10 @@ public:
 	// Writes a small CPU-visible label into an existing buffer without a page readback.
 	bool                   TryWriteLabel(uint64_t vaddr, const void* data, uint64_t size);
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+	// See MemoryTracker::MarkCpuDirtyAhead.
+	void MarkCpuDirtyAhead(uint64_t vaddr, uint64_t size) noexcept {
+		m_memory_tracker.MarkCpuDirtyAhead(vaddr, size);
+	}
 	// Only used to attribute synchronous readbacks in the KYTY_PERF_STATS output.
 	enum class ReadCaller : uint8_t { Other, ColorClear, Fault };
 	enum class PerfEvent : uint8_t { ColorClearShadowHit, WaitRegMemBackingRead };
