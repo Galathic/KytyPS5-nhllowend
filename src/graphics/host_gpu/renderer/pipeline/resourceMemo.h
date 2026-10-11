@@ -50,6 +50,66 @@ inline ResourceReuseTraceStats GetResourceReuseTraceStats() {
             c.distance128.load(std::memory_order_relaxed)};
 }
 
+// KYTY_RESOURCE_MISS_DIAG=1 (single-entry memo only): on each register-input miss,
+// record which user-data register changed first and how many changed, and whether the
+// re-materialized output differs from the previous one. Answers "do changed registers
+// produce different resources, or only different buffer addresses?" Diagnostic only.
+namespace ResourceMissDiag {
+struct Counters {
+    std::atomic<uint64_t> misses{0};
+    std::array<std::atomic<uint64_t>, 64> first_index{};
+    std::array<std::atomic<uint64_t>, 4> changed{}; // 1, 2, 3-4, 5+
+    std::atomic<uint64_t> same_images{0}, same_samplers{0}, same_buffers{0}, same_buffers_masked{0};
+    std::atomic<uint64_t> same_flat{0}, same_spec{0}, same_fill{0}, all_but_buffer_base{0}, identical{0};
+};
+inline Counters& Get() { static Counters counters; return counters; }
+inline bool Enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("KYTY_RESOURCE_MISS_DIAG");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+// V# base address is dwords 0 and the low 16 bits of dword 1. Compare everything else.
+inline bool BuffersEqualIgnoringBase(const std::vector<ShaderRecompiler::IR::DescriptorValue>& a,
+                                     const std::vector<ShaderRecompiler::IR::DescriptorValue>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (a[i].dword_count != b[i].dword_count) return false;
+        for (uint32_t w = 0; w < a[i].dword_count && w < 8; ++w) {
+            const uint32_t mask = w == 0 ? 0u : w == 1 ? 0xffff0000u : 0xffffffffu;
+            if ((a[i].dwords[w] & mask) != (b[i].dwords[w] & mask)) return false;
+        }
+    }
+    return true;
+}
+inline void Record(uint32_t first, uint32_t changed_count,
+                   const ShaderRecompiler::IR::ResourceSnapshot& before,
+                   const ShaderRecompiler::IR::ResourceSpecialization& before_spec,
+                   const ShaderRecompiler::IR::ResourceSnapshot& after,
+                   const ShaderRecompiler::IR::ResourceSpecialization& after_spec) {
+    auto& c = Get();
+    constexpr auto relaxed = std::memory_order_relaxed;
+    c.misses.fetch_add(1, relaxed);
+    c.first_index[std::min<uint32_t>(first, 63)].fetch_add(1, relaxed);
+    c.changed[changed_count <= 1 ? 0 : changed_count == 2 ? 1 : changed_count <= 4 ? 2 : 3].fetch_add(1, relaxed);
+    const bool images = before.images == after.images, samplers = before.samplers == after.samplers;
+    const bool buffers = before.buffers == after.buffers;
+    const bool masked = BuffersEqualIgnoringBase(before.buffers, after.buffers);
+    const bool flat = before.flattened_srt == after.flattened_srt, spec = before_spec == after_spec;
+    const bool fill = before.uniform_fill == after.uniform_fill;
+    c.same_images.fetch_add(images, relaxed);
+    c.same_samplers.fetch_add(samplers, relaxed);
+    c.same_buffers.fetch_add(buffers, relaxed);
+    c.same_buffers_masked.fetch_add(masked, relaxed);
+    c.same_flat.fetch_add(flat, relaxed);
+    c.same_spec.fetch_add(spec, relaxed);
+    c.same_fill.fetch_add(fill, relaxed);
+    c.all_but_buffer_base.fetch_add(images && samplers && masked && spec && fill, relaxed);
+    c.identical.fetch_add(images && samplers && buffers && flat && spec && fill, relaxed);
+}
+} // namespace ResourceMissDiag
+
 // A resource snapshot depends on register inputs AND guest memory. Validate the
 // actual reads with their original readers; unchanged pointers alone are insufficient.
 class ResourceMemoEntry {
@@ -481,6 +541,22 @@ private:
         }
         return hash;
     }
+public:
+    // ResourceMissDiag: first changed register input and how many changed (0 if none).
+    uint32_t DiffRegisterInputs(std::span<const uint32_t> current, uint32_t& changed) const {
+        uint32_t first = UINT32_MAX;
+        changed = 0;
+        if (current.size() != m_user_data.size()) return first;
+        for (const auto index: m_register_inputs) {
+            if (index < current.size() && current[index] != m_user_data[index]) {
+                first = std::min(first, index);
+                ++changed;
+            }
+        }
+        return first;
+    }
+
+private:
     Miss m_last_miss = Miss::None;
     bool RegisterInputsEqual(std::span<const uint32_t> current) const {
         if (current.size() != m_user_data.size()) return false;
@@ -557,8 +633,21 @@ public:
             if (m_entries.empty()) m_entries.emplace_back();
             auto& memo = m_entries.front().memo;
             if (m_output != &snapshot || m_specialization != &specialization) memo.Invalidate();
+            const bool diag = ResourceMissDiag::Enabled();
+            uint32_t diag_first = UINT32_MAX, diag_changed = 0;
+            if (diag) {
+                diag_first = memo.DiffRegisterInputs(runtime.user_data, diag_changed);
+                if (diag_changed != 0) {
+                    m_diag_snapshot = snapshot;
+                    m_diag_specialization = specialization;
+                }
+            }
             const bool ok = memo.Refresh(plan, runtime, snapshot, specialization, true, reused);
             m_last_miss = memo.LastMiss();
+            if (diag && ok && diag_changed != 0 && m_last_miss == Miss::Registers) {
+                ResourceMissDiag::Record(diag_first, diag_changed, m_diag_snapshot, m_diag_specialization,
+                                         snapshot, specialization);
+            }
             m_output = &snapshot;
             m_specialization = &specialization;
             if (!ok || memo.RecordedWords() > 4096) {
@@ -663,6 +752,8 @@ public:
         return true;
     }
 private:
+    ShaderRecompiler::IR::ResourceSnapshot m_diag_snapshot;
+    ShaderRecompiler::IR::ResourceSpecialization m_diag_specialization;
     void AssignDependencyGroup(size_t selected, bool dynamic_dependencies) {
         auto& entry = m_entries[selected];
         entry.memo.PrepareHashFilterMetadata();

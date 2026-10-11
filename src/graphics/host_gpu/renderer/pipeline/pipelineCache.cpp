@@ -653,6 +653,22 @@ struct PipelineCache::ProgramCache {
 			    static_cast<unsigned long long>(resource_misses[static_cast<size_t>(ResourceMemo::Miss::Workgroups)]),
 			    static_cast<unsigned long long>(resource_misses[static_cast<size_t>(ResourceMemo::Miss::ReadFailed)]),
 			    static_cast<unsigned long long>(resource_misses[static_cast<size_t>(ResourceMemo::Miss::MemoryChanged)]));
+			if (ResourceMissDiag::Enabled()) {
+				auto& d = ResourceMissDiag::Get();
+				const auto get = [](const std::atomic<uint64_t>& v) {
+					return static_cast<unsigned long long>(v.load(std::memory_order_relaxed));
+				};
+				std::printf("NHL27MISSDIAG: misses=%llu changed=1:%llu,2:%llu,3-4:%llu,5+:%llu same: images=%llu samplers=%llu "
+				            "buffers=%llu buffers_ignoring_base=%llu flat_srt=%llu spec=%llu fill=%llu "
+				            "all_but_buffer_base=%llu identical=%llu first_reg:",
+				    get(d.misses), get(d.changed[0]), get(d.changed[1]), get(d.changed[2]), get(d.changed[3]),
+				    get(d.same_images), get(d.same_samplers), get(d.same_buffers), get(d.same_buffers_masked),
+				    get(d.same_flat), get(d.same_spec), get(d.same_fill), get(d.all_but_buffer_base), get(d.identical));
+				for (size_t i = 0; i < d.first_index.size(); ++i) {
+					if (get(d.first_index[i]) != 0) std::printf(" %zu=%llu", i, get(d.first_index[i]));
+				}
+				std::printf("\n");
+			}
 			const auto reuse_trace = GetResourceReuseTraceStats();
 			if (reuse_trace.checked != 0 || reuse_trace.evictions != 0) {
 				std::printf("NHL27REUSETRACE: evictions=%llu checked=%llu register_recur=%llu distance16=%llu distance32=%llu distance64=%llu distance128=%llu\n",
