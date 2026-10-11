@@ -4,9 +4,16 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
+#include <atomic>
+#include <cstdint>
+
 namespace Libs::Graphics {
 
 struct ShaderStageRuntime;
+
+// Bumped before every compute vkCmdBindPipeline outside the guest dispatch path, so the dispatch
+// path can prove that its previously bound compute pipeline is still the bound one.
+inline std::atomic<uint64_t> g_compute_pipeline_epoch {0};
 
 vk::ShaderStageFlagBits NativeShaderStage(ShaderType stage);
 vk::PipelineStageFlags  ShaderPipelineStages(vk::ShaderStageFlags stages);

@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/nativeIndirect.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -36,6 +37,7 @@ void NativeIndirectPrep::Record(CommandBuffer& buffer, const NativeIndirectDraw&
  static_assert(sizeof(Params) == 24);
  const Params params {source.snapshot->BufferDeviceAddress(), source.stride / 4,
                       source.max_count, source.index_count_limit, 0};
+ Libs::Graphics::g_compute_pipeline_epoch.fetch_add(1, std::memory_order_relaxed);
  command.bindPipeline(vk::PipelineBindPoint::eCompute, m_pipeline);
  command.pushConstants(m_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(params), &params);
  command.dispatch((source.max_count + 63u) / 64u, 1, 1);

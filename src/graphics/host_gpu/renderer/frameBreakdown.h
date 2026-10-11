@@ -93,6 +93,19 @@ struct Counters {
 	std::atomic<uint64_t> dp_rebind_upload_ns {0}; // RebindBuffers: NativeUpload of SRT and shader data
 	std::atomic<uint64_t> dp_descriptors_ns {0};  // CommitBindings (descriptor writes)
 	std::atomic<uint64_t> dp_pipeline_ns {0};     // pipeline lookup, render targets, dynamic state, draw emit
+	// NHL27DISPATCHPREP buckets: RenderExecutor::DispatchDirect / DispatchIndirect, GPU thread.
+	// Sequential, non-overlapping scopes inside dc_total_ns; other = total minus the named buckets.
+	std::atomic<uint64_t> dc_total_ns {0};        // whole handler body (after the context lock)
+	std::atomic<uint64_t> dc_materialize_ns {0};  // GetComputeProgram (program lookup + materialization)
+	std::atomic<uint64_t> dc_textures_ns {0};     // RebindImages
+	std::atomic<uint64_t> dc_buffers_ns {0};      // FindBuffers + PrepareBda + shared memory + RebindBuffers
+	std::atomic<uint64_t> dc_bda_ns {0};          // PrepareBda (subset of buffers)
+	std::atomic<uint64_t> dc_descriptors_ns {0};  // CommitBindings
+	std::atomic<uint64_t> dc_pipeline_ns {0};     // GetComputePipeline + PrepareBindings + bindPipeline
+	std::atomic<uint64_t> dc_barrier_ns {0};      // write-hazard and access barriers
+	std::atomic<uint64_t> dc_record_ns {0};       // breadcrumb + vkCmdDispatch
+	std::atomic<uint64_t> dc_handled {0};         // handler invocations
+	std::atomic<uint64_t> dc_bind_skipped {0};    // vkCmdBindPipeline calls elided (KYTY_DISPATCH_FAST)
 	// NHL27FAULTPARSE: BDA fault-parser pass counters (FaultManager::ProcessFaultBuffer).
 	std::atomic<uint64_t> fault_parse_passes {0};
 	std::atomic<uint64_t> fault_parse_zero {0};   // passes whose count word was 0
@@ -420,6 +433,17 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 	const uint64_t dp_rebind_ns        = Take(c.dp_rebind_ns);
 	const uint64_t dp_rebind_lookup_ns = Take(c.dp_rebind_lookup_ns);
 	const uint64_t dp_rebind_upload_ns = Take(c.dp_rebind_upload_ns);
+	const uint64_t dc_total_ns       = Take(c.dc_total_ns);
+	const uint64_t dc_materialize_ns = Take(c.dc_materialize_ns);
+	const uint64_t dc_textures_ns    = Take(c.dc_textures_ns);
+	const uint64_t dc_buffers_ns     = Take(c.dc_buffers_ns);
+	const uint64_t dc_bda_ns         = Take(c.dc_bda_ns);
+	const uint64_t dc_descriptors_ns = Take(c.dc_descriptors_ns);
+	const uint64_t dc_pipeline_ns    = Take(c.dc_pipeline_ns);
+	const uint64_t dc_barrier_ns     = Take(c.dc_barrier_ns);
+	const uint64_t dc_record_ns      = Take(c.dc_record_ns);
+	const uint64_t dc_handled        = Take(c.dc_handled);
+	const uint64_t dc_bind_skipped   = Take(c.dc_bind_skipped);
 	const uint64_t fp_passes         = Take(c.fault_parse_passes);
 	const uint64_t fp_zero           = Take(c.fault_parse_zero);
 	const uint64_t fp_faults         = Take(c.fault_parse_faults);
@@ -511,6 +535,18 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 		            "descriptors=%.2fms pipeline=%.2fms other=%.2fms\n",
 		            ms(draw_prep_ns), ms(dp_materialize_ns), ms(dp_textures_ns), ms(dp_buffers_ns),
 		            ms(dp_descriptors_ns), ms(dp_pipeline_ns), other_ms);
+		{
+			const double dc_named = ms(dc_materialize_ns) + ms(dc_textures_ns) + ms(dc_buffers_ns) +
+			                        ms(dc_descriptors_ns) + ms(dc_pipeline_ns) + ms(dc_barrier_ns) +
+			                        ms(dc_record_ns);
+			std::printf("NHL27DISPATCHPREP total=%.2fms materialize=%.2fms textures=%.2fms buffers=%.2fms "
+			            "bda=%.2fms descriptors=%.2fms pipeline=%.2fms barrier=%.2fms record=%.2fms "
+			            "other=%.2fms count=%.1f bind_skipped=%.1f\n",
+			            ms(dc_total_ns), ms(dc_materialize_ns), ms(dc_textures_ns), ms(dc_buffers_ns),
+			            ms(dc_bda_ns), ms(dc_descriptors_ns), ms(dc_pipeline_ns), ms(dc_barrier_ns),
+			            ms(dc_record_ns), std::max(0.0, ms(dc_total_ns) - dc_named), per(dc_handled),
+			            per(dc_bind_skipped));
+		}
 		std::printf("NHL27BUFFERS vertex_index=%.2fms indirect=%.2fms find=%.2fms bda=%.2fms "
 		            "rebind=%.2fms rebind_lookup=%.2fms rebind_upload=%.2fms\n",
 		            ms(dp_vertex_index_ns), ms(dp_indirect_ns), ms(dp_find_buffers_ns), ms(dp_bda_ns),
