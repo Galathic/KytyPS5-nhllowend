@@ -177,6 +177,7 @@ public:
     uint64_t VerifyMatches() const { return m_verify_matches; }
     uint64_t VerifyMismatches() const { return m_verify_mismatches; }
     uint64_t VerifyInconclusive() const { return m_verify_inconclusive; }
+    void Invalidate() { m_valid = false; }
     size_t RecordedWords() const {
         size_t total = 0;
         for (const auto& read: std::span(m_reads).first(m_read_count)) total += read.values.size();
@@ -346,6 +347,22 @@ public:
             m_last_hit = SIZE_MAX;
             reused = false;
             return ShaderRecompiler::IR::MaterializeResources(plan, runtime, snapshot, specialization);
+        }
+        if (m_capacity == 1) {
+            // With one state the caller already owns the cached snapshot. Refresh it
+            // directly rather than maintaining and copying a second full snapshot.
+            if (m_entries.empty()) m_entries.emplace_back();
+            auto& memo = m_entries.front().memo;
+            if (m_output != &snapshot || m_specialization != &specialization) memo.Invalidate();
+            const bool ok = memo.Refresh(plan, runtime, snapshot, specialization, true, reused);
+            m_last_miss = memo.LastMiss();
+            m_output = &snapshot;
+            m_specialization = &specialization;
+            if (!ok || memo.RecordedWords() > 4096) {
+                m_entries.clear();
+                m_output = m_specialization = nullptr;
+            }
+            return ok;
         }
         const auto count = m_entries.size();
         for (size_t step = 0; step < count; ++step) {

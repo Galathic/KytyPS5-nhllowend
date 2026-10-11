@@ -817,8 +817,6 @@ void PipelineCache::Save() {
 	}
 	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
 	                 Common::PathToString(m_driver_cache_path));
-	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
-	m_driver_cache = nullptr;
 }
 
 void PipelineCache::InitializeShaderRecord() {

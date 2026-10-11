@@ -267,6 +267,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		const auto [it, inserted] = m_buffers.emplace(buffer.CpuAddress(), id);
 		(void)it;
 		EXIT_IF(!inserted);
+		m_memory_tracker.QueueCpuDirtyRange(buffer.CpuAddress(), buffer.Size());
 		m_total_used_memory += buffer.Size();
 		buffer.lru_id = m_lru_cache.Insert(id, m_gc_tick);
 		std::vector<vk::DeviceAddress> addresses;
@@ -943,6 +944,23 @@ void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
 			(void)SynchronizeBuffer(buffer, start, finish - start, false, false);
 		}
 	}
+}
+
+uint64_t BufferCache::SynchronizeBuffersInRanges(const RangeSet& ranges, bool full) {
+	// Drain before a full scan so a CPU write during that scan remains queued.
+	const auto visited = m_memory_tracker.DrainCpuDirtyRegions([&](uint64_t address, uint64_t size) {
+		if (!full) {
+			ranges.ForEachInRange(address, size, [&](uint64_t begin, uint64_t end) {
+				SynchronizeBuffersInRange(begin, end - begin);
+			});
+		}
+	});
+	if (full) {
+		ranges.ForEach([&](uint64_t begin, uint64_t end) {
+			SynchronizeBuffersInRange(begin, end - begin);
+		});
+	}
+	return visited;
 }
 
 } // namespace Libs::Graphics

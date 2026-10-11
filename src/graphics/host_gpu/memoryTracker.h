@@ -48,6 +48,7 @@ public:
 				if (manager->IsModified<DirtySource::Gpu>(offset, bytes)) {
 					return true;
 				}
+				QueueCpuDirty(manager);
 				manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
 				m_cpu_generation.fetch_add(1, std::memory_order_release);
 				return false;
@@ -66,6 +67,30 @@ public:
 	void ValidateGpuDirtyPages(const RangeSet&, uint64_t, uint64_t, const char*) const noexcept {}
 	void ValidateGpuDirtyOwnership(const RangeSet&, uint64_t, uint64_t, const char*) {}
 #endif
+	// Single GPU-thread consumer. Read the next link before releasing this node to
+	// producers; writes racing with its upload can then enqueue it for the next pass.
+	template <typename Func>
+	uint64_t DrainCpuDirtyRegions(Func&& func) {
+		CheckNotInUploadCallback();
+		auto* manager = m_cpu_dirty_head.exchange(nullptr, std::memory_order_acquire);
+		uint64_t count = 0;
+		while (manager != nullptr) {
+			auto* next = manager->cpu_dirty_next;
+			manager->cpu_dirty_queued.store(false, std::memory_order_release);
+			func(manager->GetCpuAddr(), TRACKER_REGION_SIZE);
+			manager = next;
+			++count;
+		}
+		return count;
+	}
+
+	// Newly registered buffers must revisit initially dirty pages even when their
+	// containing tracking region was already drained before the buffer existed.
+	void QueueCpuDirtyRange(uint64_t vaddr, uint64_t size) {
+		CheckNotInUploadCallback();
+		Iterate<true>(vaddr, size,
+		    [this](RegionManager* manager, uint64_t, uint64_t) { QueueCpuDirty(manager); });
+	}
 
 	template <bool clear, typename Func>
 	void ForEachDownloadRange(uint64_t vaddr, uint64_t size, Func&& func) {
@@ -151,7 +176,16 @@ private:
 
 	static void    ValidateRange(uint64_t vaddr, uint64_t size);
 	RegionManager* GetOrCreateRegion(uint64_t index);
+	void QueueCpuDirty(RegionManager* manager) noexcept {
+		if (manager->cpu_dirty_queued.exchange(true, std::memory_order_acq_rel)) return;
+		auto* head = m_cpu_dirty_head.load(std::memory_order_relaxed);
+		do {
+			manager->cpu_dirty_next = head;
+		} while (!m_cpu_dirty_head.compare_exchange_weak(head, manager,
+		    std::memory_order_release, std::memory_order_relaxed));
+	}
 
+	std::atomic<RegionManager*> m_cpu_dirty_head {nullptr};
 	std::atomic_uint64_t m_cpu_generation {1};
 	std::unique_ptr<std::atomic<RegionManager*>[]> m_regions;
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;

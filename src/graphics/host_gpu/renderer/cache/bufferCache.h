@@ -103,6 +103,7 @@ public:
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	uint64_t           SynchronizeBuffersInRanges(const RangeSet& ranges, bool full);
 	[[nodiscard]] uint64_t CpuModificationGeneration() const noexcept {
 		return m_memory_tracker.CpuModificationGeneration();
 	}
