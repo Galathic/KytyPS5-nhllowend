@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/runtimeFlags.h"
+#include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceFixture.h"
 
@@ -722,6 +723,7 @@ SrtWalker::SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
 	m_scalar_batch_enabled = clean_evaluator != nullptr ? clean_evaluator->m_scalar_batch_enabled : flags.srt_scalar_batch;
 	m_cfg_gather_enabled = clean_evaluator != nullptr ? clean_evaluator->m_cfg_gather_enabled : flags.srt_cfg_gather;
 	m_cfg_trace_enabled = clean_evaluator != nullptr ? clean_evaluator->m_cfg_trace_enabled : flags.srt_cfg_trace;
+	m_source_reuse_enabled = clean_evaluator != nullptr ? clean_evaluator->m_source_reuse_enabled : flags.srt_source_reuse;
 	// Opt-in: record the memory access trace this walker performs so the workload can
 	// be replayed offline. Wraps readers on the walker's own copy only, and calls
 	// straight through, so results are unchanged when it is off or on.
@@ -1497,9 +1499,30 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 						result.dwords[index] = word.value;
 					}
 				}
+				if (m_source_reuse_enabled && FrameBreakdown::Enabled()) {
+					// Measurement only: the gather output is a copy of its Literal/UserData/Flat
+					// inputs, so "reuse" cannot beat this copy. Count how often it equals the last one.
+					auto& last  = m_program.source_reuse_last;
+					auto& valid = m_program.source_reuse_valid;
+					if (last.size() != m_program.descriptor_sources.size()) {
+						last.assign(m_program.descriptor_sources.size(), {});
+						valid.assign(m_program.descriptor_sources.size(), 0u);
+					}
+					auto& counters = FrameBreakdown::g_counters;
+					if (valid[source] != 0u && last[source] == result) {
+						counters.mat_reuse_hits.fetch_add(1, std::memory_order_relaxed);
+					} else {
+						counters.mat_reuse_misses.fetch_add(1, std::memory_order_relaxed);
+						last[source]  = result;
+						valid[source] = 1u;
+					}
+				}
 				return true;
 			}
 		}
+	}
+	if (m_source_reuse_enabled && FrameBreakdown::Enabled()) {
+		FrameBreakdown::g_counters.mat_reuse_fallback.fetch_add(1, std::memory_order_relaxed);
 	}
 	for (uint32_t index = 0; index < descriptor.dword_count; ++index) {
 		if (!Evaluate(descriptor.dwords[index], result.dwords[index])) {

@@ -1,4 +1,5 @@
 #include "common/runtimeFlags.h"
+#include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/ResourcePlanFixture.h"
 
@@ -1186,6 +1187,8 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
 	const Common::RuntimeFlags::EvaluationScope flags_scope;
+	FrameBreakdown::g_counters.mat_calls.fetch_add(FrameBreakdown::Enabled() ? 1u : 0u, std::memory_order_relaxed);
+	FrameBreakdown::Timer mat_total_timer(FrameBreakdown::g_counters.mat_total_ns);
 	auto* cache = runtime.specialization_cache;
 	if (cache != nullptr && cache->active) cache = nullptr;
 	if (cache != nullptr) {
@@ -1231,7 +1234,12 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 	SrtWalker clean(program, CleanRuntime(observed));
 	SrtWalker walker(program, observed, program.clean_flat_slots,
 	                 capture_reads || program.requires_specialization_memory ? &clean : nullptr);
-	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
+	bool flat_ok;
+	{
+		FrameBreakdown::Timer timer(FrameBreakdown::g_counters.mat_flat_ns);
+		flat_ok = walker.RefreshFlatBuffer(snapshot.flattened_srt);
+	}
+	if (!flat_ok) {
 		return false;
 	}
 	const auto active = std::span<const uint8_t>(program.active_sources);
@@ -1252,6 +1260,8 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 			return false;
 		}
 		if (active.empty() || active[source]) {
+			FrameBreakdown::Timer timer(FrameBreakdown::g_counters.mat_eval_ns);
+			FrameBreakdown::g_counters.mat_evals.fetch_add(FrameBreakdown::Enabled() ? 1u : 0u, std::memory_order_relaxed);
 			return (capture_reads && written ? clean : walker).EvaluateDescriptor(source, value);
 		}
 		value = {};
@@ -1271,6 +1281,7 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 			if (source->indirect_descriptor.has_value()) {
 				snapshot.buffers[i] = {.dword_count = 4u};
 				if (active.empty() || active[base.source]) {
+					FrameBreakdown::Timer indirect_timer(FrameBreakdown::g_counters.mat_indirect_ns);
 					if (!MaterializeIndirectDescriptor(
 					        program, *source->indirect_descriptor, i, 4u, observed, clean, snapshot,
 					        snapshot.buffers, specialization.buffers, ShaderInfo::MaxBuffers,
@@ -1351,6 +1362,7 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 			}
 			const auto& indirect = *source->indirect_descriptor;
 			const bool bounded_table = IsBoundedDescriptorTable(program, indirect);
+			FrameBreakdown::Timer indirect_timer(FrameBreakdown::g_counters.mat_indirect_ns);
 			if (!MaterializeIndirectDescriptor(
 			        program, indirect, i, 8u, observed, clean, snapshot, snapshot.images,
 			        specialization.images, UINT32_MAX, [&](DescriptorValue& value) {
@@ -1388,7 +1400,10 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 		}
 	}
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
-	cache_attempt.success = BuildResourceSpecialization(program, snapshot, specialization, cache);
+	{
+		FrameBreakdown::Timer timer(FrameBreakdown::g_counters.mat_spec_ns);
+		cache_attempt.success = BuildResourceSpecialization(program, snapshot, specialization, cache);
+	}
 	return cache_attempt.success;
 }
 
