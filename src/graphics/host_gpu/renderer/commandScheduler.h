@@ -117,6 +117,7 @@ private:
 	bool                         m_priority_active      = false;
 	uint64_t                     m_priority_active_tick = 0;
 	OperationState               m_operation_state      = OperationState::Open;
+	uint32_t                     m_trace_slot           = 0; // KYTY_IDLE_TRACE GPU timeline slot + 1
 };
 
 } // namespace Libs::Graphics

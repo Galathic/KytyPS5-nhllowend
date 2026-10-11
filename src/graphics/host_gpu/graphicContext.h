@@ -38,6 +38,7 @@ struct GraphicContext {
 	bool native_indirect_enabled = false;
 	bool native_draw_parameters_enabled = false;
 	bool                                      host_query_reset_enabled              = false;
+	bool                                      calibrated_timestamps_enabled         = false;
 	bool                                      mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
 	uint32_t                           subgroup_size                         = 0;

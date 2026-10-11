@@ -22,7 +22,7 @@ namespace Common::EventTrace {
 	X(GUEST_FLIP_REQ) X(GUEST_EQ_WAIT_BEGIN) X(GUEST_EQ_WAIT_END) X(GUEST_SEMA_WAIT_BEGIN) \
 	X(GUEST_SEMA_WAIT_END) X(EOP_TRIGGER) X(LABEL_WRITE) X(FLIP_EVENT) X(VBLANK_EVENT) \
 	X(NATIVE_SUBMIT) X(NATIVE_DONE) X(SUSPEND_ACQ_BEGIN) X(SUSPEND_ACQ_END) X(SUSPEND_RELEASE) \
-	X(FLIP_READY) X(PRESENT) X(FAULT_PARSE)
+	X(FLIP_READY) X(PRESENT) X(FAULT_PARSE) X(GPU_BEGIN) X(GPU_END)
 
 enum Type : uint32_t {
 #define X(n) n,
@@ -75,6 +75,26 @@ inline void RecordSlow(uint32_t type, uint64_t a, uint64_t b) {
 	e.thread = ThreadTag();
 	e.a      = a;
 	e.b      = b;
+}
+
+// Records an event with an explicit timestamp in NowNs() (steady_clock) units, e.g. a GPU time
+// converted to the CPU clock. Such events may be out of order in the buffer. Pre-start times are dropped.
+inline void RecordAt(uint32_t type, int64_t t_ns, uint64_t a = 0, uint64_t b = 0) {
+	if (g_capturing.load(std::memory_order_relaxed)) [[unlikely]] {
+		if (t_ns < g_start_ns) {
+			return;
+		}
+		const auto i = g_index.fetch_add(1, std::memory_order_relaxed);
+		if (i >= kCapacity) {
+			return;
+		}
+		auto& e  = g_events[i];
+		e.t_ns   = static_cast<uint64_t>(t_ns);
+		e.type   = type;
+		e.thread = ThreadTag();
+		e.a      = a;
+		e.b      = b;
+	}
 }
 
 inline void Record(uint32_t type, uint64_t a = 0, uint64_t b = 0) {
