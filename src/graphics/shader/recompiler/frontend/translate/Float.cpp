@@ -1,5 +1,7 @@
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
+#include "graphics/shader/shader.h"
+
 #include <array>
 #include <utility>
 
@@ -7,6 +9,42 @@ namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
 void Translator::PackedFloat16(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                                bool accumulator, bool quiet_snan) {
+	if (ShaderNativeFp16() && !quiet_snan) {
+		// Native packed f16: only plain operands (lo<-lo, hi<-hi, no neg/abs/clamp/omod/SDWA/DPP).
+		const auto plain_source = [](const Decoder::Operand& op) {
+			return (op.kind == Decoder::OperandKind::Vgpr || op.kind == Decoder::OperandKind::Sgpr) &&
+			       !op.op_sel && op.op_sel_hi && !op.negate && !op.negate_hi && !op.absolute &&
+			       op.sdwa_sel == 6u && !op.dpp && !op.dpp8;
+		};
+		IR::ValueOpcode native = IR::ValueOpcode::Void;
+		switch (opcode) {
+			case IR::ValueOpcode::FPAdd32: native = IR::ValueOpcode::FPAdd16x2; break;
+			case IR::ValueOpcode::FPMul32: native = IR::ValueOpcode::FPMul16x2; break;
+			case IR::ValueOpcode::FPFma32: native = IR::ValueOpcode::FPFma16x2; break;
+			default: break;
+		}
+		const bool three = native == IR::ValueOpcode::FPFma16x2;
+		const bool shape_ok = three ? (accumulator || inst.src_count == 3u) : (inst.src_count == 2u);
+		if (native != IR::ValueOpcode::Void && shape_ok && !inst.dst.clamp && inst.dst.omod == 0u &&
+		    plain_source(inst.src0) && plain_source(inst.src1) &&
+		    (!three || (accumulator ? plain_source(inst.dst) : plain_source(inst.src2)))) {
+			const auto a = ReadRawU32(inst.src0);
+			const auto b = ReadRawU32(inst.src1);
+			IR::U32    result;
+			if (three) {
+				const auto c = ReadRawU32(accumulator ? inst.dst : inst.src2);
+				result       = IR::U32(ir.Emit(native, {a, b, c}));
+			} else {
+				result = IR::U32(ir.Emit(native, {a, b}));
+			}
+			auto raw  = DestinationOperand(inst);
+			raw.omod  = 0u;
+			raw.clamp = false;
+			WriteOperand(raw, result);
+			fp16_native = true;
+			return;
+		}
+	}
 	const auto translate_lane = [&](bool high) {
 		const auto lhs = ReadF16LaneAsF32(inst.src0, high);
 		const auto rhs = ReadF16LaneAsF32(inst.src1, high);
