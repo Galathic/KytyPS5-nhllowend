@@ -49,6 +49,7 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	// KYTY_PERF_STATS: time the GPU thread spends blocked on host GPU progress.
 	const bool on_gpu_thread = GuestGpu::IsGpuThread();
 	FrameBreakdown::Timer wait_timer(FrameBreakdown::g_counters.gpu_wait_ns, on_gpu_thread);
+	FrameBreakdown::GpuBusyScope busy_scope(FrameBreakdown::GB_WAIT);
 	if (on_gpu_thread) {
 		FrameBreakdown::Add(FrameBreakdown::g_counters.gpu_wait_count);
 	}

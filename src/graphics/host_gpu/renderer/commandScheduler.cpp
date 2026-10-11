@@ -6,6 +6,7 @@
 #include "common/runtimeFlags.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include <algorithm>
@@ -1082,6 +1083,7 @@ void CommandScheduler::PopPendingOperations() {
 		WaitPriorityOperations(operation.tick);
 		Common::EventTrace::Record(Common::EventTrace::NATIVE_DONE, operation.tick);
 		GpuTracePoll();
+		FrameBreakdown::GpuBusyScope busy_scope(FrameBreakdown::GB_DEFERRED);
 		RunOperation(std::move(operation.callback));
 	}
 }
@@ -1195,6 +1197,7 @@ CommandBuffer& CommandScheduler::Current() {
 
 CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
+	FrameBreakdown::GpuBusyScope busy_scope(FrameBreakdown::GB_BEGIN_CMD);
 	m_command.m_buffer = m_command_pool.Commit();
 	m_command.Begin();
 	m_trace_slot = GpuTraceBegin(m_graphics, m_command.m_buffer);
@@ -1203,6 +1206,7 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(m_command.IsInvalid());
+	FrameBreakdown::GpuBusyScope busy_scope(FrameBreakdown::GB_SUBMIT);
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 
@@ -1245,6 +1249,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
+		FrameBreakdown::GpuBusyScope queue_scope(FrameBreakdown::GB_QUEUE_SUBMIT);
 		result = graphics.queue.submit(1, &submit_info, nullptr);
 	}
 

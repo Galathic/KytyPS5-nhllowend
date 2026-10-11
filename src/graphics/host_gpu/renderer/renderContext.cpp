@@ -69,6 +69,7 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	}
 	// KYTY_PERF_STATS: fault time includes any synchronous readback it triggers (overlaps readback).
 	FrameBreakdown::Timer fault_timer(FrameBreakdown::g_counters.fault_ns);
+	FrameBreakdown::GpuBusyScope busy_scope(FrameBreakdown::GB_FAULT);
 	FrameBreakdown::Add(FrameBreakdown::g_counters.fault_count);
 	// NHL27FAULTCOST accounting (KYTY_PERF_STATS only).
 	struct FaultCostScope {
@@ -264,6 +265,7 @@ void RenderContext::PrepareBda() {
 }
 
 void RenderContext::RunGarbageCollector() {
+	FrameBreakdown::GpuBusyScope busy_scope(FrameBreakdown::GB_GC);
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;
 		m_buffer_cache.ProcessFaultBuffer();

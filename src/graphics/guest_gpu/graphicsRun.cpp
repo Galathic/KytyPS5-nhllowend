@@ -159,6 +159,7 @@ void GuestGpu::ProcessCommands() {
 			m_commands.pop_front();
 			EXIT_IF(m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
 		}
+		FrameBreakdown::GpuBusyScope busy_scope(FrameBreakdown::GB_GPU_CMDS);
 		command();
 	}
 }
@@ -671,6 +672,11 @@ void GuestGpu::ThreadRun(void* data) {
 		{
 			// KYTY_PERF_STATS: GPU thread busy = Process wall time minus its master-semaphore waits.
 			FrameBreakdown::Timer process_timer(FrameBreakdown::g_counters.gpu_process_ns);
+			// NHL27GPUBUSY: exclusive bucket attribution over the same window.
+			struct GpuBusyWindow {
+				GpuBusyWindow() { FrameBreakdown::GpuBusyBegin(); }
+				~GpuBusyWindow() { FrameBreakdown::GpuBusyEnd(); }
+			} gpu_busy_window;
 			// kind: 2 + SubmissionType (graphics/compute/flip prep/suspend point), +0x100 when sliced/blocked
 			const uint64_t kind = 2 + static_cast<uint64_t>(submission.type);
 			Common::EventTrace::Record(Common::EventTrace::GPU_CMD_BEGIN, kind, gpu->m_submit_id);
@@ -773,6 +779,37 @@ static bool SubmitSplitIsWorkOpcode(uint32_t op) {
 		case Pm4::IT_DRAW_INDEX_OFFSET_2:
 		case Pm4::IT_DRAW_INDEX_INDIRECT_MULTI: return true;
 		default: return false;
+	}
+}
+
+// NHL27GPUBUSY: which exclusive bucket a PM4 packet handler is charged to.
+static FrameBreakdown::GpuBucket PacketBusyBucket(uint32_t op) {
+	switch (op) {
+		case Pm4::IT_DRAW_INDIRECT:
+		case Pm4::IT_DRAW_INDEX_INDIRECT:
+		case Pm4::IT_DRAW_INDEX_2:
+		case Pm4::IT_DRAW_INDIRECT_MULTI:
+		case Pm4::IT_DRAW_INDEX_AUTO:
+		case Pm4::IT_DRAW_INDEX_OFFSET_2:
+		case Pm4::IT_DRAW_INDEX_INDIRECT_MULTI:
+		case Pm4::IT_DISPATCH_DRAW: return FrameBreakdown::GB_DRAW_HANDLER;
+		case Pm4::IT_DISPATCH_DIRECT:
+		case Pm4::IT_DISPATCH_INDIRECT: return FrameBreakdown::GB_DISPATCH_HANDLER;
+		case Pm4::IT_EVENT_WRITE:
+		case Pm4::IT_EVENT_WRITE_EOP:
+		case Pm4::IT_EVENT_WRITE_EOS:
+		case Pm4::IT_RELEASE_MEM:
+		case Pm4::IT_WRITE_DATA:
+		case Pm4::IT_WAIT_REG_MEM:
+		case Pm4::IT_WAIT_REG_MEM_64:
+		case Pm4::IT_MEM_SEMAPHORE:
+		case Pm4::IT_PFP_SYNC_ME:
+		case Pm4::IT_SURFACE_SYNC:
+		case Pm4::IT_ACQUIRE_MEM: return FrameBreakdown::GB_SYNC_PKT;
+		case Pm4::IT_DMA_DATA:
+		case Pm4::IT_CP_DMA:
+		case Pm4::IT_COPY_DATA: return FrameBreakdown::GB_DMA_PKT;
+		default: return FrameBreakdown::GB_HANDLER;
 	}
 }
 
@@ -1040,8 +1077,11 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		}
 
 		BufferCache::PerfSetPm4Op(opcode);
-		const auto packet_dw =
-		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+		uint32_t packet_dw;
+		{
+			FrameBreakdown::GpuBusyScope busy_scope(PacketBusyBucket(opcode));
+			packet_dw = handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+		}
 		EXIT_IF(packet_dw > remaining_dw);
 		if (execution.m_suspended) {
 			return;

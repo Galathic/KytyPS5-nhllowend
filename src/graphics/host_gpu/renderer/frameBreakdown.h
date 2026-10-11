@@ -246,6 +246,98 @@ inline void AddReadback(uint64_t ns) noexcept {
 	}
 }
 
+// NHL27GPUBUSY: exclusive attribution of GPU-thread busy time (Process wall time, KYTY_PERF_STATS).
+// Between GpuBusyBegin and GpuBusyEnd (the same window as gpu_process_ns) every nanosecond is charged
+// to exactly one bucket: the innermost active GpuBusyScope, or pm4_loop when none is active. Scopes
+// nest; a nested scope's time is removed from its parent, so the buckets add up to the Process wall
+// time. wait is the master-semaphore block time (gpu_thread_busy excludes it). Scopes are no-ops on
+// any thread/time outside that window. draw_prep is the DrawPrepBegin -> DrawEmitted window minus
+// nested scopes (its NHL27DRAWPREP total is the inclusive figure).
+enum GpuBucket : uint8_t {
+	GB_PM4_LOOP,         // Process/CommandProcessor loop outside packet handlers (fetch, parse, split checks)
+	GB_HANDLER,          // other packet handlers (register sets, NOP/flip, indirect buffer, ...)
+	GB_DRAW_HANDLER,     // draw packet handlers excluding draw_prep and nested scopes
+	GB_DISPATCH_HANDLER, // dispatch packet handlers excluding nested scopes (compute prep + record)
+	GB_SYNC_PKT,         // EOP/RELEASE_MEM/EVENT_WRITE/WRITE_DATA/WAIT_REG_MEM/semaphore/sync packets
+	GB_DMA_PKT,          // DMA_DATA/CP_DMA/COPY_DATA packets
+	GB_DRAW_PREP,        // DrawPrepBegin -> DrawEmitted, exclusive
+	GB_GPU_CMDS,         // GuestGpu::ProcessCommands (commands posted from other threads)
+	GB_FAULT,            // RenderContext::HandleFault on the GPU thread
+	GB_GC,               // RenderContext::RunGarbageCollector
+	GB_DEFERRED,         // CommandScheduler::PopPendingOperations callbacks
+	GB_SUBMIT,           // CommandScheduler::Submit excluding vkQueueSubmit (End, flags refresh, trace)
+	GB_QUEUE_SUBMIT,     // vkQueueSubmit incl. queue mutex
+	GB_BEGIN_CMD,        // CommandScheduler::BeginCommand (pool Commit + vkBeginCommandBuffer)
+	GB_RENDER_PASS,      // CommandBuffer::BeginRendering/EndRendering (actual begin/end only)
+	GB_BARRIER,          // Image::Transit and shader access/hazard barriers
+	GB_TEX_UPLOAD,       // Image::Upload
+	GB_WAIT,             // MasterSemaphore::Wait blocked (not part of gpu_thread_busy)
+	GB_COUNT
+};
+
+struct GpuBusyState {
+	bool             active = false;
+	uint8_t          cur    = GB_PM4_LOOP;
+	uint8_t          prep_prev = GB_PM4_LOOP;
+	Clock::time_point last {};
+	uint64_t         acc[GB_COUNT] {};
+};
+inline thread_local GpuBusyState g_gpu_busy;
+inline std::array<std::atomic<uint64_t>, GB_COUNT> g_gpu_busy_ns {};
+
+inline void GpuBusySwitch(uint8_t bucket) noexcept {
+	auto&      s   = g_gpu_busy;
+	const auto now = Clock::now();
+	s.acc[s.cur] += static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::nanoseconds>(now - s.last).count());
+	s.last = now;
+	s.cur  = bucket;
+}
+
+inline void GpuBusyBegin() noexcept {
+	if (!Enabled()) {
+		return;
+	}
+	auto& s = g_gpu_busy;
+	s.active = true;
+	s.cur    = GB_PM4_LOOP;
+	s.last   = Clock::now();
+}
+
+inline void GpuBusyEnd() noexcept {
+	auto& s = g_gpu_busy;
+	if (!s.active) {
+		return;
+	}
+	GpuBusySwitch(GB_PM4_LOOP);
+	for (size_t i = 0; i < GB_COUNT; ++i) {
+		g_gpu_busy_ns[i].fetch_add(s.acc[i], std::memory_order_relaxed);
+		s.acc[i] = 0;
+	}
+	s.active = false;
+}
+
+class GpuBusyScope {
+public:
+	explicit GpuBusyScope(GpuBucket bucket) noexcept: m_on(g_gpu_busy.active) {
+		if (m_on) {
+			m_prev = g_gpu_busy.cur;
+			GpuBusySwitch(bucket);
+		}
+	}
+	GpuBusyScope(const GpuBusyScope&)            = delete;
+	GpuBusyScope& operator=(const GpuBusyScope&) = delete;
+	~GpuBusyScope() {
+		if (m_on && g_gpu_busy.active) {
+			GpuBusySwitch(m_prev);
+		}
+	}
+
+private:
+	uint8_t m_prev = GB_PM4_LOOP;
+	bool    m_on;
+};
+
 // Draw prep starts at PrepareDrawRenderState entry and ends at the vkCmd draw emit. The start is
 // thread-local, so a draw skipped before its emit is simply overwritten by the next begin.
 inline thread_local Clock::time_point g_draw_prep_start {};
@@ -253,12 +345,20 @@ inline thread_local Clock::time_point g_draw_prep_start {};
 inline void DrawPrepBegin() noexcept {
 	if (Enabled()) {
 		g_draw_prep_start = Clock::now();
+		if (g_gpu_busy.active && g_gpu_busy.cur != GB_DRAW_PREP) {
+			g_gpu_busy.prep_prev = g_gpu_busy.cur;
+			GpuBusySwitch(GB_DRAW_PREP);
+		}
 	}
 }
 
 inline void DrawEmitted() noexcept {
 	if (!Enabled()) {
 		return;
+	}
+	// A draw skipped before its emit leaves draw_prep selected until the enclosing handler scope ends.
+	if (g_gpu_busy.active && g_gpu_busy.cur == GB_DRAW_PREP) {
+		GpuBusySwitch(g_gpu_busy.prep_prev);
 	}
 	g_counters.draws.fetch_add(1, std::memory_order_relaxed);
 	if (g_draw_prep_start != Clock::time_point {}) {
@@ -337,6 +437,10 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 	const uint64_t bda_sync_ns       = Take(c.bda_sync_ns);
 	const uint64_t sync_uploads      = Take(c.sync_uploads);
 	const uint64_t sync_bytes        = Take(c.sync_bytes);
+	uint64_t gb[GB_COUNT];
+	for (size_t i = 0; i < GB_COUNT; ++i) {
+		gb[i] = Take(g_gpu_busy_ns[i]);
+	}
 	g_window_start = now;
 	if (frames == 0) {
 		return;
@@ -364,6 +468,30 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 	// Tee-Object) libc uses a block buffer, so without this the window lines
 	// arrive minutes late and an automated collector cannot attribute them.
 	std::fflush(stdout);
+	// Exclusive buckets (see GpuBucket): they sum to Process wall time, so busy = sum - wait.
+	// unattributed = busy - sum(non-wait buckets); it is only timer skew / uncovered gaps.
+	{
+		uint64_t attributed = 0;
+		for (size_t i = 0; i < GB_COUNT; ++i) {
+			if (i != GB_WAIT) {
+				attributed += gb[i];
+			}
+		}
+		const double unattr_ms = ms(busy_ns) - ms(attributed);
+		std::printf("NHL27GPUBUSY busy=%.2fms pm4_loop=%.2fms handler=%.2fms draw_handler=%.2fms "
+		            "dispatch_handler=%.2fms sync_pkt=%.2fms dma_pkt=%.2fms draw_prep_excl=%.2fms "
+		            "gpu_cmds=%.2fms fault=%.2fms gc=%.2fms deferred_ops=%.2fms submit=%.2fms "
+		            "queue_submit=%.2fms begin_cmd=%.2fms render_pass=%.2fms barrier=%.2fms "
+		            "tex_upload=%.2fms wait=%.2fms unattributed=%.2fms "
+		            "(draw_prep_incl=%.2fms)\n",
+		            ms(busy_ns), ms(gb[GB_PM4_LOOP]), ms(gb[GB_HANDLER]), ms(gb[GB_DRAW_HANDLER]),
+		            ms(gb[GB_DISPATCH_HANDLER]), ms(gb[GB_SYNC_PKT]), ms(gb[GB_DMA_PKT]),
+		            ms(gb[GB_DRAW_PREP]), ms(gb[GB_GPU_CMDS]), ms(gb[GB_FAULT]), ms(gb[GB_GC]),
+		            ms(gb[GB_DEFERRED]), ms(gb[GB_SUBMIT]), ms(gb[GB_QUEUE_SUBMIT]),
+		            ms(gb[GB_BEGIN_CMD]), ms(gb[GB_RENDER_PASS]), ms(gb[GB_BARRIER]),
+		            ms(gb[GB_TEX_UPLOAD]), ms(gb[GB_WAIT]), unattr_ms, ms(draw_prep_ns));
+		std::fflush(stdout);
+	}
 	if (DetailEnabled()) {
 		std::printf("NHL27PREP frames=%" PRIu64
 		            " graphics_programs=%.3fms compute_program=%.3fms color_target=%.3fms"
