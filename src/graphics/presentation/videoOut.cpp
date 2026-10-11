@@ -1366,6 +1366,10 @@ KYTY_SYSV_ABI int VideoOutSetFlipRate(int handle, int rate) {
 	PRINT_NAME();
 
 	LOGF("\trate = %d\n", rate);
+	if (const char* stats = std::getenv("KYTY_PERF_STATS"); stats != nullptr && stats[0] == '1') {
+		std::printf("NHL27FLIPRATE: handle=%d rate=%d\n", handle, rate);
+		std::fflush(stdout);
+	}
 
 	auto* ctx = DriverState().Get(handle);
 	if (ctx == nullptr) {

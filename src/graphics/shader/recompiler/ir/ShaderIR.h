@@ -643,6 +643,8 @@ struct ResourcePlan {
 		std::vector<Op>       ops;
 		std::vector<uint32_t> slot_ops;
 		std::vector<uint32_t> condition_ops;
+		// Per condition: its op yields 0/1, or 2 where the walker's predicate fails.
+		std::vector<uint8_t> condition_tri;
 		// Cached per-demand-root DFS programs. Enter skips the whole subtree on
 		// a memo hit; exit executes the op after its ordered dependencies.
 		struct DemandStep { uint32_t op = 0; uint32_t next = UINT32_MAX; };
@@ -664,7 +666,8 @@ struct ResourcePlan {
 	struct CfgTrace {
 		// Eval/CondEval re-run the recursive walker for roots the tape does not cover.
 		// Gather marks a descriptor source CFG-gather ready (EvaluateDescriptor still verifies it).
-		enum class Kind : uint8_t { Exec, Memo, Flat, Activate, Cond, Eval, CondEval, Gather, End };
+		// CondTri: a tri-state condition op (0, 1, or 2 = predicate failed).
+		enum class Kind : uint8_t { Exec, Memo, Flat, Activate, Cond, Eval, CondEval, Gather, End, CondTri };
 		struct Step {
 			Kind     kind = Kind::End;
 			uint32_t a    = 0; // op (Exec/Memo/Flat/Cond), slot (Eval), block (Activate/CondEval), source (Gather)

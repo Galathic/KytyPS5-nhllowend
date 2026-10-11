@@ -2094,8 +2094,13 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 			const auto& tape = m_program.cfg_srt_tapes[m_clean_evaluator != nullptr ? 1 : 0];
 			const uint32_t root = tape.state == ResourcePlan::SrtTape::State::Ready
 			                          ? tape.condition_ops[index] : UINT32_MAX;
+			const bool tri = tape.state == ResourcePlan::SrtTape::State::Ready && tape.condition_tri[index] != 0u;
 			predicate_done = RunCfgRoot(root, condition);
-			if (predicate_done > 0) record({.kind = TraceKind::Cond, .a = root, .b = condition != 0u ? 1u : 0u});
+			if (predicate_done > 0 && tri) {
+				const uint32_t outcome = condition == 2u ? 2u : condition != 0u ? 1u : 0u;
+				record({.kind = TraceKind::CondTri, .a = root, .b = outcome});
+				if (outcome == 2u) predicate_done = 0; // the walker's predicate failed
+			} else if (predicate_done > 0) record({.kind = TraceKind::Cond, .a = root, .b = condition != 0u ? 1u : 0u});
 			else if (predicate_done == 0) m_cfg_trace_recording = false;
 			else {
 				predicate_done = predicate.Evaluate(block.condition, condition) ? 1 : 0;
@@ -2176,6 +2181,8 @@ bool BuildTapeForPlan(const ResourcePlan& plan, bool with_clean,
 
 	tape.ops.clear();
 	tape.slot_ops.clear();
+	tape.condition_ops.clear();
+	tape.condition_tri.clear();
 	tape.slot_ops.reserve(plan.srt_reads.size());
 	tape.clean_root = with_clean;
 
@@ -2337,6 +2344,59 @@ bool BuildTapeForPlan(const ResourcePlan& plan, bool with_clean,
 			return static_cast<int>(op_idx);
 		}
 
+		if (opcode == ValueOpcode::ConditionRef) {
+			const int alias = emit_val(inst->Arg(0), is_clean);
+			if (!cfg || alias < 0) return alias;
+			op.opcode = ValueOpcode::ReadConst; // scalar alias, with its own memo index
+			op.kind = ResourcePlan::SrtTape::Kind::Inst;
+			op.args[0] = static_cast<uint32_t>(alias);
+			op.dependency_count = 1;
+			const auto index = static_cast<uint32_t>(tape.ops.size());
+			tape.ops.push_back(op);
+			inst_to_op[key] = index;
+			return static_cast<int>(index);
+		}
+		if (opcode == ValueOpcode::LogicalAnd || opcode == ValueOpcode::LogicalOr) {
+			// The walker short-circuits and tolerates a failed operand when the other one
+			// decides the result. With one immediate operand that reduces to a constant or
+			// to bool(other operand), which fails exactly when the walker's result fails.
+			// The decisive value is 0 for And and nonzero for Or.
+			const bool is_and = opcode == ValueOpcode::LogicalAnd;
+			uint64_t imm = 0;
+			int other_arg = -1;
+			if (get_value_u64(inst->Arg(1), imm)) other_arg = 0;
+			else if (get_value_u64(inst->Arg(0), imm)) other_arg = 1;
+			if (other_arg < 0) {
+				reject_reason = 4;
+				return -1;
+			}
+			const auto emit_imm = [&](uint64_t value) {
+				if (const auto found = immediate_to_op.find(value); found != immediate_to_op.end()) {
+					return static_cast<int>(found->second);
+				}
+				ResourcePlan::SrtTape::Op imm_op;
+				imm_op.kind = ResourcePlan::SrtTape::Kind::Immediate;
+				imm_op.imm = value;
+				const auto index = static_cast<uint32_t>(tape.ops.size());
+				tape.ops.push_back(imm_op);
+				immediate_to_op.emplace(value, index);
+				return static_cast<int>(index);
+			};
+			if ((imm != 0u) != is_and) return emit_imm(is_and ? 0u : 1u);
+			const int a = emit_val(inst->Arg(other_arg), is_clean);
+			const int zero = emit_imm(0u);
+			if (a < 0 || zero < 0) return -1;
+			op.opcode = ValueOpcode::LogicalXor; // (a != 0) != false
+			op.kind = ResourcePlan::SrtTape::Kind::Inst;
+			op.args[0] = static_cast<uint32_t>(a);
+			op.args[1] = static_cast<uint32_t>(zero);
+			op.dependency_count = 2;
+			const auto index = static_cast<uint32_t>(tape.ops.size());
+			tape.ops.push_back(op);
+			inst_to_op[key] = index;
+			return static_cast<int>(index);
+		}
+
 		switch (opcode) {
 			case ValueOpcode::BitCastU32F32:
 			case ValueOpcode::BitCastF32U32:
@@ -2345,7 +2405,8 @@ bool BuildTapeForPlan(const ResourcePlan& plan, bool with_clean,
 			case ValueOpcode::FPTrunc32:
 			case ValueOpcode::FPRecipIFlag32:
 			case ValueOpcode::FPIsNan32:
-			case ValueOpcode::BitwiseNot32: {
+			case ValueOpcode::BitwiseNot32:
+			case ValueOpcode::LogicalNot: {
 				int a = emit_val(inst->Arg(0), is_clean);
 				if (a < 0) return -1;
 				op.kind = ResourcePlan::SrtTape::Kind::Inst;
@@ -2459,6 +2520,11 @@ bool BuildTapeForPlan(const ResourcePlan& plan, bool with_clean,
 		default:
 				// Any lazy/short-circuiting op (Select, Phi, ReadFirstLane, LogicalAnd, LogicalOr)
 				// falls back to the dynamic walker.
+				if (static const bool diag = std::getenv("KYTY_TAPE_REJECT_DIAG") != nullptr; diag) {
+					const auto name = ValueOpcodeName(opcode);
+					std::fprintf(stderr, "TAPEREJECT cfg=%d op=%.*s\n", cfg ? 1 : 0,
+					             static_cast<int>(name.size()), name.data());
+				}
 				reject_reason = 4;
 				return -1;
 		}
@@ -2467,6 +2533,68 @@ bool BuildTapeForPlan(const ResourcePlan& plan, bool with_clean,
 		tape.ops.push_back(op);
 		inst_to_op[key] = op_idx;
 		return static_cast<int>(op_idx);
+	};
+
+	// A value whose walker evaluation always fails: an undefined value, or an And whose
+	// other operand is a nonzero immediate (the walker cannot short-circuit it).
+	std::function<bool(Value)> always_fails = [&](Value val) {
+		const auto* inst = val.Resolve().TryInstruction();
+		if (inst == nullptr) return false;
+		switch (inst->GetOpcode()) {
+			case ValueOpcode::UndefU1:
+			case ValueOpcode::UndefU8:
+			case ValueOpcode::UndefU16:
+			case ValueOpcode::UndefU32:
+			case ValueOpcode::UndefU64: return true;
+			case ValueOpcode::LogicalAnd: {
+				uint64_t imm = 0;
+				return (get_value_u64(inst->Arg(1), imm) && imm != 0u && always_fails(inst->Arg(0))) ||
+				       (get_value_u64(inst->Arg(0), imm) && imm != 0u && always_fails(inst->Arg(1)));
+			}
+			default: return false;
+		}
+	};
+	// [Not](Or(A, F)) with F always failing: the walker yields Or = A ? 1 : failure, so the
+	// predicate is a tri-state of A. Emit Select(A, 1 or 0, 2), 2 meaning "failed". The op is
+	// synthetic: no source instruction and no walker memo slot.
+	const auto emit_tri_condition = [&](Value condition, bool is_clean) -> int {
+		auto val = condition.Resolve();
+		bool negate = false;
+		if (const auto* inst = val.TryInstruction(); inst != nullptr && inst->GetOpcode() == ValueOpcode::LogicalNot) {
+			negate = true;
+			val = inst->Arg(0).Resolve();
+		}
+		const auto* inst = val.TryInstruction();
+		if (inst == nullptr || inst->GetOpcode() != ValueOpcode::LogicalOr) return -1;
+		Value a_val;
+		if (always_fails(inst->Arg(1)) && !always_fails(inst->Arg(0))) a_val = inst->Arg(0);
+		else if (always_fails(inst->Arg(0)) && !always_fails(inst->Arg(1))) a_val = inst->Arg(1);
+		else return -1;
+		const int a = emit_val(a_val, is_clean);
+		if (a < 0) return -1;
+		const auto emit_imm = [&](uint64_t value) {
+			if (const auto found = immediate_to_op.find(value); found != immediate_to_op.end()) {
+				return found->second;
+			}
+			ResourcePlan::SrtTape::Op imm_op;
+			imm_op.kind = ResourcePlan::SrtTape::Kind::Immediate;
+			imm_op.imm = value;
+			const auto index = static_cast<uint32_t>(tape.ops.size());
+			tape.ops.push_back(imm_op);
+			immediate_to_op.emplace(value, index);
+			return index;
+		};
+		ResourcePlan::SrtTape::Op op;
+		op.kind = ResourcePlan::SrtTape::Kind::Inst;
+		op.opcode = ValueOpcode::SelectU32;
+		op.clean = is_clean ? 1 : 0;
+		op.args[0] = static_cast<uint32_t>(a);
+		op.args[1] = emit_imm(negate ? 0u : 1u);
+		op.args[2] = emit_imm(2u);
+		op.dependency_count = 3;
+		const auto index = static_cast<uint32_t>(tape.ops.size());
+		tape.ops.push_back(op);
+		return static_cast<int>(index);
 	};
 
 	for (size_t slot = 0; slot < plan.srt_reads.size(); ++slot) {
@@ -2487,8 +2615,31 @@ bool BuildTapeForPlan(const ResourcePlan& plan, bool with_clean,
 	}
 	if (cfg) {
 		for (const auto& block: plan.control_flow) {
-			const auto root = block.condition.IsEmpty() ? -1 : emit_val(block.condition, with_clean);
+			auto root = block.condition.IsEmpty() ? -1 : emit_val(block.condition, with_clean);
+			const bool tri = root < 0 && !block.condition.IsEmpty() &&
+			                 (root = emit_tri_condition(block.condition, with_clean)) >= 0;
 			tape.condition_ops.push_back(root < 0 ? UINT32_MAX : static_cast<uint32_t>(root));
+			tape.condition_tri.push_back(tri ? 1u : 0u);
+			if (static const bool diag = std::getenv("KYTY_TAPE_REJECT_DIAG") != nullptr;
+			    diag && root < 0 && !block.condition.IsEmpty()) {
+				std::string text;
+				std::function<void(Value, int)> dump = [&](Value v, int depth) {
+					v = v.Resolve();
+					if (v.IsImmediate()) { uint64_t iv = 0; get_value_u64(v, iv); text += std::to_string(iv); return; }
+					const auto* i = v.TryInstruction();
+					if (i == nullptr) { text += "?"; return; }
+					text += ValueOpcodeName(i->GetOpcode());
+					if (depth == 0) return;
+					text += "(";
+					for (size_t a = 0; a < i->NumArgs(); ++a) {
+						if (a) text += ",";
+						if (i->Arg(a).IsEmpty()) text += "-"; else dump(i->Arg(a), depth - 1);
+					}
+					text += ")";
+				};
+				dump(block.condition, 4);
+				std::fprintf(stderr, "TAPECOND %s\n", text.c_str());
+			}
 		}
 	}
 
@@ -2766,6 +2917,13 @@ int SrtWalker::ReplayCfgTrace(std::vector<uint32_t>& flat) {
 				pc = next;
 				break;
 			}
+			case TraceKind::CondTri: {
+				const auto value = static_cast<uint32_t>(values[step.a]);
+				const auto next = step.next[value == 2u ? 2 : value != 0u ? 1 : 0];
+				if (next == UINT32_MAX) return miss();
+				pc = next;
+				break;
+			}
 			case TraceKind::Eval: {
 				const auto& read = m_program.srt_reads[step.a];
 				const bool clean = read.flat_offset < m_clean_flat_slots.size() &&
@@ -2815,7 +2973,8 @@ void SrtWalker::MergeCfgTrace() {
 		const auto base = static_cast<uint32_t>(trace.steps.size());
 		for (size_t j = first; j < recorded.size(); ++j) {
 			auto step = recorded[j];
-			if (step.kind == TraceKind::Cond || step.kind == TraceKind::CondEval) {
+			if (step.kind == TraceKind::Cond || step.kind == TraceKind::CondEval ||
+			    step.kind == TraceKind::CondTri) {
 				step.next = {UINT32_MAX, UINT32_MAX, UINT32_MAX};
 				step.next[step.b] = base + static_cast<uint32_t>(j + 1 - first);
 			}
@@ -2836,7 +2995,8 @@ void SrtWalker::MergeCfgTrace() {
 		const auto& seen = recorded[i];
 		// Paths share a prefix up to their first differing condition; anything else
 		// means the refresh did not start from equivalent memo state. Keep the trie.
-		const bool branch = seen.kind == TraceKind::Cond || seen.kind == TraceKind::CondEval;
+		const bool branch = seen.kind == TraceKind::Cond || seen.kind == TraceKind::CondEval ||
+		                    seen.kind == TraceKind::CondTri;
 		if (step.kind != seen.kind || step.a != seen.a || (!branch && step.b != seen.b)) return;
 		if (seen.kind == TraceKind::End) return;
 		if (!branch) { ++pc; continue; }
@@ -3056,6 +3216,7 @@ bool SrtWalker::ExecuteTapeOp(const ResourcePlan::SrtTape::Op& op,
 				}
 				case ValueOpcode::FPIsNan32: result = std::isnan(Float32(a)); break;
 				case ValueOpcode::BitwiseNot32: result = ~static_cast<uint32_t>(a); break;
+				case ValueOpcode::LogicalNot: result = a == 0u; break;
 				case ValueOpcode::CompositeConstructU64:
 					result = static_cast<uint32_t>(a) |
 					         (static_cast<uint64_t>(static_cast<uint32_t>(b)) << 32u);
@@ -3130,6 +3291,7 @@ bool SrtWalker::ExecuteTapeOp(const ResourcePlan::SrtTape::Op& op,
 					         std::bit_cast<int32_t>(static_cast<uint32_t>(b));
 					break;
 				case ValueOpcode::LogicalXor: result = (a != 0u) != (b != 0u); break;
+				case ValueOpcode::SelectU32: result = a != 0u ? b : c; break; // synthetic tri-state conditions
 				case ValueOpcode::BitFieldUExtract: {
 					const auto offset = static_cast<uint32_t>(b);
 					const auto width = static_cast<uint32_t>(c);

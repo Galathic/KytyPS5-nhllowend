@@ -614,144 +614,174 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		return {id, nullptr, std::move(desc)};
 	}
 
-	const auto address         = descriptor.Base40();
-	const auto width           = static_cast<uint32_t>(descriptor.Width5()) + 1u;
-	const auto height          = static_cast<uint32_t>(descriptor.Height5()) + 1u;
-	const auto base_level      = descriptor.BaseLevel();
-	const auto last_level      = descriptor.LastLevel();
-	const auto type            = TextureType(descriptor);
-	const bool multisampled    = IsMultisampledTexture(type);
-	const auto max_mip         = resource.r128 ? last_level : descriptor.MaxMip();
-	const auto physical_levels = multisampled ? 1u : static_cast<uint32_t>(max_mip) + 1u;
-	// IMAGE_STORE addresses BASE_LEVEL; only IMAGE_STORE_MIP selects other view mips.
-	const bool single_storage_mip =
-	    storage && resource.mip_mode != ShaderRecompiler::IR::ImageMipMode::Dynamic;
-	const auto view_levels = multisampled || single_storage_mip
-	                             ? 1u
-	                             : static_cast<uint32_t>(last_level - base_level) + 1u;
-	auto levels =
-	    multisampled ? 1u : std::max(physical_levels, base_level + view_levels);
-	const auto tile       = descriptor.TileMode();
-	const bool depth_tile = tile == Prospero::TileMode::kDepth;
-	const bool msaa_tile  = depth_tile || tile == Prospero::TileMode::kRenderTarget;
-	const bool msaa_array = type == Prospero::ImageType::kColor2DMsaaArray;
-	if ((!multisampled && base_level > last_level) ||
-	    (multisampled &&
-	     (base_level != 0 || last_level == 0 || last_level > 3 || max_mip != last_level ||
-	      !msaa_tile || (descriptor.MsaaDepth() && !depth_tile) ||
-	      (!msaa_array && (descriptor.Depth() != 0 || descriptor.BaseArray5() != 0))))) {
-		EXIT("unsupported texture mip view: base=%u last=%u levels=%u max=%u type=%u tile=%u "
-		     "class=%u numeric=%u dimension=%u mip_mode=%u read=%d written=%d "
-		     "dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
-		     base_level, last_level, levels, descriptor.MaxMip(),
-		     static_cast<uint32_t>(descriptor.Type()), static_cast<uint32_t>(tile),
-		     static_cast<uint32_t>(resource.resource_class),
-		     static_cast<uint32_t>(resource.numeric_class),
-		     static_cast<uint32_t>(resource.dimension), static_cast<uint32_t>(resource.mip_mode),
-		     resource.read, resource.written, descriptor.fields[0], descriptor.fields[1],
-		     descriptor.fields[2], descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
-		     descriptor.fields[6], descriptor.fields[7]);
-	}
-	const auto samples = multisampled ? 1u << last_level : 1u;
-	const auto depth          = static_cast<uint32_t>(descriptor.Depth()) + 1u;
-	const auto format         = descriptor.Format();
-	const auto surface_format = TextureGetSurfaceFormatInfo(format);
-	const bool shader_conversion =
-	    surface_format.conversion_format != Prospero::BufferFormat::kInvalid;
-	const bool sampled_numeric_class =
-	    storage || resource.numeric_class == Prospero::SampledTextureNumericClass(format);
-	if (!storage && resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled &&
-	    !sampled_numeric_class) {
-		EXIT("sampled image numeric class mismatch: numeric=%u format=%u addr=0x%016" PRIx64 "\n",
-		     static_cast<uint32_t>(resource.numeric_class), static_cast<uint32_t>(format), address);
-	}
-
-	const bool    volume       = type == Prospero::ImageType::kColor3D;
-	const bool    layered      = type == Prospero::ImageType::kColor1DArray ||
-	                             type == Prospero::ImageType::kColor2DArray ||
-	                             type == Prospero::ImageType::kColor2DMsaaArray;
-	const auto    image_layers = layered ? depth : 1u;
-	auto          view_base    = static_cast<uint32_t>(base_level);
-	if (levels > physical_levels) {
-		const TileSurfaceDescription physical {
-		    format, tile, volume ? TileSurfaceDimension::Dim3D : TileSurfaceDimension::Dim2D,
-		    width, height, volume ? depth : 1u, physical_levels, image_layers};
-		if (!ResolveTextureMipView(physical, !resource.r128 && descriptor.MetaCompress(),
-		                           view_levels, levels, view_base)) {
-			EXIT("unsupported texture mip view changes physical layout: base=%u last=%u max=%u "
-			     "extent=%ux%ux%u tile=%u\n",
-			     base_level, last_level, max_mip, width, height, depth,
-			     static_cast<uint32_t>(tile));
-		}
-	}
-	uint32_t      pitch = 0;
-	TileSizeAlign size {};
-	if (multisampled) {
-		const auto bytes = Prospero::NumBytesPerElement(format);
-		pitch            = depth_tile ? TileGetDepthPitch(width, bytes, last_level)
-		                              : TileGetRenderTargetPitch(width, bytes, last_level);
-		if (pitch == 0 || !TileGetRenderTargetSize(width, height, pitch, bytes, size, last_level) ||
-		    size.size > UINT32_MAX / image_layers) {
-			EXIT("unsupported multisample texture layout\n");
-		}
-		size.size *= image_layers;
-	} else {
-		pitch = TileGetTexturePitch(format, width, tile);
-		TileGetTextureTotalSize(format, width, height, volume ? depth : image_layers,
-		                        physical_levels, tile, volume, size);
-	}
-	EXIT_NOT_IMPLEMENTED(size.size == 0 || size.align == 0 ||
-	                     (address & (static_cast<uint64_t>(size.align) - 1u)) != 0);
-	if (storage) {
-		ValidateStorageTexture(resource, descriptor, size.size);
-	}
-
-	auto pixel_format = surface_format.vk_format;
-	if (resource.depth_compare) {
-		if (const auto* depth_format = FindGuestDepthFormatPolicy(format)) {
-			pixel_format = depth_format->depth_attachment_format;
-		}
-	}
-	const auto storage_view_format = resource.atomic64 ? vk::Format::eR64Uint
-	                                 : storage && (resource.atomic ||
-	                                               format == Prospero::BufferFormat::k32SInt)
-	                                     ? vk::Format::eR32Uint
-	                                     : SrgbStorageViewFormat(pixel_format);
-	const auto view_format         = storage && storage_view_format != vk::Format::eUndefined
-	                                     ? storage_view_format
-	                                     : pixel_format;
-	const auto block_bytes         = Prospero::BlockCompressedBytesPerBlock(format);
+	// The descriptor -> ImageDesc decode (tile sizes, mip layout, validation) is a pure
+	// function of the image resource and the 8 descriptor dwords. Draws rebind the same
+	// textures constantly, so memoize it in a small direct-mapped table.
 	TextureCache::ImageDesc desc {};
-	desc.info.data         = {address, size.size};
-	desc.info.pixel_format = pixel_format;
-	desc.info.guest_format = format;
-	desc.info.type         = TextureBaseType(type);
-	desc.info.extent       = {width, height, volume ? depth : 1u};
-	desc.info.resources    = {levels, image_layers};
-	desc.info.pitch        = pitch;
-	desc.info.bytes_per_block =
-	    block_bytes != 0 ? block_bytes : Prospero::NumBytesPerElement(format);
-	desc.info.samples   = samples;
-	desc.info.tile_mode = tile;
-	if (!resource.r128 && descriptor.MetaCompress() && tile != Prospero::TileMode::kDepth &&
-	    !desc.info.IsDepth()) {
-		TileSizeAlign metadata_size {};
-		(void)TileGetDccSize(width, height, volume ? depth : image_layers,
-		                     desc.info.bytes_per_block, physical_levels, tile, metadata_size,
-		                     std::countr_zero(samples));
-		desc.info.metadata.kind          = ImageMetadataKind::Dcc;
-		desc.info.metadata.range         = {descriptor.MetaAddr() << 8u, metadata_size.size};
-		desc.info.metadata.dcc_alpha_msb = descriptor.DccAlphaPos();
-	}
-	if (samples > 1) {
-		desc.info.mip_layout[0] = {0, size.size, pitch, height};
+	bool       shader_conversion = false;
+	vk::Format pixel_format      = vk::Format::eUndefined;
+	vk::Format view_format       = vk::Format::eUndefined;
+	uint64_t   texture_size      = 0;
+	uint64_t   memo_hash         = 0xcbf29ce484222325ull ^ resource.source;
+	for (const auto field: descriptor.fields) memo_hash = (memo_hash ^ field) * 0x100000001b3ull;
+	memo_hash = (memo_hash ^ static_cast<uint64_t>(resource.written)) * 0x100000001b3ull;
+	auto& memo = m_texture_desc_memo[(memo_hash ^ (memo_hash >> 31u)) & (m_texture_desc_memo.size() - 1u)];
+	if (memo.valid && std::equal(std::begin(memo.fields), std::end(memo.fields), std::begin(descriptor.fields)) &&
+	    memo.resource == resource) {
+		desc              = memo.desc;
+		shader_conversion = memo.shader_conversion;
+		pixel_format      = memo.pixel_format;
+		view_format       = memo.view_format;
+		texture_size      = memo.size;
 	} else {
-		PopulateTextureMipLayout(desc.info);
+		const auto address         = descriptor.Base40();
+		const auto width           = static_cast<uint32_t>(descriptor.Width5()) + 1u;
+		const auto height          = static_cast<uint32_t>(descriptor.Height5()) + 1u;
+		const auto base_level      = descriptor.BaseLevel();
+		const auto last_level      = descriptor.LastLevel();
+		const auto type            = TextureType(descriptor);
+		const bool multisampled    = IsMultisampledTexture(type);
+		const auto max_mip         = resource.r128 ? last_level : descriptor.MaxMip();
+		const auto physical_levels = multisampled ? 1u : static_cast<uint32_t>(max_mip) + 1u;
+		// IMAGE_STORE addresses BASE_LEVEL; only IMAGE_STORE_MIP selects other view mips.
+		const bool single_storage_mip =
+		    storage && resource.mip_mode != ShaderRecompiler::IR::ImageMipMode::Dynamic;
+		const auto view_levels = multisampled || single_storage_mip
+		                             ? 1u
+		                             : static_cast<uint32_t>(last_level - base_level) + 1u;
+		auto levels =
+		    multisampled ? 1u : std::max(physical_levels, base_level + view_levels);
+		const auto tile       = descriptor.TileMode();
+		const bool depth_tile = tile == Prospero::TileMode::kDepth;
+		const bool msaa_tile  = depth_tile || tile == Prospero::TileMode::kRenderTarget;
+		const bool msaa_array = type == Prospero::ImageType::kColor2DMsaaArray;
+		if ((!multisampled && base_level > last_level) ||
+		    (multisampled &&
+		     (base_level != 0 || last_level == 0 || last_level > 3 || max_mip != last_level ||
+		      !msaa_tile || (descriptor.MsaaDepth() && !depth_tile) ||
+		      (!msaa_array && (descriptor.Depth() != 0 || descriptor.BaseArray5() != 0))))) {
+			EXIT("unsupported texture mip view: base=%u last=%u levels=%u max=%u type=%u tile=%u "
+			     "class=%u numeric=%u dimension=%u mip_mode=%u read=%d written=%d "
+			     "dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+			     base_level, last_level, levels, descriptor.MaxMip(),
+			     static_cast<uint32_t>(descriptor.Type()), static_cast<uint32_t>(tile),
+			     static_cast<uint32_t>(resource.resource_class),
+			     static_cast<uint32_t>(resource.numeric_class),
+			     static_cast<uint32_t>(resource.dimension), static_cast<uint32_t>(resource.mip_mode),
+			     resource.read, resource.written, descriptor.fields[0], descriptor.fields[1],
+			     descriptor.fields[2], descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
+			     descriptor.fields[6], descriptor.fields[7]);
+		}
+		const auto samples = multisampled ? 1u << last_level : 1u;
+		const auto depth          = static_cast<uint32_t>(descriptor.Depth()) + 1u;
+		const auto format         = descriptor.Format();
+		const auto surface_format = TextureGetSurfaceFormatInfo(format);
+		shader_conversion =
+		    surface_format.conversion_format != Prospero::BufferFormat::kInvalid;
+		const bool sampled_numeric_class =
+		    storage || resource.numeric_class == Prospero::SampledTextureNumericClass(format);
+		if (!storage && resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled &&
+		    !sampled_numeric_class) {
+			EXIT("sampled image numeric class mismatch: numeric=%u format=%u addr=0x%016" PRIx64 "\n",
+			     static_cast<uint32_t>(resource.numeric_class), static_cast<uint32_t>(format), address);
+		}
+
+		const bool    volume       = type == Prospero::ImageType::kColor3D;
+		const bool    layered      = type == Prospero::ImageType::kColor1DArray ||
+		                             type == Prospero::ImageType::kColor2DArray ||
+		                             type == Prospero::ImageType::kColor2DMsaaArray;
+		const auto    image_layers = layered ? depth : 1u;
+		auto          view_base    = static_cast<uint32_t>(base_level);
+		if (levels > physical_levels) {
+			const TileSurfaceDescription physical {
+			    format, tile, volume ? TileSurfaceDimension::Dim3D : TileSurfaceDimension::Dim2D,
+			    width, height, volume ? depth : 1u, physical_levels, image_layers};
+			if (!ResolveTextureMipView(physical, !resource.r128 && descriptor.MetaCompress(),
+			                           view_levels, levels, view_base)) {
+				EXIT("unsupported texture mip view changes physical layout: base=%u last=%u max=%u "
+				     "extent=%ux%ux%u tile=%u\n",
+				     base_level, last_level, max_mip, width, height, depth,
+				     static_cast<uint32_t>(tile));
+			}
+		}
+		uint32_t      pitch = 0;
+		TileSizeAlign size {};
+		if (multisampled) {
+			const auto bytes = Prospero::NumBytesPerElement(format);
+			pitch            = depth_tile ? TileGetDepthPitch(width, bytes, last_level)
+			                              : TileGetRenderTargetPitch(width, bytes, last_level);
+			if (pitch == 0 || !TileGetRenderTargetSize(width, height, pitch, bytes, size, last_level) ||
+			    size.size > UINT32_MAX / image_layers) {
+				EXIT("unsupported multisample texture layout\n");
+			}
+			size.size *= image_layers;
+		} else {
+			pitch = TileGetTexturePitch(format, width, tile);
+			TileGetTextureTotalSize(format, width, height, volume ? depth : image_layers,
+			                        physical_levels, tile, volume, size);
+		}
+		EXIT_NOT_IMPLEMENTED(size.size == 0 || size.align == 0 ||
+		                     (address & (static_cast<uint64_t>(size.align) - 1u)) != 0);
+		if (storage) {
+			ValidateStorageTexture(resource, descriptor, size.size);
+		}
+
+		pixel_format = surface_format.vk_format;
+		if (resource.depth_compare) {
+			if (const auto* depth_format = FindGuestDepthFormatPolicy(format)) {
+				pixel_format = depth_format->depth_attachment_format;
+			}
+		}
+		const auto storage_view_format = resource.atomic64 ? vk::Format::eR64Uint
+		                                 : storage && (resource.atomic ||
+		                                               format == Prospero::BufferFormat::k32SInt)
+		                                     ? vk::Format::eR32Uint
+		                                     : SrgbStorageViewFormat(pixel_format);
+		view_format = storage && storage_view_format != vk::Format::eUndefined
+		                                     ? storage_view_format
+		                                     : pixel_format;
+		const auto block_bytes         = Prospero::BlockCompressedBytesPerBlock(format);
+		// (desc declared by the memo above)
+		desc.info.data         = {address, size.size};
+		desc.info.pixel_format = pixel_format;
+		desc.info.guest_format = format;
+		desc.info.type         = TextureBaseType(type);
+		desc.info.extent       = {width, height, volume ? depth : 1u};
+		desc.info.resources    = {levels, image_layers};
+		desc.info.pitch        = pitch;
+		desc.info.bytes_per_block =
+		    block_bytes != 0 ? block_bytes : Prospero::NumBytesPerElement(format);
+		desc.info.samples   = samples;
+		desc.info.tile_mode = tile;
+		if (!resource.r128 && descriptor.MetaCompress() && tile != Prospero::TileMode::kDepth &&
+		    !desc.info.IsDepth()) {
+			TileSizeAlign metadata_size {};
+			(void)TileGetDccSize(width, height, volume ? depth : image_layers,
+			                     desc.info.bytes_per_block, physical_levels, tile, metadata_size,
+			                     std::countr_zero(samples));
+			desc.info.metadata.kind          = ImageMetadataKind::Dcc;
+			desc.info.metadata.range         = {descriptor.MetaAddr() << 8u, metadata_size.size};
+			desc.info.metadata.dcc_alpha_msb = descriptor.DccAlphaPos();
+		}
+		if (samples > 1) {
+			desc.info.mip_layout[0] = {0, size.size, pitch, height};
+		} else {
+			PopulateTextureMipLayout(desc.info);
+		}
+		desc.view_info = TextureViewInfo(resource, descriptor, view_format, surface_format, storage,
+		                                 view_levels, desc.info.resources.layers);
+		desc.view_info.base_level = view_base;
+		desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
+		texture_size = size.size;
+		memo.valid             = true;
+		std::copy(std::begin(descriptor.fields), std::end(descriptor.fields), std::begin(memo.fields));
+		memo.resource          = resource;
+		memo.desc              = desc;
+		memo.shader_conversion = shader_conversion;
+		memo.pixel_format      = pixel_format;
+		memo.view_format       = view_format;
+		memo.size              = texture_size;
 	}
-	desc.view_info = TextureViewInfo(resource, descriptor, view_format, surface_format, storage,
-	                                 view_levels, desc.info.resources.layers);
-	desc.view_info.base_level = view_base;
-	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
 
 	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
 	auto*      image               = &texture_cache.GetImage(id);
@@ -763,7 +793,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		if (storage) {
 			EXIT("depth target cannot be bound as a storage image\n");
 		}
-		ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format, size.size);
+		ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format, texture_size);
 	} else if (storage) {
 		// Block-compressed images whose format has no storage support on this device (e.g.
 		// BC6H on AMD) are created without STORAGE usage; a storage view on them is invalid and
@@ -1127,25 +1157,28 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		        (pipeline_bind_point == vk::PipelineBindPoint::eCompute &&
 		         shader_stage != vk::ShaderStageFlagBits::eCompute));
 	}
+	// The written ranges do not depend on the read, so collect them once per commit
+	// (bound images can number in the hundreds; slot lookups per read dominated here).
+	bool written_ready = false;
 	for (const auto* reader: prepared_bindings) {
 		const auto& reads = reader->runtime->resources->specialization_reads;
 		if (reads.empty()) continue;
-		for (const auto* writer: prepared_bindings) {
-			if (writer->runtime->program->has_address_writes) {
-				EXIT("scalar resource reads cannot be proven disjoint from shader address writes\n");
+		if (!written_ready) {
+			written_ready = true;
+			for (const auto* writer: prepared_bindings) {
+				if (writer->runtime->program->has_address_writes) {
+					EXIT("scalar resource reads cannot be proven disjoint from shader address writes\n");
+				}
 			}
-		}
-		for (const auto [address, size]: reads) {
+			m_written_image_ranges.clear();
+			m_written_buffer_ranges.clear();
 			for (const auto id: m_bound_images) {
 				const auto* image = m_context.GetTextureCache().m_slot_images.try_get(id);
 				if (image == nullptr ||
 				    (!image->binding.shader_write && !image->binding.is_target)) continue;
 				for (const auto written: {image->info.data, image->info.stencil,
 				                          image->info.metadata.range}) {
-					if (written.size != 0 && ImageRangeOverlaps(address, size,
-					                                          written.address, written.size)) {
-						EXIT("scalar resource reads overlap an image or attachment write\n");
-					}
+					if (written.size != 0) m_written_image_ranges.emplace_back(written.address, written.size);
 				}
 			}
 			for (const auto* writer: prepared_bindings) {
@@ -1154,10 +1187,19 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					const auto resource = program.bindings.descriptors.front().resources[i];
 					if (!program.info.buffers[resource].written) continue;
 					const auto& written = writer->buffer_sources[i];
-					if (written.size != 0 && ImageRangeOverlaps(address, size,
-					                                          written.address, written.size)) {
-						EXIT("scalar resource reads overlap a shader buffer write\n");
-					}
+					if (written.size != 0) m_written_buffer_ranges.emplace_back(written.address, written.size);
+				}
+			}
+		}
+		for (const auto [address, size]: reads) {
+			for (const auto& [written_address, written_size]: m_written_image_ranges) {
+				if (ImageRangeOverlaps(address, size, written_address, written_size)) {
+					EXIT("scalar resource reads overlap an image or attachment write\n");
+				}
+			}
+			for (const auto& [written_address, written_size]: m_written_buffer_ranges) {
+				if (ImageRangeOverlaps(address, size, written_address, written_size)) {
+					EXIT("scalar resource reads overlap a shader buffer write\n");
 				}
 			}
 		}

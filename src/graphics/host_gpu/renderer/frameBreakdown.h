@@ -1,5 +1,7 @@
 #pragma once
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
@@ -41,6 +43,8 @@ inline bool DetailEnabled() {
 struct Counters {
 	std::atomic<uint64_t> flip_ns {0};          // presented flip -> presented flip
 	std::atomic<uint64_t> flip_intervals {0};   // number of those intervals (= frames)
+	// Flip intervals rounded to 60 Hz vblanks: [0] = 1 vblank ... [4] = 5 or more.
+	std::array<std::atomic<uint64_t>, 5> flip_vblanks {};
 	std::atomic<uint64_t> gpu_process_ns {0};   // GPU thread: GuestGpu::Process wall time
 	std::atomic<uint64_t> gpu_wait_ns {0};      // GPU thread: blocked in MasterSemaphore::Wait
 	std::atomic<uint64_t> gpu_wait_count {0};   // GPU thread: waits that actually blocked
@@ -182,11 +186,15 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 	std::printf("NHL27FRAME fps=%.1f frame=%.2fms frames=%" PRIu64
 	            " gpu_thread_busy=%.2fms wait_gpu=%.2fms(%.2f) readback=%.2fms(%.2f) "
 	            "faults=%.2fms(%.2f) compile=%.2fms(%.3f) draw_prep=%.2fms(%.1fus/draw) "
-	            "draws=%.1f dispatches=%.1f\n",
+	            "draws=%.1f dispatches=%.1f vblanks=%llu,%llu,%llu,%llu,%llu\n",
 	            static_cast<double>(frames) / seconds, ms(frame_ns), frames, ms(busy_ns),
 	            ms(wait_ns), per(wait_count), ms(readback_ns), per(readback_n), ms(fault_ns),
 	            per(fault_n), ms(compile_ns), per(compile_n), ms(draw_prep_ns), draw_us,
-	            per(draws), per(dispatches));
+	            per(draws), per(dispatches), static_cast<unsigned long long>(Take(c.flip_vblanks[0])),
+	            static_cast<unsigned long long>(Take(c.flip_vblanks[1])),
+	            static_cast<unsigned long long>(Take(c.flip_vblanks[2])),
+	            static_cast<unsigned long long>(Take(c.flip_vblanks[3])),
+	            static_cast<unsigned long long>(Take(c.flip_vblanks[4])));
 	// Flush every line: when stdout is a pipe (the launcher pipes into
 	// Tee-Object) libc uses a block buffer, so without this the window lines
 	// arrive minutes late and an automated collector cannot attribute them.
@@ -220,6 +228,9 @@ inline void OnPresentedFlip() {
 		const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now - g_last_flip);
 		g_counters.flip_ns.fetch_add(static_cast<uint64_t>(ns.count()), std::memory_order_relaxed);
 		g_counters.flip_intervals.fetch_add(1, std::memory_order_relaxed);
+		const auto vblanks = (static_cast<uint64_t>(ns.count()) + 8'333'333u) / 16'666'667u;
+		g_counters.flip_vblanks[std::clamp<uint64_t>(vblanks, 1u, 5u) - 1u].fetch_add(
+		    1, std::memory_order_relaxed);
 	}
 	g_last_flip = now;
 	PrintIfDueLocked(now);

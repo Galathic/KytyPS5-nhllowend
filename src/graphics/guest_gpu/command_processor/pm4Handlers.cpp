@@ -2291,6 +2291,14 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0061060);
 
+	// Like EVENT_WRITE: command buffers can share a 4 KiB page with compute-shader output.
+	// Peek the CPU-written payload instead of faulting a whole-page download + queue drain.
+	std::array<uint32_t, 7> payload {};
+	if (Common::RuntimeFlags::Current().pm4_event_clean &&
+	    cp.TryPeekCleanBackingBytes(buffer, payload.data(), sizeof(payload))) {
+		buffer = payload.data();
+	}
+
 	uint32_t cache_policy       = (buffer[0] >> 25u) & 0x3u;
 	uint32_t eop_event_type     = buffer[0] & 0x3fu;
 	uint32_t event_index        = (buffer[0] >> 8u) & 0x7u;

@@ -250,6 +250,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
 		m_image_page_table[page].push_back(id);
 	});
+	m_images_by_address[image.info.data.address].push_back(id);
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
 	m_total_used_memory += image.AccountedSize();
@@ -271,6 +272,19 @@ void TextureCache::UnregisterImage(ImageId id) {
 			EXIT("TextureCache: image missing from page owner index\n");
 		}
 	});
+	{
+		const auto by_address = m_images_by_address.find(image.info.data.address);
+		if (by_address == m_images_by_address.end()) {
+			EXIT("TextureCache: image missing from address index\n");
+		}
+		auto& ids = by_address->second;
+		const auto found = std::find(ids.begin(), ids.end(), id);
+		if (found == ids.end()) {
+			EXIT("TextureCache: image missing from address index\n");
+		}
+		ids.erase(found);
+		if (ids.empty()) m_images_by_address.erase(by_address);
+	}
 	m_lru_cache.Free(image.lru_id);
 	const auto accounted = image.AccountedSize();
 	if (accounted > m_total_used_memory) {
@@ -1476,8 +1490,6 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	ImageId result {};
 	{
 		std::scoped_lock lock {m_lock};
-		const auto       candidates =
-		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
 
 		// A color render target can alias a depth buffer's stencil plane (games write stencil via an
 		// R8 color target). Stencil association records have no native image, so never hand one
@@ -1485,10 +1497,29 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		const auto skip_candidate = [&](ImageId id) {
 			return desc.type == BindingType::RenderTarget && m_slot_images[id].depth_id;
 		};
-		for (const auto id: candidates) {
-			const auto& image = m_slot_images[id];
-			if (!skip_candidate(id) && SameBacking(image.info, desc.info, exact_format)) {
-				result = id;
+		// Fast path: SameBacking requires an identical start address, so every image the region
+		// scan below could select is in the address index. With exactly one match the scan
+		// would pick that same image; skip walking every owner on the covered 1 MiB pages.
+		if (const auto by_address = m_images_by_address.find(desc.info.data.address);
+		    by_address != m_images_by_address.end()) {
+			uint32_t matches = 0;
+			ImageId  match {};
+			for (const auto id: by_address->second) {
+				if (!skip_candidate(id) && SameBacking(m_slot_images[id].info, desc.info, exact_format)) {
+					match = id;
+					++matches;
+				}
+			}
+			if (matches == 1) result = match;
+		}
+		ImageIds candidates;
+		if (!result) {
+			candidates = FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
+			for (const auto id: candidates) {
+				const auto& image = m_slot_images[id];
+				if (!skip_candidate(id) && SameBacking(image.info, desc.info, exact_format)) {
+					result = id;
+				}
 			}
 		}
 

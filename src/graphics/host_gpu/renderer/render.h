@@ -303,6 +303,21 @@ private:
 	std::shared_ptr<NativeIndirectPrep> m_native_indirect_prep;
 	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;
+	// ResolveTexture: memoized pure descriptor -> ImageDesc decode (direct-mapped).
+	struct TextureDescMemo {
+		bool                                valid = false;
+		uint32_t                            fields[8] {};
+		ShaderRecompiler::IR::ImageResource resource;
+		TextureCache::ImageDesc             desc;
+		bool                                shader_conversion = false;
+		vk::Format                          pixel_format      = vk::Format::eUndefined;
+		vk::Format                          view_format       = vk::Format::eUndefined;
+		uint64_t                            size              = 0;
+	};
+	std::vector<TextureDescMemo> m_texture_desc_memo = std::vector<TextureDescMemo>(1024);
+	// CommitBindings scratch: ranges written by bound images / shader buffers.
+	std::vector<std::pair<uint64_t, uint64_t>> m_written_image_ranges;
+	std::vector<std::pair<uint64_t, uint64_t>> m_written_buffer_ranges;
 	std::vector<vk::DescriptorBufferInfo> m_descriptor_buffers;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
