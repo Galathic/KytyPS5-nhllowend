@@ -17,6 +17,7 @@
 //   NHL27FRAME fps=... frame=... gpu_thread_busy=... wait_gpu=... readback=... faults=...
 //              compile=... draw_prep=... draws=... dispatches=...
 //   NHL27DRAWPREP total=... materialize=... textures=... buffers=... descriptors=... pipeline=... other=...
+//   NHL27MATERIALIZE calls=... total=... flat=... eval=...(n) indirect=... spec=... rest=... reuse_hit=... reuse_miss=... reuse_fallback=...
 //   NHL27BUFFERS vertex_index=... indirect=... find=... bda=... rebind=... rebind_lookup=... rebind_upload=...
 //   NHL27PROTECT calls=... ms=...
 //   NHL27FAULTCOST n=... gpu_r/gpu_w/guest_r/guest_w=... pages=... refault=... total=... veh=... lock=...
@@ -95,6 +96,18 @@ struct Counters {
 	std::atomic<uint64_t> obtain_cache_misses {0}; // KYTY_BUFFER_FAST: lookups that went to ObtainBuffer
 	std::atomic<uint64_t> dp_descriptors_ns {0};  // CommitBindings (descriptor writes)
 	std::atomic<uint64_t> dp_pipeline_ns {0};     // pipeline lookup, render targets, dynamic state, draw emit
+	// NHL27MATERIALIZE: MaterializeResourcesImpl split. total is the whole call; flat, eval, indirect and
+	// spec are sequential sub-scopes (eval includes the clean walker); rest = total - the four.
+	std::atomic<uint64_t> mat_calls {0};
+	std::atomic<uint64_t> mat_total_ns {0};
+	std::atomic<uint64_t> mat_flat_ns {0};      // RefreshFlatBuffer
+	std::atomic<uint64_t> mat_eval_ns {0};      // EvaluateDescriptor (direct sources)
+	std::atomic<uint64_t> mat_indirect_ns {0};  // MaterializeIndirectDescriptor
+	std::atomic<uint64_t> mat_spec_ns {0};      // BuildResourceSpecialization
+	std::atomic<uint64_t> mat_evals {0};        // EvaluateDescriptor calls
+	std::atomic<uint64_t> mat_reuse_hits {0};   // KYTY_SRT_SOURCE_REUSE: gather output equals the previous one
+	std::atomic<uint64_t> mat_reuse_misses {0}; // gather output differs / first time
+	std::atomic<uint64_t> mat_reuse_fallback {0}; // sources not on the gather fast path
 	// NHL27FAULTPARSE: BDA fault-parser pass counters (FaultManager::ProcessFaultBuffer).
 	std::atomic<uint64_t> fault_parse_passes {0};
 	std::atomic<uint64_t> fault_parse_zero {0};   // passes whose count word was 0
@@ -415,6 +428,16 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 	const uint64_t dp_buffers_ns     = Take(c.dp_buffers_ns);
 	const uint64_t dp_descriptors_ns = Take(c.dp_descriptors_ns);
 	const uint64_t dp_pipeline_ns    = Take(c.dp_pipeline_ns);
+	const uint64_t mat_calls         = Take(c.mat_calls);
+	const uint64_t mat_total_ns      = Take(c.mat_total_ns);
+	const uint64_t mat_flat_ns       = Take(c.mat_flat_ns);
+	const uint64_t mat_eval_ns       = Take(c.mat_eval_ns);
+	const uint64_t mat_indirect_ns   = Take(c.mat_indirect_ns);
+	const uint64_t mat_spec_ns       = Take(c.mat_spec_ns);
+	const uint64_t mat_evals         = Take(c.mat_evals);
+	const uint64_t mat_reuse_hits    = Take(c.mat_reuse_hits);
+	const uint64_t mat_reuse_misses  = Take(c.mat_reuse_misses);
+	const uint64_t mat_reuse_fallback = Take(c.mat_reuse_fallback);
 	const uint64_t dp_vertex_index_ns  = Take(c.dp_vertex_index_ns);
 	const uint64_t dp_indirect_ns      = Take(c.dp_indirect_ns);
 	const uint64_t dp_find_buffers_ns  = Take(c.dp_find_buffers_ns);
@@ -515,6 +538,16 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 		            "descriptors=%.2fms pipeline=%.2fms other=%.2fms\n",
 		            ms(draw_prep_ns), ms(dp_materialize_ns), ms(dp_textures_ns), ms(dp_buffers_ns),
 		            ms(dp_descriptors_ns), ms(dp_pipeline_ns), other_ms);
+		{
+			const uint64_t mat_named = mat_flat_ns + mat_eval_ns + mat_indirect_ns + mat_spec_ns;
+			const uint64_t mat_rest  = mat_total_ns > mat_named ? mat_total_ns - mat_named : 0;
+			std::printf("NHL27MATERIALIZE calls=%.1f total=%.2fms flat=%.2fms eval=%.2fms(%.1f) "
+			            "indirect=%.2fms spec=%.2fms rest=%.2fms reuse_hit=%.1f reuse_miss=%.1f "
+			            "reuse_fallback=%.1f\n",
+			            per(mat_calls), ms(mat_total_ns), ms(mat_flat_ns), ms(mat_eval_ns), per(mat_evals),
+			            ms(mat_indirect_ns), ms(mat_spec_ns), ms(mat_rest), per(mat_reuse_hits),
+			            per(mat_reuse_misses), per(mat_reuse_fallback));
+		}
 		std::printf("NHL27BUFFERS vertex_index=%.2fms indirect=%.2fms find=%.2fms bda=%.2fms "
 		            "rebind=%.2fms rebind_lookup=%.2fms rebind_upload=%.2fms\n",
 		            ms(dp_vertex_index_ns), ms(dp_indirect_ns), ms(dp_find_buffers_ns), ms(dp_bda_ns),

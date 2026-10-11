@@ -685,6 +685,9 @@ struct ResourcePlan {
 	};
 	mutable std::array<CfgTrace, 2> cfg_traces;
 	mutable std::vector<CfgTrace::Step> cfg_trace_scratch;
+	// KYTY_SRT_SOURCE_REUSE: previous gather-path output per descriptor source (GPU thread only).
+	mutable std::vector<DescriptorValue> source_reuse_last;
+	mutable std::vector<uint8_t>         source_reuse_valid;
 };
 
 struct Program: ResourcePlan {

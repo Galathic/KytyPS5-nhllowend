@@ -125,6 +125,7 @@ private:
 	bool                            m_scalar_batch_enabled = false;
 	bool                            m_cfg_gather_enabled = false;
 	bool                            m_cfg_trace_enabled = false;
+	bool                            m_source_reuse_enabled = false;
 	// Set while a CFG refresh records its trace; cleared by anything the replay cannot reproduce.
 	bool                            m_cfg_trace_recording = false;
 	std::vector<uint8_t>            m_cfg_gather_ready_sources;
