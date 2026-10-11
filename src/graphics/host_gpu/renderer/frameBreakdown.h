@@ -19,6 +19,7 @@
 //   NHL27DRAWPREP total=... materialize=... textures=... buffers=... descriptors=... pipeline=... other=...
 //   NHL27BUFFERS vertex_index=... indirect=... find=... bda=... rebind=... rebind_lookup=... rebind_upload=...
 //   NHL27PROTECT calls=... ms=...
+//   NHL27FAULTCOST n=... gpu_r/gpu_w/guest_r/guest_w=... pages=... refault=... total=... veh=... lock=...
 //   NHL27FAULTPARSE passes=... zero=... faults=... ring_wait=...ms
 // Every value except fps and frames is a per-frame average (a frame is one presented flip
 // interval). Header-only so probes in several translation units share one set of counters
@@ -116,6 +117,84 @@ struct Counters {
 	std::atomic<uint64_t> sync_bytes {0};
 };
 inline Counters g_counters;
+
+// NHL27FAULTCOST: breakdown of guest page-fault handling (RenderContext::HandleFault), all threads.
+// Time buckets are summed over every faulting thread (guest CPU threads run in parallel with the GPU
+// thread, so the sum can exceed wall time). Nested buckets: buf_inv includes tracker lock, protect and
+// (for GPU-dirty pages) readmem; tex_inv includes tex_lock; readmem includes the GPU queue wait.
+struct FaultCost {
+	std::atomic<uint64_t> total_ns {0};      // HandleFault body wall time (same span as faults=)
+	std::atomic<uint64_t> veh_ns {0};        // VEH entry -> HandleFault entry
+	std::atomic<uint64_t> lock_ns {0};       // tracker region spinlock wait + texture-cache m_lock wait
+	std::atomic<uint64_t> buf_inv_ns {0};    // BufferCache::InvalidateMemory (write faults)
+	std::atomic<uint64_t> tex_inv_ns {0};    // TextureCache::InvalidateMemory (write faults)
+	std::atomic<uint64_t> readmem_ns {0};    // BufferCache::ReadMemory, any fault path (incl. GPU wait)
+	std::atomic<uint64_t> rd_readmem_ns {0}; // ReadMemory from read faults only
+	std::atomic<uint64_t> protect_ns {0};    // PageManager Protect (VirtualProtect) during a fault
+	std::atomic<uint64_t> protect_calls {0};
+	std::atomic<uint64_t> total_gpu_ns {0};  // total_ns spent on the GPU thread (inside gpu_thread_busy)
+	std::atomic<uint64_t> total_guest_ns {0};
+	std::atomic<uint64_t> n[4] {};           // gpu_r, gpu_w, guest_r, guest_w
+	std::atomic<uint64_t> distinct {0};      // distinct 4 KiB pages faulted, counted once per frame
+	std::atomic<uint64_t> epoch {1};         // frame counter, bumped on every presented flip
+	static constexpr size_t kSlots = 16384;
+	std::atomic<uint64_t> slots[kSlots] {};  // epoch<<36 | page index
+};
+inline FaultCost g_fault_cost;
+// True while this thread is inside RenderContext::HandleFault.
+inline thread_local bool g_in_fault = false;
+
+inline uint64_t NowNs() noexcept {
+	return static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count());
+}
+
+// Counts the page once per frame epoch; open addressing with stale-epoch slots reusable.
+inline void NoteFaultPage(uint64_t vaddr) noexcept {
+	auto&          fc    = g_fault_cost;
+	const uint64_t page  = (vaddr >> 12) & ((1ull << 36) - 1);
+	const uint64_t epoch = fc.epoch.load(std::memory_order_relaxed);
+	const uint64_t want  = (epoch << 36) | page;
+	size_t         idx   = static_cast<size_t>((page * 0x9E3779B97F4A7C15ull) >> 50) % FaultCost::kSlots;
+	for (int probe = 0; probe < 32; ++probe, idx = (idx + 1) % FaultCost::kSlots) {
+		uint64_t cur = fc.slots[idx].load(std::memory_order_relaxed);
+		if (cur == want) {
+			return;
+		}
+		if ((cur >> 36) != epoch) {
+			if (fc.slots[idx].compare_exchange_strong(cur, want, std::memory_order_relaxed)) {
+				fc.distinct.fetch_add(1, std::memory_order_relaxed);
+				return;
+			}
+			if (cur == want) {
+				return;
+			}
+		}
+	}
+	fc.distinct.fetch_add(1, std::memory_order_relaxed); // table full: count conservatively
+}
+
+// Times a nested fault bucket, only on a thread that is currently inside HandleFault.
+class FaultTimer {
+public:
+	explicit FaultTimer(std::atomic<uint64_t>& sink) noexcept: m_sink(&sink), m_active(g_in_fault) {
+		if (m_active) {
+			m_start = NowNs();
+		}
+	}
+	FaultTimer(const FaultTimer&)            = delete;
+	FaultTimer& operator=(const FaultTimer&) = delete;
+	~FaultTimer() {
+		if (m_active) {
+			m_sink->fetch_add(NowNs() - m_start, std::memory_order_relaxed);
+		}
+	}
+
+private:
+	std::atomic<uint64_t>* m_sink;
+	uint64_t               m_start = 0;
+	bool                   m_active;
+};
 
 // Adds the elapsed time to sink when the scope ends, or earlier through Stop().
 class Timer {
@@ -320,6 +399,31 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 			            per(bda_pages), bda_lock_ms, 0.0, bda_sync_ms, 0.0, bda_other_ms);
 			std::printf("NHL27SYNC uploads=%.2f kb=%.2f\n", per(sync_uploads), per(sync_bytes) / 1024.0);
 		std::printf("NHL27PROTECT calls=%.2f ms=%.3f\n", per(protect_calls), ms(protect_ns));
+		{
+			auto&          fc  = g_fault_cost;
+			const uint64_t gr  = Take(fc.n[0]);
+			const uint64_t gw  = Take(fc.n[1]);
+			const uint64_t cr  = Take(fc.n[2]);
+			const uint64_t cw  = Take(fc.n[3]);
+			const uint64_t all = gr + gw + cr + cw;
+			const uint64_t dis = Take(fc.distinct);
+			const uint64_t tot = Take(fc.total_ns);
+			const uint64_t buf = Take(fc.buf_inv_ns);
+			const uint64_t tex = Take(fc.tex_inv_ns);
+			const uint64_t rdm = Take(fc.rd_readmem_ns);
+			const uint64_t rem = tot > buf + tex + rdm ? tot - buf - tex - rdm : 0;
+			const uint64_t pn  = Take(fc.protect_calls);
+			std::printf("NHL27FAULTCOST n=%.1f gpu_r=%.1f gpu_w=%.1f guest_r=%.1f guest_w=%.1f "
+			            "pages=%.1f refault=%.2f total=%.2fms(gpu=%.2f guest=%.2f) us/fault=%.1f "
+			            "veh=%.2fms lock=%.2fms buf_inv=%.2fms tex_inv=%.2fms readmem=%.2fms "
+			            "rd_readmem=%.2fms protect=%.2fms(%.1f) other=%.2fms\n",
+			            per(all), per(gr), per(gw), per(cr), per(cw), per(dis),
+			            dis != 0 ? static_cast<double>(all) / static_cast<double>(dis) : 0.0, ms(tot),
+			            ms(Take(fc.total_gpu_ns)), ms(Take(fc.total_guest_ns)),
+			            all != 0 ? static_cast<double>(tot) / 1e3 / static_cast<double>(all) : 0.0,
+			            ms(Take(fc.veh_ns)), ms(Take(fc.lock_ns)), ms(buf), ms(tex),
+			            ms(Take(fc.readmem_ns)), ms(rdm), ms(Take(fc.protect_ns)), per(pn), ms(rem));
+		}
 		std::printf("NHL27FAULTPARSE passes=%.2f zero=%.2f faults=%.2f ring_wait=%.2fms\n",
 		            per(fp_passes), per(fp_zero), per(fp_faults), ms(fp_ring_wait_ns));
 		std::fflush(stdout);
@@ -337,6 +441,7 @@ inline void OnPresentedFlip() {
 	if (!Enabled()) {
 		return;
 	}
+	g_fault_cost.epoch.fetch_add(1, std::memory_order_relaxed);
 	std::lock_guard lock(g_window_mutex);
 	const auto now = Clock::now();
 	if (g_last_flip != Clock::time_point {}) {

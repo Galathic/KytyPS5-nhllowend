@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include "common/assert.h"
+#include "common/hostException.h"
 #include "common/logging/log.h"
 #include "common/runtimeFlags.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -69,9 +70,44 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	// KYTY_PERF_STATS: fault time includes any synchronous readback it triggers (overlaps readback).
 	FrameBreakdown::Timer fault_timer(FrameBreakdown::g_counters.fault_ns);
 	FrameBreakdown::Add(FrameBreakdown::g_counters.fault_count);
+	// NHL27FAULTCOST accounting (KYTY_PERF_STATS only).
+	struct FaultCostScope {
+		bool     active = FrameBreakdown::Enabled();
+		bool     gpu    = false;
+		uint64_t start  = 0;
+		~FaultCostScope() {
+			if (!active) {
+				return;
+			}
+			auto&          fc = FrameBreakdown::g_fault_cost;
+			const uint64_t ns = FrameBreakdown::NowNs() - start;
+			fc.total_ns.fetch_add(ns, std::memory_order_relaxed);
+			(gpu ? fc.total_gpu_ns : fc.total_guest_ns).fetch_add(ns, std::memory_order_relaxed);
+			FrameBreakdown::g_in_fault = false;
+		}
+	} cost_scope;
+	if (cost_scope.active) {
+		auto&          fc    = FrameBreakdown::g_fault_cost;
+		const uint64_t entry = Common::HostException::LastEntryTimeNs();
+		cost_scope.start     = FrameBreakdown::NowNs();
+		if (entry != 0 && cost_scope.start > entry) {
+			fc.veh_ns.fetch_add(cost_scope.start - entry, std::memory_order_relaxed);
+		}
+		cost_scope.gpu = GuestGpu::IsGpuThread();
+		fc.n[(cost_scope.gpu ? 0 : 2) + (access == PageFaultAccess::Write ? 1 : 0)].fetch_add(
+		    1, std::memory_order_relaxed);
+		FrameBreakdown::NoteFaultPage(fault_vaddr);
+		FrameBreakdown::g_in_fault = true;
+	}
 	if (access == PageFaultAccess::Write) {
-		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
-		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
+		{
+			FrameBreakdown::FaultTimer t(FrameBreakdown::g_fault_cost.buf_inv_ns);
+			m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
+		}
+		{
+			FrameBreakdown::FaultTimer t(FrameBreakdown::g_fault_cost.tex_inv_ns);
+			m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
+		}
 		// KYTY_FAULT_AHEAD: streaming writers (ring buffers) fault on every page they touch
 		// each frame, and each page is re-protected after its upload. Unprotect the next
 		// pages of the buffer tracker up front so one fault covers the run.
@@ -83,6 +119,7 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 			}
 		}
 	} else {
+		FrameBreakdown::FaultTimer t(FrameBreakdown::g_fault_cost.rd_readmem_ns);
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size, false, BufferCache::ReadCaller::Fault);
 	}
 	return true;

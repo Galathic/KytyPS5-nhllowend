@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
+#include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "kernel/memory.h"
 
@@ -1934,7 +1935,11 @@ void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid memory-invalidation range\n");
 	}
-	std::scoped_lock lock {m_lock};
+	std::unique_lock lock {m_lock, std::defer_lock};
+	{
+		FrameBreakdown::FaultTimer lock_timer(FrameBreakdown::g_fault_cost.lock_ns);
+		lock.lock();
+	}
 	InvalidateCpuAliases(address, size);
 }
 

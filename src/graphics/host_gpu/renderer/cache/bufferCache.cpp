@@ -474,8 +474,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadC
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
+	FrameBreakdown::FaultTimer fault_readmem_timer(FrameBreakdown::g_fault_cost.readmem_ns);
 	const bool     on_gpu = GuestGpu::IsGpuThread();
-	const uint64_t tid    = static_cast<uint64_t>(std::hash<std::thread::id> {}(std::this_thread::get_id()));
+	const uint64_t tid   = static_cast<uint64_t>(std::hash<std::thread::id> {}(std::this_thread::get_id()));
 	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write, caller, on_gpu, tid] {
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;

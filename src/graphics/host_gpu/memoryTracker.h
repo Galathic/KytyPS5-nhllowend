@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/regionManager.h"
+#include "graphics/host_gpu/renderer/frameBreakdown.h"
 
 #include <algorithm>
 #include <atomic>
@@ -44,7 +45,11 @@ public:
 				// Perform both the GPU modification check and CPU state change with the lock in
 				// case the GPU thread is racing to mark the page modified. If a flush is needed,
 				// on_flush performs the CPU state change.
-				std::scoped_lock lock(manager->lock);
+				std::unique_lock<TrackingSpinLock> lock(manager->lock, std::defer_lock);
+				{
+					FrameBreakdown::FaultTimer lock_timer(FrameBreakdown::g_fault_cost.lock_ns);
+					lock.lock();
+				}
 				if (manager->IsModified<DirtySource::Gpu>(offset, bytes)) {
 					return true;
 				}

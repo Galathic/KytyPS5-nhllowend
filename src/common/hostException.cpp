@@ -1,6 +1,7 @@
 #include "common/hostException.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -80,9 +81,24 @@ bool InitializeThreadSignalStack() {
 
 #endif
 
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+uint64_t LastEntryTimeNs() noexcept {
+	return 0;
+}
+#endif
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 
+static thread_local uint64_t g_last_entry_ns = 0;
+
+uint64_t LastEntryTimeNs() noexcept {
+	return g_last_entry_ns;
+}
+
 static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
+	g_last_entry_ns = static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::nanoseconds>(
+	        std::chrono::steady_clock::now().time_since_epoch()).count());
 	auto* exception_record = exception->ExceptionRecord;
 
 	if (exception_record->ExceptionCode == DBG_PRINTEXCEPTION_C ||
