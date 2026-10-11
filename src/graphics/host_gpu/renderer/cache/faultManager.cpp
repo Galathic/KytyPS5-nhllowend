@@ -1,3 +1,4 @@
+#include "common/eventTrace.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 
 #include "common/assert.h"
@@ -143,6 +144,7 @@ FaultManager::~FaultManager() {
 // The download slot is host-visible and zeroed by the CPU before the pass, so a skipped parser
 // leaves count==0 in place and the existing deferred readback is still correct.
 void FaultManager::ProcessFaultBuffer() {
+	Common::EventTrace::Record(Common::EventTrace::FAULT_PARSE, m_current_area);
 	if (const auto wait_tick = m_fault_areas[m_current_area]; wait_tick != 0) {
 		// Ring slot reuse: the previous pass on this slot may still be in flight. Time only the
 		// wait itself (a slot that already finished costs ~0).

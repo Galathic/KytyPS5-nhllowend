@@ -14,7 +14,7 @@
 
 namespace Common::RuntimeFlags {
 inline constexpr int64_t kIntervalMs = 250;
-inline constexpr unsigned kRevisionShift = 15;
+inline constexpr unsigned kRevisionShift = 16;
 inline constexpr uint64_t kFlagMask = (uint64_t{1} << kRevisionShift) - 1;
 inline constexpr uint32_t kUnpinnedBits = uint32_t{1} << kRevisionShift;
 static_assert(kRevisionShift < 32, "evaluation bits and unpinned sentinel must fit uint32_t");
@@ -34,11 +34,12 @@ struct FlagSet {
  bool fault_ahead = false;
  bool resource_spec_cache = false;
  bool fault_parse_gate = false;
+ bool idle_trace = false;
 };
 inline constexpr const char* kSwitchableFlags[] = {
  "KYTY_RESOURCE_DYNAMIC_DEPS", "KYTY_RESOURCE_MEMO_VERIFY", "KYTY_SRT_CFG_TAPE",
  "KYTY_SRT_CFG_SCHEDULE", "KYTY_PM4_EVENT_CLEAN", "KYTY_PM4_WRITE_DATA_FAST", "KYTY_SHADER_CLEAN_READS", "KYTY_SRT_SCALAR_BATCH", "KYTY_RESOURCE_HASH_FILTER", "KYTY_RESOURCE_MEMO_BYPASS", "KYTY_SRT_CFG_GATHER",
- "KYTY_SRT_CFG_TRACE", "KYTY_FAULT_AHEAD", "KYTY_RESOURCE_SPEC_CACHE", "KYTY_FAULT_PARSE_GATE"
+ "KYTY_SRT_CFG_TRACE", "KYTY_FAULT_AHEAD", "KYTY_RESOURCE_SPEC_CACHE", "KYTY_FAULT_PARSE_GATE", "KYTY_IDLE_TRACE"
 };
 inline uint64_t Bits(const FlagSet& f) {
  return uint64_t(f.resource_dynamic_deps) | (uint64_t(f.resource_memo_verify)<<1) |
@@ -46,7 +47,7 @@ inline uint64_t Bits(const FlagSet& f) {
   (uint64_t(f.pm4_event_clean)<<4) | (uint64_t(f.pm4_write_data_fast)<<5) | (uint64_t(f.shader_clean_reads)<<6) | (uint64_t(f.srt_scalar_batch)<<7) |
   (uint64_t(f.resource_hash_filter)<<8) | (uint64_t(f.resource_memo_bypass)<<9) |
   (uint64_t(f.srt_cfg_gather)<<10) | (uint64_t(f.srt_cfg_trace)<<11) | (uint64_t(f.fault_ahead)<<12) |
-  (uint64_t(f.resource_spec_cache)<<13) | (uint64_t(f.fault_parse_gate)<<14);
+  (uint64_t(f.resource_spec_cache)<<13) | (uint64_t(f.fault_parse_gate)<<14) | (uint64_t(f.idle_trace)<<15);
 }
 // Low kRevisionShift bits flags; remaining bits revision. One atomic publication.
 inline std::atomic<uint64_t> g_published{0};
@@ -74,7 +75,7 @@ inline FlagSet Current() {
   .pm4_write_data_fast=bool(bits&32),.shader_clean_reads=bool(bits&64),.srt_scalar_batch=bool(bits&128),
   .resource_hash_filter=bool(bits&256),.resource_memo_bypass=bool(bits&512),
   .srt_cfg_gather=bool(bits&1024),.srt_cfg_trace=bool(bits&2048),.fault_ahead=bool(bits&4096),
-  .resource_spec_cache=bool(bits&8192),.fault_parse_gate=bool(bits&16384)};
+  .resource_spec_cache=bool(bits&8192),.fault_parse_gate=bool(bits&16384),.idle_trace=bool(bits&32768)};
 }
 inline uint64_t Revision() { return g_published.load(std::memory_order_relaxed)>>kRevisionShift; }
 inline int64_t NowMs() {
@@ -104,6 +105,7 @@ inline bool* FieldFor(FlagSet& f,const char* name) {
  if (!std::strcmp(name,kSwitchableFlags[12])) return &f.fault_ahead;
  if (!std::strcmp(name,kSwitchableFlags[13])) return &f.resource_spec_cache;
  if (!std::strcmp(name,kSwitchableFlags[14])) return &f.fault_parse_gate;
+ if (!std::strcmp(name,kSwitchableFlags[15])) return &f.idle_trace;
  return nullptr;
 }
 inline void Trim(std::string& s) {

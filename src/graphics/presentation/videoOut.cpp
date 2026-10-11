@@ -1,3 +1,4 @@
+#include "common/eventTrace.h"
 #include "graphics/presentation/videoOut.h"
 
 #include "common/abi.h"
@@ -376,6 +377,11 @@ static void TriggerVideoOutEvents(VideoOutConfig& video_out, VideoOutEventKind k
 		Common::LockGuard lock(video_out.events->mutex);
 		queues = VideoOutEventQueuesFor(*video_out.events, kind);
 	}
+	if (kind == VideoOutEventKind::Flip) {
+		Common::EventTrace::Record(Common::EventTrace::FLIP_EVENT, reinterpret_cast<uint64_t>(trigger_data));
+	} else if (kind == VideoOutEventKind::Vblank) {
+		Common::EventTrace::Record(Common::EventTrace::VBLANK_EVENT, reinterpret_cast<uint64_t>(trigger_data));
+	}
 	for (const auto& registration: queues) {
 		if (!registration || registration->generation != video_out.generation) {
 			continue;
@@ -526,6 +532,8 @@ static int ReserveFlipRequest(VideoOutDriver::Impl& driver, int handle, int inde
 	if (!IsValidBufferIndex(index)) {
 		return VIDEO_OUT_ERROR_INVALID_INDEX;
 	}
+	Common::EventTrace::Record(Common::EventTrace::GUEST_FLIP_REQ, static_cast<uint64_t>(index),
+	                           static_cast<uint64_t>(flip_arg));
 
 	Common::LockGuard lock(video_out->mutex);
 	if ((video_out->master != nullptr) != (flip_mode == VIDEO_OUT_FLIP_MODE_SLAVE) ||
@@ -1158,6 +1166,7 @@ void FlipQueue::Complete(uint64_t request_id) {
 			EXIT("completed GPU flip has no prepared recording, id=%" PRIu64 "\n", request_id);
 		}
 		request->state = RequestState::Ready;
+		Common::EventTrace::Record(Common::EventTrace::FLIP_READY, request_id, static_cast<uint64_t>(request->index));
 		m_submit_cond_var.Signal();
 		m_mutex.Unlock();
 		return;

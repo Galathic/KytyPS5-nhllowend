@@ -1,3 +1,4 @@
+#include "common/eventTrace.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 
 #include "common/assert.h"
@@ -182,6 +183,7 @@ void GuestGpu::Submit(std::span<const uint32_t> draw_commands,
 		return;
 	}
 	Submission submission;
+	Common::EventTrace::Record(Common::EventTrace::GUEST_SUBMIT, 0, draw_commands.size());
 	submission.type              = SubmissionType::Graphics;
 	submission.queue_id          = 0;
 	submission.commands          = draw_commands;
@@ -195,6 +197,7 @@ void GuestGpu::SubmitCompute(uint32_t queue, std::span<const uint32_t> commands)
 	EXIT_NOT_IMPLEMENTED(queue < ComputeQueueBase || queue >= ComputeQueueBase + ComputeQueueCount);
 
 	const auto compute_queue = queue - ComputeQueueBase;
+	Common::EventTrace::Record(Common::EventTrace::GUEST_SUBMIT, 1 + compute_queue, commands.size());
 	Submission submission;
 	submission.type     = SubmissionType::Compute;
 	submission.queue_id = 1 + compute_queue;
@@ -214,7 +217,9 @@ void GuestGpu::SuspendPoint() {
 	EXIT_IF(IsGpuThread() || CommandScheduler::InDeferredOperation());
 	// Do not hold a queue lock while waiting: asynchronous work may be needed to
 	// finish the preceding graphics frame. The first point returns immediately.
+	Common::EventTrace::Record(Common::EventTrace::SUSPEND_ACQ_BEGIN);
 	m_suspend_point_ready->acquire();
+	Common::EventTrace::Record(Common::EventTrace::SUSPEND_ACQ_END);
 	Submission submission;
 	submission.type = SubmissionType::SuspendPoint;
 	Enqueue(std::move(submission));
@@ -595,7 +600,10 @@ void GuestGpu::ThreadRun(void* data) {
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
 				const auto idle_start = std::chrono::steady_clock::now();
+				Common::EventTrace::Record(Common::EventTrace::GPU_WAIT_BEGIN);
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
+				Common::EventTrace::Record(Common::EventTrace::GPU_WAIT_END,
+				                           gpu->m_commands.size() + gpu->m_submission_count);
 				FrameBreakdown::AddIdleGap(static_cast<uint64_t>(
 				    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - idle_start)
 				        .count()));
@@ -646,7 +654,9 @@ void GuestGpu::ThreadRun(void* data) {
 
 		if (command) {
 			EXIT_IF(g_current_processor != nullptr);
+			Common::EventTrace::Record(Common::EventTrace::GPU_CMD_BEGIN, 1, 0);
 			command();
+			Common::EventTrace::Record(Common::EventTrace::GPU_CMD_END, 1, 0);
 
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			gpu->m_processing = false;
@@ -661,7 +671,12 @@ void GuestGpu::ThreadRun(void* data) {
 		{
 			// KYTY_PERF_STATS: GPU thread busy = Process wall time minus its master-semaphore waits.
 			FrameBreakdown::Timer process_timer(FrameBreakdown::g_counters.gpu_process_ns);
+			// kind: 2 + SubmissionType (graphics/compute/flip prep/suspend point), +0x100 when sliced/blocked
+			const uint64_t kind = 2 + static_cast<uint64_t>(submission.type);
+			Common::EventTrace::Record(Common::EventTrace::GPU_CMD_BEGIN, kind, gpu->m_submit_id);
 			complete = gpu->Process(submission);
+			Common::EventTrace::Record(Common::EventTrace::GPU_CMD_END, kind | (complete ? 0u : 0x100u),
+			                           gpu->m_submit_id);
 		}
 		FrameBreakdown::MaybePrint();
 
@@ -766,7 +781,10 @@ bool GuestGpu::Process(Submission& submission) {
 		case SubmissionType::SuspendPoint:
 			cp.EmitGlobalBarrier();
 			m_renderer.GetCommandScheduler().DeferPriorityOperation(
-			    [ready = m_suspend_point_ready] { ready->release(); });
+			    [ready = m_suspend_point_ready] {
+				    Common::EventTrace::Record(Common::EventTrace::SUSPEND_RELEASE);
+				    ready->release();
+			    });
 			cp.BufferFlush();
 			cp.Reset();
 			break;
@@ -1404,6 +1422,9 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 		return setting != nullptr && setting[0] == '1';
 	}();
 	auto write_label = [&](void* destination, const void* data, uint64_t bytes) {
+		Common::EventTrace::Record(Common::EventTrace::LABEL_WRITE,
+		                           reinterpret_cast<uint64_t>(destination) & 0xffffffffu,
+		                           m_renderer.GetCommandScheduler().CurrentTick());
 		if (!direct_labels || !m_renderer.GetBufferCache().TryWriteLabel(
 		        reinterpret_cast<uint64_t>(destination), data, bytes)) {
 			std::memcpy(destination, data, static_cast<size_t>(bytes));

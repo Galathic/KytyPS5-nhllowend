@@ -1,3 +1,4 @@
+#include "common/eventTrace.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
 #include "common/assert.h"
@@ -602,6 +603,7 @@ void CommandScheduler::PopPendingOperations() {
 			m_pending_operations.pop();
 		}
 		WaitPriorityOperations(operation.tick);
+		Common::EventTrace::Record(Common::EventTrace::NATIVE_DONE, operation.tick);
 		RunOperation(std::move(operation.callback));
 	}
 }
@@ -657,6 +659,7 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 			m_priority_active_tick = operation.tick;
 		}
 		m_master.Wait(operation.tick);
+		Common::EventTrace::Record(Common::EventTrace::NATIVE_DONE, operation.tick);
 		if (!stop.stop_requested()) {
 			RunOperation(std::move(operation.callback));
 		}
@@ -729,6 +732,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	// nothing is submitted yet, so the snapshot can be replaced without racing a
 	// reader mid-submission. Throttled internally.
 	Common::RuntimeFlags::Refresh();
+	Common::EventTrace::Poll();
 
 	const auto buffer   = m_command.m_buffer;
 	auto&      graphics = m_graphics;
@@ -786,6 +790,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	m_command.m_buffer = nullptr;
+	Common::EventTrace::Record(Common::EventTrace::NATIVE_SUBMIT, tick);
 	GpuTimingPoll();
 	return tick;
 }
