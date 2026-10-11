@@ -2376,6 +2376,12 @@ static int BenchmarkResourcePlans(const char* directory, uint64_t iterations) {
  const auto tape_stats = GetSrtTapeStats();
  std::printf("cfg_trace: hits=%llu misses=%llu recorded=%llu\n", static_cast<unsigned long long>(tape_stats.cfg_trace_hits),
   static_cast<unsigned long long>(tape_stats.cfg_trace_misses), static_cast<unsigned long long>(tape_stats.cfg_trace_recorded));
+ const auto spec = GetResourceSpecializationCacheStats();
+ std::printf("specialization_cache: enabled=%d calls=%llu buffer_hits=%llu buffer_misses=%llu image_hits=%llu image_misses=%llu indirect_uncached=%llu\n",
+  Common::RuntimeFlags::Current().resource_spec_cache, static_cast<unsigned long long>(spec.calls),
+  static_cast<unsigned long long>(spec.buffer_hits), static_cast<unsigned long long>(spec.buffer_misses),
+  static_cast<unsigned long long>(spec.image_hits), static_cast<unsigned long long>(spec.image_misses),
+  static_cast<unsigned long long>(spec.indirect_uncached));
  return 0;
 }
 
@@ -2626,6 +2632,7 @@ void TestResourcePlanFixture() {
 #include "ScalarBatchTests.inc"
 #include "ScalarBatchFixtureTests.inc"
 #include "ScalarBatchMemoTests.inc"
+#include "ResourceSpecializationCacheTests.inc"
 void TestCfgDescriptorGatherMemoShortcut() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   struct Reads { std::vector<uint64_t> addresses; } reads;
@@ -2705,6 +2712,7 @@ void TestCfgDescriptorGatherMemoShortcut() {
 
 int main(int argc, char **argv) {
   Common::RuntimeFlags::Refresh(true);
+  TestResourceSpecializationCacheTransitions();
   TestCfgDescriptorGatherMemoShortcut();
   if ((argc == 3 || argc == 4) && std::strcmp(argv[1], "--benchmark-resource-memo") == 0) {
     uint64_t iterations = 1000;

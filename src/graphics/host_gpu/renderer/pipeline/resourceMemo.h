@@ -283,6 +283,8 @@ class ResourceMemoEntry {
         // Verification must not replay dependency notifications to an outer collector.
         replay_runtime.observe_user_data = nullptr;
         replay_runtime.user_data_observer_userdata = nullptr;
+        // The reference must derive metadata independently of the component cache.
+        replay_runtime.specialization_cache = nullptr;
 
         const auto active_sources = plan.active_sources;
         auto expected_snapshot = cached_snapshot;

@@ -39,6 +39,36 @@ struct ResourceSpecialization {
 	bool operator==(const ResourceSpecialization&) const = default;
 };
 
+// Retains direct descriptor decoding independently of changing addresses/payloads.
+// The owner must reset this cache if its immutable plan is replaced or modified.
+struct ResourceSpecializationCache {
+	struct BufferEntry {
+		std::array<uint32_t, 2> key {};
+		ResourceSpecialization::Buffer value;
+		bool valid = false;
+	};
+	struct ImageEntry {
+		std::array<uint32_t, 7> key {};
+		ResourceSpecialization::Image value;
+		bool null = false;
+		bool valid = false;
+	};
+	const ResourcePlan* owner = nullptr;
+	bool active = false; // A nested materialization falls back instead of sharing mutable entries.
+	std::vector<BufferEntry> buffers;
+	std::vector<ImageEntry> images;
+	void Reset() { owner = nullptr; active = false; buffers.clear(); images.clear(); }
+};
+
+struct ResourceSpecializationCacheStats {
+	uint64_t calls = 0;
+	uint64_t buffer_hits = 0, buffer_misses = 0;
+	uint64_t image_hits = 0, image_misses = 0;
+	uint64_t indirect_uncached = 0;
+};
+// Per-thread counters: diagnostics do not introduce contended atomics in draw prep.
+ResourceSpecializationCacheStats GetResourceSpecializationCacheStats();
+
 // Extracts the descriptor/SRT value graph before resource specialization. The returned plan owns
 // its values and is independent of the translated shader CFG.
 ResourcePlan ExtractResourcePlan(const Program& program);

@@ -913,12 +913,15 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.images.resize(program.info.images.size());
 	prepared.samplers.clear();
 	prepared.shader_data.clear();
-	for (uint32_t i = 0; i < program.info.images.size(); i++) {
-		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
-		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
-		binding.mip_views.swap(prepared.images[i].mip_views);
-		binding.mip_views.clear();
-		prepared.images[i] = std::move(binding);
+	{
+		FrameBreakdown::Timer textures_timer(FrameBreakdown::g_counters.dp_textures_ns);
+		for (uint32_t i = 0; i < program.info.images.size(); i++) {
+			auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
+			BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
+			binding.mip_views.swap(prepared.images[i].mip_views);
+			binding.mip_views.clear();
+			prepared.images[i] = std::move(binding);
+		}
 	}
 	prepared.samplers.reserve(program.info.samplers.size());
 	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
@@ -1019,6 +1022,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		const auto shift = (index % 4u) * 8u;
 		prepared.shader_data[dword] |= offset << shift;
 	};
+	FrameBreakdown::Timer lookup_timer(FrameBreakdown::g_counters.dp_rebind_lookup_ns);
 	for (uint32_t i = 0; i < layout.memory_offset_count; i++) {
 		const auto resource = layout.descriptors.front().resources[i];
 		uint32_t buffer_offset = 0;
@@ -1027,6 +1031,8 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		                                               buffer_offset));
 		pack_memory_offset(i, buffer_offset);
 	}
+	lookup_timer.Stop();
+	FrameBreakdown::Timer upload_timer(FrameBreakdown::g_counters.dp_rebind_upload_ns);
 	if (ShaderRecompiler::IR::FindBinding(
 	        layout, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) != nullptr) {
 		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
@@ -1087,36 +1093,51 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
                                              std::span<RenderColorInfo> colors) {
+	// Draw-prep buckets (NHL27DRAWPREP) are sequential blocks here, in the original call order.
 	bool uses_dma = false;
-	FindBuffers(stages);
-	for (auto* stage: stages) {
-		uses_dma |= stage->runtime->program->info.uses_dma;
+	{
+		FrameBreakdown::Timer buffers_timer(FrameBreakdown::g_counters.dp_buffers_ns);
+		{
+			FrameBreakdown::Timer find_timer(FrameBreakdown::g_counters.dp_find_buffers_ns);
+			FindBuffers(stages);
+		}
+		for (auto* stage: stages) {
+			uses_dma |= stage->runtime->program->info.uses_dma;
+		}
+		if (uses_dma) {
+			FrameBreakdown::Timer bda_timer(FrameBreakdown::g_counters.dp_bda_ns);
+			m_context.PrepareBda();
+		}
 	}
-	if (uses_dma) {
-		m_context.PrepareBda();
-	}
-	for (auto* stage: stages) {
-		RebindImages(*stage);
-	}
-	auto& cache = m_context.GetTextureCache();
-	for (auto& target: colors) {
-		EXIT_IF(!target.image_id);
-		const auto old_image = cache.m_slot_images.try_get(target.image_id);
-		if (old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
-		    old_image->binding.needs_rebind) {
-			if (old_image != nullptr) {
-				old_image->binding = {};
+	{
+		FrameBreakdown::Timer textures_timer(FrameBreakdown::g_counters.dp_textures_ns);
+		for (auto* stage: stages) {
+			RebindImages(*stage);
+		}
+		auto& cache = m_context.GetTextureCache();
+		for (auto& target: colors) {
+			EXIT_IF(!target.image_id);
+			const auto old_image = cache.m_slot_images.try_get(target.image_id);
+			if (old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
+			    old_image->binding.needs_rebind) {
+				if (old_image != nullptr) {
+					old_image->binding = {};
+				}
+				target.desc.view_info.base_level = target.guest_mip_level;
+				target.desc.view_info.base_layer = target.guest_array_layer;
+				target.image_id = cache.FindImage(target.desc);
+				BindRenderTarget(target.image_id);
 			}
-			target.desc.view_info.base_level = target.guest_mip_level;
-			target.desc.view_info.base_layer = target.guest_array_layer;
-			target.image_id = cache.FindImage(target.desc);
-			BindRenderTarget(target.image_id);
 		}
 	}
 	// Discovery can read back PS5 metadata and submit the scheduler. Reserve draw buffers only
 	// after image identities are final; attachment layout transitions follow buffer alias copies.
-	for (auto* stage: stages) {
-		RebindBuffers(*stage);
+	{
+		FrameBreakdown::Timer buffers_timer(FrameBreakdown::g_counters.dp_buffers_ns);
+		FrameBreakdown::Timer rebind_timer(FrameBreakdown::g_counters.dp_rebind_ns);
+		for (auto* stage: stages) {
+			RebindBuffers(*stage);
+		}
 	}
 }
 

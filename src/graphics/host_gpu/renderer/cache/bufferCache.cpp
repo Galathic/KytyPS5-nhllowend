@@ -653,6 +653,8 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	    },
 	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
 	if (source) {
+		FrameBreakdown::Add(FrameBreakdown::g_counters.sync_uploads);
+		FrameBreakdown::Add(FrameBreakdown::g_counters.sync_bytes, total_size);
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
 		const auto native = command.Handle();

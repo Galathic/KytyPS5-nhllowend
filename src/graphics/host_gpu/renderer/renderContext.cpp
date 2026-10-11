@@ -143,6 +143,11 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	m_gpu->SendCommandSync(unmap);
 }
 
+// Pages of TRACKER_PAGE_SIZE covering [start, end). Used only by the NHL27BDA counters.
+static uint64_t PagesIn(uint64_t start, uint64_t end) {
+	return (end - start + TRACKER_PAGE_SIZE - 1) / TRACKER_PAGE_SIZE;
+}
+
 void RenderContext::PrepareBda() {
 	if (!m_bda_logged) {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
@@ -160,7 +165,13 @@ void RenderContext::PrepareBda() {
 		const char* value = std::getenv("KYTY_BDA_DIRTY_REGIONS");
 		return value != nullptr && value[0] == '1' && value[1] == '\0';
 	}();
-	std::shared_lock lock(m_mapped_ranges_mutex);
+	FrameBreakdown::Add(FrameBreakdown::g_counters.bda_calls);
+	FrameBreakdown::Timer total_timer(FrameBreakdown::g_counters.bda_total_ns);
+	std::shared_lock<decltype(m_mapped_ranges_mutex)> lock;
+	{
+		FrameBreakdown::Timer lock_timer(FrameBreakdown::g_counters.bda_lock_ns);
+		lock = std::shared_lock(m_mapped_ranges_mutex);
+	}
 	const auto cpu = m_buffer_cache.CpuModificationGeneration();
 	const auto registrations = m_buffer_cache.RegistrationGeneration();
 	const bool unchanged = cache_enabled && cpu == m_bda_cpu_generation &&
@@ -168,15 +179,27 @@ void RenderContext::PrepareBda() {
 	                       m_mapping_generation == m_bda_mapping_generation;
 	if (unchanged) {
 		++m_bda_stats.reused;
+		FrameBreakdown::Add(FrameBreakdown::g_counters.bda_skips);
 	} else {
 		++m_bda_stats.scans;
 		if (cache_enabled && dirty_regions) {
 			const bool full = m_mapping_generation != m_bda_mapping_generation;
 			m_bda_stats.full_scans += full;
-			m_bda_stats.dirty_regions += m_buffer_cache.SynchronizeBuffersInRanges(m_mapped_ranges, full);
+			if (full) {
+				FrameBreakdown::Add(FrameBreakdown::g_counters.bda_scans);
+			}
+			uint64_t drained = 0;
+			{
+				FrameBreakdown::Timer sync_timer(FrameBreakdown::g_counters.bda_sync_ns);
+				drained = m_buffer_cache.SynchronizeBuffersInRanges(m_mapped_ranges, full);
+			}
 		} else {
 			++m_bda_stats.full_scans;
+			FrameBreakdown::Add(FrameBreakdown::g_counters.bda_scans);
+			FrameBreakdown::Timer sync_timer(FrameBreakdown::g_counters.bda_sync_ns);
 			m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
+				FrameBreakdown::Add(FrameBreakdown::g_counters.bda_ranges);
+				FrameBreakdown::Add(FrameBreakdown::g_counters.bda_pages, PagesIn(start, end));
 				m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
 			});
 		}
@@ -186,6 +209,7 @@ void RenderContext::PrepareBda() {
 		m_bda_registration_generation = registrations;
 		m_bda_mapping_generation = m_mapping_generation;
 	}
+	total_timer.Stop();
 	// Lazy BDA faults still need processing even when uploads were unchanged.
 	m_fault_process_pending = true;
 	if (stats_enabled && ((m_bda_stats.scans + m_bda_stats.reused) & 4095u) == 0) {

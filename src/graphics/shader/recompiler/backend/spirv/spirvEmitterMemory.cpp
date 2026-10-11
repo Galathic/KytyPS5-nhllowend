@@ -178,6 +178,12 @@ void RecordBdaFault(EmitterState& state, uint32_t page) {
 	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
 	state.builder.AddFunction(spv::OpStore, pointer,
 	                          Binary(state, spv::OpBitwiseOr, TypeU32(state), value, bit));
+	// Dirty flag for FaultManager's gate pass: one word past the bitmap. Every bitmap store is
+	// followed by a plain store of 1 here, so "dirty == 0" implies no bit was set since the last
+	// parser clear. Must stay in sync with FaultManager (DirtyWordIndex).
+	const auto dirty_pointer = FaultElementPointer(
+	    state, ConstantU32(state, static_cast<uint32_t>(BufferCache::CACHING_NUMPAGES / 32)));
+	state.builder.AddFunction(spv::OpStore, dirty_pointer, ConstantU32(state, 1u));
 }
 
 uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address, bool coherent = false) {

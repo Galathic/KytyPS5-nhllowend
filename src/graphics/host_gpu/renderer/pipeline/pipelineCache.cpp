@@ -334,6 +334,7 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		std::vector<Permutation>                    permutations;
 		ResourceMemo                               resource_memo;
+		ShaderRecompiler::IR::ResourceSpecializationCache specialization_cache;
 		size_t                                     last_permutation = std::numeric_limits<size_t>::max();
 		bool                                       native_plan_checked = false;
 		bool                                       native_plan_allowed = false;
@@ -459,7 +460,10 @@ struct PipelineCache::ProgramCache {
         }
         const bool memo_enabled = reuse_enabled && replaying == nullptr && !runtime_flags.resource_memo_bypass;
         const auto refresh = [&](SourceEntry& source, bool& reused) {
-            const bool ok = source.resource_memo.Refresh(source.resource_plan, runtime,
+            auto observed_runtime = runtime;
+            observed_runtime.specialization_cache = runtime_flags.resource_spec_cache
+                ? &source.specialization_cache : nullptr;
+            const bool ok = source.resource_memo.Refresh(source.resource_plan, observed_runtime,
                 source.resources, source.specialization, memo_enabled, reused);
             if (!ok && replaying == nullptr) EXIT("Resource materialization failed\n");
             return ok;
@@ -645,6 +649,13 @@ struct PipelineCache::ProgramCache {
 		    enabled, static_cast<unsigned long long>(lookups), static_cast<unsigned long long>(source_hits),
 		    static_cast<unsigned long long>(resource_hits), static_cast<unsigned long long>(materializations),
 		    static_cast<unsigned long long>(permutation_hits));
+		const auto spec = ShaderRecompiler::IR::GetResourceSpecializationCacheStats();
+		std::printf("NHL27SPECCACHE: enabled=%d calls=%llu buffers=%llu/%llu images=%llu/%llu indirect_uncached=%llu\n",
+		    Common::RuntimeFlags::Current().resource_spec_cache,
+		    static_cast<unsigned long long>(spec.calls),
+		    static_cast<unsigned long long>(spec.buffer_hits), static_cast<unsigned long long>(spec.buffer_misses),
+		    static_cast<unsigned long long>(spec.image_hits), static_cast<unsigned long long>(spec.image_misses),
+		    static_cast<unsigned long long>(spec.indirect_uncached));
 		if (enabled) {
 			std::printf("NHL27PROGRAMMISS: cold=%llu base=%llu regs=%llu groups=%llu read_failed=%llu memory_changed=%llu\n",
 			    static_cast<unsigned long long>(resource_misses[static_cast<size_t>(ResourceMemo::Miss::Cold)]),

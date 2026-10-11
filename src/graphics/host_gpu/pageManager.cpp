@@ -3,6 +3,7 @@
 #include "common/alignment.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/regionDefinitions.h"
+#include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
@@ -191,6 +192,8 @@ struct PageManager::Impl {
 	}
 
 	void Protect(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode) noexcept {
+		FrameBreakdown::Add(FrameBreakdown::g_counters.protect_calls);
+		FrameBreakdown::Timer protect_timer(FrameBreakdown::g_counters.protect_ns);
 		if (!Libs::LibKernel::Memory::ProtectGuestHostMemory(vaddr, size, mode)) {
 			Fatal("address-space protection failed at 0x%016" PRIx64 ", mode=0x%08" PRIx32, vaddr,
 			      static_cast<uint32_t>(mode));

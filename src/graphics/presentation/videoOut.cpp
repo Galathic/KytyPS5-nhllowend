@@ -1366,7 +1366,10 @@ KYTY_SYSV_ABI int VideoOutSetFlipRate(int handle, int rate) {
 	PRINT_NAME();
 
 	LOGF("\trate = %d\n", rate);
-	if (const char* stats = std::getenv("KYTY_PERF_STATS"); stats != nullptr && stats[0] == '1') {
+	// The game calls this every frame; print only when the rate changes.
+	static std::atomic<int> last_printed_rate {-1};
+	if (const char* stats = std::getenv("KYTY_PERF_STATS"); stats != nullptr && stats[0] == '1' &&
+	    last_printed_rate.exchange(rate) != rate) {
 		std::printf("NHL27FLIPRATE: handle=%d rate=%d\n", handle, rate);
 		std::fflush(stdout);
 	}

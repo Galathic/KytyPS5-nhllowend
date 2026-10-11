@@ -8,6 +8,7 @@
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
 class Value;
+struct ResourceSpecializationCache;
 
 using SrtMemoryReader = bool (*)(void* userdata, uint64_t address, std::span<uint32_t> values);
 using SrtUserDataObserver = void (*)(void* userdata, uint32_t index);
@@ -38,6 +39,8 @@ struct SrtRuntime {
 	// every requested DWORD in that reader domain. These share reader userdata.
 	SrtMemoryReader try_read_memory_span = nullptr;
 	SrtMemoryReader try_read_specialization_span = nullptr;
+	// Owned by the immutable shader-plan entry. Derived metadata only; never skips reads.
+	ResourceSpecializationCache* specialization_cache = nullptr;
 };
 
 enum class RuntimeValueType { Any, Integer };

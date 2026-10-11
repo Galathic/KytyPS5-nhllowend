@@ -265,6 +265,7 @@ struct ResourcePlanFixture {
   ReplayResult result;
   ResourceSnapshot actual;
   ResourceSpecialization specialization;
+  ResourceSpecializationCache specialization_cache;
   uint64_t conflict_count = 0;
   ReplayBacking() = default;
   explicit ReplayBacking(const ResourcePlanFixture& fixture) {
@@ -313,6 +314,8 @@ struct ResourcePlanFixture {
   backing.Reset();
   if (backing.result.conflicts) return backing.result;
   SrtRuntime runtime {.user_data=user_data,.shader_base=shader_base,.userdata=&backing,.workgroup_counts=workgroups};
+  if (Common::RuntimeFlags::Current().resource_spec_cache)
+   runtime.specialization_cache = &backing.specialization_cache;
   if (ordinary_reader) runtime.read_memory = +[](void* p,uint64_t a,std::span<uint32_t> v) { return static_cast<ReplayBacking*>(p)->Read(false,a,v); };
   else runtime.read_memory = +[](void* p,uint64_t,std::span<uint32_t>) {
    auto& r = static_cast<ReplayBacking*>(p)->result; ++r.ordinary_calls; ++r.missing; return false;

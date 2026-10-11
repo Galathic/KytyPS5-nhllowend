@@ -26,6 +26,7 @@ namespace {
 
 constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
 constexpr uint64_t MaxIndirectDescriptorProbes = 65536u;
+thread_local ResourceSpecializationCacheStats g_specialization_cache_stats;
 
 bool SpecializationFail(std::string_view message) {
 	std::fprintf(stderr, "shader resource specialization failed: %.*s\n",
@@ -532,7 +533,8 @@ private:
 };
 
 static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSnapshot& snapshot,
-                                        ResourceSpecialization& specialization) {
+                                        ResourceSpecialization& specialization,
+                                        ResourceSpecializationCache* cache) {
 	for (uint32_t i = 0; i < specialization.images.size(); i++) {
 		const auto& descriptor = snapshot.images[i];
 		auto&       image      = specialization.images[i];
@@ -545,16 +547,43 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		    (base.atomic && base.resource_class != ImageResourceClass::Storage)) {
 			return SpecializationFail(fmt::format("image resource {} has an invalid class", i));
 		}
+		ResourceSpecializationCache::ImageEntry* cached = nullptr;
+		std::array<uint32_t, 7> cache_key {};
+		const bool null = NullImageDescriptor(descriptor);
+		if (cache != nullptr) {
+			const auto* source = Source(program, base.source);
+			if (i < program.info.images.size() &&
+			    image.indirect_root == ImageResource::NoIndirectImage && source != nullptr &&
+			    !source->indirect_descriptor.has_value()) {
+				cached = &cache->images[i];
+				std::copy_n(descriptor.dwords.begin() + 1, cache_key.size(), cache_key.begin());
+				// Address word 0 changes independently of shader typing. Nullness is separate.
+				if (cached->valid && cached->key == cache_key && cached->null == null) {
+					image = cached->value;
+					++g_specialization_cache_stats.image_hits;
+					continue;
+				}
+				++g_specialization_cache_stats.image_misses;
+			} else {
+				++g_specialization_cache_stats.indirect_uncached;
+			}
+		}
+		const auto retain = [&] {
+			if (cached != nullptr) {
+				*cached = {.key = cache_key, .value = image, .null = null, .valid = true};
+			}
+		};
 		image.mip_count = ImageMipCount(base, descriptor);
 		if (image.mip_count == 0u) {
 			return SpecializationFail(
 			    fmt::format("image descriptor {} has an invalid mip range", i));
 		}
-		if (NullImageDescriptor(descriptor)) {
+		if (null) {
 			image.numeric_class = base.atomic ? Prospero::TextureNumericClass::Uint
 			                                  : Prospero::TextureNumericClass::Float;
 			image.dimension     = Decoder::ImageDimension::Dim2D;
 			image.cube          = false;
+			retain();
 			continue;
 		}
 		const auto descriptor_dimension = DescriptorDimension(descriptor, base.dimension);
@@ -612,6 +641,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			    fmt::format("sampled image descriptor {} uses unsupported format {}", i,
 			                static_cast<uint32_t>(format)));
 		}
+		retain();
 	}
 	for (uint32_t root_index = 0; root_index < specialization.images.size(); root_index++) {
 		auto& root = specialization.images[root_index];
@@ -1156,6 +1186,29 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
 	const Common::RuntimeFlags::EvaluationScope flags_scope;
+	auto* cache = runtime.specialization_cache;
+	if (cache != nullptr && cache->active) cache = nullptr;
+	if (cache != nullptr) {
+		if (cache->owner != &program || cache->buffers.size() != program.info.buffers.size() ||
+		    cache->images.size() != program.info.images.size()) {
+			cache->Reset();
+			cache->owner = &program;
+			cache->buffers.resize(program.info.buffers.size());
+			cache->images.resize(program.info.images.size());
+		}
+		cache->active = true;
+		++g_specialization_cache_stats.calls;
+	}
+	struct CacheAttempt {
+		ResourceSpecializationCache* cache;
+		bool success = false;
+		~CacheAttempt() {
+			if (cache != nullptr) {
+				cache->active = false;
+				if (!success) cache->Reset();
+			}
+		}
+	} cache_attempt {cache};
 	if (!program.resource_tracking_complete ||
 	    (program.requires_specialization_memory && runtime.read_specialization_memory == nullptr)) {
 		return false;
@@ -1237,6 +1290,25 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 			descriptor_value.dwords.fill(0);
 			descriptor = {};
 		}
+		ResourceSpecializationCache::BufferEntry* cached = nullptr;
+		const std::array<uint32_t, 2> cache_key {descriptor.fields[1] & 0xffff0000u,
+		                                        descriptor.fields[3]};
+		if (cache != nullptr) {
+			const auto* source = Source(program, base.source);
+			if (i < program.info.buffers.size() && source != nullptr &&
+			    !source->indirect_descriptor.has_value()) {
+				cached = &cache->buffers[i];
+				// NumRecords and the 48-bit address stay live in snapshot, not specialization.
+				if (cached->valid && cached->key == cache_key) {
+					specialization.buffers[i] = cached->value;
+					++g_specialization_cache_stats.buffer_hits;
+					continue;
+				}
+				++g_specialization_cache_stats.buffer_misses;
+			} else {
+				++g_specialization_cache_stats.indirect_uncached;
+			}
+		}
 		auto       packed_stride = descriptor.PackedStride();
 		const auto stride        = packed_stride & 0x3fffu;
 		const bool swizzle       = stride != 0u && ((packed_stride >> 14u) & 1u) != 0u;
@@ -1251,6 +1323,7 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 		    base.formatted ? descriptor.Format() : Prospero::BufferFormat::kInvalid;
 		buffer.descriptor_swizzle = base.formatted ? descriptor.DstSelXYZW() : DstSel(4, 5, 6, 7);
 		buffer.zero_stride_oob    = descriptor.OutOfBounds() == 0u && stride == 0u;
+		if (cached != nullptr) *cached = {.key = cache_key, .value = buffer, .valid = true};
 	}
 	snapshot.images.resize(program.info.images.size());
 	specialization.images.resize(program.info.images.size());
@@ -1315,7 +1388,12 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 		}
 	}
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
-	return BuildResourceSpecialization(program, snapshot, specialization);
+	cache_attempt.success = BuildResourceSpecialization(program, snapshot, specialization, cache);
+	return cache_attempt.success;
+}
+
+ResourceSpecializationCacheStats GetResourceSpecializationCacheStats() {
+	return g_specialization_cache_stats;
 }
 
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,

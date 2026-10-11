@@ -1119,7 +1119,10 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	state.ps_active = buffer.GetShaders().GetPs().ps_regs.data_addr != 0 &&
 	                  (color_output_mask != 0 ||
 	                   PixelShaderHasDepthOrCoverageSideEffects(shader_regs));
-	RefreshShaders(buffer, draw, color_output_mask, state);
+	{
+		FrameBreakdown::Timer materialize_timer(FrameBreakdown::g_counters.dp_materialize_ns);
+		RefreshShaders(buffer, draw, color_output_mask, state);
+	}
 	if (!state.programs.vertex[0]) {
 		// NHL debugging: a shader failed to build (KYTY_DBG_SKIP_BAD_SHADERS=1); skip the draw.
 		return false;
@@ -1133,22 +1136,25 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		}
 	}
 	mrt_mask &= color_output_mask;
-	if (draw.IsIndexed()) {
-		LogDrawPhase(draw.Name(), "ResolveRenderColorTarget");
-	}
-	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
-		if ((mrt_mask & (1u << slot)) != 0) {
-			ResolveRenderColorTarget(buffer, state.color_info[state.color_count],
-			                         render_target_slice_offset, slot);
-			if (state.color_info[state.color_count].image_id) {
-				state.color_count++;
+	{
+		FrameBreakdown::Timer textures_timer(FrameBreakdown::g_counters.dp_textures_ns);
+		if (draw.IsIndexed()) {
+			LogDrawPhase(draw.Name(), "ResolveRenderColorTarget");
+		}
+		for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+			if ((mrt_mask & (1u << slot)) != 0) {
+				ResolveRenderColorTarget(buffer, state.color_info[state.color_count],
+				                         render_target_slice_offset, slot);
+				if (state.color_info[state.color_count].image_id) {
+					state.color_count++;
+				}
 			}
 		}
+		if (draw.IsIndexed()) {
+			LogDrawPhase(draw.Name(), "ResolveRenderDepthTarget");
+		}
+		ResolveRenderDepthTarget(buffer, state.depth_info);
 	}
-	if (draw.IsIndexed()) {
-		LogDrawPhase(draw.Name(), "ResolveRenderDepthTarget");
-	}
-	ResolveRenderDepthTarget(buffer, state.depth_info);
 
 	if (state.color_count == 0 && !state.depth_info.image_id && !state.ps_active) {
 		LogFramebufferSkip(draw.Name(), state.color_info[0], state.depth_info, buffer,
@@ -1293,6 +1299,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 
 	if (mesh_active && draw.IsIndexed()) {
+		FrameBreakdown::Timer buffers_timer(FrameBreakdown::g_counters.dp_buffers_ns);
+		FrameBreakdown::Timer vertex_index_timer(FrameBreakdown::g_counters.dp_vertex_index_ns);
 		// Register the original guest indices for shader reads; PrepareGraphicsBindings
 		// synchronizes registered BDA ranges before any draw commands are committed.
 		(void)m_context.GetBufferCache().FindBuffer(
@@ -1322,6 +1330,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	// Discover indirect ranges before finalizing descriptors and vertex buffer handles.
 	if (emit.indirect != nullptr) {
+		FrameBreakdown::Timer buffers_timer(FrameBreakdown::g_counters.dp_buffers_ns);
+		FrameBreakdown::Timer indirect_timer(FrameBreakdown::g_counters.dp_indirect_ns);
 		auto& source = *emit.indirect;
 		auto& cache = m_context.GetBufferCache();
 		(void)cache.FindBuffer(source.args_addr, source.ArgsSize());
@@ -1331,6 +1341,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
 	if (!mesh_active) {
+		FrameBreakdown::Timer buffers_timer(FrameBreakdown::g_counters.dp_buffers_ns);
+		FrameBreakdown::Timer vertex_index_timer(FrameBreakdown::g_counters.dp_vertex_index_ns);
 		LogDrawPhase(draw.Name(), "PrepareVertexBuffers");
 		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
@@ -1339,6 +1351,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		LogDrawPhase(draw.Name(), "CreatePipeline");
 	}
 	if (emit.indirect != nullptr) {
+		FrameBreakdown::Timer buffers_timer(FrameBreakdown::g_counters.dp_buffers_ns);
+		FrameBreakdown::Timer indirect_timer(FrameBreakdown::g_counters.dp_indirect_ns);
 		auto& source = *emit.indirect;
 		auto& cache = m_context.GetBufferCache();
 		const auto [args, args_offset] = cache.ObtainBuffer(source.args_addr, source.ArgsSize(), false);
@@ -1375,6 +1389,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                        vk::PipelineStageFlagBits::eDrawIndirect | vk::PipelineStageFlagBits::eHost | vk::PipelineStageFlagBits::eVertexShader,
 		                        {}, 1, &copied, 0, nullptr, 0, nullptr);
 	}
+	// Pipeline bucket: paused around CommitBindings (its own bucket) and stopped after the draw.
+	std::optional<FrameBreakdown::Timer> pipeline_timer;
+	pipeline_timer.emplace(FrameBreakdown::g_counters.dp_pipeline_ns);
 	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(
 	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
@@ -1395,7 +1412,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (state.ps_active && !draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x300u);
 	}
-	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
+	pipeline_timer.reset();
+	{
+		FrameBreakdown::Timer descriptors_timer(FrameBreakdown::g_counters.dp_descriptors_ns);
+		CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
+	}
+	pipeline_timer.emplace(FrameBreakdown::g_counters.dp_pipeline_ns);
 	if (mesh_active) {
 		const uint32_t draw_data[] {
 		    draw.index_count,
@@ -1487,6 +1509,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		BreadcrumbEnd(m_context.GetGraphics(), vk_buffer, crumb);
 		FrameBreakdown::DrawEmitted();
 	}
+	pipeline_timer.reset();
 
 	if (FrameDump::TraceEnabled()) {
 		for (uint32_t i = 0; i < state.color_count && i < RENDER_COLOR_ATTACHMENTS_MAX; i++) {
