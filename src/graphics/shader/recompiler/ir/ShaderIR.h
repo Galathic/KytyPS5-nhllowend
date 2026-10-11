@@ -601,6 +601,8 @@ struct ResourcePlan {
 	mutable std::vector<uint8_t>            visited_blocks;
 	mutable std::vector<uint32_t>           pending_blocks;
 	mutable std::vector<uint32_t>           material_keys;
+	// Dense evaluation index of each srt_reads[slot].value, filled on first batched refresh.
+	mutable std::vector<uint32_t>           srt_evaluation_indices;
 };
 
 struct Program: ResourcePlan {

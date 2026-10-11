@@ -41633,6 +41633,10 @@ int main(int argc, char **argv) {
     EnsureConfigInitialized(false, false);
     return ResourceReplayBenchmark(argv[2]);
   }
+  if ((argc == 3 || argc == 4) && std::strcmp(argv[1], "--resource-replay-phases") == 0) {
+    EnsureConfigInitialized(false, false);
+    return ResourceReplayPhases(argv[2], argc == 4 ? static_cast<unsigned>(std::strtoul(argv[3], nullptr, 10)) : 20u);
+  }
   if (argc == 3 && std::strcmp(argv[1], "--resource-scalar-gpu-replay") == 0) {
     EnsureConfigInitialized(false, false);
     return ResourceReplayBenchmark(argv[2], true);

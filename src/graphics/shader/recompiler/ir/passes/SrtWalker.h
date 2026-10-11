@@ -3,6 +3,7 @@
 
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
+#include <array>
 #include <span>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -10,6 +11,13 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 class Value;
 
 using SrtMemoryReader = bool (*)(void* userdata, uint64_t address, std::span<uint32_t> values);
+
+// Optional per-phase CPU timing of MaterializeResources (diagnostics and replay benchmarks).
+struct MaterializationTimings {
+	enum class Phase : uint8_t { Setup, Flat, ScalarRanges, Fill, Buffers, Images, Samplers, Specialization, Count };
+	std::array<uint64_t, static_cast<size_t>(Phase::Count)> ns {};
+	uint64_t calls = 0;
+};
 
 struct SrtRuntime {
 	std::span<const uint32_t> user_data;
@@ -19,6 +27,8 @@ struct SrtRuntime {
 	SrtMemoryReader           read_specialization_memory = nullptr;
 	std::span<const uint32_t> workgroup_counts;
 	bool                      batch_reads = false;
+	// Caller-owned diagnostics; absent during ordinary rendering.
+	MaterializationTimings*   materialization_timings = nullptr;
 };
 
 enum class RuntimeValueType { Any, Integer };

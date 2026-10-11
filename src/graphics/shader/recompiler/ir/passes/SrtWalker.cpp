@@ -567,9 +567,13 @@ bool SrtWalker::RefreshReadBatch(uint32_t slot, uint32_t count, std::vector<uint
 	if (clean && (m_clean_evaluator == nullptr || m_runtime.read_specialization_memory == nullptr)) return false;
 	auto& evaluator = clean ? *m_clean_evaluator : *this;
 	if (read.flat_offset > flat.size() || count > flat.size() - read.flat_offset) return false;
-	std::array<uint32_t, 64> indices;
-	for (uint32_t i = 0; i < count; ++i)
-		indices[i] = m_program.srt_reads[slot + i].value.ResolveInstruction()->EvaluationIndex(m_program.evaluation_value_count);
+	auto& slot_indices = m_program.srt_evaluation_indices;
+	if (slot_indices.size() != m_program.srt_reads.size()) {
+		slot_indices.resize(m_program.srt_reads.size());
+		for (size_t i = 0; i < slot_indices.size(); ++i)
+			slot_indices[i] = m_program.srt_reads[i].value.ResolveInstruction()->EvaluationIndex(m_program.evaluation_value_count);
+	}
+	const auto* indices = slot_indices.data() + slot;
 	const auto already_evaluated = [&] {
 		for (uint32_t i = 0; i < count; ++i) {
 			if (indices[i] < evaluator.m_context.values.size() &&

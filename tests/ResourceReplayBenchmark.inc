@@ -134,3 +134,102 @@ int ResourceReplayBenchmark(const char* path, bool gpu_scalar_data = false,
               checked, eligible, skipped, total_scalar, total_batch);
   return 0;
 }
+
+// CPU-only per-phase cost of batched materialization for every replayable record:
+// --resource-replay-phases <copied .shaders file> [iterations]. Memory reads come from the
+// recorded words, so the absolute cost of reads differs from live guest-memory reads.
+int ResourceReplayPhases(const char* path, unsigned iterations) {
+  using namespace ShaderRecompiler;
+  using namespace ShaderRecompiler::IR;
+  PipelineRecord::Records records;
+  PipelineRecord::RecordFile file;
+  if (!file.Open(std::filesystem::path(path), records) || records.programs.empty()) return 2;
+  struct Memory {
+    std::unordered_map<uint64_t, PipelineRecord::MemoryRead> ordinary, strict;
+    static bool Read(const std::unordered_map<uint64_t, PipelineRecord::MemoryRead>& memory,
+                     uint64_t address, std::span<uint32_t> words) {
+      for (size_t i = 0; i < words.size(); ++i) {
+        const auto found = memory.find(address + i * 4);
+        if (found == memory.end() || !found->second.valid) return false;
+        words[i] = found->second.value;
+      }
+      return true;
+    }
+  };
+  struct ReadStats { uint64_t calls = 0, words = 0; };
+  MaterializationTimings totals;
+  uint64_t total_ns = 0, read_calls = 0, read_words = 0;
+  unsigned checked = 0, skipped = 0;
+  for (auto& record : records.programs) {
+    CompileOptions options;
+    options.stage = record.stage;
+    options.shader_hash = record.hash;
+    options.user_data = record.user_data;
+    options.back_code = record.back_code;
+    options.dump_ir = false;
+    switch (record.stage) {
+      case ShaderType::Vertex:
+        options.wave_size = record.vertex.wave_size;
+        options.user_data_base = 8;
+        options.input_info.vertex = &record.vertex;
+        break;
+      case ShaderType::Pixel:
+        options.wave_size = record.pixel.wave_size;
+        options.input_info.pixel = &record.pixel;
+        break;
+      case ShaderType::Compute:
+        options.wave_size = record.compute.wave_size;
+        options.input_info.compute = &record.compute;
+        break;
+      default: ++skipped; continue;
+    }
+    auto translated = TranslateProgram(record.code, options);
+    if (translated.build_failed) { ++skipped; continue; }
+    auto plan = ExtractResourcePlan(translated.program);
+    struct Context { Memory memory; ReadStats stats; } context;
+    for (const auto read : record.raw_reads) context.memory.ordinary.emplace(read.address, read);
+    for (const auto read : record.reads) context.memory.strict.emplace(read.address, read);
+    SrtRuntime runtime{
+      .user_data = record.user_data,
+      .shader_base = record.shader_base,
+      .read_memory = +[](void* data, uint64_t address, std::span<uint32_t> words) {
+        auto& c = *static_cast<Context*>(data);
+        ++c.stats.calls;
+        c.stats.words += words.size();
+        return Memory::Read(c.memory.ordinary, address, words);
+      },
+      .userdata = &context,
+      .read_specialization_memory = +[](void* data, uint64_t address, std::span<uint32_t> words) {
+        auto& c = *static_cast<Context*>(data);
+        ++c.stats.calls;
+        c.stats.words += words.size();
+        return Memory::Read(c.memory.strict, address, words);
+      },
+      .workgroup_counts = record.compute.workgroup_counts,
+      .batch_reads = true,
+    };
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    if (!MaterializeResources(plan, runtime, snapshot, specialization)) { ++skipped; continue; }
+    ++checked;
+    context.stats = {};
+    MaterializationTimings timings;
+    runtime.materialization_timings = &timings;
+    const auto begin = std::chrono::steady_clock::now();
+    for (unsigned i = 0; i < iterations; ++i) {
+      if (!MaterializeResources(plan, runtime, snapshot, specialization)) return 1;
+    }
+    total_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                          std::chrono::steady_clock::now() - begin).count());
+    for (size_t i = 0; i < timings.ns.size(); ++i) totals.ns[i] += timings.ns[i];
+    read_calls += context.stats.calls;
+    read_words += context.stats.words;
+  }
+  static const char* const names[] = {"setup", "flat", "scalar_ranges", "fill", "buffers", "images", "samplers", "specialization"};
+  std::printf("ResourcePhases: checked=%u skipped=%u iterations=%u total_us/pass=%.1f reads/pass=%.0f words/pass=%.0f\n",
+              checked, skipped, iterations, total_ns / 1e3 / iterations,
+              static_cast<double>(read_calls) / iterations, static_cast<double>(read_words) / iterations);
+  for (size_t i = 0; i < totals.ns.size(); ++i)
+    std::printf("ResourcePhases:   %-15s us/pass=%.1f\n", names[i], totals.ns[i] / 1e3 / iterations);
+  return 0;
+}

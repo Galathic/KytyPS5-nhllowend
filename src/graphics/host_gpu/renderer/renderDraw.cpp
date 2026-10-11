@@ -1302,6 +1302,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                              index_source.guest_element_size);
 	}
 	LogDrawPhase(draw.Name(), "PrepareBindings");
+	BufferCache::PerfTimerScope section(BufferCache::PerfTimer::DrawBindPrepare);
 	auto&                            bindings = m_graphics_bindings;
 	std::array<PreparedBindings*, 4> descriptor_stages {};
 	uint32_t                         stage_count = 0;
@@ -1329,7 +1330,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		(void)cache.FindBuffer(source.args_addr, source.ArgsSize());
 		if (source.count_addr != 0) (void)cache.FindBuffer(source.count_addr, sizeof(uint32_t));
 	}
+	section.Stop();
+	BufferCache::PerfTimerScope resolve_section(BufferCache::PerfTimer::DrawBindResolve);
 	PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
+	resolve_section.Stop();
+	BufferCache::PerfTimerScope vertex_section(BufferCache::PerfTimer::DrawVertex);
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
 	if (!mesh_active) {
@@ -1377,14 +1382,20 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                        vk::PipelineStageFlagBits::eDrawIndirect | vk::PipelineStageFlagBits::eHost | vk::PipelineStageFlagBits::eVertexShader,
 		                        {}, 1, &copied, 0, nullptr, 0, nullptr);
 	}
+	vertex_section.Stop();
+	BufferCache::PerfTimerScope pipeline_section(BufferCache::PerfTimer::DrawPipeline);
 	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(
 	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
 	    state.programs);
+	pipeline_section.Stop();
+	BufferCache::PerfTimerScope attachments_section(BufferCache::PerfTimer::DrawAttachments);
 	vk::ImageAspectFlags feedback_aspects;
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
 	                         feedback_aspects, stages);
+	attachments_section.Stop();
+	BufferCache::PerfTimerScope commit_section(BufferCache::PerfTimer::DrawCommit);
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
@@ -1420,6 +1431,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		vk_buffer.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
 	}
 
+	commit_section.Stop();
+	BufferCache::PerfTimerScope record_section(BufferCache::PerfTimer::DrawRecord);
 	LogDrawPhase(draw.Name(), "BeginRendering");
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);

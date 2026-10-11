@@ -5,6 +5,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
+#include "common/experiments.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/bindEpoch.h"
 #include "graphics/host_gpu/renderer/renderContext.h"

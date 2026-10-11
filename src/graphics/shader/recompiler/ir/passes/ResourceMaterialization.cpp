@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
@@ -22,6 +23,30 @@ namespace {
 
 constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
 constexpr uint64_t MaxIndirectDescriptorProbes = 65536u;
+
+class MaterializationTimer {
+public:
+	explicit MaterializationTimer(MaterializationTimings* timings): m_timings(timings) {
+		if (m_timings != nullptr) {
+			++m_timings->calls;
+			m_begin = std::chrono::steady_clock::now();
+		}
+	}
+	~MaterializationTimer() { Step(m_phase); }
+	void Step(MaterializationTimings::Phase phase) {
+		if (m_timings == nullptr) return;
+		const auto now = std::chrono::steady_clock::now();
+		m_timings->ns[static_cast<size_t>(m_phase)] +=
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(now - m_begin).count();
+		m_phase = phase;
+		m_begin = now;
+	}
+
+private:
+	MaterializationTimings*               m_timings;
+	MaterializationTimings::Phase         m_phase = MaterializationTimings::Phase::Setup;
+	std::chrono::steady_clock::time_point m_begin {};
+};
 
 bool SpecializationFail(std::string_view message) {
 	std::fprintf(stderr, "shader resource specialization failed: %.*s\n",
@@ -1201,6 +1226,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	    (program.requires_specialization_memory && runtime.read_specialization_memory == nullptr)) {
 		return false;
 	}
+	MaterializationTimer timer(runtime.materialization_timings);
 	const bool capture_reads = program.capture_specialization_reads;
 	auto& reads = snapshot.specialization_reads;
 	reads.clear();
@@ -1215,9 +1241,11 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	SrtWalker clean(program, CleanRuntime(observed));
 	SrtWalker walker(program, observed, program.clean_flat_slots,
 	                 capture_reads || program.requires_specialization_memory ? &clean : nullptr);
+	timer.Step(MaterializationTimings::Phase::Flat);
 	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
 		return false;
 	}
+	timer.Step(MaterializationTimings::Phase::Fill);
 	const auto active = std::span<const uint8_t>(program.active_sources);
 	snapshot.uniform_fill = {};
 	snapshot.uniform_copy = program.uniform_copy;
@@ -1243,6 +1271,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		value.dword_count = program.descriptor_sources[source].dword_count;
 		return true;
 	};
+	timer.Step(MaterializationTimings::Phase::Buffers);
 	snapshot.buffers.resize(program.info.buffers.size());
 	specialization.buffers.assign(program.info.buffers.size(), {});
 	for (uint32_t i = 0; i < snapshot.buffers.size(); ++i) {
@@ -1290,6 +1319,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		buffer.descriptor_swizzle = base.formatted ? descriptor.DstSelXYZW() : DstSel(4, 5, 6, 7);
 		buffer.zero_stride_oob    = descriptor.OutOfBounds() == 0u && stride == 0u;
 	}
+	timer.Step(MaterializationTimings::Phase::Images);
 	snapshot.images.resize(program.info.images.size());
 	specialization.images.resize(program.info.images.size());
 	for (uint32_t i = 0; i < program.info.images.size(); ++i) {
@@ -1336,6 +1366,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			}
 		}
 	}
+	timer.Step(MaterializationTimings::Phase::Samplers);
 	snapshot.samplers.resize(program.info.samplers.size());
 	for (uint32_t i = 0; i < program.info.samplers.size(); ++i) {
 		if (!evaluate(program.info.samplers[i].source, snapshot.samplers[i])) {
@@ -1353,6 +1384,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		}
 	}
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
+	timer.Step(MaterializationTimings::Phase::Specialization);
 	return BuildResourceSpecialization(program, snapshot, specialization);
 }
 

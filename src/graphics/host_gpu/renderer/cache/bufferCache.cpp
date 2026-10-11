@@ -104,6 +104,10 @@ void BufferCache::PerfAddTime(PerfTimer timer, uint64_t ns) {
 	g_perf.timer_ns[index].fetch_add(ns, std::memory_order_relaxed);
 }
 
+uint64_t BufferCache::PerfFlipCount() {
+	return g_perf.events[static_cast<size_t>(PerfEvent::Flip)].load(std::memory_order_relaxed);
+}
+
 void BufferCache::PerfCount(PerfEvent event) {
 	if (PerfStatsEnabled()) {
 		g_perf.events[static_cast<size_t>(event)].fetch_add(1, std::memory_order_relaxed);
@@ -199,6 +203,15 @@ void BufferCache::PerfMaybePrint() {
 		            per_frame(PerfTimer::Dispatch), per_frame(PerfTimer::DispatchProgram),
 		            static_cast<unsigned long long>(count[static_cast<size_t>(PerfTimer::Dispatch)]),
 		            per_frame(PerfTimer::GpuWait), per_frame(PerfTimer::Submit));
+		std::printf("NHL27DRAW: ms/frame bind_prepare=%.1f bind_resolve=%.1f vertex=%.1f "
+		            "pipeline=%.1f attachments=%.1f commit=%.1f record=%.1f | per frame: "
+		            "buffer_creates=%.1f buffer_uploads=%.1f\n",
+		            per_frame(PerfTimer::DrawBindPrepare), per_frame(PerfTimer::DrawBindResolve),
+		            per_frame(PerfTimer::DrawVertex), per_frame(PerfTimer::DrawPipeline),
+		            per_frame(PerfTimer::DrawAttachments), per_frame(PerfTimer::DrawCommit),
+		            per_frame(PerfTimer::DrawRecord),
+		            flips != 0 ? static_cast<double>(events[static_cast<size_t>(PerfEvent::BufferCreate)]) / flips : 0.0,
+		            flips != 0 ? static_cast<double>(events[static_cast<size_t>(PerfEvent::BufferUpload)]) / flips : 0.0);
 	}
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	{
@@ -740,6 +753,7 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	vaddr = Common::AlignDown(vaddr, CACHING_PAGESIZE);
 	size               = end - vaddr;
 	const auto overlap = ResolveOverlaps(vaddr, size);
+	PerfCount(PerfEvent::BufferCreate);
 
 	const auto id = m_slot_buffers.insert(
 	    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, overlap.begin,
@@ -769,6 +783,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	    },
 	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
 	if (source) {
+		PerfCount(PerfEvent::BufferUpload);
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
 		const auto native = command.Handle();

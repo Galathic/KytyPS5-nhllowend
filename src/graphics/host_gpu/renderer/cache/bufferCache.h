@@ -69,6 +69,8 @@ public:
 		BarrierSkipped,
 		FalseShareRead,
 		Pm4ShadowPacket,
+		BufferCreate,
+		BufferUpload,
 		Count
 	};
 	// KYTY_GUEST_SYNC=1 (experiment): compute dispatches rely on the guest's own partial-flush,
@@ -77,6 +79,7 @@ public:
 	// KYTY_PERF_NO_SYNC_READBACK=1 enables the readback-avoidance paths (default: off).
 	[[nodiscard]] static bool PerfNoSyncReadback();
 	static void               PerfCount(PerfEvent event);
+	[[nodiscard]] static uint64_t PerfFlipCount();
 	static void               PerfSetPm4Op(uint32_t opcode);
 	// KYTY_PERF_STATS: host time spent beginning command buffers, submitting them and waiting
 	// for the GPU on the GPU thread.
@@ -93,6 +96,14 @@ public:
 		DrawExecute,
 		Dispatch,
 		DispatchProgram,
+		// Sections of draw execution.
+		DrawBindPrepare,
+		DrawBindResolve,
+		DrawVertex,
+		DrawPipeline,
+		DrawAttachments,
+		DrawCommit,
+		DrawRecord,
 		Count
 	};
 	[[nodiscard]] static bool PerfTimersEnabled();
