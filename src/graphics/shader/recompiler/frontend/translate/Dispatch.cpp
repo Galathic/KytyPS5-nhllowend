@@ -28,7 +28,13 @@ void Translator::RecordFp16Coverage(const Decoder::Instruction& inst) {
 	const bool covered = inst.opcode == Decoder::Opcode::V_PK_ADD_F16 ||
 	                     inst.opcode == Decoder::Opcode::V_PK_MUL_F16 ||
 	                     inst.opcode == Decoder::Opcode::V_PK_FMA_F16 ||
-	                     inst.opcode == Decoder::Opcode::V_PK_FMAC_F16;
+	                     inst.opcode == Decoder::Opcode::V_PK_FMAC_F16 ||
+	                     inst.opcode == Decoder::Opcode::V_ADD_F16 ||
+	                     inst.opcode == Decoder::Opcode::V_SUB_F16 ||
+	                     inst.opcode == Decoder::Opcode::V_SUBREV_F16 ||
+	                     inst.opcode == Decoder::Opcode::V_MUL_F16 ||
+	                     inst.opcode == Decoder::Opcode::V_FMA_F16 ||
+	                     inst.opcode == Decoder::Opcode::V_FMAC_F16;
 	auto& reasons = fp16_coverage->reasons;
 	if (!covered) {
 		reasons[0]++;
@@ -45,10 +51,11 @@ void Translator::RecordFp16Coverage(const Decoder::Instruction& inst) {
 		if (op.sdwa_sel != 6u) mask |= 1u << 8u;
 		if (op.dpp || op.dpp8) mask |= 1u << 9u;
 	};
-	const bool fmac = inst.opcode == Decoder::Opcode::V_PK_FMAC_F16;
+	const bool fmac = inst.opcode == Decoder::Opcode::V_PK_FMAC_F16 ||
+	                  inst.opcode == Decoder::Opcode::V_FMAC_F16;
 	scan(inst.src0);
 	scan(inst.src1);
-	if (inst.opcode == Decoder::Opcode::V_PK_FMA_F16) scan(inst.src2);
+	if (inst.opcode == Decoder::Opcode::V_PK_FMA_F16 || inst.opcode == Decoder::Opcode::V_FMA_F16) scan(inst.src2);
 	if (fmac) {
 		const auto before = mask;
 		scan(inst.dst);

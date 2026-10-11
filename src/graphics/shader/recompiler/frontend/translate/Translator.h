@@ -160,6 +160,10 @@ private:
 	void V_PACK_B32_F16(const Decoder::Instruction& inst);
 	void PackedFloat16(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool accumulator,
 	                   bool quiet_snan);
+	bool NativeF16Eligible(const Decoder::Operand& op) const;
+	IR::U32 NativePackedF16Source(const Decoder::Operand& op);
+	bool NativeScalarF16(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool reverse,
+	                     bool accumulator);
 	void Float16Unary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
 	                  bool invalid_negative);
 	void Float16Trig(const Decoder::Instruction& inst, IR::ValueOpcode opcode);

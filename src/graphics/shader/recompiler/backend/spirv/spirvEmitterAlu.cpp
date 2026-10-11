@@ -155,6 +155,17 @@ uint32_t EmitFPFma16x2(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) 
 	                    BitcastToF16x2(state, c)}));
 }
 
+uint32_t EmitFPClamp16x2(EmitterState& state, uint32_t a) {
+	const auto half = state.builder.Type(spv::OpTypeFloat, 16u);
+	const auto zero = state.builder.Constant(spv::OpConstant, half, 0x0000u);
+	const auto one  = state.builder.Constant(spv::OpConstant, half, 0x3c00u);
+	const auto vec  = TypeF16Vector2(state);
+	const auto zero2 = state.builder.Constant(spv::OpConstantComposite, vec, zero, zero);
+	const auto one2  = state.builder.Constant(spv::OpConstantComposite, vec, one, one);
+	return BitcastF16x2ToU32(
+	    state, EmitExt(state, vec, GLSLstd450FClamp, {BitcastToF16x2(state, a), zero2, one2}));
+}
+
 uint32_t EmitFPFma32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 	const auto result = EmitGlsl<GLSLstd450Fma, IR::Type::F32>(state, a, b, c);
 	state.builder.AddAnnotation(spv::OpDecorate, result, spv::DecorationNoContraction);
