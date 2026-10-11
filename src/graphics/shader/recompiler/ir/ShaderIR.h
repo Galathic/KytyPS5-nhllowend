@@ -657,6 +657,31 @@ struct ResourcePlan {
 	mutable std::array<SrtTape, 2> srt_tapes;
 	mutable std::array<SrtTape, 2> cfg_srt_tapes;
 	mutable std::vector<uint64_t>  srt_tape_values;
+	// Recorded CFG tape refreshes (KYTY_SRT_CFG_TRACE=1), one per cfg_srt_tapes variant.
+	// A trace replays the exact op/memo/flat/activity sequence of a complete tape-only
+	// refresh. Cond steps check the recorded predicate outcome and branch to other
+	// observed paths, so the steps form a trie; an unseen outcome falls back to the DFS.
+	struct CfgTrace {
+		// Eval/CondEval re-run the recursive walker for roots the tape does not cover.
+		// Gather marks a descriptor source CFG-gather ready (EvaluateDescriptor still verifies it).
+		enum class Kind : uint8_t { Exec, Memo, Flat, Activate, Cond, Eval, CondEval, Gather, End };
+		struct Step {
+			Kind     kind = Kind::End;
+			uint32_t a    = 0; // op (Exec/Memo/Flat/Cond), slot (Eval), block (Activate/CondEval), source (Gather)
+			uint32_t b    = 0; // Flat/Eval: flat offset; Cond/CondEval (recording): outcome
+			// Cond/CondEval: next step per outcome (0 = zero, 1 = non-zero, 2 = evaluation failed).
+			std::array<uint32_t, 3> next {UINT32_MAX, UINT32_MAX, UINT32_MAX};
+		};
+		std::vector<Step>    steps;
+		std::vector<uint8_t> base_active;
+		uint32_t             paths    = 0;
+		uint32_t             hits     = 0;
+		uint32_t             misses   = 0;
+		bool                 disabled = false;
+		bool                 strict   = false; // recorded with a strict reader (conditions evaluated)
+	};
+	mutable std::array<CfgTrace, 2> cfg_traces;
+	mutable std::vector<CfgTrace::Step> cfg_trace_scratch;
 };
 
 struct Program: ResourcePlan {

@@ -2373,6 +2373,9 @@ static int BenchmarkResourcePlans(const char* directory, uint64_t iterations) {
   static_cast<unsigned long long>(total_scalar_batch_words / iterations),
   static_cast<unsigned long long>(total_schedule_steps / iterations), static_cast<unsigned long long>(total_cfg_scheduled / iterations),
   static_cast<unsigned long long>(total_gather_eligible / iterations), static_cast<unsigned long long>(total_gather_hits / iterations));
+ const auto tape_stats = GetSrtTapeStats();
+ std::printf("cfg_trace: hits=%llu misses=%llu recorded=%llu\n", static_cast<unsigned long long>(tape_stats.cfg_trace_hits),
+  static_cast<unsigned long long>(tape_stats.cfg_trace_misses), static_cast<unsigned long long>(tape_stats.cfg_trace_recorded));
  return 0;
 }
 

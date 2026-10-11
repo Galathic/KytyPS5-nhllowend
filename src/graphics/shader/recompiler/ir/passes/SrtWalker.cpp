@@ -303,6 +303,7 @@ struct GlobalTapeStats {
 	std::atomic<uint64_t> cfg_runs {0}, cfg_fallback {0};
 	std::atomic<uint64_t> cfg_scheduled {0};
 	std::atomic<uint64_t> cfg_checked {0}, cfg_matched {0}, cfg_mismatch {0}, cfg_inconclusive {0};
+	std::atomic<uint64_t> cfg_trace_hits {0}, cfg_trace_misses {0}, cfg_trace_recorded {0};
 	std::array<std::atomic<uint64_t>, 8> reject {};
 } g_tape_stats;
 
@@ -720,6 +721,7 @@ SrtWalker::SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
 	m_cfg_schedule_enabled = clean_evaluator != nullptr ? clean_evaluator->m_cfg_schedule_enabled : flags.srt_cfg_schedule;
 	m_scalar_batch_enabled = clean_evaluator != nullptr ? clean_evaluator->m_scalar_batch_enabled : flags.srt_scalar_batch;
 	m_cfg_gather_enabled = clean_evaluator != nullptr ? clean_evaluator->m_cfg_gather_enabled : flags.srt_cfg_gather;
+	m_cfg_trace_enabled = clean_evaluator != nullptr ? clean_evaluator->m_cfg_trace_enabled : flags.srt_cfg_trace;
 	// Opt-in: record the memory access trace this walker performs so the workload can
 	// be replayed offline. Wraps readers on the walker's own copy only, and calls
 	// straight through, so results are unchanged when it is off or on.
@@ -1695,7 +1697,22 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	}
 	m_context.refreshed_flat = nullptr;
 	if (!m_program.srt_plan_complete) return false;
+	using TraceKind = ResourcePlan::CfgTrace::Kind;
+	struct TraceReset {
+		bool& recording;
+		~TraceReset() { recording = false; }
+	} trace_reset {m_cfg_trace_recording};
+	// Trace replay reproduces DFS tape refreshes without scalar batching or ordered schedules.
+	const bool trace_eligible = !m_program.control_flow.empty() && m_cfg_trace_enabled && m_cfg_tape_enabled &&
+	                            !m_skip_tape && !m_cfg_schedule_enabled &&
+	                            !m_scalar_batch_enabled && m_active_mask.IsEmpty() &&
+	                            (m_clean_evaluator == nullptr || m_clean_evaluator->m_active_mask.IsEmpty());
+	if (trace_eligible && ReplayCfgTrace(flat) > 0) return true;
 	if (!m_program.control_flow.empty()) PrepareCfgTape();
+	auto& trace_steps = m_program.cfg_trace_scratch;
+	const auto record = [&](ResourcePlan::CfgTrace::Step step) {
+		if (m_cfg_trace_recording) trace_steps.push_back(step);
+	};
 	const auto refresh = [&](uint32_t slot) {
 		if (slot >= m_program.srt_reads.size()) return false;
 		const auto& read = m_program.srt_reads[slot];
@@ -1709,7 +1726,11 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 			const uint32_t root = tape.state == ResourcePlan::SrtTape::State::Ready
 			                          ? tape.slot_ops[slot] : UINT32_MAX;
 			const int done = RunCfgRoot(root, flat[read.flat_offset]);
+			if (done > 0) record({.kind = TraceKind::Flat, .a = root, .b = read.flat_offset});
 			if (done >= 0) return done != 0;
+			if (!evaluator.Evaluate(read.value, flat[read.flat_offset])) return false;
+			record({.kind = TraceKind::Eval, .a = slot, .b = read.flat_offset});
+			return true;
 		}
 		return read.flat_offset < flat.size() && evaluator.Evaluate(read.value, flat[read.flat_offset]);
 	};
@@ -1961,6 +1982,16 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	for (const auto& block: m_program.control_flow) {
 		for (const auto source: block.sources) active.at(source) = 0u;
 	}
+	{
+		auto& trace = m_program.cfg_traces[m_clean_evaluator != nullptr ? 1 : 0];
+		m_cfg_trace_recording = trace_eligible && !trace.disabled &&
+		                        m_program.cfg_srt_tapes[m_clean_evaluator != nullptr ? 1 : 0].state ==
+		                            ResourcePlan::SrtTape::State::Ready;
+		if (m_cfg_trace_recording) {
+			trace_steps.clear();
+			if (trace.base_active.empty()) trace.base_active = active;
+		}
+	}
 	auto& visited = m_program.visited_blocks;
 	auto& pending = m_program.pending_blocks;
 	visited.assign(m_program.control_flow.size(), 0u);
@@ -1997,6 +2028,7 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 			epochs[slot] = block_epoch;
 		};
 		for (const auto source: block.sources) active[source] = 1u;
+		if (!block.sources.empty()) record({.kind = TraceKind::Activate, .a = index});
 		for (size_t read_index = 0; read_index < block.srt_reads.size();) {
 			const auto batched = TryFlatScalarBatch(std::span(block.srt_reads).subspan(read_index), 0u, flat);
 			if (batched != 0) {
@@ -2048,6 +2080,7 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 						eligible = false;
 				}
 				if (eligible) {
+					record({.kind = TraceKind::Gather, .a = source});
 					m_cfg_gather_ready_sources[source] = 1u;
 					if (m_clean_evaluator != nullptr && source < m_clean_evaluator->m_cfg_gather_ready_sources.size())
 						m_clean_evaluator->m_cfg_gather_ready_sources[source] = 1u;
@@ -2059,15 +2092,26 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		int predicate_done = -1;
 		if (!block.condition.IsEmpty() && m_runtime.read_specialization_memory != nullptr) {
 			const auto& tape = m_program.cfg_srt_tapes[m_clean_evaluator != nullptr ? 1 : 0];
-			predicate_done = RunCfgRoot(tape.state == ResourcePlan::SrtTape::State::Ready
-			                               ? tape.condition_ops[index] : UINT32_MAX, condition);
+			const uint32_t root = tape.state == ResourcePlan::SrtTape::State::Ready
+			                          ? tape.condition_ops[index] : UINT32_MAX;
+			predicate_done = RunCfgRoot(root, condition);
+			if (predicate_done > 0) record({.kind = TraceKind::Cond, .a = root, .b = condition != 0u ? 1u : 0u});
+			else if (predicate_done == 0) m_cfg_trace_recording = false;
+			else {
+				predicate_done = predicate.Evaluate(block.condition, condition) ? 1 : 0;
+				record({.kind = TraceKind::CondEval, .a = index,
+				        .b = predicate_done == 0 ? 2u : condition != 0u ? 1u : 0u});
+			}
 		}
-		if (!block.condition.IsEmpty() && m_runtime.read_specialization_memory != nullptr &&
-		    (predicate_done >= 0 ? predicate_done != 0 : predicate.Evaluate(block.condition, condition))) {
+		if (!block.condition.IsEmpty() && m_runtime.read_specialization_memory != nullptr && predicate_done > 0) {
 			pending.push_back(block.successors[condition != 0u ? 0u : 1u]);
 		} else {
 			pending.insert(pending.end(), block.successors.begin(), block.successors.end());
 		}
+	}
+	if (m_cfg_trace_recording) {
+		record({.kind = TraceKind::End});
+		MergeCfgTrace();
 	}
 	m_context.refreshed_flat = &flat;
 	if (m_clean_evaluator != nullptr) m_clean_evaluator->m_context.refreshed_flat = &flat;
@@ -2108,6 +2152,9 @@ SrtTapeStats GetSrtTapeStats() {
 	s.cfg_matched = g_tape_stats.cfg_matched.load(std::memory_order_relaxed);
 	s.cfg_mismatch = g_tape_stats.cfg_mismatch.load(std::memory_order_relaxed);
 	s.cfg_inconclusive = g_tape_stats.cfg_inconclusive.load(std::memory_order_relaxed);
+	s.cfg_trace_hits = g_tape_stats.cfg_trace_hits.load(std::memory_order_relaxed);
+	s.cfg_trace_misses = g_tape_stats.cfg_trace_misses.load(std::memory_order_relaxed);
+	s.cfg_trace_recorded = g_tape_stats.cfg_trace_recorded.load(std::memory_order_relaxed);
 	for (size_t i = 0; i < s.reject.size(); ++i) {
 		s.reject[i] = g_tape_stats.reject[i].load(std::memory_order_relaxed);
 	}
@@ -2563,6 +2610,8 @@ void SrtWalker::PrepareCfgTape() {
 		                                    m_clean_flat_slots, tape, reason, true);
 		tape.state = built ? ResourcePlan::SrtTape::State::Ready
 		                   : ResourcePlan::SrtTape::State::Unsupported;
+		// Trace steps index this tape's ops; a rebuilt tape starts a new trace.
+		m_program.cfg_traces[m_clean_evaluator != nullptr ? 1 : 0] = {};
 	}
 	if (tape.state != ResourcePlan::SrtTape::State::Ready) return;
 	m_context.tape_values.resize(tape.ops.size());
@@ -2580,12 +2629,15 @@ int SrtWalker::RunCfgRoot(uint32_t root, uint32_t& result) {
 	if (root >= tape.ops.size()) return -1;
 	g_tape_stats.cfg_runs.fetch_add(1, std::memory_order_relaxed);
 	if (m_cfg_schedule_enabled) {
+		m_cfg_trace_recording = false;
 		const int scheduled = RunCfgSchedule(root, result);
 		if (scheduled >= 0) return scheduled;
 	}
 	auto& values = m_context.tape_values;
 	auto& marks = m_context.tape_marks;
 	auto& pending = m_context.tape_pending;
+	auto* trace = m_cfg_trace_recording ? &m_program.cfg_trace_scratch : nullptr;
+	using TraceKind = ResourcePlan::CfgTrace::Kind;
 	pending.clear();
 	pending.emplace_back(root, 0u);
 	while (!pending.empty()) {
@@ -2598,6 +2650,7 @@ int SrtWalker::RunCfgRoot(uint32_t root, uint32_t& result) {
 			const auto& memo = context.values[op.memo_index];
 			if (memo.generation == context.generation) {
 				values[index] = memo.value;
+				if (trace != nullptr && marks[index] != 1u) trace->push_back({.kind = TraceKind::Memo, .a = index});
 				marks[index] = 1u;
 				pending.pop_back();
 				continue;
@@ -2605,12 +2658,13 @@ int SrtWalker::RunCfgRoot(uint32_t root, uint32_t& result) {
 			if (memo.generation == (context.generation | 1u)) {
 				if (op.clean && m_clean_evaluator != nullptr) ++m_clean_evaluator->m_cycle_count;
 				else ++m_cycle_count;
+				m_cfg_trace_recording = false;
 				return 0;
 			}
-			if (memo.generation == (context.generation | 2u)) return 0;
+			if (memo.generation == (context.generation | 2u)) { m_cfg_trace_recording = false; return 0; }
 		}
 		if (marks[index] == 1u) { pending.pop_back(); continue; }
-		if (marks[index] == 2u) return 0;
+		if (marks[index] == 2u) { m_cfg_trace_recording = false; return 0; }
 		if (pending.back().second < op.dependency_count) {
 			const auto dependency = op.args[pending.back().second++];
 			pending.emplace_back(dependency, 0u);
@@ -2622,13 +2676,176 @@ int SrtWalker::RunCfgRoot(uint32_t root, uint32_t& result) {
 				context.values.resize(m_program.evaluation_value_count);
 				context.values[op.memo_index].generation = context.generation | 2u;
 			}
+			m_cfg_trace_recording = false;
 			return 0;
 		}
+		if (trace != nullptr) trace->push_back({.kind = TraceKind::Exec, .a = index});
 		marks[index] = 1u;
 		pending.pop_back();
 	}
 	result = static_cast<uint32_t>(values[root]);
 	return 1;
+}
+
+int SrtWalker::ReplayCfgTrace(std::vector<uint32_t>& flat) {
+	using TraceKind = ResourcePlan::CfgTrace::Kind;
+	const size_t variant = m_clean_evaluator != nullptr ? 1 : 0;
+	auto& trace = m_program.cfg_traces[variant];
+	const auto& tape = m_program.cfg_srt_tapes[variant];
+	if (trace.disabled || trace.steps.empty() || tape.state != ResourcePlan::SrtTape::State::Ready ||
+	    trace.strict != (m_runtime.read_specialization_memory != nullptr))
+		return -1;
+	auto& values = m_context.tape_values;
+	if (values.size() < tape.ops.size()) values.resize(tape.ops.size());
+	flat.assign(m_program.srt_reads.size(), 0u);
+	auto& active = m_program.active_sources;
+	active = trace.base_active;
+	const auto context_for = [&](const ResourcePlan::SrtTape::Op& op) -> ResourcePlan::EvaluationContext& {
+		return op.clean && m_clean_evaluator != nullptr ? m_clean_evaluator->m_context : m_context;
+	};
+	// Memo slots this replay published. Every memo written so far holds a correct value
+	// for this session, but a miss restores the tape's slots so the DFS fallback records
+	// the same op sequence as the trie and the new branch can be merged. Memoized
+	// failures from before the refresh are never touched (Exec checks them first).
+	auto& published = m_context.tape_pending;
+	published.clear();
+	const auto miss = [&] {
+		for (const auto& [index, unused]: published) {
+			const auto& op = tape.ops[index];
+			context_for(op).values[op.memo_index].generation = 0;
+		}
+		published.clear();
+		if (m_cfg_gather_enabled) {
+			std::fill(m_cfg_gather_ready_sources.begin(), m_cfg_gather_ready_sources.end(), 0u);
+			if (m_clean_evaluator != nullptr)
+				std::fill(m_clean_evaluator->m_cfg_gather_ready_sources.begin(),
+				          m_clean_evaluator->m_cfg_gather_ready_sources.end(), 0u);
+		}
+		if (++trace.misses > 256 && trace.misses > trace.hits) trace.disabled = true;
+		g_tape_stats.cfg_trace_misses.fetch_add(1, std::memory_order_relaxed);
+		return -1;
+	};
+	for (uint32_t pc = 0;;) {
+		const auto& step = trace.steps[pc];
+		switch (step.kind) {
+			case TraceKind::Exec: {
+				// Recorded as executed: the DFS saw no memo (value, in-progress or failure) here.
+				const auto& op = tape.ops[step.a];
+				if (op.memo_index != UINT32_MAX) {
+					const auto& context = context_for(op);
+					if (op.memo_index < context.values.size() &&
+					    (context.values[op.memo_index].generation | 3u) == (context.generation | 3u))
+						return miss();
+				}
+				if (!ExecuteTapeOp(op, values, step.a)) return miss();
+				if (op.memo_index != UINT32_MAX) published.emplace_back(step.a, 0u);
+				++pc;
+				break;
+			}
+			case TraceKind::Memo: {
+				const auto& op = tape.ops[step.a];
+				const auto& context = op.clean && m_clean_evaluator != nullptr ? m_clean_evaluator->m_context : m_context;
+				if (op.memo_index >= context.values.size() ||
+				    context.values[op.memo_index].generation != context.generation)
+					return miss();
+				values[step.a] = context.values[op.memo_index].value;
+				++pc;
+				break;
+			}
+			case TraceKind::Flat:
+				flat[step.b] = static_cast<uint32_t>(values[step.a]);
+				++pc;
+				break;
+			case TraceKind::Activate:
+				for (const auto source: m_program.control_flow[step.a].sources) active[source] = 1u;
+				++pc;
+				break;
+			case TraceKind::Cond: {
+				const auto next = step.next[static_cast<uint32_t>(values[step.a]) != 0u ? 1 : 0];
+				if (next == UINT32_MAX) return miss();
+				pc = next;
+				break;
+			}
+			case TraceKind::Eval: {
+				const auto& read = m_program.srt_reads[step.a];
+				const bool clean = read.flat_offset < m_clean_flat_slots.size() &&
+				                   m_clean_flat_slots[read.flat_offset] != 0u;
+				if (clean && (m_clean_evaluator == nullptr || m_runtime.read_specialization_memory == nullptr))
+					return miss();
+				auto& evaluator = clean ? *m_clean_evaluator : *this;
+				if (!evaluator.Evaluate(read.value, flat[step.b])) return miss();
+				++pc;
+				break;
+			}
+			case TraceKind::Gather:
+				// The DFS proved the source's flat slots were refreshed on this path.
+				if (m_cfg_gather_enabled) {
+					m_cfg_gather_ready_sources[step.a] = 1u;
+					if (m_clean_evaluator != nullptr) m_clean_evaluator->m_cfg_gather_ready_sources[step.a] = 1u;
+				}
+				++pc;
+				break;
+			case TraceKind::CondEval: {
+				auto& predicate = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
+				uint32_t condition = 0;
+				const bool ok = predicate.Evaluate(m_program.control_flow[step.a].condition, condition);
+				const auto next = step.next[!ok ? 2 : condition != 0u ? 1 : 0];
+				if (next == UINT32_MAX) return miss();
+				pc = next;
+				break;
+			}
+			case TraceKind::End:
+				++trace.hits;
+				g_tape_stats.cfg_trace_hits.fetch_add(1, std::memory_order_relaxed);
+				m_context.refreshed_flat = &flat;
+				if (m_clean_evaluator != nullptr) m_clean_evaluator->m_context.refreshed_flat = &flat;
+				return 1;
+		}
+	}
+}
+
+void SrtWalker::MergeCfgTrace() {
+	using TraceKind = ResourcePlan::CfgTrace::Kind;
+	constexpr size_t   kMaxSteps = size_t {1} << 16;
+	constexpr uint32_t kMaxPaths = 32;
+	auto& trace = m_program.cfg_traces[m_clean_evaluator != nullptr ? 1 : 0];
+	const auto& recorded = m_program.cfg_trace_scratch;
+	if (trace.disabled || recorded.empty() || recorded.back().kind != TraceKind::End) return;
+	const auto append = [&](size_t first) {
+		const auto base = static_cast<uint32_t>(trace.steps.size());
+		for (size_t j = first; j < recorded.size(); ++j) {
+			auto step = recorded[j];
+			if (step.kind == TraceKind::Cond || step.kind == TraceKind::CondEval) {
+				step.next = {UINT32_MAX, UINT32_MAX, UINT32_MAX};
+				step.next[step.b] = base + static_cast<uint32_t>(j + 1 - first);
+			}
+			trace.steps.push_back(step);
+		}
+		++trace.paths;
+		g_tape_stats.cfg_trace_recorded.fetch_add(1, std::memory_order_relaxed);
+	};
+	const bool strict = m_runtime.read_specialization_memory != nullptr;
+	if (trace.steps.empty()) {
+		trace.strict = strict;
+		if (recorded.size() <= kMaxSteps) append(0);
+		return;
+	}
+	if (trace.strict != strict) return;
+	for (uint32_t pc = 0, i = 0; i < recorded.size(); ++i) {
+		auto& step = trace.steps[pc];
+		const auto& seen = recorded[i];
+		// Paths share a prefix up to their first differing condition; anything else
+		// means the refresh did not start from equivalent memo state. Keep the trie.
+		const bool branch = seen.kind == TraceKind::Cond || seen.kind == TraceKind::CondEval;
+		if (step.kind != seen.kind || step.a != seen.a || (!branch && step.b != seen.b)) return;
+		if (seen.kind == TraceKind::End) return;
+		if (!branch) { ++pc; continue; }
+		if (step.next[seen.b] != UINT32_MAX) { pc = step.next[seen.b]; continue; }
+		if (trace.paths >= kMaxPaths || trace.steps.size() + recorded.size() - i > kMaxSteps) return;
+		step.next[seen.b] = static_cast<uint32_t>(trace.steps.size());
+		append(i + 1);
+		return;
+	}
 }
 
 int SrtWalker::RunTape(std::vector<uint32_t>& flat) {

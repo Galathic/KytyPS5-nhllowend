@@ -685,7 +685,7 @@ struct PipelineCache::ProgramCache {
 				    static_cast<unsigned long long>(filter.rejected),
 				    static_cast<unsigned long long>(filter.matched));
 			}
-			std::printf("NHL27SRTTAPE: runs=%llu failed=%llu walker=%llu built=%llu unsupported=%llu ops=%llu cfg_roots=%llu cfg_fallback=%llu cfg_checked=%llu cfg_matched=%llu cfg_mismatch=%llu cfg_inconclusive=%llu\n",
+			std::printf("NHL27SRTTAPE: runs=%llu failed=%llu walker=%llu built=%llu unsupported=%llu ops=%llu cfg_roots=%llu cfg_fallback=%llu cfg_checked=%llu cfg_matched=%llu cfg_mismatch=%llu cfg_inconclusive=%llu trace_hits=%llu trace_misses=%llu trace_recorded=%llu\n",
 			    static_cast<unsigned long long>(tape.runs),
 			    static_cast<unsigned long long>(tape.failed),
 			    static_cast<unsigned long long>(tape.walker),
@@ -697,7 +697,10 @@ struct PipelineCache::ProgramCache {
 			    static_cast<unsigned long long>(tape.cfg_checked),
 			    static_cast<unsigned long long>(tape.cfg_matched),
 			    static_cast<unsigned long long>(tape.cfg_mismatch),
-			    static_cast<unsigned long long>(tape.cfg_inconclusive));
+			    static_cast<unsigned long long>(tape.cfg_inconclusive),
+			    static_cast<unsigned long long>(tape.cfg_trace_hits),
+			    static_cast<unsigned long long>(tape.cfg_trace_misses),
+			    static_cast<unsigned long long>(tape.cfg_trace_recorded));
 		}
 		last_stats = now;
 	}

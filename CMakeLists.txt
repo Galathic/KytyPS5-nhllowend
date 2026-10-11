@@ -470,6 +470,10 @@ add_executable(resource_materialization_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(resource_materialization_tests fmt::fmt)
 target_include_directories(resource_materialization_tests PRIVATE ${inc_headers})
+if(KYTY_CLANG_CL)
+	# Symbols for stack-sampling the offline plan benchmark (--benchmark-plans).
+	target_link_options(resource_materialization_tests PRIVATE "/DEBUG:FULL")
+endif()
 
 add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ResourceTrackingTests.cpp"

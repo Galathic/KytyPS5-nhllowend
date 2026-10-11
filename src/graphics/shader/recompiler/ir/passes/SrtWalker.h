@@ -62,6 +62,9 @@ struct SrtTapeStats {
 	uint64_t cfg_matched = 0;  // fully covered matching recursive refreshes
 	uint64_t cfg_mismatch = 0; // fully covered mismatch; validated recursive fallback
 	uint64_t cfg_inconclusive = 0; // rejected refresh: no safe captured-only comparison
+	uint64_t cfg_trace_hits = 0;    // CFG refreshes replayed from a recorded trace
+	uint64_t cfg_trace_misses = 0;  // trace present but path/memo diverged; DFS fallback
+	uint64_t cfg_trace_recorded = 0; // paths merged into a trace
 	std::array<uint64_t, 8> reject {}; // rejection reasons, see SrtTapeRejectName
 };
 SrtTapeStats GetSrtTapeStats();
@@ -101,6 +104,9 @@ private:
 	bool VerifyCfgRefresh(std::vector<uint32_t>& flat);
 	int RunCfgRoot(uint32_t root, uint32_t& result);
 	int RunCfgSchedule(uint32_t root, uint32_t& result);
+	// 1 = refreshed from a recorded trace, -1 = no matching trace (run the DFS).
+	int  ReplayCfgTrace(std::vector<uint32_t>& flat);
+	void MergeCfgTrace();
 	bool ExecuteTapeOp(const ResourcePlan::SrtTape::Op& op, std::vector<uint64_t>& values,
 	                   uint32_t index);
 
@@ -115,6 +121,9 @@ private:
 	bool                            m_cfg_schedule_enabled = false;
 	bool                            m_scalar_batch_enabled = false;
 	bool                            m_cfg_gather_enabled = false;
+	bool                            m_cfg_trace_enabled = false;
+	// Set while a CFG refresh records its trace; cleared by anything the replay cannot reproduce.
+	bool                            m_cfg_trace_recording = false;
 	std::vector<uint8_t>            m_cfg_gather_ready_sources;
 	uint64_t                        m_cycle_count = 0;
 	ResourcePlan::EvaluationContext& m_context;
