@@ -91,6 +91,8 @@ struct Counters {
 	std::atomic<uint64_t> dp_rebind_ns {0};        // RebindBuffers as a whole
 	std::atomic<uint64_t> dp_rebind_lookup_ns {0}; // RebindBuffers: NativeStorageBuffer / ObtainBuffer loop
 	std::atomic<uint64_t> dp_rebind_upload_ns {0}; // RebindBuffers: NativeUpload of SRT and shader data
+	std::atomic<uint64_t> obtain_cache_hits {0};   // KYTY_BUFFER_FAST: ObtainBuffer result cache hits
+	std::atomic<uint64_t> obtain_cache_misses {0}; // KYTY_BUFFER_FAST: lookups that went to ObtainBuffer
 	std::atomic<uint64_t> dp_descriptors_ns {0};  // CommitBindings (descriptor writes)
 	std::atomic<uint64_t> dp_pipeline_ns {0};     // pipeline lookup, render targets, dynamic state, draw emit
 	// NHL27FAULTPARSE: BDA fault-parser pass counters (FaultManager::ProcessFaultBuffer).
@@ -420,6 +422,8 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 	const uint64_t dp_rebind_ns        = Take(c.dp_rebind_ns);
 	const uint64_t dp_rebind_lookup_ns = Take(c.dp_rebind_lookup_ns);
 	const uint64_t dp_rebind_upload_ns = Take(c.dp_rebind_upload_ns);
+	const uint64_t obtain_cache_hits   = Take(c.obtain_cache_hits);
+	const uint64_t obtain_cache_misses = Take(c.obtain_cache_misses);
 	const uint64_t fp_passes         = Take(c.fault_parse_passes);
 	const uint64_t fp_zero           = Take(c.fault_parse_zero);
 	const uint64_t fp_faults         = Take(c.fault_parse_faults);
@@ -514,7 +518,9 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 		std::printf("NHL27BUFFERS vertex_index=%.2fms indirect=%.2fms find=%.2fms bda=%.2fms "
 		            "rebind=%.2fms rebind_lookup=%.2fms rebind_upload=%.2fms\n",
 		            ms(dp_vertex_index_ns), ms(dp_indirect_ns), ms(dp_find_buffers_ns), ms(dp_bda_ns),
-		            ms(dp_rebind_ns), ms(dp_rebind_lookup_ns), ms(dp_rebind_upload_ns));
+		            ms(dp_rebind_ns), ms(dp_rebind_lookup_ns), ms(dp_rebind_upload_ns),
+		            static_cast<unsigned long long>(obtain_cache_hits),
+		            static_cast<unsigned long long>(obtain_cache_misses));
 			// drain_ms is always 0: the queue drain runs inside BufferCache::SynchronizeBuffersInRanges,
 			// so its time is counted in sync_ms. pagetable_ms is always 0: PrepareBda never writes the
 			// BDA page table (BufferCache::ChangeRegister does, at buffer registration).

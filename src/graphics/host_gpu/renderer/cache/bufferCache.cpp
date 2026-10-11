@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/runtimeFlags.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
@@ -757,6 +758,39 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		m_gpu_modified_ranges.Add(vaddr, size);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
+}
+
+std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferCached(uint64_t vaddr, uint64_t size,
+                                                             bool is_written, bool is_texel_buffer,
+                                                             BufferId id) {
+	if (is_written || is_texel_buffer || !Common::RuntimeFlags::Current().buffer_fast) {
+		return ObtainBuffer(vaddr, size, is_written, is_texel_buffer, id);
+	}
+	auto&      entry = m_obtain_cache[((vaddr >> 4) * 0x9E3779B97F4A7C15ull ^ size) % kObtainCacheSize];
+	const auto cpu   = m_memory_tracker.CpuModificationGeneration();
+	if (entry.vaddr == vaddr && entry.size == size && entry.registration == m_registration_generation &&
+	    !IsBufferInvalid(entry.id) && m_slot_buffers[entry.id].IsInBounds(vaddr, size) &&
+	    (entry.cpu_generation == cpu || !m_memory_tracker.IsRegionCpuModified(vaddr, size))) {
+		// Registration unchanged: the buffer set, page table and offsets are the same. The range was
+		// CPU-clean when stored and is still CPU-clean, so SynchronizeBuffer would upload nothing.
+		entry.cpu_generation = cpu;
+		auto& buffer         = m_slot_buffers[entry.id];
+		TouchBuffer(buffer);
+		FrameBreakdown::Add(FrameBreakdown::g_counters.obtain_cache_hits);
+		return {&buffer, entry.offset};
+	}
+	FrameBreakdown::Add(FrameBreakdown::g_counters.obtain_cache_misses);
+	// Stamp before the lookup so a CPU write racing with it forces a recheck on the next hit.
+	const auto registration = m_registration_generation;
+	const auto result       = ObtainBuffer(vaddr, size, false, false, id);
+	if (result.first != &m_stream_buffer && registration == m_registration_generation &&
+	    !m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
+		const auto found = FindBuffer(vaddr, size);
+		if (!IsBufferInvalid(found) && &m_slot_buffers[found] == result.first) {
+			entry = {vaddr, size, registration, cpu, found, result.second};
+		}
+	}
+	return result;
 }
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
