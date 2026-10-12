@@ -627,6 +627,7 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	vaddr = Common::AlignDown(vaddr, CACHING_PAGESIZE);
 	size               = end - vaddr;
 	const auto overlap = ResolveOverlaps(vaddr, size);
+	FrameBreakdown::Add(FrameBreakdown::g_counters.port_buffer_creates);
 
 	const auto id = m_slot_buffers.insert(
 	    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, overlap.begin,
@@ -965,7 +966,11 @@ void BufferCache::RunGarbageCollector() {
 	}
 
 	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory;
-	const uint64_t age        = std::min<uint64_t>(aggressive ? 80 : 160, tick);
+	// The collector runs after every guest submission, so 160 ticks is only a few frames: buffers for
+	// transient data revisited every few frames are deleted and recreated each frame. KYTY_LONG_BUFFER_GC_AGE
+	// keeps idle buffers 10x longer, except under critical memory pressure (the aggressive age is unchanged).
+	const uint64_t normal_age = Common::RuntimeFlags::Current().long_buffer_gc_age ? 1600 : 160;
+	const uint64_t age        = std::min<uint64_t>(aggressive ? 80 : normal_age, tick);
 	const size_t   limit      = aggressive ? 64 : 32;
 
 	std::vector<BufferId> dirty_buffers;
@@ -984,6 +989,7 @@ void BufferCache::RunGarbageCollector() {
 			dirty_buffers.push_back(id);
 		} else {
 			m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
+			FrameBreakdown::Add(FrameBreakdown::g_counters.port_buffer_gc_deletes);
 			DeleteBuffer(id);
 		}
 		return ++retire_count == limit;

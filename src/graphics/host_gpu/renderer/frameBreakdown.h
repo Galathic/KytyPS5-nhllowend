@@ -173,6 +173,20 @@ struct Counters {
 	// NHL27SYNC: BufferCache::SynchronizeBuffer upload events (each ends rendering + barriers).
 	std::atomic<uint64_t> sync_uploads {0};
 	std::atomic<uint64_t> sync_bytes {0};
+	// NHL27PORT: counters for the patch-series ports (KYTY_GUEST_SYNC, KYTY_GUEST_BARRIER_DEDUP,
+	// KYTY_DISPATCH_ARGS_GUARD, KYTY_RT_DECODE_MEMO, KYTY_LONG_BUFFER_GC_AGE).
+	std::atomic<uint64_t> port_auto_barriers {0};      // per-dispatch hazard/access barriers recorded
+	std::atomic<uint64_t> port_auto_barriers_skipped {0}; // ... elided by KYTY_GUEST_SYNC
+	std::atomic<uint64_t> port_guest_barriers {0};     // EmitGlobalBarrier barriers recorded
+	std::atomic<uint64_t> port_guest_barriers_skipped {0}; // ... elided by KYTY_GUEST_BARRIER_DEDUP
+	std::atomic<uint64_t> port_acquire_mem {0};        // ACQUIRE_MEM packets (barrier under GUEST_SYNC)
+	std::atomic<uint64_t> port_guard_dispatches {0};   // indirect dispatches routed through the guard
+	std::atomic<uint64_t> port_hint_hits {0};          // FindImage resolved by the unique by-address match
+	std::atomic<uint64_t> port_hint_misses {0};        // FindImage fell back to the FindImagesInRegion walk
+	std::atomic<uint64_t> port_rt_memo_hits {0};       // color-target decodes served by the memo
+	std::atomic<uint64_t> port_rt_memo_misses {0};     // decodes computed and inserted
+	std::atomic<uint64_t> port_buffer_gc_deletes {0};  // buffers deleted by the buffer collector
+	std::atomic<uint64_t> port_buffer_creates {0};     // buffers created (churn indicator)
 };
 inline Counters g_counters;
 
@@ -871,6 +885,18 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 	const uint64_t bda_sync_ns       = Take(c.bda_sync_ns);
 	const uint64_t sync_uploads      = Take(c.sync_uploads);
 	const uint64_t sync_bytes        = Take(c.sync_bytes);
+	const uint64_t port_auto         = Take(c.port_auto_barriers);
+	const uint64_t port_auto_skip    = Take(c.port_auto_barriers_skipped);
+	const uint64_t port_gbar         = Take(c.port_guest_barriers);
+	const uint64_t port_gbar_skip    = Take(c.port_guest_barriers_skipped);
+	const uint64_t port_acq          = Take(c.port_acquire_mem);
+	const uint64_t port_guard        = Take(c.port_guard_dispatches);
+	const uint64_t port_hit          = Take(c.port_hint_hits);
+	const uint64_t port_miss         = Take(c.port_hint_misses);
+	const uint64_t port_rt_hit       = Take(c.port_rt_memo_hits);
+	const uint64_t port_rt_miss      = Take(c.port_rt_memo_misses);
+	const uint64_t port_gc_del       = Take(c.port_buffer_gc_deletes);
+	const uint64_t port_buf_new      = Take(c.port_buffer_creates);
 	uint64_t gb[GB_COUNT];
 	for (size_t i = 0; i < GB_COUNT; ++i) {
 		gb[i] = Take(g_gpu_busy_ns[i]);
@@ -926,6 +952,13 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 		            ms(gb[GB_TEX_UPLOAD]), ms(gb[GB_WAIT]), unattr_ms, ms(draw_prep_ns));
 		std::fflush(stdout);
 	}
+	std::printf("NHL27PORT per_frame: auto_barriers=%.1f(skipped %.1f) guest_barriers=%.1f(deduped %.1f) "
+	            "acquire_mem=%.1f guard_dispatches=%.1f image_by_addr=%.1f(region_scans %.1f) "
+	            "rt_memo_hit=%.1f(miss %.1f) buffer_creates=%.1f buffer_gc_deletes=%.1f\n",
+	            per(port_auto), per(port_auto_skip), per(port_gbar), per(port_gbar_skip), per(port_acq),
+	            per(port_guard), per(port_hit), per(port_miss), per(port_rt_hit), per(port_rt_miss),
+	            per(port_buf_new), per(port_gc_del));
+	std::fflush(stdout);
 	if (DetailEnabled()) {
 		std::printf("NHL27PREP frames=%" PRIu64
 		            " graphics_programs=%.3fms compute_program=%.3fms color_target=%.3fms"

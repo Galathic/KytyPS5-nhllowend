@@ -14,7 +14,7 @@
 
 namespace Common::RuntimeFlags {
 inline constexpr int64_t kIntervalMs = 250;
-inline constexpr unsigned kRevisionShift = 23;
+inline constexpr unsigned kRevisionShift = 28;
 inline constexpr uint64_t kFlagMask = (uint64_t{1} << kRevisionShift) - 1;
 inline constexpr uint32_t kUnpinnedBits = uint32_t{1} << kRevisionShift;
 static_assert(kRevisionShift < 32, "evaluation bits and unpinned sentinel must fit uint32_t");
@@ -44,6 +44,11 @@ struct FlagSet {
  bool drawprep_delta = true;
  bool srt_compiled = true;
  bool pipeline_memo = true;
+ bool guest_sync = false;
+ bool guest_barrier_dedup = false;
+ bool dispatch_args_guard = true;
+ bool long_buffer_gc_age = false;
+ bool rt_decode_memo = false;
 };
 inline constexpr const char* kSwitchableFlags[] = {
  "KYTY_RESOURCE_DYNAMIC_DEPS",
@@ -68,7 +73,12 @@ inline constexpr const char* kSwitchableFlags[] = {
  "KYTY_BUFFER_FAST",
  "KYTY_DRAWPREP_DELTA",
  "KYTY_SRT_COMPILED",
- "KYTY_PIPELINE_MEMO"
+ "KYTY_PIPELINE_MEMO",
+ "KYTY_GUEST_SYNC",
+ "KYTY_GUEST_BARRIER_DEDUP",
+ "KYTY_DISPATCH_ARGS_GUARD",
+ "KYTY_LONG_BUFFER_GC_AGE",
+ "KYTY_RT_DECODE_MEMO"
 };
 static_assert(sizeof(kSwitchableFlags) / sizeof(kSwitchableFlags[0]) == kRevisionShift, "one bit per switchable flag");
 inline constexpr uint64_t Bits(const FlagSet& f) {
@@ -94,15 +104,22 @@ inline constexpr uint64_t Bits(const FlagSet& f) {
   (uint64_t(f.buffer_fast)<<19) |
   (uint64_t(f.drawprep_delta)<<20) |
   (uint64_t(f.srt_compiled)<<21) |
-  (uint64_t(f.pipeline_memo)<<22);
+  (uint64_t(f.pipeline_memo)<<22) |
+  (uint64_t(f.guest_sync)<<23) |
+  (uint64_t(f.guest_barrier_dedup)<<24) |
+  (uint64_t(f.dispatch_args_guard)<<25) |
+  (uint64_t(f.long_buffer_gc_age)<<26) |
+  (uint64_t(f.rt_decode_memo)<<27);
 }
 // Bit positions for the few call sites that test g_published directly without decoding a FlagSet.
 inline constexpr unsigned kBitIdleTrace = 15;
 inline constexpr unsigned kBitSrtSourceReuse = 17;
 inline constexpr unsigned kBitSrtCompiled = 21;
+inline constexpr unsigned kBitLongBufferGcAge = 26;
 static_assert(Bits(FlagSet{.idle_trace=true}) >> kBitIdleTrace & 1, "kBitIdleTrace");
 static_assert(Bits(FlagSet{.srt_source_reuse=true}) >> kBitSrtSourceReuse & 1, "kBitSrtSourceReuse");
 static_assert(Bits(FlagSet{.srt_compiled=true}) >> kBitSrtCompiled & 1, "kBitSrtCompiled");
+static_assert(Bits(FlagSet{.long_buffer_gc_age=true}) >> kBitLongBufferGcAge & 1, "kBitLongBufferGcAge");
 // Low kRevisionShift bits flags; remaining bits revision. One atomic publication.
 // Starts at the defaults (revision 0) so a reader that runs before the first Refresh sees them.
 inline std::atomic<uint64_t> g_published{Bits(FlagSet{})};
@@ -149,6 +166,11 @@ inline FlagSet Current() {
  f.drawprep_delta=(bits>>20&1u)!=0;
  f.srt_compiled=(bits>>21&1u)!=0;
  f.pipeline_memo=(bits>>22&1u)!=0;
+ f.guest_sync=(bits>>23&1u)!=0;
+ f.guest_barrier_dedup=(bits>>24&1u)!=0;
+ f.dispatch_args_guard=(bits>>25&1u)!=0;
+ f.long_buffer_gc_age=(bits>>26&1u)!=0;
+ f.rt_decode_memo=(bits>>27&1u)!=0;
  return f;
 }
 inline uint64_t Revision() { return g_published.load(std::memory_order_relaxed)>>kRevisionShift; }
@@ -187,6 +209,11 @@ inline bool* FieldFor(FlagSet& f,const char* name) {
  if (!std::strcmp(name,kSwitchableFlags[20])) return &f.drawprep_delta;
  if (!std::strcmp(name,kSwitchableFlags[21])) return &f.srt_compiled;
  if (!std::strcmp(name,kSwitchableFlags[22])) return &f.pipeline_memo;
+ if (!std::strcmp(name,kSwitchableFlags[23])) return &f.guest_sync;
+ if (!std::strcmp(name,kSwitchableFlags[24])) return &f.guest_barrier_dedup;
+ if (!std::strcmp(name,kSwitchableFlags[25])) return &f.dispatch_args_guard;
+ if (!std::strcmp(name,kSwitchableFlags[26])) return &f.long_buffer_gc_age;
+ if (!std::strcmp(name,kSwitchableFlags[27])) return &f.rt_decode_memo;
  return nullptr;
 }
 inline void Trim(std::string& s) {

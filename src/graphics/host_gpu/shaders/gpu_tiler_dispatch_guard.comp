@@ -1,0 +1,34 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+// Copies one indirect dispatch's group counts, zeroing all three when any exceeds the device
+// limit: such counts never finish and the driver resets the device.
+layout(local_size_x=1) in;
+layout(buffer_reference, std430, buffer_reference_align=4) buffer Words { uint words[]; };
+layout(buffer_reference, std430, buffer_reference_align=8) buffer Trips { uint count; uint pad; uint64_t addresses[16]; };
+layout(push_constant, std430) uniform Params {
+ uint64_t source;
+ uint64_t destination;
+ uint64_t trips;
+ uint64_t guest_address;
+ uint max_x;
+ uint max_y;
+ uint max_z;
+ uint reserved;
+} p;
+void main() {
+ Words src = Words(p.source);
+ Words dst = Words(p.destination);
+ uint x = src.words[0];
+ uint y = src.words[1];
+ uint z = src.words[2];
+ bool bad = x > p.max_x || y > p.max_y || z > p.max_z;
+ if (bad) {
+  Trips trips = Trips(p.trips);
+  uint index = atomicAdd(trips.count, 1u);
+  trips.addresses[index % 16u] = p.guest_address;
+ }
+ dst.words[0] = bad ? 0u : x;
+ dst.words[1] = bad ? 0u : y;
+ dst.words[2] = bad ? 0u : z;
+}

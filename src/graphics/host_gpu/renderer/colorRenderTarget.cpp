@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 
 #include "common/assert.h"
+#include "common/runtimeFlags.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -19,6 +20,9 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cstring>
+#include <type_traits>
+#include <unordered_map>
 
 namespace Libs::Graphics {
 
@@ -39,6 +43,42 @@ static bool DccAlphaOnMsb(const HW::ColorInfo& info) {
 	return components == 3 || info.channel_order == Prospero::ChannelOrder::kStandard ||
 	       info.channel_order == Prospero::ChannelOrder::kAlt;
 }
+
+namespace {
+
+// KYTY_RT_DECODE_MEMO: the register -> image-description decode below is a pure function of the slot's
+// render-target registers and the call arguments (it reads nothing else: no memory, no device state,
+// every EXIT is a function of the same inputs). The memo keeps the description exactly as it is handed
+// to TextureCache::FindImage; the image lookup (which may adjust desc.view_info) still runs per draw.
+static_assert(std::is_trivially_copyable_v<HW::RenderTarget>);
+struct ColorTargetKey {
+	std::array<uint8_t, sizeof(HW::RenderTarget)> registers {};
+	uint32_t slice_offset = 0;
+	uint32_t slot         = 0;
+	uint32_t mask         = 0;
+	bool     ignore_mask  = false;
+	bool     exact_format = false;
+	bool operator==(const ColorTargetKey&) const = default;
+};
+
+struct ColorTargetKeyHash {
+	size_t operator()(const ColorTargetKey& key) const noexcept {
+		uint64_t hash = 0xcbf29ce484222325ull;
+		for (const auto byte: key.registers) hash = (hash ^ byte) * 0x100000001b3ull;
+		hash = (hash ^ key.slice_offset) * 0x100000001b3ull;
+		hash = (hash ^ (key.slot | (key.mask << 8u) | (key.ignore_mask ? 1u << 16u : 0u) |
+		                (key.exact_format ? 1u << 17u : 0u))) *
+		       0x100000001b3ull;
+		return static_cast<size_t>(hash ^ (hash >> 29u));
+	}
+};
+
+std::unordered_map<ColorTargetKey, RenderColorInfo, ColorTargetKeyHash>& ColorTargetMemo() {
+	static std::unordered_map<ColorTargetKey, RenderColorInfo, ColorTargetKeyHash> memo;
+	return memo;
+}
+
+} // namespace
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& r,
@@ -73,6 +113,25 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		}
 
 		return;
+	}
+	const bool memoize = Common::RuntimeFlags::Current().rt_decode_memo;
+	ColorTargetKey memo_key;
+	if (memoize) {
+		std::memcpy(memo_key.registers.data(), &rt, sizeof(rt));
+		memo_key.slice_offset = render_target_slice_offset;
+		memo_key.slot         = rt_slot;
+		memo_key.mask         = mask;
+		memo_key.ignore_mask  = ignore_target_mask;
+		memo_key.exact_format = exact_format;
+		auto& memo = ColorTargetMemo();
+		if (const auto found = memo.find(memo_key); found != memo.end()) {
+			r = found->second;
+			FrameBreakdown::Add(FrameBreakdown::g_counters.port_rt_memo_hits);
+			r.image_id = m_context.GetTextureCache().FindImage(r.desc, exact_format);
+			BindRenderTarget(r.image_id);
+			return;
+		}
+		FrameBreakdown::Add(FrameBreakdown::g_counters.port_rt_memo_misses);
 	}
 	const auto samples = render_sample_count(rt.attrib.num_fragments);
 	if (samples == 0 || rt.attrib.num_samples != rt.attrib.num_fragments) {
@@ -338,8 +397,15 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	auto& texture_cache        = m_context.GetTextureCache();
 	r.guest_mip_level          = rt.view.current_mip_level;
 	r.guest_array_layer        = view.base_layer;
-	r.image_id                 = texture_cache.FindImage(r.desc, exact_format);
 	r.export_mapping           = target_format.export_mapping;
+	if (memoize) {
+		auto& memo = ColorTargetMemo();
+		if (memo.size() > 16384u) memo.clear();
+		auto& cached    = memo[memo_key];
+		cached          = r;
+		cached.image_id = {};
+	}
+	r.image_id                 = texture_cache.FindImage(r.desc, exact_format);
 	BindRenderTarget(r.image_id);
 }
 

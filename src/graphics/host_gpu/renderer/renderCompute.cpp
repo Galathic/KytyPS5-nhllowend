@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/host_gpu/renderer/frameDump.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
+#include "graphics/host_gpu/renderer/nativeIndirect.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -37,6 +38,7 @@
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <tuple>
 #include <span>
 #include <unordered_map>
 #include <vector>
@@ -492,11 +494,20 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		                           ShaderRecompiler::IR::ImageResourceClass::Storage;
 	                }) ||
 	    has_storage_writes;
+	// KYTY_GUEST_SYNC: the automatic barriers around each dispatch are dropped; the guest's own
+	// partial-flush / release-mem / acquire-mem packets (EmitGlobalBarrier) order the work instead.
+	const bool guest_sync = Common::RuntimeFlags::Current().guest_sync;
+	g_work_epoch.fetch_add(1, std::memory_order_relaxed);
 	if (has_storage_writes) {
-		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
-		// while allowing the queue to execute asynchronously.
-		FrameBreakdown::Timer barrier_timer(FrameBreakdown::g_counters.dc_barrier_ns);
-		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		if (guest_sync) {
+			FrameBreakdown::Add(FrameBreakdown::g_counters.port_auto_barriers_skipped);
+		} else {
+			// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
+			// while allowing the queue to execute asynchronously.
+			FrameBreakdown::Timer barrier_timer(FrameBreakdown::g_counters.dc_barrier_ns);
+			ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+			FrameBreakdown::Add(FrameBreakdown::g_counters.port_auto_barriers);
+		}
 	}
 	if (Config::GraphicsDebugDumpEnabled()) {
 		const auto sampled_images = std::count_if(
@@ -633,9 +644,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	record_timer.Stop();
 
 	// The removed host fence also ordered read-only dispatches before later writers.
-	{
+	if (guest_sync) {
+		FrameBreakdown::Add(FrameBreakdown::g_counters.port_auto_barriers_skipped);
+	} else {
 		FrameBreakdown::Timer barrier_timer(FrameBreakdown::g_counters.dc_barrier_ns);
 		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		FrameBreakdown::Add(FrameBreakdown::g_counters.port_auto_barriers);
 	}
 	if (FrameDump::TraceEnabled()) {
 		for (size_t i = 0; i < bindings.images.size() && i < program.info.images.size(); i++) {
@@ -737,6 +751,21 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
+	// KYTY_DISPATCH_ARGS_GUARD: read the group counts through a GPU pass that zeroes counts above the
+	// device limits (they never complete and lose the device). Recorded before the bindings are committed,
+	// since it binds its own compute pipeline and push constants.
+	const auto port_flags = Common::RuntimeFlags::Current();
+	vk::Buffer indirect_buffer = args_buffer->Handle();
+	uint64_t   indirect_offset = args_offset;
+	if (port_flags.dispatch_args_guard) {
+		if (!m_dispatch_guard) {
+			m_dispatch_guard = std::make_shared<DispatchArgsGuard>(m_context.GetGraphics(),
+			                                                       m_context.GetCommandScheduler());
+		}
+		std::tie(indirect_buffer, indirect_offset) =
+		    m_dispatch_guard->Record(buffer, *args_buffer, args_offset, args_addr);
+		FrameBreakdown::Add(FrameBreakdown::g_counters.port_guard_dispatches);
+	}
 	RebindBuffers(bindings);
 	args_timer.Stop();
 	{
@@ -752,9 +781,18 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		                                ShaderRecompiler::IR::ImageResourceClass::Storage;
 	    });
 	FrameBreakdown::Timer barrier_timer(FrameBreakdown::g_counters.dc_barrier_ns);
+	const bool guest_sync = port_flags.guest_sync;
+	g_work_epoch.fetch_add(1, std::memory_order_relaxed);
 	if (has_storage_writes) {
-		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		if (guest_sync) {
+			FrameBreakdown::Add(FrameBreakdown::g_counters.port_auto_barriers_skipped);
+		} else {
+			ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+			FrameBreakdown::Add(FrameBreakdown::g_counters.port_auto_barriers);
+		}
 	}
+	// Kept under KYTY_GUEST_SYNC: it makes earlier writes of the argument record visible to the
+	// indirect read, and the guest cannot be relied on to order the host-side argument staging.
 	vk::MemoryBarrier barrier {};
 	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
 	barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
@@ -775,11 +813,16 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	const auto crumb = BreadcrumbBegin(m_context.GetGraphics(), vk_buffer, "dispatch-indirect",
 	                                   program.shader_hash, args_addr);
 	FrameBreakdown::Add(FrameBreakdown::g_counters.dc_handled);
-	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+	vk_buffer.dispatchIndirect(indirect_buffer, indirect_offset);
 	BreadcrumbEnd(m_context.GetGraphics(), vk_buffer, crumb);
 	record_timer.Stop();
 	FrameBreakdown::Timer access_timer(FrameBreakdown::g_counters.dc_barrier_ns);
-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	if (guest_sync) {
+		FrameBreakdown::Add(FrameBreakdown::g_counters.port_auto_barriers_skipped);
+	} else {
+		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		FrameBreakdown::Add(FrameBreakdown::g_counters.port_auto_barriers);
+	}
 	ResetBindings();
 }
 

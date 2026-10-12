@@ -1553,6 +1553,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// point onward, every operation targets the current command buffer and cannot touch guest
 	// memory.
 	auto vk_buffer = buffer.Handle();
+	g_work_epoch.fetch_add(1, std::memory_order_relaxed);
 	SetDrawDebugPhase(buffer, submit_id, draw, draw.IsIndexed() ? 0x100u : 0x200u);
 	if (!mesh_active) {
 		FrameBreakdown::Timer vcommit_timer(FrameBreakdown::g_pl.vcommit_ns, FrameBreakdown::Verbose());

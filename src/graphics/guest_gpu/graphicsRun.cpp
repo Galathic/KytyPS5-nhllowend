@@ -13,6 +13,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -1783,6 +1784,27 @@ void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_
 
 void CommandProcessor::EmitGlobalBarrier() {
 	Common::LockGuard lock(m_renderer.GetMutex());
+	// KYTY_GUEST_BARRIER_DEDUP: a global barrier with no draw, dispatch or host helper pass (tiler, fault
+	// manager, blit, indirect prep: they bump the pipeline epochs) recorded since the previous one in the
+	// same command-buffer recording orders nothing new. A recording is identified by the scheduler tick.
+	static uint64_t last_work = UINT64_MAX, last_compute = UINT64_MAX, last_graphics = UINT64_MAX;
+	static uint64_t last_tick = UINT64_MAX;
+	if (Common::RuntimeFlags::Current().guest_barrier_dedup) {
+		const uint64_t work     = g_work_epoch.load(std::memory_order_relaxed);
+		const uint64_t compute  = g_compute_pipeline_epoch.load(std::memory_order_relaxed);
+		const uint64_t graphics = g_graphics_pipeline_epoch.load(std::memory_order_relaxed);
+		const uint64_t tick     = GetScheduler().CurrentTick();
+		const bool     redundant = work == last_work && compute == last_compute &&
+		                           graphics == last_graphics && tick == last_tick;
+		last_work = work; last_compute = compute; last_graphics = graphics; last_tick = tick;
+		if (redundant) {
+			FrameBreakdown::Add(FrameBreakdown::g_counters.port_guest_barriers_skipped);
+			return;
+		}
+	} else {
+		last_tick = UINT64_MAX;
+	}
+	FrameBreakdown::Add(FrameBreakdown::g_counters.port_guest_barriers);
 
 	vk::MemoryBarrier2 barrier {};
 	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;

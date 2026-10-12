@@ -1577,6 +1577,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			}
 			if (matches == 1) result = match;
 		}
+		FrameBreakdown::Add(result ? FrameBreakdown::g_counters.port_hint_hits
+		                           : FrameBreakdown::g_counters.port_hint_misses);
 		ImageIds candidates;
 		if (!result) {
 			candidates = FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
