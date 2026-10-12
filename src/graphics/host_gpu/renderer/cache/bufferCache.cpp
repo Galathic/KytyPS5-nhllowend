@@ -86,7 +86,7 @@ bool PerfStatsEnabled() {
 } // namespace
 
 bool BufferCache::GuestSyncOnly() {
-	return Common::Experiments::Enabled(Common::Experiments::GuestSync);
+	return Common::RuntimeFlags::Current().guest_sync;
 }
 
 bool BufferCache::PerfNoSyncReadback() {
@@ -537,17 +537,25 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		}
 	};
 	if constexpr (!async) {
-		// Experiment ReadbackQueue: a buffer last written by an already submitted command buffer
-		// can be copied on the second queue once that submission finishes, rather than after
-		// everything queued since (the whole remaining frame, when the game rewrites command
-		// memory next to GPU-written bytes right after an end-of-pipe event).
+		// KYTY_READBACK_QUEUE: a buffer last written by an already submitted command buffer is
+		// copied on the second queue once that submission finishes, not after everything queued.
 		if (buffer.last_write_tick < m_scheduler.CurrentTick() &&
-		    Common::Experiments::Enabled(Common::Experiments::ReadbackQueue) &&
-		    ReadbackOnSecondQueue(buffer, download, copies, buffer.last_write_tick)) {
-			// Older asynchronous downloads of these bytes publish first, as on the normal path.
-			m_scheduler.WaitPriorityOperations(buffer.last_write_tick);
-			publish();
-			return true;
+		    Common::RuntimeFlags::Current().readback_queue) {
+			const auto rb_start = std::chrono::steady_clock::now();
+			const bool ok = ReadbackOnSecondQueue(buffer, download, copies, buffer.last_write_tick);
+			if (FrameBreakdown::Enabled()) {
+				FrameBreakdown::Add(ok ? FrameBreakdown::g_counters.port_rbq_used
+				                       : FrameBreakdown::g_counters.port_rbq_fallback);
+				FrameBreakdown::Add(FrameBreakdown::g_counters.port_rbq_wait_ns,
+				                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+				                        std::chrono::steady_clock::now() - rb_start).count()));
+			}
+			if (ok) {
+				// Older asynchronous downloads of these bytes publish first, as on the normal path.
+				m_scheduler.WaitPriorityOperations(buffer.last_write_tick);
+				publish();
+				return true;
+			}
 		}
 	}
 
@@ -643,7 +651,12 @@ bool BufferCache::ReadbackOnSecondQueue(const Buffer& source, const Buffer& dest
 	submit.pWaitDstStageMask  = &stage;
 	submit.commandBufferCount = 1;
 	submit.pCommandBuffers    = &m_readback_buffer;
-	if (graphics.readback_queue.submit(1, &submit, m_readback_fence) != vk::Result::eSuccess) {
+	vk::Result result;
+	{
+		Common::LockGuard lock(graphics.queue_mutex);
+		result = graphics.readback_queue.submit(1, &submit, m_readback_fence);
+	}
+	if (result != vk::Result::eSuccess) {
 		EXIT("BufferCache: readback queue submission failed\n");
 	}
 	Common::Timeline::Mark("readback-queue", wait_tick);
@@ -728,13 +741,6 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	DropGpuFills(vaddr, size);
 	m_memory_tracker.InvalidateRegion(vaddr, size,
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
-}
-
-void BufferCache::InvalidateCleanWindow(uint64_t vaddr, uint64_t size) {
-	if (!GuestRange {vaddr, size}.Valid()) {
-		return;
-	}
-	m_memory_tracker.InvalidateCleanWindow(vaddr, size);
 }
 
 static bool SharedWritesDebug() {
@@ -1306,18 +1312,17 @@ void BufferCache::RunGarbageCollector() {
 	}
 
 	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory;
-	// The scan below revisits every idle GPU-modified buffer, which it cannot collect, after each
-	// guest submission. Experiment SparseBufferGc scans every 16th one unless memory is critical.
-	if (!aggressive && (tick & 15u) != 0 &&
-	    Common::Experiments::Enabled(Common::Experiments::SparseBufferGc)) {
+	// The scan revisits every idle GPU-modified buffer, which it cannot collect, after each guest
+	// submission. KYTY_SPARSE_BUFFER_GC scans every 16th one unless memory is critical.
+	if (!aggressive && (tick & 15u) != 0 && Common::RuntimeFlags::Current().sparse_buffer_gc) {
+		FrameBreakdown::Add(FrameBreakdown::g_counters.port_gc_sparse_skips);
 		return;
 	}
-	// Collection runs after every guest submission, so 160 ticks is only a few frames: buffers
-	// for transient data revisited every few frames were deleted and recreated each frame
-	// (~20 per frame in a paused NHL 27 match). Experiment LongBufferGcAge keeps them 10x longer
-	// unless memory is critical.
-	const uint64_t normal_age =
-	    Common::Experiments::Enabled(Common::Experiments::LongBufferGcAge) ? 1600 : 160;
+	FrameBreakdown::Add(FrameBreakdown::g_counters.port_gc_scans);
+	// The collector runs after every guest submission, so 160 ticks is only a few frames: buffers for
+	// transient data revisited every few frames are deleted and recreated each frame. KYTY_LONG_BUFFER_GC_AGE
+	// keeps idle buffers 10x longer, except under critical memory pressure (the aggressive age is unchanged).
+	const uint64_t normal_age = Common::RuntimeFlags::Current().long_buffer_gc_age ? 1600 : 160;
 	const uint64_t age        = std::min<uint64_t>(aggressive ? 80 : normal_age, tick);
 	const size_t   limit      = aggressive ? 64 : 32;
 

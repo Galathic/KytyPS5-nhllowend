@@ -794,35 +794,26 @@ struct PipelineCache::ProgramCache {
 		std::fflush(stdout);
 	}
 
-	// Runtime experiments SrtBatchReads / ResourceMultiCache (KYTY_EXPERIMENT_FILE) switch
-	// scalar read batching and the 16-state resource memo inside one match. A capacity change
-	// invalidates memo states and keeps compiled shaders and pipelines.
+	// Runtime experiment SrtBatchReads (KYTY_EXPERIMENT_FILE) switches scalar read batching inside
+	// one match; compiled shaders and pipelines are kept.
 	void ApplyExperiments() {
-		constexpr uint32_t Bits =
-		    Common::Experiments::SrtBatchReads | Common::Experiments::ResourceMultiCache;
+		constexpr uint32_t Bits = Common::Experiments::SrtBatchReads;
 		const uint32_t mask = Common::Experiments::Mask() & Bits;
 		if (mask == applied_experiments) return;
-		const uint32_t changed = mask ^ applied_experiments;
 		applied_experiments = mask;
-		if ((changed & Common::Experiments::SrtBatchReads) != 0) {
-			batch_reads = env_batch_reads || (mask & Common::Experiments::SrtBatchReads) != 0;
-		}
-		if ((changed & Common::Experiments::ResourceMultiCache) != 0) {
-			const unsigned capacity =
-			    (mask & Common::Experiments::ResourceMultiCache) != 0 ? 16u : 1u;
-			cache_control_capacity = capacity;
-		}
-		std::printf("NHL27RESOURCE: experiments batch_reads=%d capacity=%u\n", batch_reads ? 1 : 0,
-		            cache_control_capacity);
+		batch_reads = env_batch_reads || (mask & Common::Experiments::SrtBatchReads) != 0;
+		std::printf("NHL27RESOURCE: experiments batch_reads=%d\n", batch_reads ? 1 : 0);
 	}
 
 	explicit ProgramCache(vk::Device device): device(device) {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 		const char* timing = std::getenv("KYTY_PERF_RESOURCE_TIMING");
 		resource_timing = timing != nullptr && timing[0] == '1';
+		// Default on: only an explicit KYTY_SRT_BATCH_READS=0 disables it. env_batch_reads (an
+		// explicit 1) keeps it on when a KYTY_EXPERIMENT_FILE mask turns the bit off.
 		const char* batch = std::getenv("KYTY_SRT_BATCH_READS");
-		batch_reads = batch != nullptr && batch[0] == '1';
-		env_batch_reads = batch_reads;
+		batch_reads = Common::Experiments::Enabled(Common::Experiments::SrtBatchReads);
+		env_batch_reads = batch != nullptr && batch[0] == '1';
 		if (resource_timing) {
 			if (const char* path = std::getenv("KYTY_RESOURCE_CACHE_CONTROL_FILE")) cache_control_file = path;
 		}

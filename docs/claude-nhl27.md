@@ -1,11 +1,69 @@
 # NHL 27 performance switches (claude/nhl27-perf)
 
-All switches are environment variables and default off, except the dispatch guard. Each one also
-has a bit in the runtime experiments mask (`KYTY_EXPERIMENT_FILE` names a file holding a decimal
-mask; while the file exists it replaces the environment defaults), which is how the in-match
-A/B comparisons below were made.
+There are two kinds of switches, and a key name belongs to exactly one of them.
 
-## Recommended for NHL 27
+* **Runtime flags** (`src/common/runtimeFlags.h`): read from the environment at startup and from
+  `flags.ctl` (`KEY=0|1` per line, `KYTY_FLAG_FILE` names another file) every 250 ms, so they can be
+  flipped while the game runs. A key missing from both means the default in `FlagSet`; an explicit
+  `0`/`1` overrides it.
+* **Env-only startup switches** (`src/common/experiments.cpp`): `KYTY_X=1` enables, `KYTY_X=0`
+  disables, unset means the default below. They are read once at startup. For in-match A/B tests,
+  `KYTY_EXPERIMENT_FILE` names a file holding a decimal mask (bit numbers below); while the file
+  exists its mask replaces the environment values.
+
+## Merged defaults (nhl27 + claude/nhl27-perf)
+
+Where both branches implemented the same feature, only one implementation is left and it is a
+runtime flag. The experiment bits for these features are retired (their bit numbers are unused).
+
+### Runtime flags (flags.ctl, live)
+
+| Key | Default | Notes |
+|---|---|---|
+| `KYTY_GUEST_SYNC` | on | Orders compute work with the guest's own barriers instead of a barrier around every dispatch (+13% with `KYTY_SKIP_REDUNDANT_BINDS`) |
+| `KYTY_GUEST_BARRIER_DEDUP` | on | Skips redundant guest global barriers |
+| `KYTY_DISPATCH_ARGS_GUARD` | on | See "Always on" below; `0` disables |
+| `KYTY_RT_DECODE_MEMO` | on | Memoizes color render-target decoding (this was `KYTY_RENDER_TARGET_MEMO`, +3.4%; that name no longer exists) |
+| `KYTY_FAULT_COALESCE` | on | A CPU write fault releases its clean aligned window (`KYTY_FAULT_COALESCE_PAGES`, env only, default 16); +2.0%, write faults -85% |
+| `KYTY_BDA_BATCH`, `KYTY_RESOURCE_SPEC_CACHE`, `KYTY_SRT_COMPILED` and the other pengui07 flags | on | See `runtimeFlags.h` |
+| `KYTY_LONG_BUFFER_GC_AGE` | off | Keeps idle cache buffers 10x longer; +9.2% in Petr's measurement |
+| `KYTY_READBACK_QUEUE` | off | Downloads of a buffer last written by an already submitted command buffer run on a second queue; +1.4% |
+| `KYTY_DIRECT_EOP_INTERRUPTS` | off | End-of-pipe interrupts are delivered when the CP reaches them; +0.7% |
+| `KYTY_SPARSE_BUFFER_GC` | off | Scans for idle cache buffers every 16th submission; +1.0% |
+
+The four that are off were measured as wins on Petr's tree but are still off in the merged
+defaults; turn them on with `KYTY_X=1` or a `flags.ctl` line, or flip the default in `FlagSet`.
+
+### Env-only startup switches (default on, `=0` disables)
+
+| Variable | Mask bit | What it does | Measured |
+|---|---|---|---|
+| `KYTY_SRT_BATCH_READS` | 128 | Reads contiguous resource-table dwords with one call | +54% in a match |
+| `KYTY_SKIP_REDUNDANT_BINDS` | 2 | Skips re-pushing identical descriptors and push constants | (with guest sync) |
+| `KYTY_DIRECT_SRT_READS` | 1024 | Evaluates resource-table reads and descriptor copies without the IR interpreter | +22.4% paused match (11.1 -> 13.6 fps) |
+| `KYTY_IMAGE_LOOKUP_HINT` | 4096 | Reuses the image a texture last resolved to instead of scanning every page | +2.3% paused match |
+| `KYTY_CLEAN_FROM_DIRECT` | 262144 | The strict resource-table evaluator takes words the direct reads already fetched | +3.1% paused match |
+| `KYTY_TEXTURE_DESC_CACHE` | 2048 | No consumer in the merged tree (pengui07's draw-prep delta replaces it); accepted for compatibility | was +15.5% |
+| `KYTY_ADAPTIVE_RESOURCE_MEMO` | 32768 | No consumer in the merged tree (`KYTY_RESOURCE_MEMO_BYPASS` replaces it); accepted for compatibility | was +2.3% |
+
+Default off (set to `1` to enable): `KYTY_CPU_COPY_FORWARD` (8), `KYTY_FALSE_SHARE_READS` (64),
+`KYTY_ASYNC_SUBMIT` (2097152), `KYTY_LAZY_SHARED_WRITES` (4194304). The last three are wins for NHL 27
+(see the measurement log).
+`KYTY_RESOURCE_MULTI_CACHE=1` (16-state resource memo) is read only by the resource memo at startup and has no mask bit.
+
+The bits of the removed switches (1, 4, 256, 512, 8192, 16384, 65536, 131072, 524288, 1048576) are ignored in
+an experiment mask; use `flags.ctl` for those features.
+
+Dispatch args guard, `KYTY_PROGRAM_RESOURCE_CACHE=1`, `KYTY_PERF_NO_SYNC_READBACK=1`,
+`KYTY_EOP_DIRECT_LABELS=1` and `KYTY_SHADER_PREGEN=0` remain separate environment settings.
+
+## Measurement log (claude/nhl27-perf before the merge)
+
+The table below is the original per-switch log, from when every switch was env-only and default off
+(`=1` and the mask bits below describe that build). The merged defaults and key types are the tables
+above; read this only for the measurements.
+
+### Recommended for NHL 27 on that build
 
 On top of the fork's usual flags (`KYTY_PROGRAM_RESOURCE_CACHE=1`, `KYTY_PERF_NO_SYNC_READBACK=1`,
 `KYTY_EOP_DIRECT_LABELS=1`, `KYTY_SHADER_PREGEN=0`, ...):
@@ -30,9 +88,9 @@ On top of the fork's usual flags (`KYTY_PROGRAM_RESOURCE_CACHE=1`, `KYTY_PERF_NO
 | `KYTY_ASYNC_SUBMIT=1` | 2097152 | `vkQueueSubmit` runs on a worker thread in tick order (about 65 us of GPU-thread time per submit); submit splits default to 48 draws / 0.75 ms with it | +1.5% paused match, +4.5% more with the finer splits |
 | `KYTY_LAZY_SHARED_WRITES=1` | 4194304 | A guest thread's store into a page where the GPU wrote at most 256 other bytes no longer waits for that GPU work: the download is queued and merged into guest memory later, keeping bytes the CPU changed meanwhile | +7.3% paused match |
 
-Mask for all of the above: `8387651`, plus `KYTY_SRT_BATCH_READS=1` in the environment and
-`KYTY_PM4_WRITE_DATA_FAST=1` (pengui07's runtime flag, `flags.ctl` or environment; no measured
-change on its own).
+The last three rows were measured after the merge (merged defaults, plus the four runtime flags
+that are off by default and `KYTY_PM4_WRITE_DATA_FAST=1`). They are env-only switches, default
+off; their mask bits are 64, 2097152 and 4194304.
 
 ### Why a frame waits
 
@@ -62,7 +120,7 @@ the GPU thread records.
 
 ## Always on
 
-`KYTY_DISPATCH_ARGS_GUARD` (set to `0` to disable): every indirect dispatch reads its group counts
+`KYTY_DISPATCH_ARGS_GUARD` (a runtime flag, default on; set to `0` in the environment or `flags.ctl` to disable): every indirect dispatch reads its group counts
 through a small GPU pass that zeroes counts above the device limit. NHL 27 occasionally issues an
 indirect dispatch with 0xffffffff x3 groups during match loads; without the guard the GPU never
 finishes it and the device is lost. Zeroed dispatches are reported as `NHL27GUARD` lines.

@@ -101,7 +101,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	if (ignore_target_mask && rt.base.addr != 0 && mask == 0) {
 		mask = 0x0f;
 	}
-	const bool memoize = Common::Experiments::Enabled(Common::Experiments::RenderTargetMemo) &&
+	const bool memoize = Common::RuntimeFlags::Current().rt_decode_memo &&
 	                     rt.base.addr != 0 && mask != 0;
 	ColorTargetKey key;
 	if (memoize) {

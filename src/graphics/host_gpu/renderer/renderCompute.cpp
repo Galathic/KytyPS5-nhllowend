@@ -5,6 +5,7 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/runtimeFlags.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -836,11 +837,8 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
-	// KYTY_DISPATCH_ARGS_GUARD=0 disables the GPU-side check of the group counts.
-	static const bool guard_args = [] {
-		const char* value = std::getenv("KYTY_DISPATCH_ARGS_GUARD");
-		return value == nullptr || value[0] != '0';
-	}();
+	// KYTY_DISPATCH_ARGS_GUARD (runtime flag, default on; =0 disables) is the GPU-side check of the group counts.
+	const bool guard_args = Common::RuntimeFlags::Current().dispatch_args_guard;
 	vk::Buffer indirect_buffer = args_buffer->Handle();
 	uint64_t   indirect_offset = args_offset;
 	if (guard_args) {

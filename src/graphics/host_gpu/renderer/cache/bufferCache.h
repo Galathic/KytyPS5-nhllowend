@@ -55,11 +55,9 @@ public:
 	// Writes a small CPU-visible label into an existing buffer without a page readback.
 	bool                   TryWriteLabel(uint64_t vaddr, const void* data, uint64_t size);
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
-	// Releases a whole clean window around a CPU write fault (experiment FaultCoalesce).
-	void                   InvalidateCleanWindow(uint64_t vaddr, uint64_t size);
 	// See MemoryTracker::MarkCpuDirtyAhead.
-	void MarkCpuDirtyAhead(uint64_t vaddr, uint64_t size) noexcept {
-		m_memory_tracker.MarkCpuDirtyAhead(vaddr, size);
+	uint64_t MarkCpuDirtyAhead(uint64_t vaddr, uint64_t size) noexcept {
+		return m_memory_tracker.MarkCpuDirtyAhead(vaddr, size);
 	}
 	// Only used to attribute synchronous readbacks in the KYTY_PERF_STATS output.
 	enum class ReadCaller : uint8_t { Other, ColorClear, Fault };
@@ -85,7 +83,7 @@ public:
 		ImageUpload,
 		Count
 	};
-	// KYTY_GUEST_SYNC=1 (experiment): compute dispatches rely on the guest's own partial-flush,
+	// KYTY_GUEST_SYNC (runtime flag, default on): compute dispatches rely on the guest's own partial-flush,
 	// cache and ACQUIRE_MEM packets for ordering instead of a full barrier around each dispatch.
 	[[nodiscard]] static bool GuestSyncOnly();
 	// KYTY_PERF_NO_SYNC_READBACK=1 enables the readback-avoidance paths (default: off).
@@ -262,7 +260,7 @@ private:
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;
-	// Experiment ReadbackQueue: copies downloads on GraphicContext::readback_queue.
+	// KYTY_READBACK_QUEUE: copies downloads on GraphicContext::readback_queue.
 	vk::CommandPool                                   m_readback_pool   = nullptr;
 	vk::CommandBuffer                                 m_readback_buffer = nullptr;
 	vk::Fence                                         m_readback_fence  = nullptr;

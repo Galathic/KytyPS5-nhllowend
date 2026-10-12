@@ -22,34 +22,33 @@ namespace Common::Experiments {
 
 namespace {
 
-bool EnvOn(const char* name) {
+// "1" enables, "0" disables, anything else (including unset) keeps the default.
+bool EnvSwitch(const char* name, bool on_by_default) {
 	const char* value = std::getenv(name);
-	return value != nullptr && value[0] == '1';
+	if (value != nullptr && (value[0] == '0' || value[0] == '1') && value[1] == '\0') {
+		return value[0] == '1';
+	}
+	return on_by_default;
 }
 
 uint32_t EnvironmentMask() {
 	uint32_t mask = 0;
-	if (EnvOn("KYTY_GUEST_SYNC")) mask |= GuestSync;
-	if (EnvOn("KYTY_SKIP_REDUNDANT_BINDS")) mask |= SkipRedundantBinds;
-	if (EnvOn("KYTY_DEDUP_BARRIERS")) mask |= DedupBarriers;
-	if (EnvOn("KYTY_CPU_COPY_FORWARD")) mask |= CpuCopyForward;
-	if (EnvOn("KYTY_FALSE_SHARE_READS")) mask |= FalseShareReads;
-	if (EnvOn("KYTY_SRT_BATCH_READS")) mask |= SrtBatchReads;
-	if (EnvOn("KYTY_RESOURCE_MULTI_CACHE")) mask |= ResourceMultiCache;
-	if (EnvOn("KYTY_BACKING_READ_CACHE")) mask |= BackingReadCache;
-	if (EnvOn("KYTY_DIRECT_SRT_READS")) mask |= DirectSrtReads;
-	if (EnvOn("KYTY_TEXTURE_DESC_CACHE")) mask |= TextureDescCache;
-	if (EnvOn("KYTY_IMAGE_LOOKUP_HINT")) mask |= ImageLookupHint;
-	if (EnvOn("KYTY_LONG_BUFFER_GC_AGE")) mask |= LongBufferGcAge;
-	if (EnvOn("KYTY_RENDER_TARGET_MEMO")) mask |= RenderTargetMemo;
-	if (EnvOn("KYTY_ADAPTIVE_RESOURCE_MEMO")) mask |= AdaptiveResourceMemo;
-	if (EnvOn("KYTY_FAULT_COALESCE")) mask |= FaultCoalesce;
-	if (EnvOn("KYTY_SPARSE_BUFFER_GC")) mask |= SparseBufferGc;
-	if (EnvOn("KYTY_CLEAN_FROM_DIRECT")) mask |= CleanFromDirect;
-	if (EnvOn("KYTY_DIRECT_EOP_INTERRUPTS")) mask |= DirectEopInterrupts;
-	if (EnvOn("KYTY_READBACK_QUEUE")) mask |= ReadbackQueue;
-	if (EnvOn("KYTY_ASYNC_SUBMIT")) mask |= AsyncSubmit;
-	if (EnvOn("KYTY_LAZY_SHARED_WRITES")) mask |= LazySharedWrites;
+	const auto set = [&mask](const char* name, Bit bit, bool on_by_default) {
+		if (EnvSwitch(name, on_by_default)) mask |= bit;
+	};
+	// The NHL 27 recommended set is on unless its variable is set to 0.
+	set("KYTY_SKIP_REDUNDANT_BINDS", SkipRedundantBinds, true);
+	set("KYTY_SRT_BATCH_READS", SrtBatchReads, true);
+	set("KYTY_DIRECT_SRT_READS", DirectSrtReads, true);
+	set("KYTY_TEXTURE_DESC_CACHE", TextureDescCache, true);
+	set("KYTY_IMAGE_LOOKUP_HINT", ImageLookupHint, true);
+	set("KYTY_ADAPTIVE_RESOURCE_MEMO", AdaptiveResourceMemo, true);
+	set("KYTY_CLEAN_FROM_DIRECT", CleanFromDirect, true);
+	// Not part of the recommended set: opt in with 1.
+	set("KYTY_CPU_COPY_FORWARD", CpuCopyForward, false);
+	set("KYTY_FALSE_SHARE_READS", FalseShareReads, false);
+	set("KYTY_ASYNC_SUBMIT", AsyncSubmit, false);
+	set("KYTY_LAZY_SHARED_WRITES", LazySharedWrites, false);
 	return mask;
 }
 
