@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceFixture.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/SrtProf.h"
 
 #include <algorithm>
@@ -733,7 +734,11 @@ SrtWalker::SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
 	AttachFixtureRecording(m_runtime);
 }
 
-SrtWalker::~SrtWalker() { --m_program.evaluation_depth; }
+SrtWalker::~SrtWalker() {
+	if (m_desc_reuse != 0u || m_desc_eval != 0u || m_memo_skipped != 0u)
+		SrtCompiledCountDesc(m_desc_reuse, m_desc_eval, m_memo_skipped);
+	--m_program.evaluation_depth;
+}
 
 bool SrtWalker::Evaluate(Value value, uint32_t& result) {
 	uint64_t wide = 0;
@@ -1427,6 +1432,145 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 	}
 	return false;
 }
+// --- input-keyed descriptor reuse -----------------------------------------------------------------
+// The recursive evaluation of a descriptor source after a compiled refresh is a function of the memo
+// entries it hits. This walk finds those entries ("leaves") for one (evaluator mode, source): it stops at
+// any node the served tape publishes in the evaluator's context and descends only through operations that
+// are pure functions of their operands. Anything else (guest reads, user data, shader base, selects, phi)
+// makes the source ineligible, so a reused result can never skip a read, an observer call or a decision.
+namespace {
+
+constexpr size_t kMaxReuseLeaves = 24;
+
+// Diagnostic switch for A/B measurement: KYTY_SRT_NO_DESC_REUSE=1 restores the full per-call evaluation.
+bool DescriptorReuseEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SRT_NO_DESC_REUSE");
+		return value == nullptr || value[0] != '1';
+	}();
+	return enabled;
+}
+
+bool IsPureReuseOpcode(ValueOpcode opcode) {
+	switch (opcode) {
+		case ValueOpcode::BitCastU32F32:
+		case ValueOpcode::BitCastF32U32:
+		case ValueOpcode::ConvertF32U32:
+		case ValueOpcode::ConvertU32F32:
+		case ValueOpcode::FPTrunc32:
+		case ValueOpcode::FPRecipIFlag32:
+		case ValueOpcode::FPIsNan32:
+		case ValueOpcode::BitwiseNot32:
+		case ValueOpcode::LogicalNot:
+		case ValueOpcode::CompositeConstructU64:
+		case ValueOpcode::CompositeConstructU32x2:
+		case ValueOpcode::CompositeExtractU64:
+		case ValueOpcode::CompositeExtractU32x2:
+		case ValueOpcode::IAddCarry32:
+		case ValueOpcode::IAdd32:
+		case ValueOpcode::IAdd64:
+		case ValueOpcode::ISub32:
+		case ValueOpcode::ISub64:
+		case ValueOpcode::IMul32:
+		case ValueOpcode::IMul64:
+		case ValueOpcode::UMulHi:
+		case ValueOpcode::UMin32:
+		case ValueOpcode::FPMul32:
+		case ValueOpcode::FPOrdLessThanEqual32:
+		case ValueOpcode::FPOrdGreaterThanEqual32:
+		case ValueOpcode::BitwiseAnd32:
+		case ValueOpcode::BitwiseAnd64:
+		case ValueOpcode::BitwiseOr32:
+		case ValueOpcode::BitwiseXor32:
+		case ValueOpcode::ShiftLeftLogical32:
+		case ValueOpcode::ShiftLeftLogical64:
+		case ValueOpcode::ShiftRightLogical32:
+		case ValueOpcode::ShiftRightLogical64:
+		case ValueOpcode::ShiftRightArithmetic32:
+		case ValueOpcode::ShiftRightArithmetic64:
+		case ValueOpcode::IEqual32:
+		case ValueOpcode::INotEqual32:
+		case ValueOpcode::ULessThan32:
+		case ValueOpcode::ULessThanEqual32:
+		case ValueOpcode::UGreaterThan32:
+		case ValueOpcode::SGreaterThanEqual32:
+		case ValueOpcode::LogicalXor:
+		case ValueOpcode::LogicalAnd:
+		case ValueOpcode::LogicalOr:
+		case ValueOpcode::ConditionRef:
+		case ValueOpcode::BitFieldUExtract:
+		case ValueOpcode::BitFieldSExtract:
+		case ValueOpcode::BitFieldInsert: return true;
+		default: return false;
+	}
+}
+
+void BuildSourceReusePlan(const ResourcePlan& program, const ResourcePlan::SrtTape& tape, int mode,
+                          std::span<const uint8_t> clean_flat_slots, uint32_t source,
+                          ResourcePlan::SourceReusePlan& plan) {
+	static std::atomic<uint64_t> serial {1};
+	plan.leaves.clear();
+	plan.serial   = serial.fetch_add(1, std::memory_order_relaxed);
+	plan.tape     = &tape;
+	plan.tape_ops = tape.ops.size();
+	plan.state    = ResourcePlan::SourceReusePlan::State::Ineligible;
+	if (mode < 0 || mode > 2 || source >= program.descriptor_sources.size()) return;
+	const auto& descriptor = program.descriptor_sources[source];
+	if (descriptor.indirect_descriptor.has_value()) return;
+	// Stop set: which (instruction, role) pairs the served tape publishes into the evaluating
+	// walker's context. Mode 0: everything (no clean partner). Mode 1: ordinary ops for the walker's own
+	// context, clean ops for its partner's. Mode 2 (the clean partner itself): clean ops only.
+	std::unordered_map<const Inst*, uint32_t> stops; // bit 0 = own context, bit 1 = clean partner context
+	for (const auto& op: tape.ops) {
+		if (op.source == nullptr || op.memo_index == UINT32_MAX) continue;
+		uint32_t bit = 0;
+		if (mode == 0) bit = 1u;
+		else if (mode == 1) bit = op.clean != 0u ? 2u : 1u;
+		else if (op.clean != 0u) bit = 1u;
+		if (bit != 0u) stops[op.source] |= bit;
+	}
+	struct Item { Value value; uint8_t role; };
+	std::vector<Item> stack;
+	std::unordered_set<uint64_t> visited;
+	for (uint32_t i = 0; i < descriptor.dword_count && i < descriptor.dwords.size(); ++i)
+		stack.push_back({descriptor.dwords[i], 0u});
+	while (!stack.empty()) {
+		auto item = stack.back();
+		stack.pop_back();
+		const auto value = item.value.Resolve();
+		if (value.IsEmpty()) return;
+		if (value.IsImmediate()) continue;
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr) return;
+		if (!visited.insert((reinterpret_cast<uint64_t>(inst) << 1u) | item.role).second) continue;
+		if (visited.size() > 256u) return;
+		if (const auto found = stops.find(inst); found != stops.end() && (found->second & (1u << item.role)) != 0u) {
+			if (plan.leaves.size() >= kMaxReuseLeaves) return;
+			uint32_t memo_index = UINT32_MAX;
+			for (const auto& op: tape.ops) {
+				if (op.source == inst && op.memo_index != UINT32_MAX) { memo_index = op.memo_index; break; }
+			}
+			if (memo_index == UINT32_MAX) return;
+			plan.leaves.push_back({inst, item.role, memo_index});
+			continue;
+		}
+		const auto opcode = inst->GetOpcode();
+		if (opcode == ValueOpcode::ReadConst) {
+			const auto slot = inst->Arg(1).Resolve();
+			if (!slot.IsImmediate() || slot.GetType() != Type::U32 || slot.U32() >= program.srt_reads.size()) return;
+			uint8_t role = item.role;
+			if (mode == 1 && slot.U32() < clean_flat_slots.size() && clean_flat_slots[slot.U32()] != 0u) role = 1u;
+			stack.push_back({program.srt_reads[slot.U32()].value, role});
+			continue;
+		}
+		if (!IsPureReuseOpcode(opcode)) return;
+		for (size_t i = 0; i < inst->NumArgs(); ++i) stack.push_back({inst->Arg(i), item.role});
+	}
+	plan.state = ResourcePlan::SourceReusePlan::State::Eligible;
+}
+
+} // namespace
+
 bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 	SRT_PROF_SCOPE(SrtProf::EvalDesc);
 	if (source >= m_program.descriptor_sources.size()) {
@@ -1452,7 +1596,20 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 		}
 		if (ready) {
 			bool cfg_gather = gather.needs_flat && !m_program.control_flow.empty();
-			if (cfg_gather) {
+			// A compiled Gather step has one fixed predecessor path in the trie, so whether the memo of every
+			// Flat word's srt_read agrees with the flat buffer is decided by the step, not by the values:
+			// the memo slot and the flat word are both written from the same op result. Verify once per
+			// (program build, Gather step, evaluator role), then answer without re-reading the memo.
+			uint32_t* verified = nullptr;
+			bool      verified_skip = false;
+			if (cfg_gather && m_served_cfg != nullptr && DescriptorReuseEnabled() && source < m_cfg_gather_ready_sources.size() &&
+			    m_cfg_gather_ready_sources[source] >= 2u) {
+				auto& table = m_served_cfg->verified_gather[m_served_mode == 2 ? 1 : 0];
+				if (table.size() <= source) table.resize(m_program.descriptor_sources.size(), 0u);
+				verified      = &table[source];
+				verified_skip = *verified == m_cfg_gather_ready_sources[source];
+			}
+			if (cfg_gather && !verified_skip) {
 				// The CFG gather is only a shortcut for recursive lookup of values that
 				// this exact evaluator already computed successfully in this generation.
 				for (uint32_t index = 0; index < descriptor.dword_count && cfg_gather; ++index) {
@@ -1481,6 +1638,7 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 						cfg_gather = false;
 				}
 				if (!cfg_gather) ready = false;
+				else if (verified != nullptr) *verified = m_cfg_gather_ready_sources[source];
 			}
 			if (ready && cfg_gather && m_runtime.evaluation_counts != nullptr) {
 				++m_runtime.evaluation_counts->cfg_gather_eligible;
@@ -1521,17 +1679,70 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 						valid[source] = 1u;
 					}
 				}
+				SRT_PROF_COUNT(eval_gather, 1);
+				if (verified_skip) ++m_desc_reuse;
+				else ++m_desc_eval;
 				return true;
 			}
 		}
 	}
+	SRT_PROF_COUNT(eval_recursive, 1);
 	if (m_source_reuse_enabled && FrameBreakdown::Enabled()) {
 		FrameBreakdown::g_counters.mat_reuse_fallback.fetch_add(1, std::memory_order_relaxed);
 	}
+	// Input-keyed reuse. After a compiled refresh, a recursive evaluation of a source whose value graph is
+	// pure arithmetic over published memo values is a function of exactly those values. If they are all
+	// published and bit-identical to the ones behind the stored result, the result is that stored result.
+	// Anything impure (guest reads, user data, shader base, lazy ops) makes the source ineligible.
+	ResourceDelta::SourceReuse* entry = nullptr;
+	std::array<uint64_t, kMaxReuseLeaves> inputs;
+	size_t input_count = 0;
+	if (m_served_mode >= 0 && m_served_tape != nullptr && m_runtime.delta != nullptr && DescriptorReuseEnabled() &&
+	    m_active_mask.IsEmpty() && m_program.control_flow.empty() == (m_served_cfg == nullptr)) {
+		auto& plans = m_program.source_reuse_plans[static_cast<size_t>(m_served_mode)];
+		if (plans.size() != m_program.descriptor_sources.size()) plans.assign(m_program.descriptor_sources.size(), {});
+		auto& plan = plans[source];
+		if (plan.state == ResourcePlan::SourceReusePlan::State::Unbuilt || plan.tape != m_served_tape ||
+		    plan.tape_ops != m_served_tape->ops.size())
+			BuildSourceReusePlan(m_program, *m_served_tape, m_served_mode, m_clean_flat_slots, source, plan);
+		if (plan.state == ResourcePlan::SourceReusePlan::State::Eligible) {
+			bool all = true;
+			for (const auto& leaf: plan.leaves) {
+				const SrtWalker* evaluator = leaf.role != 0u ? m_clean_evaluator : this;
+				if (evaluator == nullptr) { all = false; break; }
+				const auto& context = evaluator->m_context;
+				if (leaf.memo_index >= context.values.size() ||
+				    context.values[leaf.memo_index].generation != context.generation) { all = false; break; }
+				inputs[input_count++] = context.values[leaf.memo_index].value;
+			}
+			if (all) {
+				auto& sources = m_runtime.delta->sources;
+				if (sources.size() != m_program.descriptor_sources.size()) sources.assign(m_program.descriptor_sources.size(), {});
+				entry = &sources[source];
+				if (entry->valid && entry->mode == static_cast<uint8_t>(m_served_mode) &&
+				    entry->plan_serial == plan.serial && entry->inputs.size() == input_count &&
+				    std::equal(inputs.begin(), inputs.begin() + static_cast<ptrdiff_t>(input_count), entry->inputs.begin())) {
+					result = entry->output;
+					++m_desc_reuse;
+					SRT_PROF_COUNT(eval_reused, 1);
+					return true;
+				}
+				entry->plan_serial = plan.serial;
+			}
+		}
+	}
+	++m_desc_eval;
 	for (uint32_t index = 0; index < descriptor.dword_count; ++index) {
 		if (!Evaluate(descriptor.dwords[index], result.dwords[index])) {
+			if (entry != nullptr) entry->valid = false;
 			return false;
 		}
+	}
+	if (entry != nullptr) {
+		entry->valid  = true;
+		entry->mode   = static_cast<uint8_t>(m_served_mode);
+		entry->inputs.assign(inputs.begin(), inputs.begin() + static_cast<ptrdiff_t>(input_count));
+		entry->output = result;
 	}
 	return true;
 }
@@ -1738,6 +1949,14 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		return VerifyCfgRefresh(flat);
 	}
 	m_context.refreshed_flat = nullptr;
+	m_served_mode = -1;
+	m_served_tape = nullptr;
+	m_served_cfg  = nullptr;
+	if (m_clean_evaluator != nullptr) {
+		m_clean_evaluator->m_served_mode = -1;
+		m_clean_evaluator->m_served_tape = nullptr;
+		m_clean_evaluator->m_served_cfg  = nullptr;
+	}
 	if (!m_program.srt_plan_complete) return false;
 	using TraceKind = ResourcePlan::CfgTrace::Kind;
 	struct TraceReset {
@@ -3406,7 +3625,7 @@ inline bool TapeAlu(ValueOpcode opcode, const std::array<uint32_t, 5>& args, uin
 } // namespace
 
 bool SrtWalker::ExecuteTapeOp(const ResourcePlan::SrtTape::Op& op,
-                              std::vector<uint64_t>& values, uint32_t index) {
+                              std::vector<uint64_t>& values, uint32_t index, bool publish) {
 	// Per-op counters are tallied once per RunTape (RunTape::TapeOpTally).
 	uint64_t result = 0;
 	switch (op.kind) {
@@ -3517,6 +3736,10 @@ bool SrtWalker::ExecuteTapeOp(const ResourcePlan::SrtTape::Op& op,
 	}
 
 	values[index] = result;
+	if (!publish) {
+		++m_memo_skipped;
+		return true;
+	}
 	SRT_PROF_SCOPE(SrtProf::MemoWrite);
 	// A clean op belongs to the clean walker context only. The same IR instruction
 	// may have a separate ordinary op with a different memory-reader domain.
@@ -3549,6 +3772,7 @@ struct GlobalCompiledStats {
 	std::atomic<uint64_t> calls {0}, compiled {0}, failed {0}, nocfg {0}, cfg {0}, builds {0}, steps {0};
 	std::atomic<uint64_t> reads {0}, read_words {0}, groups_hit {0}, groups_miss {0};
 	std::atomic<uint64_t> spec_recomputed {0}, spec_reused {0}, verify_checks {0}, verify_mismatch {0};
+	std::atomic<uint64_t> desc_reuse {0}, desc_eval {0}, memo_skipped {0};
 	std::atomic<uint64_t> mask_calls {0}, mask_first {0}, mask_images {0}, mask_samplers {0}, mask_buffer_fmt {0};
 	std::atomic<uint64_t> mask_buffer_addr {0}, mask_buffer_size {0}, mask_flat {0}, mask_user_data {0}, mask_all_same {0};
 	std::array<std::atomic<uint64_t>, static_cast<size_t>(SrtCompiledFallback::Count)> fallback {};
@@ -3635,6 +3859,138 @@ void FormReadGroups(CompiledSrt& program) {
 	}
 }
 
+// --- dead-memo elimination ----------------------------------------------------------------------
+// A compiled step publishes its result into the evaluator memo (value + generation) so that later
+// recursive evaluation and the CFG trace-miss rollback can see it. Most published slots are never read:
+// the only code that can consult the memo after (or during) a compiled run is
+//   * recursive Evaluate / EvaluateDescriptor, whose roots are fixed by the plan: the descriptor source
+//     dwords, the indirect-descriptor expressions and the uniform-fill values;
+//   * the CFG descriptor gather check, which reads the memo of the srt_read value behind every Flat
+//     gather word (those values are reached from the source dwords, so they are roots too);
+//   * the compiled Memo steps themselves (kept unconditionally).
+// A recursive evaluation stops at the first memoized node, so it can reach a slot only through nodes
+// that are not published on every path. The analysis therefore walks the value graph from the roots
+// and stops at nodes that every path through the program publishes (in the same evaluator context);
+// everything visited that the program publishes is kept, the rest is dead. The trace-miss rollback only
+// resets slots that were published, and a slot that was never published carries an older generation,
+// which the recording DFS treats exactly like the rolled-back state, so skipping publication is safe.
+// Any construct the walk cannot model (Phi, ReadFirstLane, an oversized graph, a branch that does not
+// move forward) keeps every publication.
+using MemoKey = uintptr_t;
+inline MemoKey MakeMemoKey(const Inst* inst, uint32_t ctx) {
+	return (reinterpret_cast<uintptr_t>(inst) << 1u) | ctx;
+}
+
+void ClassifyMemoPublication(const ResourcePlan& plan, const ResourcePlan::SrtTape& tape, CompiledSrt& program) {
+	using Code = CompiledSrt::Code;
+	auto& steps = program.steps;
+	program.dead_memo_steps = 0;
+	if (std::getenv("KYTY_SRT_KEEP_MEMO") != nullptr) return; // diagnostic: publish everything
+	const uint32_t contexts = tape.clean_root ? 2u : 1u;
+	const size_t   count    = steps.size();
+	std::unordered_map<MemoKey, uint32_t> key_index;
+	std::vector<int32_t> step_key(count, -1);
+	std::vector<MemoKey> keys;
+	const auto key_of = [&](const CompiledSrt::Step& step) -> MemoKey {
+		const auto& op = tape.ops[step.out];
+		return MakeMemoKey(op.source, tape.clean_root && step.clean ? 1u : 0u);
+	};
+	for (size_t pc = 0; pc < count; ++pc) {
+		const auto& step = steps[pc];
+		if (step.code != Code::UserData && step.code != Code::ShaderBase && step.code != Code::Alu &&
+		    step.code != Code::Read)
+			continue;
+		if (step.memo == UINT32_MAX || step.out >= tape.ops.size() || tape.ops[step.out].source == nullptr) continue;
+		const auto key = key_of(step);
+		const auto [it, added] = key_index.emplace(key, static_cast<uint32_t>(keys.size()));
+		if (added) keys.push_back(key);
+		step_key[pc] = static_cast<int32_t>(it->second);
+	}
+	if (keys.empty()) return;
+	// Keys published on every path from each step to End.
+	const size_t words = (keys.size() + 63u) / 64u;
+	std::vector<uint64_t> must(count * words, 0u);
+	for (size_t pc = count; pc-- > 0;) {
+		const auto& step = steps[pc];
+		uint64_t*   cur  = &must[pc * words];
+		if (step.code == Code::End) continue;
+		if (step.code == Code::Cond || step.code == Code::CondTri) {
+			bool first = true;
+			for (const auto target: step.next) {
+				if (target == UINT32_MAX) continue;
+				if (target <= pc || target >= count) return; // not a forward trie edge: keep everything
+				const uint64_t* succ = &must[static_cast<size_t>(target) * words];
+				for (size_t w = 0; w < words; ++w) cur[w] = first ? succ[w] : (cur[w] & succ[w]);
+				first = false;
+			}
+			continue;
+		}
+		if (pc + 1 >= count) return;
+		const uint64_t* succ = &must[(pc + 1) * words];
+		for (size_t w = 0; w < words; ++w) cur[w] = succ[w];
+		if (step_key[pc] >= 0) cur[static_cast<size_t>(step_key[pc]) / 64u] |= uint64_t {1} << (step_key[pc] % 64u);
+	}
+	const uint64_t* all = must.data();
+	const auto      published_on_every_path = [&](uint32_t index) { return ((all[index / 64u] >> (index % 64u)) & 1u) != 0u; };
+
+	std::unordered_set<MemoKey> visited, needed;
+	std::vector<std::pair<const Inst*, uint32_t>> stack;
+	const auto push = [&](Value value) {
+		value = value.Resolve();
+		if (value.IsEmpty() || value.IsImmediate()) return;
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr) return;
+		for (uint32_t ctx = 0; ctx < contexts; ++ctx) stack.emplace_back(inst, ctx);
+	};
+	for (const auto& source: plan.descriptor_sources) {
+		for (uint32_t i = 0; i < source.dword_count && i < source.dwords.size(); ++i) push(source.dwords[i]);
+		if (source.indirect_descriptor.has_value()) {
+			push(source.indirect_descriptor->key_count);
+			push(source.indirect_descriptor->selector_first);
+			push(source.indirect_descriptor->selector_mask);
+		}
+	}
+	for (const auto& value: plan.uniform_fill.values) push(value);
+	for (const auto& gather: plan.descriptor_gathers) {
+		if (!gather.valid || !gather.needs_flat) continue;
+		for (const auto& word: gather.words) {
+			if (word.kind == ResourcePlan::DescriptorGather::Word::Kind::Flat && word.read_slot < plan.srt_reads.size())
+				push(plan.srt_reads[word.read_slot].value);
+		}
+	}
+	for (size_t pc = 0; pc < count; ++pc) {
+		const auto& step = steps[pc];
+		if (step.code == Code::Memo && step.out < tape.ops.size() && tape.ops[step.out].source != nullptr)
+			needed.insert(key_of(step));
+	}
+	constexpr size_t kMaxVisited = 1u << 16;
+	while (!stack.empty()) {
+		const auto [inst, ctx] = stack.back();
+		stack.pop_back();
+		const auto key = MakeMemoKey(inst, ctx);
+		if (!visited.insert(key).second) continue;
+		if (visited.size() > kMaxVisited) return;
+		if (const auto found = key_index.find(key); found != key_index.end()) {
+			needed.insert(key);
+			if (published_on_every_path(found->second)) continue;
+		}
+		const auto opcode = inst->GetOpcode();
+		if (opcode == ValueOpcode::Phi || opcode == ValueOpcode::ReadFirstLane) return;
+		if (opcode == ValueOpcode::ReadConst) {
+			const auto slot = inst->Arg(1).Resolve();
+			if (slot.IsImmediate() && slot.GetType() == Type::U32 && slot.U32() < plan.srt_reads.size())
+				push(plan.srt_reads[slot.U32()].value);
+		}
+		for (size_t i = 0; i < inst->NumArgs(); ++i) push(inst->Arg(i));
+	}
+	for (size_t pc = 0; pc < count; ++pc) {
+		if (step_key[pc] < 0) continue;
+		const bool keep = needed.count(keys[static_cast<size_t>(step_key[pc])]) != 0u;
+		steps[pc].publish = keep ? 1u : 0u;
+		program.dead_memo_steps += keep ? 0u : 1u;
+	}
+}
+
 bool CompileNocfg(const ResourcePlan& plan, const ResourcePlan::SrtTape& tape, CompiledSrt& program) {
 	program.steps.clear();
 	program.reason = 0;
@@ -3658,12 +4014,14 @@ bool CompileNocfg(const ResourcePlan& plan, const ResourcePlan::SrtTape& tape, C
 	step.code = CompiledSrt::Code::End;
 	program.steps.push_back(step);
 	FormReadGroups(program);
+	ClassifyMemoPublication(plan, tape, program);
 	return true;
 }
 
 // Lowers the recorded trie. Eval/CondEval steps re-run the recursive walker and cannot be expressed
 // (reason 1). Branch targets are remapped through `landing` because folded immediates disappear.
-bool CompileTrace(const ResourcePlan::SrtTape& tape, const ResourcePlan::CfgTrace& trace, CompiledSrt& program) {
+bool CompileTrace(const ResourcePlan& plan, const ResourcePlan::SrtTape& tape, const ResourcePlan::CfgTrace& trace,
+                  CompiledSrt& program) {
 	using TraceKind = ResourcePlan::CfgTrace::Kind;
 	program.steps.clear();
 	program.reason = 0;
@@ -3766,6 +4124,8 @@ bool CompileTrace(const ResourcePlan::SrtTape& tape, const ResourcePlan::CfgTrac
 	if (out.empty() || out.back().code != CompiledSrt::Code::End) return false;
 	program.steps = std::move(out);
 	FormReadGroups(program);
+	ClassifyMemoPublication(plan, tape, program);
+	program.verified_gather = {};
 	return true;
 }
 
@@ -3789,6 +4149,9 @@ SrtCompiledStats GetSrtCompiledStats() {
 	s.spec_reused         = load(g_compiled_stats.spec_reused);
 	s.verify_checks       = load(g_compiled_stats.verify_checks);
 	s.verify_mismatch     = load(g_compiled_stats.verify_mismatch);
+	s.desc_reuse          = load(g_compiled_stats.desc_reuse);
+	s.desc_eval           = load(g_compiled_stats.desc_eval);
+	s.memo_skipped        = load(g_compiled_stats.memo_skipped);
 	s.mask_calls          = load(g_compiled_stats.mask_calls);
 	s.mask_first          = load(g_compiled_stats.mask_first);
 	s.mask_images         = load(g_compiled_stats.mask_images);
@@ -3806,6 +4169,12 @@ SrtCompiledStats GetSrtCompiledStats() {
 const char* SrtCompiledFallbackName(size_t reason) {
 	static const char* const names[] = {"ineligible", "nocfg_unsupported", "cfg_no_trace", "cfg_eval", "cfg_miss"};
 	return reason < std::size(names) ? names[reason] : "unknown";
+}
+
+void SrtCompiledCountDesc(uint64_t reuse, uint64_t eval, uint64_t skipped) {
+	if (reuse != 0u) g_compiled_stats.desc_reuse.fetch_add(reuse, std::memory_order_relaxed);
+	if (eval != 0u) g_compiled_stats.desc_eval.fetch_add(eval, std::memory_order_relaxed);
+	if (skipped != 0u) g_compiled_stats.memo_skipped.fetch_add(skipped, std::memory_order_relaxed);
 }
 
 void SrtCompiledCountSpec(bool recomputed) {
@@ -3894,6 +4263,10 @@ bool SrtWalker::ReadCompiledGroup(const CompiledSrt::Step* steps, uint32_t count
 		const auto& step = steps[i];
 		values[step.out] = words[i];
 		if (step.memo != UINT32_MAX) {
+			if (step.publish == 0u) {
+				++m_memo_skipped;
+				continue;
+			}
 			auto& context = step.clean && m_clean_evaluator != nullptr ? m_clean_evaluator->m_context : m_context;
 			if (step.memo >= context.values.size()) context.values.resize(m_program.evaluation_value_count);
 			context.values[step.memo].value      = words[i];
@@ -3956,7 +4329,7 @@ int SrtWalker::TryCompiled(std::vector<uint32_t>& flat, bool cfg) {
 		    program->source_paths != trace->paths) {
 			program->source_steps = static_cast<uint32_t>(trace->steps.size());
 			program->source_paths = trace->paths;
-			program->state = CompileTrace(tape, *trace, *program) ? CompiledSrt::State::Ready
+			program->state = CompileTrace(m_program, tape, *trace, *program) ? CompiledSrt::State::Ready
 			                                                      : CompiledSrt::State::Unsupported;
 			g_compiled_stats.builds.fetch_add(1, std::memory_order_relaxed);
 		}
@@ -3988,6 +4361,10 @@ int SrtWalker::TryCompiled(std::vector<uint32_t>& flat, bool cfg) {
 	};
 	const auto store_memo = [&](const CompiledSrt::Step& step, uint64_t result) {
 		if (step.memo == UINT32_MAX) return;
+		if (step.publish == 0u) {
+			++m_memo_skipped;
+			return;
+		}
 		SRT_PROF_SCOPE(SrtProf::MemoWrite);
 		auto& context = context_for(step);
 		if (step.memo >= context.values.size()) context.values.resize(m_program.evaluation_value_count);
@@ -4120,8 +4497,8 @@ int SrtWalker::TryCompiled(std::vector<uint32_t>& flat, bool cfg) {
 						return miss(true);
 				}
 				// Single reads keep the tape's exact address, bounds and domain handling.
-				if (!ExecuteTapeOp(tape.ops[step.out], values, step.out)) return cfg ? miss(true) : fail();
-				if (cfg && step.memo != UINT32_MAX) published.emplace_back(step.out, 0u);
+				if (!ExecuteTapeOp(tape.ops[step.out], values, step.out, step.publish != 0u)) return cfg ? miss(true) : fail();
+				if (cfg && step.memo != UINT32_MAX && step.publish != 0u) published.emplace_back(step.out, 0u);
 				g_compiled_stats.reads.fetch_add(1, std::memory_order_relaxed);
 				g_compiled_stats.read_words.fetch_add(1, std::memory_order_relaxed);
 				++executed;
@@ -4159,8 +4536,10 @@ int SrtWalker::TryCompiled(std::vector<uint32_t>& flat, bool cfg) {
 			}
 			case Code::Gather:
 				if (m_cfg_gather_enabled) {
-					m_cfg_gather_ready_sources[step.aux] = 1u;
-					if (m_clean_evaluator != nullptr) m_clean_evaluator->m_cfg_gather_ready_sources[step.aux] = 1u;
+					// The step index names the Gather step: EvaluateDescriptor remembers which steps it verified.
+					const uint32_t id = pc + 2u;
+					m_cfg_gather_ready_sources[step.aux] = id;
+					if (m_clean_evaluator != nullptr) m_clean_evaluator->m_cfg_gather_ready_sources[step.aux] = id;
 				}
 				++pc;
 				break;
@@ -4177,6 +4556,14 @@ int SrtWalker::TryCompiled(std::vector<uint32_t>& flat, bool cfg) {
 				(cfg ? g_compiled_stats.cfg : g_compiled_stats.nocfg).fetch_add(1, std::memory_order_relaxed);
 				m_context.refreshed_flat = &flat;
 				if (m_clean_evaluator != nullptr) m_clean_evaluator->m_context.refreshed_flat = &flat;
+				m_served_mode = m_clean_evaluator != nullptr ? 1 : 0;
+				m_served_tape = tape_ptr;
+				m_served_cfg  = cfg ? program : nullptr;
+				if (m_clean_evaluator != nullptr) {
+					m_clean_evaluator->m_served_mode = 2;
+					m_clean_evaluator->m_served_tape = tape_ptr;
+					m_clean_evaluator->m_served_cfg  = m_served_cfg;
+				}
 				if (cfg) {
 					++trace->hits;
 					g_tape_stats.cfg_trace_hits.fetch_add(1, std::memory_order_relaxed);

@@ -1073,7 +1073,8 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 					            "fb_nocfg_unsup=%.1f fb_cfg_no_trace=%.1f fb_cfg_eval=%.1f fb_cfg_miss=%.1f builds=%.1f "
 					            "reads=%.1f words=%.1f groups_hit=%.1f groups_miss=%.1f spec_recompute=%.1f spec_reuse=%.1f "
 					            "verify_checks=%.1f verify_mismatch=%.1f mask_img=%.1f%% mask_smp=%.1f%% mask_fmt=%.1f%% "
-					            "mask_addr=%.1f%% mask_size=%.1f%% mask_flat=%.1f%% mask_ud=%.1f%% mask_all_same=%.1f%%\n",
+					            "mask_addr=%.1f%% mask_size=%.1f%% mask_flat=%.1f%% mask_ud=%.1f%% mask_all_same=%.1f%% "
+					            "desc_reuse=%.1f desc_eval=%.1f memo_skipped=%.1f\n",
 					            total > 0 ? 100.0 * served / total : 0.0, d(cs.compiled, last_cs.compiled), d(cs.nocfg, last_cs.nocfg),
 					            d(cs.cfg, last_cs.cfg), d(cs.failed, last_cs.failed), d(cs.fallback[0], last_cs.fallback[0]),
 					            d(cs.fallback[1], last_cs.fallback[1]), d(cs.fallback[2], last_cs.fallback[2]),
@@ -1085,7 +1086,9 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 					            mp(cs.mask_images, last_cs.mask_images), mp(cs.mask_samplers, last_cs.mask_samplers),
 					            mp(cs.mask_buffer_fmt, last_cs.mask_buffer_fmt), mp(cs.mask_buffer_addr, last_cs.mask_buffer_addr),
 					            mp(cs.mask_buffer_size, last_cs.mask_buffer_size), mp(cs.mask_flat, last_cs.mask_flat),
-					            mp(cs.mask_user_data, last_cs.mask_user_data), mp(cs.mask_all_same, last_cs.mask_all_same));
+					            mp(cs.mask_user_data, last_cs.mask_user_data), mp(cs.mask_all_same, last_cs.mask_all_same),
+					            d(cs.desc_reuse, last_cs.desc_reuse), d(cs.desc_eval, last_cs.desc_eval),
+					            d(cs.memo_skipped, last_cs.memo_skipped));
 					last_cs = cs;
 				}
 			}

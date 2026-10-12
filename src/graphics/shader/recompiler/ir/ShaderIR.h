@@ -695,6 +695,9 @@ struct ResourcePlan {
 		struct Step {
 			Code                    code   = Code::End;
 			uint8_t                 clean  = 0;
+			// Dead-memo elimination: 0 = nothing can read this step's memo slot after it ran, so the
+			// value/generation store and the rollback bookkeeping are skipped (see ClassifyMemoPublication).
+			uint8_t                 publish = 1;
 			// Read: number of adjacent same-pointer scalar loads starting here that may be fetched in
 			// one reader call when their addresses are contiguous (1 = single read).
 			uint8_t                 group  = 1;
@@ -716,9 +719,30 @@ struct ResourcePlan {
 		uint32_t source_paths = 0;
 		uint32_t read_steps   = 0;  // statistics: Read steps / merged groups
 		uint32_t group_steps  = 0;
+		uint32_t dead_memo_steps = 0; // steps whose memo publication was eliminated
+		// CFG: per evaluator role (0 = ordinary, 1 = clean), the Gather step id whose memo/flat agreement
+		// EvaluateDescriptor already verified per source. A trie step has one fixed predecessor path, so
+		// the agreement is a property of the step, not of the values. Cleared whenever the program is rebuilt.
+		std::array<std::vector<uint32_t>, 2> verified_gather;
 	};
 	mutable std::array<CompiledSrt, 2> compiled_nocfg;
 	mutable std::array<CompiledSrt, 2> compiled_cfg;
+	// KYTY_SRT_COMPILED input-keyed descriptor reuse: for one (evaluator mode, descriptor source) the memo
+	// leaves its recursive evaluation can reach. Built lazily from a purity walk of the source's dwords.
+	struct SourceReusePlan {
+		enum class State : uint8_t { Unbuilt, Eligible, Ineligible };
+		struct Leaf {
+			const Inst* inst = nullptr;
+			uint8_t     role = 0;     // 0 = the evaluating walker's own context, 1 = its clean partner's
+			uint32_t    memo_index = 0;
+		};
+		State             state = State::Unbuilt;
+		uint64_t          serial = 0;       // changes whenever the plan is rebuilt
+		const void*       tape  = nullptr;  // tape the stop set was derived from
+		size_t            tape_ops = 0;
+		std::vector<Leaf> leaves;
+	};
+	mutable std::array<std::vector<SourceReusePlan>, 3> source_reuse_plans;
 	// KYTY_SRT_SOURCE_REUSE: previous gather-path output per descriptor source (GPU thread only).
 	mutable std::vector<DescriptorValue> source_reuse_last;
 	mutable std::vector<uint8_t>         source_reuse_valid;

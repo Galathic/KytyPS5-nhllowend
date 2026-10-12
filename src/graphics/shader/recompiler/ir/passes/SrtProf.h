@@ -47,6 +47,7 @@ struct Data {
 	uint64_t                    steps = 0, replays = 0;
 	uint64_t                    reader_calls = 0, reader_words = 0;
 	uint64_t                    memo_published = 0;
+	uint64_t                    eval_gather = 0, eval_recursive = 0, eval_reused = 0;
 	bool                        enabled = false;
 	// Optional reader-call log (address, dwords, strict) for isolating the fixture reader cost.
 	struct Call { uint64_t address; uint32_t words; bool strict; };
