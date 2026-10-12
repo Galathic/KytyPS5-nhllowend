@@ -340,6 +340,7 @@ struct PipelineCache::ProgramCache {
 		std::vector<Permutation>                    permutations;
 		ResourceMemo                               resource_memo;
 		ShaderRecompiler::IR::ResourceSpecializationCache specialization_cache;
+		ShaderRecompiler::IR::ResourceDelta               delta; // KYTY_SRT_COMPILED: this program's previous outputs
 		size_t                                     last_permutation = std::numeric_limits<size_t>::max();
 		bool                                       native_plan_checked = false;
 		bool                                       native_plan_allowed = false;
@@ -468,6 +469,9 @@ struct PipelineCache::ProgramCache {
             auto observed_runtime = runtime;
             observed_runtime.specialization_cache = runtime_flags.resource_spec_cache
                 ? &source.specialization_cache : nullptr;
+            // Frozen pipeline-record readers see single-dword requests only; never merge there.
+            observed_runtime.allow_compiled = replaying == nullptr;
+            observed_runtime.delta = runtime_flags.srt_compiled && replaying == nullptr ? &source.delta : nullptr;
             const bool ok = source.resource_memo.Refresh(source.resource_plan, observed_runtime,
                 source.resources, source.specialization, memo_enabled, reused);
             if (!ok && replaying == nullptr) EXIT("Resource materialization failed\n");

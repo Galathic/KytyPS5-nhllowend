@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceFixture.h"
+#include "graphics/shader/recompiler/ir/passes/SrtProf.h"
 
 #include <algorithm>
 #include <bit>
@@ -724,6 +725,8 @@ SrtWalker::SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
 	m_cfg_gather_enabled = clean_evaluator != nullptr ? clean_evaluator->m_cfg_gather_enabled : flags.srt_cfg_gather;
 	m_cfg_trace_enabled = clean_evaluator != nullptr ? clean_evaluator->m_cfg_trace_enabled : flags.srt_cfg_trace;
 	m_source_reuse_enabled = clean_evaluator != nullptr ? clean_evaluator->m_source_reuse_enabled : flags.srt_source_reuse;
+	m_compiled_enabled = clean_evaluator != nullptr ? clean_evaluator->m_compiled_enabled
+	                                                : (flags.srt_compiled && runtime.allow_compiled);
 	// Opt-in: record the memory access trace this walker performs so the workload can
 	// be replayed offline. Wraps readers on the walker's own copy only, and calls
 	// straight through, so results are unchanged when it is off or on.
@@ -1425,6 +1428,7 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 	return false;
 }
 bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
+	SRT_PROF_SCOPE(SrtProf::EvalDesc);
 	if (source >= m_program.descriptor_sources.size()) {
 		return false;
 	}
@@ -1707,6 +1711,7 @@ bool SrtWalker::VerifyCfgRefresh(std::vector<uint32_t>& flat) {
 }
 
 bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
+	SRT_PROF_SCOPE(SrtProf::Refresh);
 	// KYTY_PERF_STATS: one clock pair per call, split by how the refresh was served.
 	struct FlatCallTimer {
 		bool                         active = FrameBreakdown::Enabled();
@@ -1748,7 +1753,17 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		const int why = m_program.control_flow.empty() ? 0 : (!m_cfg_trace_enabled || !m_cfg_tape_enabled) ? 1 : 2;
 		FrameBreakdown::g_counters.mat_tr_why[why].fetch_add(1, std::memory_order_relaxed);
 	}
-	if (trace_eligible && ReplayCfgTrace(flat) > 0) {
+	bool compiled_missed = false;
+	if (trace_eligible && m_compiled_enabled) {
+		const int compiled = TryCompiled(flat, true);
+		if (compiled > 0) {
+			if (FrameBreakdown::Enabled()) FrameBreakdown::g_counters.mat_flat_trace_hits.fetch_add(1, std::memory_order_relaxed);
+			call_timer.kind = 1;
+			return true;
+		}
+		compiled_missed = compiled == -2;
+	}
+	if (trace_eligible && !compiled_missed && ReplayCfgTrace(flat) > 0) {
 		if (FrameBreakdown::Enabled()) FrameBreakdown::g_counters.mat_flat_trace_hits.fetch_add(1, std::memory_order_relaxed);
 		call_timer.kind = 1;
 		return true;
@@ -1784,6 +1799,10 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	auto& active = m_program.active_sources;
 	if (m_program.control_flow.empty()) {
 		int run_tape = -1;
+		if (m_compiled_enabled) {
+			const int compiled = TryCompiled(flat, false);
+			if (compiled >= 0) return compiled != 0;
+		}
 		if (!m_skip_tape && SrtTapeVerifyEnabled()) {
 			TapeReadCapture capture {.source = m_runtime};
 			auto observed = m_runtime;
@@ -2905,6 +2924,9 @@ int SrtWalker::ReplayCfgTrace(std::vector<uint32_t>& flat) {
 		return -1;
 	}
 	int miss_why = 0;
+	SRT_PROF_STEPPER(prof);
+	SRT_PROF_TICK(prof, SrtProf::Preamble);
+	SRT_PROF_COUNT(replays, 1);
 	auto& values = m_context.tape_values;
 	if (values.size() < tape.ops.size()) values.resize(tape.ops.size());
 	{
@@ -2923,6 +2945,7 @@ int SrtWalker::ReplayCfgTrace(std::vector<uint32_t>& flat) {
 	auto& published = m_context.tape_pending;
 	published.clear();
 	const auto miss = [&] {
+		SRT_PROF_FINISH(prof);
 		if (FrameBreakdown::Enabled()) FrameBreakdown::g_counters.mat_tr_why[miss_why].fetch_add(1, std::memory_order_relaxed);
 		for (const auto& [index, unused]: published) {
 			const auto& op = tape.ops[index];
@@ -2948,6 +2971,28 @@ int SrtWalker::ReplayCfgTrace(std::vector<uint32_t>& flat) {
 	if (reuse) published.reserve(tape.ops.size());
 	for (uint32_t pc = 0;;) {
 		const auto& step = reuse ? steps_ptr[pc] : trace.steps[pc];
+#if KYTY_SRT_PROFILE
+		{
+			int slot = SrtProf::StepEnd;
+			switch (step.kind) {
+				case TraceKind::Exec: {
+					const auto k = tape.ops[step.a].kind;
+					slot = k == ResourcePlan::SrtTape::Kind::RawRead ? SrtProf::StepRead
+					       : k == ResourcePlan::SrtTape::Kind::Inst ? SrtProf::StepAlu
+					       : k == ResourcePlan::SrtTape::Kind::Immediate ? SrtProf::StepImm : SrtProf::StepUserData;
+					break;
+				}
+				case TraceKind::Memo: slot = SrtProf::StepMemo; break;
+				case TraceKind::Flat: slot = SrtProf::StepFlat; break;
+				case TraceKind::Activate: slot = SrtProf::StepActivate; break;
+				case TraceKind::Cond:
+				case TraceKind::CondTri: slot = SrtProf::StepCond; break;
+				case TraceKind::Gather: slot = SrtProf::StepGather; break;
+				default: break;
+			}
+			SRT_PROF_TICK(prof, slot);
+		}
+#endif
 		if (stats) ++n_steps;
 		switch (step.kind) {
 			case TraceKind::Exec: {
@@ -3030,6 +3075,7 @@ int SrtWalker::ReplayCfgTrace(std::vector<uint32_t>& flat) {
 				break;
 			}
 			case TraceKind::End:
+				SRT_PROF_FINISH(prof);
 				++trace.hits;
 				if (stats) {
 					auto& fc = FrameBreakdown::g_counters;
@@ -3190,6 +3236,175 @@ int SrtWalker::RunTape(std::vector<uint32_t>& flat) {
 }
 
 
+namespace {
+inline float TapeFloat32(uint64_t bits) { return std::bit_cast<float>(static_cast<uint32_t>(bits)); }
+// Shared by the tape executor and the compiled executor (KYTY_SRT_COMPILED): one definition of
+// every ALU operation so the two paths cannot diverge.
+inline bool TapeAlu(ValueOpcode opcode, const std::array<uint32_t, 5>& args, uint64_t imm,
+                    const uint64_t* values, uint64_t& result) {
+	const uint64_t a = values[args[0]];
+	const uint64_t b = values[args[1]];
+	const uint64_t c = values[args[2]];
+	switch (opcode) {
+		case ValueOpcode::ReadConst: result = a; break; // CFG scalar aliases
+		case ValueOpcode::BitCastU32F32:
+		case ValueOpcode::BitCastF32U32: result = a; break;
+		case ValueOpcode::ConvertF32U32:
+			result = std::bit_cast<uint32_t>(static_cast<float>(static_cast<uint32_t>(a)));
+			break;
+		case ValueOpcode::ConvertU32F32: {
+			const auto v = TapeFloat32(a);
+			if (!std::isfinite(v) || v < 0.0f || static_cast<double>(v) > UINT32_MAX) {
+				g_tape_stats.failed.fetch_add(1, std::memory_order_relaxed);
+				return false;
+			}
+			result = static_cast<uint32_t>(v);
+			break;
+		}
+		case ValueOpcode::FPTrunc32:
+			result = std::bit_cast<uint32_t>(std::trunc(TapeFloat32(a)));
+			break;
+		case ValueOpcode::FPRecipIFlag32: {
+			const auto exp = (a >> 23u) & 0xffu;
+			if ((a & 0x807fffffu) != 0u || exp == 0u || exp >= 254u) {
+				g_tape_stats.failed.fetch_add(1, std::memory_order_relaxed);
+				return false;
+			}
+			result = (254u - exp) << 23u;
+			break;
+		}
+		case ValueOpcode::FPIsNan32: result = std::isnan(TapeFloat32(a)); break;
+		case ValueOpcode::BitwiseNot32: result = ~static_cast<uint32_t>(a); break;
+		case ValueOpcode::LogicalNot: result = a == 0u; break;
+		case ValueOpcode::CompositeConstructU64:
+			result = static_cast<uint32_t>(a) |
+			         (static_cast<uint64_t>(static_cast<uint32_t>(b)) << 32u);
+			break;
+		case ValueOpcode::CompositeExtractU64:
+			result = static_cast<uint32_t>(a >> (imm * 32u));
+			break;
+		case ValueOpcode::CompositeExtractU32x2: { // used for IAddCarry32
+			const auto sum = static_cast<uint64_t>(static_cast<uint32_t>(a)) +
+			                 static_cast<uint32_t>(b);
+			result = imm == 0u ? static_cast<uint32_t>(sum)
+			                      : static_cast<uint32_t>(sum >> 32u);
+			break;
+		}
+		case ValueOpcode::IAdd32: result = static_cast<uint32_t>(a + b); break;
+		case ValueOpcode::IAdd64: result = a + b; break;
+		case ValueOpcode::ISub32: result = static_cast<uint32_t>(a - b); break;
+		case ValueOpcode::ISub64: result = a - b; break;
+		case ValueOpcode::IMul32: result = static_cast<uint32_t>(a * b); break;
+		case ValueOpcode::IMul64: result = a * b; break;
+		case ValueOpcode::UMulHi:
+			result = (static_cast<uint64_t>(static_cast<uint32_t>(a)) * static_cast<uint32_t>(b)) >> 32u;
+			break;
+		case ValueOpcode::UMin32:
+			result = std::min(static_cast<uint32_t>(a), static_cast<uint32_t>(b));
+			break;
+		case ValueOpcode::FPMul32:
+			result = std::bit_cast<uint32_t>(TapeFloat32(a) * TapeFloat32(b));
+			break;
+		case ValueOpcode::FPOrdLessThanEqual32:
+			result = TapeFloat32(a) <= TapeFloat32(b);
+			break;
+		case ValueOpcode::FPOrdGreaterThanEqual32:
+			result = TapeFloat32(a) >= TapeFloat32(b);
+			break;
+		case ValueOpcode::BitwiseAnd32: result = static_cast<uint32_t>(a & b); break;
+		case ValueOpcode::BitwiseAnd64: result = a & b; break;
+		case ValueOpcode::BitwiseOr32: result = static_cast<uint32_t>(a | b); break;
+		case ValueOpcode::BitwiseXor32: result = static_cast<uint32_t>(a ^ b); break;
+		case ValueOpcode::ShiftLeftLogical32:
+			result = static_cast<uint32_t>(a) << (b & 31u);
+			break;
+		case ValueOpcode::ShiftLeftLogical64: result = a << (b & 63u); break;
+		case ValueOpcode::ShiftRightLogical32:
+			result = static_cast<uint32_t>(a) >> (b & 31u);
+			break;
+		case ValueOpcode::ShiftRightLogical64: result = a >> (b & 63u); break;
+		case ValueOpcode::ShiftRightArithmetic32:
+			result = static_cast<uint32_t>(
+			    std::bit_cast<int32_t>(static_cast<uint32_t>(a)) >> (b & 31u));
+			break;
+		case ValueOpcode::ShiftRightArithmetic64:
+			result = static_cast<uint64_t>(std::bit_cast<int64_t>(a) >> (b & 63u));
+			break;
+		case ValueOpcode::IEqual32:
+			result = static_cast<uint32_t>(a) == static_cast<uint32_t>(b);
+			break;
+		case ValueOpcode::INotEqual32:
+			result = static_cast<uint32_t>(a) != static_cast<uint32_t>(b);
+			break;
+		case ValueOpcode::ULessThan32:
+			result = static_cast<uint32_t>(a) < static_cast<uint32_t>(b);
+			break;
+		case ValueOpcode::ULessThanEqual32:
+			result = static_cast<uint32_t>(a) <= static_cast<uint32_t>(b);
+			break;
+		case ValueOpcode::UGreaterThan32:
+			result = static_cast<uint32_t>(a) > static_cast<uint32_t>(b);
+			break;
+		case ValueOpcode::SGreaterThanEqual32:
+			result = std::bit_cast<int32_t>(static_cast<uint32_t>(a)) >=
+			         std::bit_cast<int32_t>(static_cast<uint32_t>(b));
+			break;
+		case ValueOpcode::LogicalXor: result = (a != 0u) != (b != 0u); break;
+		case ValueOpcode::SelectU32: result = a != 0u ? b : c; break; // synthetic tri-state conditions
+		case ValueOpcode::BitFieldUExtract: {
+			const auto offset = static_cast<uint32_t>(b);
+			const auto width = static_cast<uint32_t>(c);
+			if (offset > 32u || width > 32u - offset) {
+				g_tape_stats.failed.fetch_add(1, std::memory_order_relaxed);
+				return false;
+			}
+			const auto mask = width == 32u ? UINT32_MAX : (width == 0u ? 0u : (1u << width) - 1u);
+			result = width == 0u ? 0u : (static_cast<uint32_t>(a) >> offset) & mask;
+			break;
+		}
+		case ValueOpcode::BitFieldSExtract: {
+			const auto offset = static_cast<uint32_t>(b);
+			const auto width = static_cast<uint32_t>(c);
+			if (offset > 32u || width > 32u - offset) {
+				g_tape_stats.failed.fetch_add(1, std::memory_order_relaxed);
+				return false;
+			}
+			if (width == 0u) {
+				result = 0;
+			} else {
+				const auto mask = width == 32u ? UINT32_MAX : (1u << width) - 1u;
+				auto bits = (static_cast<uint32_t>(a) >> offset) & mask;
+				if (width < 32u && (bits & (1u << (width - 1u))) != 0u) bits |= ~mask;
+				result = bits;
+			}
+			break;
+		}
+		case ValueOpcode::BitFieldInsert: {
+			const uint64_t d = values[args[3]];
+			const auto offset = static_cast<uint32_t>(c);
+			const auto width = static_cast<uint32_t>(d);
+			if (offset > 32u || width > 32u - offset) {
+				g_tape_stats.failed.fetch_add(1, std::memory_order_relaxed);
+				return false;
+			}
+			if (width == 0u) {
+				result = static_cast<uint32_t>(a);
+			} else {
+				const auto mask = width == 32u ? UINT32_MAX : ((1u << width) - 1u) << offset;
+				result = (static_cast<uint32_t>(a) & ~mask) |
+				         ((static_cast<uint32_t>(b) << offset) & mask);
+			}
+			break;
+		}
+		default:
+			g_tape_stats.failed.fetch_add(1, std::memory_order_relaxed);
+			return false;
+	}
+
+	return true;
+}
+} // namespace
+
 bool SrtWalker::ExecuteTapeOp(const ResourcePlan::SrtTape::Op& op,
                               std::vector<uint64_t>& values, uint32_t index) {
 	// Per-op counters are tallied once per RunTape (RunTape::TapeOpTally).
@@ -3269,7 +3484,11 @@ bool SrtWalker::ExecuteTapeOp(const ResourcePlan::SrtTape::Op& op,
 			const bool is_vector = op.opcode == ValueOpcode::LoadBufferU32;
 			const auto reader = (is_vector || op.clean) ? m_runtime.read_specialization_memory
 			                                            : m_runtime.read_memory;
+			SRT_PROF_COUNT(reader_calls, 1);
+			SRT_PROF_COUNT(reader_words, 1);
+			SRT_PROF_LOG(address, 1, is_vector || op.clean);
 			if (reader != nullptr) {
+				SRT_PROF_SCOPE(SrtProf::Reader);
 				if (FrameBreakdown::Enabled()) {
 					auto& fc = FrameBreakdown::g_counters;
 					fc.mat_flat_reads.fetch_add(1, std::memory_order_relaxed);
@@ -3292,170 +3511,13 @@ bool SrtWalker::ExecuteTapeOp(const ResourcePlan::SrtTape::Op& op,
 			result = word;
 			break;
 		}
-		case ResourcePlan::SrtTape::Kind::Inst: {
-			const uint64_t a = values[op.args[0]];
-			const uint64_t b = values[op.args[1]];
-			const uint64_t c = values[op.args[2]];
-			switch (op.opcode) {
-				case ValueOpcode::ReadConst: result = a; break; // CFG scalar aliases
-				case ValueOpcode::BitCastU32F32:
-				case ValueOpcode::BitCastF32U32: result = a; break;
-				case ValueOpcode::ConvertF32U32:
-					result = std::bit_cast<uint32_t>(static_cast<float>(static_cast<uint32_t>(a)));
-					break;
-				case ValueOpcode::ConvertU32F32: {
-					const auto v = Float32(a);
-					if (!std::isfinite(v) || v < 0.0f || static_cast<double>(v) > UINT32_MAX) {
-						g_tape_stats.failed.fetch_add(1, std::memory_order_relaxed);
-						return false;
-					}
-					result = static_cast<uint32_t>(v);
-					break;
-				}
-				case ValueOpcode::FPTrunc32:
-					result = std::bit_cast<uint32_t>(std::trunc(Float32(a)));
-					break;
-				case ValueOpcode::FPRecipIFlag32: {
-					const auto exp = (a >> 23u) & 0xffu;
-					if ((a & 0x807fffffu) != 0u || exp == 0u || exp >= 254u) {
-						g_tape_stats.failed.fetch_add(1, std::memory_order_relaxed);
-						return false;
-					}
-					result = (254u - exp) << 23u;
-					break;
-				}
-				case ValueOpcode::FPIsNan32: result = std::isnan(Float32(a)); break;
-				case ValueOpcode::BitwiseNot32: result = ~static_cast<uint32_t>(a); break;
-				case ValueOpcode::LogicalNot: result = a == 0u; break;
-				case ValueOpcode::CompositeConstructU64:
-					result = static_cast<uint32_t>(a) |
-					         (static_cast<uint64_t>(static_cast<uint32_t>(b)) << 32u);
-					break;
-				case ValueOpcode::CompositeExtractU64:
-					result = static_cast<uint32_t>(a >> (op.imm * 32u));
-					break;
-				case ValueOpcode::CompositeExtractU32x2: { // used for IAddCarry32
-					const auto sum = static_cast<uint64_t>(static_cast<uint32_t>(a)) +
-					                 static_cast<uint32_t>(b);
-					result = op.imm == 0u ? static_cast<uint32_t>(sum)
-					                      : static_cast<uint32_t>(sum >> 32u);
-					break;
-				}
-				case ValueOpcode::IAdd32: result = static_cast<uint32_t>(a + b); break;
-				case ValueOpcode::IAdd64: result = a + b; break;
-				case ValueOpcode::ISub32: result = static_cast<uint32_t>(a - b); break;
-				case ValueOpcode::ISub64: result = a - b; break;
-				case ValueOpcode::IMul32: result = static_cast<uint32_t>(a * b); break;
-				case ValueOpcode::IMul64: result = a * b; break;
-				case ValueOpcode::UMulHi:
-					result = (static_cast<uint64_t>(static_cast<uint32_t>(a)) * static_cast<uint32_t>(b)) >> 32u;
-					break;
-				case ValueOpcode::UMin32:
-					result = std::min(static_cast<uint32_t>(a), static_cast<uint32_t>(b));
-					break;
-				case ValueOpcode::FPMul32:
-					result = std::bit_cast<uint32_t>(Float32(a) * Float32(b));
-					break;
-				case ValueOpcode::FPOrdLessThanEqual32:
-					result = Float32(a) <= Float32(b);
-					break;
-				case ValueOpcode::FPOrdGreaterThanEqual32:
-					result = Float32(a) >= Float32(b);
-					break;
-				case ValueOpcode::BitwiseAnd32: result = static_cast<uint32_t>(a & b); break;
-				case ValueOpcode::BitwiseAnd64: result = a & b; break;
-				case ValueOpcode::BitwiseOr32: result = static_cast<uint32_t>(a | b); break;
-				case ValueOpcode::BitwiseXor32: result = static_cast<uint32_t>(a ^ b); break;
-				case ValueOpcode::ShiftLeftLogical32:
-					result = static_cast<uint32_t>(a) << (b & 31u);
-					break;
-				case ValueOpcode::ShiftLeftLogical64: result = a << (b & 63u); break;
-				case ValueOpcode::ShiftRightLogical32:
-					result = static_cast<uint32_t>(a) >> (b & 31u);
-					break;
-				case ValueOpcode::ShiftRightLogical64: result = a >> (b & 63u); break;
-				case ValueOpcode::ShiftRightArithmetic32:
-					result = static_cast<uint32_t>(
-					    std::bit_cast<int32_t>(static_cast<uint32_t>(a)) >> (b & 31u));
-					break;
-				case ValueOpcode::ShiftRightArithmetic64:
-					result = static_cast<uint64_t>(std::bit_cast<int64_t>(a) >> (b & 63u));
-					break;
-				case ValueOpcode::IEqual32:
-					result = static_cast<uint32_t>(a) == static_cast<uint32_t>(b);
-					break;
-				case ValueOpcode::INotEqual32:
-					result = static_cast<uint32_t>(a) != static_cast<uint32_t>(b);
-					break;
-				case ValueOpcode::ULessThan32:
-					result = static_cast<uint32_t>(a) < static_cast<uint32_t>(b);
-					break;
-				case ValueOpcode::ULessThanEqual32:
-					result = static_cast<uint32_t>(a) <= static_cast<uint32_t>(b);
-					break;
-				case ValueOpcode::UGreaterThan32:
-					result = static_cast<uint32_t>(a) > static_cast<uint32_t>(b);
-					break;
-				case ValueOpcode::SGreaterThanEqual32:
-					result = std::bit_cast<int32_t>(static_cast<uint32_t>(a)) >=
-					         std::bit_cast<int32_t>(static_cast<uint32_t>(b));
-					break;
-				case ValueOpcode::LogicalXor: result = (a != 0u) != (b != 0u); break;
-				case ValueOpcode::SelectU32: result = a != 0u ? b : c; break; // synthetic tri-state conditions
-				case ValueOpcode::BitFieldUExtract: {
-					const auto offset = static_cast<uint32_t>(b);
-					const auto width = static_cast<uint32_t>(c);
-					if (offset > 32u || width > 32u - offset) {
-						g_tape_stats.failed.fetch_add(1, std::memory_order_relaxed);
-						return false;
-					}
-					const auto mask = width == 32u ? UINT32_MAX : (width == 0u ? 0u : (1u << width) - 1u);
-					result = width == 0u ? 0u : (static_cast<uint32_t>(a) >> offset) & mask;
-					break;
-				}
-				case ValueOpcode::BitFieldSExtract: {
-					const auto offset = static_cast<uint32_t>(b);
-					const auto width = static_cast<uint32_t>(c);
-					if (offset > 32u || width > 32u - offset) {
-						g_tape_stats.failed.fetch_add(1, std::memory_order_relaxed);
-						return false;
-					}
-					if (width == 0u) {
-						result = 0;
-					} else {
-						const auto mask = width == 32u ? UINT32_MAX : (1u << width) - 1u;
-						auto bits = (static_cast<uint32_t>(a) >> offset) & mask;
-						if (width < 32u && (bits & (1u << (width - 1u))) != 0u) bits |= ~mask;
-						result = bits;
-					}
-					break;
-				}
-				case ValueOpcode::BitFieldInsert: {
-					const uint64_t d = values[op.args[3]];
-					const auto offset = static_cast<uint32_t>(c);
-					const auto width = static_cast<uint32_t>(d);
-					if (offset > 32u || width > 32u - offset) {
-						g_tape_stats.failed.fetch_add(1, std::memory_order_relaxed);
-						return false;
-					}
-					if (width == 0u) {
-						result = static_cast<uint32_t>(a);
-					} else {
-						const auto mask = width == 32u ? UINT32_MAX : ((1u << width) - 1u) << offset;
-						result = (static_cast<uint32_t>(a) & ~mask) |
-						         ((static_cast<uint32_t>(b) << offset) & mask);
-					}
-					break;
-				}
-				default:
-					g_tape_stats.failed.fetch_add(1, std::memory_order_relaxed);
-					return false;
-			}
+		case ResourcePlan::SrtTape::Kind::Inst:
+			if (!TapeAlu(op.opcode, op.args, op.imm, values.data(), result)) return false;
 			break;
-		}
 	}
 
 	values[index] = result;
+	SRT_PROF_SCOPE(SrtProf::MemoWrite);
 	// A clean op belongs to the clean walker context only. The same IR instruction
 	// may have a separate ordinary op with a different memory-reader domain.
 	if (op.memo_index != UINT32_MAX && op.clean && m_clean_evaluator != nullptr) {
@@ -3474,6 +3536,660 @@ bool SrtWalker::ExecuteTapeOp(const ResourcePlan::SrtTape::Op& op,
 	}
 	return true;
 }
+// --- KYTY_SRT_COMPILED -----------------------------------------------------------------------
+// A compiled plan is the straight-line tape (or the recorded CFG trace trie) lowered to a flat step
+// array. It is not a cache of results: every call re-reads every user-data register and every guest
+// dword, recomputes every pointer and re-tests every branch condition. Adjacent scalar loads from
+// one pointer window are fetched with a single reader call when their addresses are contiguous, and
+// are retried as the original single reads whenever the reader declines the merged request.
+
+namespace {
+
+struct GlobalCompiledStats {
+	std::atomic<uint64_t> calls {0}, compiled {0}, failed {0}, nocfg {0}, cfg {0}, builds {0}, steps {0};
+	std::atomic<uint64_t> reads {0}, read_words {0}, groups_hit {0}, groups_miss {0};
+	std::atomic<uint64_t> spec_recomputed {0}, spec_reused {0}, verify_checks {0}, verify_mismatch {0};
+	std::atomic<uint64_t> mask_calls {0}, mask_first {0}, mask_images {0}, mask_samplers {0}, mask_buffer_fmt {0};
+	std::atomic<uint64_t> mask_buffer_addr {0}, mask_buffer_size {0}, mask_flat {0}, mask_user_data {0}, mask_all_same {0};
+	std::array<std::atomic<uint64_t>, static_cast<size_t>(SrtCompiledFallback::Count)> fallback {};
+} g_compiled_stats;
+
+constexpr uint32_t kMaxCompiledGroup = 16;
+
+bool SrtTapeEnabled() {
+	static const bool enabled = [] {
+		const char* val = std::getenv("KYTY_SRT_TAPE");
+		return val == nullptr || val[0] != '0';
+	}();
+	return enabled;
+}
+
+void CountCompiledFallback(SrtCompiledFallback reason) {
+	g_compiled_stats.fallback[static_cast<size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+}
+
+using CompiledSrt = ResourcePlan::CompiledSrt;
+
+// Immediates are folded into the constant table; every other tape op becomes one step.
+bool LowerTapeOp(const ResourcePlan::SrtTape::Op& op, uint32_t index, CompiledSrt::Step& step) {
+	using Kind  = ResourcePlan::SrtTape::Kind;
+	step        = {};
+	step.out    = index;
+	step.memo   = op.memo_index;
+	step.clean  = op.clean;
+	step.opcode = op.opcode;
+	step.args   = op.args;
+	step.imm    = op.imm;
+	switch (op.kind) {
+		case Kind::Immediate: return false;
+		case Kind::UserData:
+			step.code = CompiledSrt::Code::UserData;
+			step.aux  = op.args[0];
+			return true;
+		case Kind::ShaderBase: step.code = CompiledSrt::Code::ShaderBase; return true;
+		case Kind::RawRead:
+			step.code = CompiledSrt::Code::Read;
+			step.aux  = op.aux;
+			return true;
+		case Kind::Inst: step.code = CompiledSrt::Code::Alu; return true;
+	}
+	return false;
+}
+
+void FoldConstants(const ResourcePlan::SrtTape& tape, CompiledSrt& program) {
+	program.consts.clear();
+	for (uint32_t i = 0; i < tape.ops.size(); ++i) {
+		if (tape.ops[i].kind == ResourcePlan::SrtTape::Kind::Immediate) {
+			program.consts.emplace_back(i, tape.ops[i].imm);
+		}
+	}
+	program.value_count = static_cast<uint32_t>(tape.ops.size());
+}
+
+// Marks runs of adjacent scalar loads that share one pointer (same low/high operands, domain and
+// opcode). Only the first step of a run carries the count; the following steps stay valid single
+// reads, which is what executes when the merged request is declined.
+void FormReadGroups(CompiledSrt& program) {
+	auto& steps         = program.steps;
+	program.read_steps  = 0;
+	program.group_steps = 0;
+	for (size_t i = 0; i < steps.size(); ++i) {
+		if (steps[i].code != CompiledSrt::Code::Read) continue;
+		++program.read_steps;
+		if (steps[i].opcode != ValueOpcode::LoadAddressU32) continue;
+		size_t count = 1;
+		while (count < kMaxCompiledGroup && i + count < steps.size()) {
+			const auto& head = steps[i];
+			const auto& next = steps[i + count];
+			if (next.code != CompiledSrt::Code::Read || next.opcode != head.opcode ||
+			    next.clean != head.clean || next.args[0] != head.args[0] || next.args[1] != head.args[1])
+				break;
+			++count;
+		}
+		if (count > 1) {
+			steps[i].group = static_cast<uint8_t>(count);
+			++program.group_steps;
+			program.read_steps += static_cast<uint32_t>(count - 1);
+			i += count - 1;
+		}
+	}
+}
+
+bool CompileNocfg(const ResourcePlan& plan, const ResourcePlan::SrtTape& tape, CompiledSrt& program) {
+	program.steps.clear();
+	program.reason = 0;
+	FoldConstants(tape, program);
+	program.steps.reserve(tape.ops.size() + plan.srt_reads.size() + 1);
+	CompiledSrt::Step step;
+	for (uint32_t i = 0; i < tape.ops.size(); ++i) {
+		if (LowerTapeOp(tape.ops[i], i, step)) program.steps.push_back(step);
+	}
+	if (tape.slot_ops.size() != plan.srt_reads.size()) return false;
+	for (size_t slot = 0; slot < plan.srt_reads.size(); ++slot) {
+		if (plan.srt_reads[slot].flat_offset >= plan.srt_reads.size() || tape.slot_ops[slot] >= tape.ops.size())
+			return false;
+		step      = {};
+		step.code = CompiledSrt::Code::Flat;
+		step.out  = tape.slot_ops[slot];
+		step.aux  = plan.srt_reads[slot].flat_offset;
+		program.steps.push_back(step);
+	}
+	step      = {};
+	step.code = CompiledSrt::Code::End;
+	program.steps.push_back(step);
+	FormReadGroups(program);
+	return true;
+}
+
+// Lowers the recorded trie. Eval/CondEval steps re-run the recursive walker and cannot be expressed
+// (reason 1). Branch targets are remapped through `landing` because folded immediates disappear.
+bool CompileTrace(const ResourcePlan::SrtTape& tape, const ResourcePlan::CfgTrace& trace, CompiledSrt& program) {
+	using TraceKind = ResourcePlan::CfgTrace::Kind;
+	program.steps.clear();
+	program.reason = 0;
+	FoldConstants(tape, program);
+	const auto&                    src = trace.steps;
+	std::vector<CompiledSrt::Step> lowered(src.size());
+	std::vector<uint8_t>           kept(src.size(), 0u);
+	for (size_t pc = 0; pc < src.size(); ++pc) {
+		const auto& in   = src[pc];
+		auto&       step = lowered[pc];
+		bool        keep = true;
+		switch (in.kind) {
+			case TraceKind::Exec:
+				if (in.a >= tape.ops.size()) return false;
+				keep = LowerTapeOp(tape.ops[in.a], in.a, step);
+				break;
+			case TraceKind::Memo:
+				if (in.a >= tape.ops.size()) return false;
+				step.code  = CompiledSrt::Code::Memo;
+				step.out   = in.a;
+				step.memo  = tape.ops[in.a].memo_index;
+				step.clean = tape.ops[in.a].clean;
+				break;
+			case TraceKind::Flat:
+				if (in.a >= tape.ops.size()) return false;
+				step.code = CompiledSrt::Code::Flat;
+				step.out  = in.a;
+				step.aux  = in.b;
+				break;
+			case TraceKind::Activate:
+				step.code = CompiledSrt::Code::Activate;
+				step.aux  = in.a;
+				break;
+			case TraceKind::Cond:
+			case TraceKind::CondTri:
+				if (in.a >= tape.ops.size()) return false;
+				step.code = in.kind == TraceKind::Cond ? CompiledSrt::Code::Cond : CompiledSrt::Code::CondTri;
+				step.out  = in.a;
+				break;
+			case TraceKind::Gather:
+				step.code = CompiledSrt::Code::Gather;
+				step.aux  = in.a;
+				break;
+			case TraceKind::End: step.code = CompiledSrt::Code::End; break;
+			case TraceKind::Eval:
+			case TraceKind::CondEval: program.reason = 1; return false;
+		}
+		kept[pc] = keep ? 1u : 0u;
+	}
+	// Flat copies and activity marks only consume finished values, so within a straight-line segment
+	// they can be deferred to its end. That makes the loads of one descriptor table adjacent steps,
+	// which FormReadGroups then fetches with one reader call per contiguous run. Segments end at
+	// branches, Gather (its flat slots must be written before it runs) and End, which never move.
+	{
+		std::vector<uint32_t> order(src.size());
+		for (size_t i = 0; i < order.size(); ++i) order[i] = static_cast<uint32_t>(i);
+		size_t seg = 0;
+		for (size_t pc = 0; pc < src.size(); ++pc) {
+			const auto kind = src[pc].kind;
+			if (kind != TraceKind::Cond && kind != TraceKind::CondTri && kind != TraceKind::Gather &&
+			    kind != TraceKind::End)
+				continue;
+			std::stable_partition(order.begin() + static_cast<ptrdiff_t>(seg), order.begin() + static_cast<ptrdiff_t>(pc),
+			                      [&](uint32_t i) { return src[i].kind != TraceKind::Flat && src[i].kind != TraceKind::Activate; });
+			seg = pc + 1;
+		}
+		std::vector<CompiledSrt::Step> lowered_ordered(src.size());
+		std::vector<uint8_t>           kept_ordered(src.size());
+		for (size_t pc = 0; pc < src.size(); ++pc) {
+			lowered_ordered[pc] = lowered[order[pc]];
+			kept_ordered[pc]    = kept[order[pc]];
+		}
+		lowered = std::move(lowered_ordered);
+		kept    = std::move(kept_ordered);
+	}
+	std::vector<uint32_t> landing(src.size(), UINT32_MAX);
+	uint32_t              kept_count = 0;
+	for (size_t pc = 0; pc < src.size(); ++pc) kept_count += kept[pc];
+	uint32_t next_landing = kept_count;
+	uint32_t index        = kept_count;
+	for (size_t pc = src.size(); pc-- > 0;) {
+		if (kept[pc]) next_landing = --index;
+		landing[pc] = next_landing;
+	}
+	std::vector<CompiledSrt::Step> out;
+	out.reserve(kept_count);
+	for (size_t pc = 0; pc < src.size(); ++pc) {
+		if (!kept[pc]) continue;
+		auto step = lowered[pc];
+		if (src[pc].kind == TraceKind::Cond || src[pc].kind == TraceKind::CondTri) {
+			for (size_t k = 0; k < 3; ++k) {
+				const auto target = src[pc].next[k];
+				if (target == UINT32_MAX) continue;
+				if (target >= src.size() || landing[target] >= kept_count) return false;
+				step.next[k] = landing[target];
+			}
+		}
+		out.push_back(step);
+	}
+	if (out.empty() || out.back().code != CompiledSrt::Code::End) return false;
+	program.steps = std::move(out);
+	FormReadGroups(program);
+	return true;
+}
+
+} // namespace
+
+SrtCompiledStats GetSrtCompiledStats() {
+	SrtCompiledStats s;
+	const auto       load = [](const std::atomic<uint64_t>& v) { return v.load(std::memory_order_relaxed); };
+	s.calls               = load(g_compiled_stats.calls);
+	s.compiled            = load(g_compiled_stats.compiled);
+	s.failed              = load(g_compiled_stats.failed);
+	s.nocfg               = load(g_compiled_stats.nocfg);
+	s.cfg                 = load(g_compiled_stats.cfg);
+	s.builds              = load(g_compiled_stats.builds);
+	s.steps               = load(g_compiled_stats.steps);
+	s.reads               = load(g_compiled_stats.reads);
+	s.read_words          = load(g_compiled_stats.read_words);
+	s.groups_hit          = load(g_compiled_stats.groups_hit);
+	s.groups_miss         = load(g_compiled_stats.groups_miss);
+	s.spec_recomputed     = load(g_compiled_stats.spec_recomputed);
+	s.spec_reused         = load(g_compiled_stats.spec_reused);
+	s.verify_checks       = load(g_compiled_stats.verify_checks);
+	s.verify_mismatch     = load(g_compiled_stats.verify_mismatch);
+	s.mask_calls          = load(g_compiled_stats.mask_calls);
+	s.mask_first          = load(g_compiled_stats.mask_first);
+	s.mask_images         = load(g_compiled_stats.mask_images);
+	s.mask_samplers       = load(g_compiled_stats.mask_samplers);
+	s.mask_buffer_fmt     = load(g_compiled_stats.mask_buffer_fmt);
+	s.mask_buffer_addr    = load(g_compiled_stats.mask_buffer_addr);
+	s.mask_buffer_size    = load(g_compiled_stats.mask_buffer_size);
+	s.mask_flat           = load(g_compiled_stats.mask_flat);
+	s.mask_user_data      = load(g_compiled_stats.mask_user_data);
+	s.mask_all_same       = load(g_compiled_stats.mask_all_same);
+	for (size_t i = 0; i < s.fallback.size(); ++i) s.fallback[i] = load(g_compiled_stats.fallback[i]);
+	return s;
+}
+
+const char* SrtCompiledFallbackName(size_t reason) {
+	static const char* const names[] = {"ineligible", "nocfg_unsupported", "cfg_no_trace", "cfg_eval", "cfg_miss"};
+	return reason < std::size(names) ? names[reason] : "unknown";
+}
+
+void SrtCompiledCountSpec(bool recomputed) {
+	(recomputed ? g_compiled_stats.spec_recomputed : g_compiled_stats.spec_reused)
+	    .fetch_add(1, std::memory_order_relaxed);
+}
+
+void SrtCompiledCountMask(bool first, bool images, bool samplers, bool buffer_fmt, bool buffer_addr,
+                          bool buffer_size, bool flat, bool user_data) {
+	auto& st = g_compiled_stats;
+	st.mask_calls.fetch_add(1, std::memory_order_relaxed);
+	if (first) {
+		st.mask_first.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	st.mask_images.fetch_add(images, std::memory_order_relaxed);
+	st.mask_samplers.fetch_add(samplers, std::memory_order_relaxed);
+	st.mask_buffer_fmt.fetch_add(buffer_fmt, std::memory_order_relaxed);
+	st.mask_buffer_addr.fetch_add(buffer_addr, std::memory_order_relaxed);
+	st.mask_buffer_size.fetch_add(buffer_size, std::memory_order_relaxed);
+	st.mask_flat.fetch_add(flat, std::memory_order_relaxed);
+	st.mask_user_data.fetch_add(user_data, std::memory_order_relaxed);
+	if (!images && !samplers && !buffer_fmt && !buffer_addr && !buffer_size && !flat && !user_data)
+		st.mask_all_same.fetch_add(1, std::memory_order_relaxed);
+}
+
+void SrtCompiledCountVerify(bool mismatch) {
+	g_compiled_stats.verify_checks.fetch_add(1, std::memory_order_relaxed);
+	if (mismatch) g_compiled_stats.verify_mismatch.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool SrtWalker::CompiledEligible() const {
+	return m_compiled_enabled && !m_skip_tape && !m_cfg_verifying && !m_scalar_batch_enabled &&
+	       !m_cfg_schedule_enabled && m_active_mask.IsEmpty() &&
+	       (m_clean_evaluator == nullptr || m_clean_evaluator->m_active_mask.IsEmpty()) &&
+	       m_program.srt_plan_complete && SrtTapeEnabled() && !SrtTapeVerifyEnabled();
+}
+
+// Fetches `count` adjacent scalar loads (same pointer) with one reader call per contiguous run.
+// Commits nothing unless every run succeeded, so a declined or failed merge leaves the original
+// single-read steps to execute exactly as before.
+bool SrtWalker::ReadCompiledGroup(const CompiledSrt::Step* steps, uint32_t count,
+                                  std::vector<uint64_t>& values, bool cfg) {
+	const auto& head = steps[0];
+	if (head.clean && (m_clean_evaluator == nullptr || m_runtime.read_specialization_memory == nullptr))
+		return false;
+	const auto  reader = head.clean ? m_runtime.read_specialization_memory : m_runtime.read_memory;
+	const uint64_t low  = values[head.args[0]];
+	const uint64_t high = values[head.args[1]];
+	const auto     base = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
+	std::array<uint64_t, kMaxCompiledGroup> addresses;
+	std::array<uint32_t, kMaxCompiledGroup> words;
+	for (uint32_t i = 0; i < count; ++i) {
+		const auto& step = steps[i];
+		if (step.memo != UINT32_MAX && cfg) {
+			const auto& context = step.clean && m_clean_evaluator != nullptr ? m_clean_evaluator->m_context : m_context;
+			if (step.memo < context.values.size() &&
+			    (context.values[step.memo].generation | 3u) == (context.generation | 3u))
+				return false;
+		}
+		if (step.aux >= m_program.memory_info.size()) return false;
+		const auto immediate = static_cast<int64_t>(static_cast<int32_t>(m_program.memory_info[step.aux].offset));
+		const auto offset    = values[step.args[2]];
+		const auto relative  = (immediate & ~int64_t {3}) + static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
+		if (!AddSignedAddress(base & ~uint64_t {3}, relative, addresses[i])) return false;
+	}
+	for (uint32_t first = 0; first < count;) {
+		uint32_t run = 1;
+		while (first + run < count && addresses[first + run] == addresses[first] + run * 4u) ++run;
+		const std::span<uint32_t> out(words.data() + first, run);
+		SRT_PROF_COUNT(reader_calls, 1);
+		SRT_PROF_COUNT(reader_words, run);
+		SRT_PROF_LOG(addresses[first], run, head.clean != 0);
+		if (reader != nullptr) {
+			SRT_PROF_SCOPE(SrtProf::Reader);
+			if (!reader(m_runtime.userdata, addresses[first], out)) return false;
+		} else {
+			std::memcpy(out.data(), reinterpret_cast<const void*>(addresses[first]), out.size_bytes());
+		}
+		g_compiled_stats.reads.fetch_add(1, std::memory_order_relaxed);
+		first += run;
+	}
+	g_compiled_stats.read_words.fetch_add(count, std::memory_order_relaxed);
+	SRT_PROF_SCOPE(SrtProf::MemoWrite);
+	for (uint32_t i = 0; i < count; ++i) {
+		const auto& step = steps[i];
+		values[step.out] = words[i];
+		if (step.memo != UINT32_MAX) {
+			auto& context = step.clean && m_clean_evaluator != nullptr ? m_clean_evaluator->m_context : m_context;
+			if (step.memo >= context.values.size()) context.values.resize(m_program.evaluation_value_count);
+			context.values[step.memo].value      = words[i];
+			context.values[step.memo].generation = context.generation;
+			if (cfg) m_context.tape_pending.emplace_back(step.out, 0u);
+		}
+	}
+	return true;
+}
+
+int SrtWalker::TryCompiled(std::vector<uint32_t>& flat, bool cfg) {
+	using Code   = CompiledSrt::Code;
+	const size_t variant = m_clean_evaluator != nullptr ? 1 : 0;
+	g_compiled_stats.calls.fetch_add(1, std::memory_order_relaxed);
+	if (!CompiledEligible()) {
+		CountCompiledFallback(SrtCompiledFallback::Ineligible);
+		return -1;
+	}
+	const ResourcePlan::SrtTape* tape_ptr = nullptr;
+	CompiledSrt*                 program  = nullptr;
+	ResourcePlan::CfgTrace*      trace    = nullptr;
+	if (!cfg) {
+		auto& tape = m_program.srt_tapes[variant];
+		if (tape.state == ResourcePlan::SrtTape::State::Unbuilt) {
+			size_t reject_reason = 0;
+			if (BuildTapeForPlan(m_program, m_clean_evaluator != nullptr, m_clean_flat_slots, tape, reject_reason)) {
+				tape.state = ResourcePlan::SrtTape::State::Ready;
+				g_tape_stats.built.fetch_add(1, std::memory_order_relaxed);
+			} else {
+				tape.state = ResourcePlan::SrtTape::State::Unsupported;
+				g_tape_stats.unsupported.fetch_add(1, std::memory_order_relaxed);
+				if (reject_reason < 8) g_tape_stats.reject[reject_reason].fetch_add(1, std::memory_order_relaxed);
+			}
+		}
+		program = &m_program.compiled_nocfg[variant];
+		if (tape.state != ResourcePlan::SrtTape::State::Ready) {
+			CountCompiledFallback(SrtCompiledFallback::NocfgUnsupported);
+			return -1;
+		}
+		if (program->state == CompiledSrt::State::Unbuilt) {
+			program->state = CompileNocfg(m_program, tape, *program) ? CompiledSrt::State::Ready
+			                                                          : CompiledSrt::State::Unsupported;
+			g_compiled_stats.builds.fetch_add(1, std::memory_order_relaxed);
+		}
+		if (program->state != CompiledSrt::State::Ready) {
+			CountCompiledFallback(SrtCompiledFallback::NocfgUnsupported);
+			return -1;
+		}
+		tape_ptr = &tape;
+	} else {
+		trace          = &m_program.cfg_traces[variant];
+		const auto& tape = m_program.cfg_srt_tapes[variant];
+		if (trace->disabled || trace->steps.empty() || tape.state != ResourcePlan::SrtTape::State::Ready ||
+		    trace->strict != (m_runtime.read_specialization_memory != nullptr)) {
+			CountCompiledFallback(SrtCompiledFallback::CfgNoTrace);
+			return -1;
+		}
+		program = &m_program.compiled_cfg[variant];
+		if (program->state == CompiledSrt::State::Unbuilt || program->source_steps != trace->steps.size() ||
+		    program->source_paths != trace->paths) {
+			program->source_steps = static_cast<uint32_t>(trace->steps.size());
+			program->source_paths = trace->paths;
+			program->state = CompileTrace(tape, *trace, *program) ? CompiledSrt::State::Ready
+			                                                      : CompiledSrt::State::Unsupported;
+			g_compiled_stats.builds.fetch_add(1, std::memory_order_relaxed);
+		}
+		if (program->state != CompiledSrt::State::Ready) {
+			CountCompiledFallback(program->reason == 1 ? SrtCompiledFallback::CfgEval
+			                                           : SrtCompiledFallback::CfgNoTrace);
+			return -1;
+		}
+		tape_ptr = &tape;
+	}
+	const auto& tape = *tape_ptr;
+	SRT_PROF_STEPPER(prof);
+	SRT_PROF_TICK(prof, SrtProf::Preamble);
+	SRT_PROF_COUNT(replays, 1);
+	auto&       values = m_context.tape_values;
+	if (values.size() < program->value_count) values.resize(program->value_count);
+	for (const auto& [index, imm]: program->consts) values[index] = imm;
+	auto& active    = m_program.active_sources;
+	auto& published = m_context.tape_pending;
+	if (cfg) {
+		flat.assign(m_program.srt_reads.size(), 0u);
+		active = trace->base_active;
+		published.clear();
+	} else {
+		flat.resize(m_program.srt_reads.size());
+	}
+	const auto context_for = [&](const CompiledSrt::Step& step) -> ResourcePlan::EvaluationContext& {
+		return step.clean && m_clean_evaluator != nullptr ? m_clean_evaluator->m_context : m_context;
+	};
+	const auto store_memo = [&](const CompiledSrt::Step& step, uint64_t result) {
+		if (step.memo == UINT32_MAX) return;
+		SRT_PROF_SCOPE(SrtProf::MemoWrite);
+		auto& context = context_for(step);
+		if (step.memo >= context.values.size()) context.values.resize(m_program.evaluation_value_count);
+		context.values[step.memo].value      = result;
+		context.values[step.memo].generation = context.generation;
+		if (cfg) published.emplace_back(step.out, 0u);
+	};
+	uint64_t executed = 0;
+	uint64_t* v = values.data();
+	const auto* steps = program->steps.data();
+	// A divergence restores the memo slots this replay published, so the recording DFS sees the
+	// same state as after a failed ReplayCfgTrace.
+	const auto miss = [&](bool count_cfg_miss) {
+		SRT_PROF_FINISH(prof);
+		for (const auto& [index, unused]: published) {
+			const auto& op = tape.ops[index];
+			(op.clean && m_clean_evaluator != nullptr ? m_clean_evaluator->m_context : m_context)
+			    .values[op.memo_index].generation = 0;
+		}
+		published.clear();
+		if (m_cfg_gather_enabled) {
+			std::fill(m_cfg_gather_ready_sources.begin(), m_cfg_gather_ready_sources.end(), 0u);
+			if (m_clean_evaluator != nullptr)
+				std::fill(m_clean_evaluator->m_cfg_gather_ready_sources.begin(),
+				          m_clean_evaluator->m_cfg_gather_ready_sources.end(), 0u);
+		}
+		if (count_cfg_miss) {
+			if (++trace->misses > (m_source_reuse_enabled ? 8192u : 256u) && trace->misses > trace->hits)
+				trace->disabled = true;
+			g_tape_stats.cfg_trace_misses.fetch_add(1, std::memory_order_relaxed);
+		}
+		g_compiled_stats.steps.fetch_add(executed, std::memory_order_relaxed);
+		CountCompiledFallback(SrtCompiledFallback::CfgMiss);
+		return -2;
+	};
+	const auto fail = [&]() {
+		SRT_PROF_FINISH(prof);
+		g_compiled_stats.steps.fetch_add(executed, std::memory_order_relaxed);
+		g_compiled_stats.failed.fetch_add(1, std::memory_order_relaxed);
+		g_compiled_stats.compiled.fetch_add(1, std::memory_order_relaxed);
+		g_compiled_stats.nocfg.fetch_add(1, std::memory_order_relaxed);
+		return 0;
+	};
+	for (uint32_t pc = 0;;) {
+		const auto& step = steps[pc];
+#if KYTY_SRT_PROFILE
+		{
+			int slot = SrtProf::StepEnd;
+			switch (step.code) {
+				case Code::UserData:
+				case Code::ShaderBase: slot = SrtProf::StepUserData; break;
+				case Code::Alu: slot = SrtProf::StepAlu; break;
+				case Code::Read: slot = SrtProf::StepRead; break;
+				case Code::Memo: slot = SrtProf::StepMemo; break;
+				case Code::Flat: slot = SrtProf::StepFlat; break;
+				case Code::Activate: slot = SrtProf::StepActivate; break;
+				case Code::Cond:
+				case Code::CondTri: slot = SrtProf::StepCond; break;
+				case Code::Gather: slot = SrtProf::StepGather; break;
+				default: break;
+			}
+			SRT_PROF_TICK(prof, slot);
+		}
+#endif
+		switch (step.code) {
+			case Code::UserData: {
+				if (cfg && step.memo != UINT32_MAX) {
+					const auto& context = context_for(step);
+					if (step.memo < context.values.size() &&
+					    (context.values[step.memo].generation | 3u) == (context.generation | 3u))
+						return miss(true);
+				}
+				const uint32_t reg = step.aux;
+				if (reg < m_program.user_data_base || reg - m_program.user_data_base >= m_runtime.user_data.size()) {
+					g_tape_stats.failed.fetch_add(1, std::memory_order_relaxed);
+					return cfg ? miss(true) : fail();
+				}
+				const auto user_data_index = reg - m_program.user_data_base;
+				if (m_runtime.observe_user_data != nullptr)
+					m_runtime.observe_user_data(m_runtime.user_data_observer_userdata, user_data_index);
+				const uint64_t result = m_runtime.user_data[user_data_index];
+				v[step.out]           = result;
+				store_memo(step, result);
+				++executed;
+				++pc;
+				break;
+			}
+			case Code::ShaderBase: {
+				if (cfg && step.memo != UINT32_MAX) {
+					const auto& context = context_for(step);
+					if (step.memo < context.values.size() &&
+					    (context.values[step.memo].generation | 3u) == (context.generation | 3u))
+						return miss(true);
+				}
+				v[step.out] = m_runtime.shader_base;
+				store_memo(step, m_runtime.shader_base);
+				++executed;
+				++pc;
+				break;
+			}
+			case Code::Alu: {
+				if (cfg && step.memo != UINT32_MAX) {
+					const auto& context = context_for(step);
+					if (step.memo < context.values.size() &&
+					    (context.values[step.memo].generation | 3u) == (context.generation | 3u))
+						return miss(true);
+				}
+				uint64_t result = 0;
+				if (!TapeAlu(step.opcode, step.args, step.imm, v, result)) return cfg ? miss(true) : fail();
+				v[step.out] = result;
+				store_memo(step, result);
+				++executed;
+				++pc;
+				break;
+			}
+			case Code::Read: {
+				if (step.group > 1u) {
+					if (ReadCompiledGroup(&step, step.group, values, cfg)) {
+						g_compiled_stats.groups_hit.fetch_add(1, std::memory_order_relaxed);
+						executed += step.group;
+						pc += step.group;
+						break;
+					}
+					g_compiled_stats.groups_miss.fetch_add(1, std::memory_order_relaxed);
+				}
+				if (cfg && step.memo != UINT32_MAX) {
+					const auto& context = context_for(step);
+					if (step.memo < context.values.size() &&
+					    (context.values[step.memo].generation | 3u) == (context.generation | 3u))
+						return miss(true);
+				}
+				// Single reads keep the tape's exact address, bounds and domain handling.
+				if (!ExecuteTapeOp(tape.ops[step.out], values, step.out)) return cfg ? miss(true) : fail();
+				if (cfg && step.memo != UINT32_MAX) published.emplace_back(step.out, 0u);
+				g_compiled_stats.reads.fetch_add(1, std::memory_order_relaxed);
+				g_compiled_stats.read_words.fetch_add(1, std::memory_order_relaxed);
+				++executed;
+				++pc;
+				break;
+			}
+			case Code::Memo: {
+				const auto& context = context_for(step);
+				if (step.memo >= context.values.size() || context.values[step.memo].generation != context.generation)
+					return miss(true);
+				v[step.out] = context.values[step.memo].value;
+				++pc;
+				break;
+			}
+			case Code::Flat:
+				flat[step.aux] = static_cast<uint32_t>(v[step.out]);
+				++pc;
+				break;
+			case Code::Activate:
+				for (const auto source: m_program.control_flow[step.aux].sources) active[source] = 1u;
+				++pc;
+				break;
+			case Code::Cond: {
+				const auto next = step.next[static_cast<uint32_t>(v[step.out]) != 0u ? 1 : 0];
+				if (next == UINT32_MAX) return miss(true);
+				pc = next;
+				break;
+			}
+			case Code::CondTri: {
+				const auto value = static_cast<uint32_t>(v[step.out]);
+				const auto next  = step.next[value == 2u ? 2 : value != 0u ? 1 : 0];
+				if (next == UINT32_MAX) return miss(true);
+				pc = next;
+				break;
+			}
+			case Code::Gather:
+				if (m_cfg_gather_enabled) {
+					m_cfg_gather_ready_sources[step.aux] = 1u;
+					if (m_clean_evaluator != nullptr) m_clean_evaluator->m_cfg_gather_ready_sources[step.aux] = 1u;
+				}
+				++pc;
+				break;
+			case Code::End: {
+				SRT_PROF_FINISH(prof);
+				if (m_runtime.evaluation_counts) m_runtime.evaluation_counts->tape_ops += executed;
+				if (FrameBreakdown::Enabled()) {
+					auto& fc = FrameBreakdown::g_counters;
+					fc.mat_flat_ops.fetch_add(executed, std::memory_order_relaxed);
+					if (!cfg) fc.mat_flat_nocfg_ops.fetch_add(executed, std::memory_order_relaxed);
+				}
+				g_compiled_stats.steps.fetch_add(executed, std::memory_order_relaxed);
+				g_compiled_stats.compiled.fetch_add(1, std::memory_order_relaxed);
+				(cfg ? g_compiled_stats.cfg : g_compiled_stats.nocfg).fetch_add(1, std::memory_order_relaxed);
+				m_context.refreshed_flat = &flat;
+				if (m_clean_evaluator != nullptr) m_clean_evaluator->m_context.refreshed_flat = &flat;
+				if (cfg) {
+					++trace->hits;
+					g_tape_stats.cfg_trace_hits.fetch_add(1, std::memory_order_relaxed);
+				} else {
+					g_tape_stats.runs.fetch_add(1, std::memory_order_relaxed);
+					g_tape_stats.ops.fetch_add(tape.ops.size(), std::memory_order_relaxed);
+				}
+				return 1;
+			}
+		}
+	}
+}
+
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValueType type) {
 	return RuntimeValidator(program, type).Run(value);
 }

@@ -9,6 +9,7 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 
 class Value;
 struct ResourceSpecializationCache;
+struct ResourceDelta;
 
 using SrtMemoryReader = bool (*)(void* userdata, uint64_t address, std::span<uint32_t> values);
 using SrtUserDataObserver = void (*)(void* userdata, uint32_t index);
@@ -41,6 +42,10 @@ struct SrtRuntime {
 	SrtMemoryReader try_read_specialization_span = nullptr;
 	// Owned by the immutable shader-plan entry. Derived metadata only; never skips reads.
 	ResourceSpecializationCache* specialization_cache = nullptr;
+	// KYTY_SRT_COMPILED: false for frozen/recorded readers whose request granularity matters.
+	bool allow_compiled = true;
+	// Owned by the immutable shader-plan entry (KYTY_SRT_COMPILED): per-program previous outputs.
+	ResourceDelta* delta = nullptr;
 };
 
 enum class RuntimeValueType { Any, Integer };
@@ -71,6 +76,42 @@ struct SrtTapeStats {
 	std::array<uint64_t, 8> reject {}; // rejection reasons, see SrtTapeRejectName
 };
 SrtTapeStats GetSrtTapeStats();
+
+// KYTY_SRT_COMPILED counters (relaxed atomics; reset only by process start).
+enum class SrtCompiledFallback : uint8_t {
+	Ineligible,       // verify/skip/scalar-batch/active-mask or plan incomplete
+	NocfgUnsupported, // tape rejected the plan, or the tape op set cannot be compiled
+	CfgNoTrace,       // CFG plan with no usable recorded trace yet (first sightings, disabled, strict mismatch)
+	CfgEval,          // recorded trace needs the recursive walker (Eval/CondEval) and cannot be compiled
+	CfgMiss,          // branch outcome or memo state diverged from every recorded path
+	Count
+};
+struct SrtCompiledStats {
+	uint64_t calls = 0;           // flat refreshes that considered the compiled executor
+	uint64_t compiled = 0;        // served by the compiled executor (success or walker-equivalent failure)
+	uint64_t failed = 0;          // ... that reported a failure (same as the tape)
+	uint64_t nocfg = 0, cfg = 0;  // compiled calls by plan class
+	uint64_t builds = 0;          // programs compiled (including CFG recompiles after trace growth)
+	uint64_t steps = 0;           // steps executed
+	uint64_t reads = 0;           // guest reader calls issued
+	uint64_t read_words = 0;      // guest dwords requested
+	uint64_t groups_hit = 0;      // merged reads served by one reader call
+	uint64_t groups_miss = 0;     // merged reads that fell back to single reads
+	uint64_t spec_recomputed = 0; // BuildResourceSpecialization runs (delta enabled)
+	uint64_t spec_reused = 0;     // BuildResourceSpecialization skipped by the ChangeMask
+	uint64_t verify_checks = 0;
+	uint64_t verify_mismatch = 0;
+	// ChangeMask counters: calls compared against a previous output, then calls where each part changed.
+	uint64_t mask_calls = 0, mask_first = 0, mask_images = 0, mask_samplers = 0, mask_buffer_fmt = 0;
+	uint64_t mask_buffer_addr = 0, mask_buffer_size = 0, mask_flat = 0, mask_user_data = 0, mask_all_same = 0;
+	std::array<uint64_t, static_cast<size_t>(SrtCompiledFallback::Count)> fallback {};
+};
+SrtCompiledStats GetSrtCompiledStats();
+const char* SrtCompiledFallbackName(size_t reason);
+void SrtCompiledCountSpec(bool recomputed);
+void SrtCompiledCountMask(bool first, bool images, bool samplers, bool buffer_fmt, bool buffer_addr,
+                          bool buffer_size, bool flat, bool user_data);
+void SrtCompiledCountVerify(bool mismatch);
 const char*  SrtTapeRejectName(size_t reason);
 
 // One memoized evaluation session shared by the entire shader resource refresh.
@@ -112,6 +153,12 @@ private:
 	void MergeCfgTrace();
 	bool ExecuteTapeOp(const ResourcePlan::SrtTape::Op& op, std::vector<uint64_t>& values,
 	                   uint32_t index);
+	// KYTY_SRT_COMPILED. 1 = refreshed, 0 = failed (same as the tape), -1 = not served (run the
+	// existing path), -2 = CFG divergence: state restored, go straight to the recording DFS.
+	int  TryCompiled(std::vector<uint32_t>& flat, bool cfg);
+	bool CompiledEligible() const;
+	bool ReadCompiledGroup(const ResourcePlan::CompiledSrt::Step* steps, uint32_t count,
+	                       std::vector<uint64_t>& values, bool cfg);
 
 	const ResourcePlan&              m_program;
 	SrtRuntime                      m_runtime;
@@ -126,6 +173,7 @@ private:
 	bool                            m_cfg_gather_enabled = false;
 	bool                            m_cfg_trace_enabled = false;
 	bool                            m_source_reuse_enabled = false;
+	bool                            m_compiled_enabled = false;
 	// Set while a CFG refresh records its trace; cleared by anything the replay cannot reproduce.
 	bool                            m_cfg_trace_recording = false;
 	std::vector<uint8_t>            m_cfg_gather_ready_sources;

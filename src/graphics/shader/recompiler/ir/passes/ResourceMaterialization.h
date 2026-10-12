@@ -74,6 +74,38 @@ struct ResourceSpecializationCacheStats {
 // Per-thread counters: diagnostics do not introduce contended atomics in draw prep.
 ResourceSpecializationCacheStats GetResourceSpecializationCacheStats();
 
+// KYTY_SRT_COMPILED (part A): the previous outputs of one program (owned by its plan entry) and the
+// per-part change mask of the most recent call against them. Keyed on the program's own last use,
+// not on the previous draw. Compare-then-copy keeps the stored copy current without extra passes.
+struct ResourceChangeMask {
+	bool valid             = false; // a previous successful call existed to compare against
+	bool images            = false;
+	bool samplers          = false;
+	bool buffer_fmt        = false; // stride/format/swizzle words (everything but address and num_records)
+	bool buffer_addr       = false; // dword0 plus dword1[15:0]
+	bool buffer_size       = false; // num_records
+	bool flat_changed      = false;
+	bool user_data_changed = false;
+};
+
+struct ResourceDelta {
+	std::vector<DescriptorValue> images, samplers, buffers;
+	std::vector<uint32_t>        flat, user_data;
+	bool                         have = false;
+	ResourceChangeMask           mask;
+	// Specialization built from the image words below; reused while those words are unchanged.
+	const ResourcePlan*                         owner = nullptr;
+	std::vector<DescriptorValue>                spec_images_in;
+	std::vector<ResourceSpecialization::Image> spec_images_out;
+	bool                                        spec_valid = false;
+	uint64_t                                    verify_ticker = 0;
+	void Reset() {
+		have = spec_valid = false;
+		mask = {};
+		owner = nullptr;
+	}
+};
+
 // A ResourcePlan carries mutable evaluation scratch (value memo, tapes, CFG traces, active_sources,
 // Value::evaluation_index). It is single-threaded by design. The KYTY_DRAWPREP_PREFETCH worker
 // materializes plans off the GPU thread, so every access to a plan's mutable state (any

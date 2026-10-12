@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/renderer/pipeline/resourceMemo.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceFixture.h"
 #include "graphics/shader/recompiler/ir/passes/ResourcePlanFixture.h"
+#include "graphics/shader/recompiler/ir/passes/SrtProf.h"
 
 #include <array>
 #include <algorithm>
@@ -14,6 +15,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -2633,6 +2635,7 @@ void TestResourcePlanFixture() {
 #include "ScalarBatchFixtureTests.inc"
 #include "ScalarBatchMemoTests.inc"
 #include "ResourceSpecializationCacheTests.inc"
+#include "CompiledSrtTests.inc"
 void TestCfgDescriptorGatherMemoShortcut() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   struct Reads { std::vector<uint64_t> addresses; } reads;
@@ -2710,11 +2713,165 @@ void TestCfgDescriptorGatherMemoShortcut() {
         "CFG descriptor gather changed reads/results or did not skip successful memo lookup");
 }
 
+
+// Offline structural dump of one plan's recorded CFG trace trie (--dump-trace): step mix and an
+// abbreviated listing. Diagnostic only.
+static int DumpCfgTrace(const char* file, uint32_t limit) {
+ using namespace Libs::Graphics::ShaderRecompiler::IR;
+ using TK = ResourcePlan::CfgTrace::Kind;
+ using OK = ResourcePlan::SrtTape::Kind;
+ ResourcePlanFixture fx;
+ if (!fx.Load(file)) { std::fprintf(stderr,"dump-trace: load failed\n"); return 2; }
+ auto backing = ResourcePlanFixture::ReplayBacking(fx);
+ for (int i=0;i<4;++i) fx.ReplayPrepared(backing);
+ const size_t variant = fx.plan.cfg_traces[1].steps.size() > fx.plan.cfg_traces[0].steps.size() ? 1 : 0;
+ std::printf("variant=%zu (steps v0=%zu v1=%zu)\n",variant,fx.plan.cfg_traces[0].steps.size(),fx.plan.cfg_traces[1].steps.size());
+ const auto& trace = fx.plan.cfg_traces[variant];
+ const auto& tape = fx.plan.cfg_srt_tapes[variant];
+ std::printf("plan %s: steps=%zu paths=%u hits=%u misses=%u tape_ops=%zu srt_reads=%zu blocks=%zu sources=%zu\n",file,
+  trace.steps.size(),trace.paths,trace.hits,trace.misses,tape.ops.size(),fx.plan.srt_reads.size(),
+  fx.plan.control_flow.size(),fx.plan.descriptor_sources.size());
+ std::map<std::string,uint32_t> mix;
+ uint32_t shown=0;
+ // One path only: follow the trie from step 0 taking the first recorded outcome.
+ std::vector<uint32_t> path;
+ for (uint32_t pc=0; pc<trace.steps.size();) {
+  const auto& st=trace.steps[pc]; path.push_back(pc);
+  if (st.kind==TK::End) break;
+  if (st.kind==TK::Cond||st.kind==TK::CondTri||st.kind==TK::CondEval) {
+   uint32_t nx=UINT32_MAX; for (auto n: st.next) if (n!=UINT32_MAX) { nx=n; break; }
+   if (nx==UINT32_MAX) break; pc=nx;
+  } else ++pc;
+ }
+ std::printf("first path length=%zu\n",path.size());
+ for (auto pc: path) {
+  const auto& st=trace.steps[pc];
+  std::string key;
+  switch (st.kind) {
+   case TK::Exec: { const auto& op=tape.ops[st.a];
+     key = op.kind==OK::Immediate?"Exec:Imm":op.kind==OK::UserData?"Exec:UserData":op.kind==OK::ShaderBase?"Exec:ShaderBase":
+       op.kind==OK::RawRead?std::string("Exec:Read:")+std::string(ValueOpcodeName(op.opcode)):std::string("Exec:Alu:")+std::string(ValueOpcodeName(op.opcode));
+     key += op.memo_index!=UINT32_MAX?"(memo)":"(nomemo)"; break; }
+   case TK::Memo: key="Memo"; break; case TK::Flat: key="Flat"; break; case TK::Activate: key="Activate"; break;
+   case TK::Cond: key="Cond"; break; case TK::CondTri: key="CondTri"; break; case TK::Eval: key="Eval"; break;
+   case TK::CondEval: key="CondEval"; break; case TK::Gather: key="Gather"; break; case TK::End: key="End"; break;
+  }
+  ++mix[key];
+  if (shown<limit) {
+   ++shown;
+   if (st.kind==TK::Exec) { const auto& op=tape.ops[st.a];
+    if (op.kind==OK::RawRead) { const auto& mi=fx.plan.memory_info[op.aux];
+     std::printf("  [%u] READ op%u %s lo=op%u hi=op%u off=op%u imm=%d\n",pc,st.a,std::string(ValueOpcodeName(op.opcode)).c_str(),op.args[0],op.args[1],op.args[2],static_cast<int32_t>(mi.offset)); }
+    else std::printf("  [%u] op%u kind=%d %s a=%u,%u,%u imm=%llu\n",pc,st.a,(int)op.kind,std::string(ValueOpcodeName(op.opcode)).c_str(),op.args[0],op.args[1],op.args[2],(unsigned long long)op.imm);
+   } else std::printf("  [%u] %s a=%u b=%u\n",pc,st.kind==TK::Cond?"Cond":st.kind==TK::CondTri?"CondTri":st.kind==TK::Flat?"Flat":st.kind==TK::Memo?"Memo":st.kind==TK::Activate?"Activate":st.kind==TK::Gather?"Gather":"Other",st.a,st.b);
+  }
+ }
+ std::printf("first-path step mix:\n");
+ for (auto& [k,v]: mix) std::printf("  %5u  %s\n",v,k.c_str());
+ return 0;
+}
+
+#if KYTY_SRT_PROFILE
+// --profile-plans: TSC breakdown of CFG plan materialization (offline, hashed fixture reader). Counts
+// every heap allocation made during a call via the replaced global operator new below.
+static uint64_t g_alloc_count = 0, g_alloc_bytes = 0;
+static std::vector<size_t>* g_alloc_log = nullptr;
+void* operator new(size_t n) { ++g_alloc_count; g_alloc_bytes += n; if (g_alloc_log) g_alloc_log->push_back(n); void* p = std::malloc(n ? n : 1); return p; }
+void* operator new[](size_t n) { ++g_alloc_count; g_alloc_bytes += n; void* p = std::malloc(n ? n : 1); return p; }
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete[](void* p) noexcept { std::free(p); }
+void operator delete(void* p, size_t) noexcept { std::free(p); }
+void operator delete[](void* p, size_t) noexcept { std::free(p); }
+
+static int ProfilePlans(const char* directory, uint64_t iterations, bool compiled, bool all_plans) {
+ using namespace Libs::Graphics::ShaderRecompiler::IR;
+ std::error_code ec;
+ std::vector<std::filesystem::path> paths;
+ for (std::filesystem::directory_iterator it(directory, ec), end; !ec && it != end; it.increment(ec))
+  if (it->is_regular_file(ec) && it->path().extension() == ".rpf") paths.push_back(it->path());
+ std::sort(paths.begin(), paths.end());
+ // TSC rate and per-probe overhead.
+ const auto c0 = std::chrono::steady_clock::now(); const uint64_t t0 = __rdtsc();
+ while (std::chrono::steady_clock::now() - c0 < std::chrono::milliseconds(200)) {}
+ const double ghz = double(__rdtsc() - t0) / double(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - c0).count());
+ SrtProf::g = {}; SrtProf::g.enabled = true;
+ for (int i = 0; i < 1000000; ++i) { SRT_PROF_SCOPE(SrtProf::Preamble); }
+ const double scope_cycles = double(SrtProf::g.cycles[SrtProf::Preamble]) / 1e6;
+ SrtProf::g = {};
+ std::printf("profile: executor=%s tsc=%.3f GHz scope_pair_overhead=%.1f cycles (%.1f ns)\n", compiled ? "compiled" : "trace-replay", ghz, scope_cycles, scope_cycles / ghz);
+ struct Row { std::string name; double total_ns = 0, ns[SrtProf::Count] = {}; double steps = 0, rcalls = 0, rwords = 0, allocs = 0, alloc_bytes = 0, eval_cnt = 0; };
+ std::vector<Row> rows;
+ CompiledSrtTest::SetCompiled(compiled);
+ for (const auto& path : paths) {
+  ResourcePlanFixture fx;
+  if (!fx.Load(path.string())) return 2;
+  if (!all_plans && fx.plan.control_flow.empty()) continue;
+  auto backing = ResourcePlanFixture::ReplayBacking(fx);
+  backing.BuildFast();
+  for (int w = 0; w < 50; ++w) { const auto r = fx.ReplayPrepared(backing); if (!r.matched) { std::fprintf(stderr, "profile: mismatch %s\n", path.string().c_str()); return 1; } }
+  { static std::vector<size_t> log; log.reserve(64); g_alloc_log = &log; fx.ReplayPrepared(backing); g_alloc_log = nullptr;
+    std::printf("allocs %s:", path.filename().string().c_str()); for (auto v : log) std::printf(" %zu", v); std::printf("\n"); log.clear(); }
+  SrtProf::g.enabled = false;
+  const auto a0 = g_alloc_count, b0 = g_alloc_bytes;
+  const auto start = std::chrono::steady_clock::now();
+  for (uint64_t i = 0; i < iterations; ++i) fx.ReplayPrepared(backing);
+  const double ns_plain = double(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()) / iterations;
+  const double allocs = double(g_alloc_count - a0) / iterations, abytes = double(g_alloc_bytes - b0) / iterations;
+  // Reader isolation: log one call's reader sequence, then replay it in bulk (no per-call probes).
+  std::vector<SrtProf::Data::Call> calls;
+  { SrtProf::g = {}; SrtProf::g.log = &calls; fx.ReplayPrepared(backing); SrtProf::g.log = nullptr; }
+  double reader_bulk_ns = 0, capture_bulk_ns = 0;
+  { std::array<uint32_t, 16> out{}; std::vector<std::pair<uint64_t, uint64_t>> ranges; ranges.reserve(calls.size());
+    const uint64_t reps = 2000; uint64_t sink = 0;
+    auto t = std::chrono::steady_clock::now();
+    for (uint64_t r = 0; r < reps; ++r) for (const auto& c : calls) { backing.Read(c.strict, c.address, std::span<uint32_t>(out.data(), c.words)); sink += out[0]; }
+    reader_bulk_ns = double(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t).count()) / reps;
+    t = std::chrono::steady_clock::now();
+    for (uint64_t r = 0; r < reps; ++r) { ranges.clear(); for (const auto& c : calls) { backing.Read(c.strict, c.address, std::span<uint32_t>(out.data(), c.words)); ranges.emplace_back(c.address, c.words * 4ull); sink += out[0]; } }
+    capture_bulk_ns = double(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t).count()) / reps;
+    if (sink == 42) std::printf(" ");
+    std::printf("reader-isolated %s: calls=%zu fixture_read_us=%.2f (%.1f ns/call) +capture_push_us=%.2f\n", path.filename().string().c_str(), calls.size(), reader_bulk_ns / 1000, reader_bulk_ns / calls.size(), capture_bulk_ns / 1000); }
+  SrtProf::g = {}; SrtProf::g.enabled = true;
+  for (uint64_t i = 0; i < iterations; ++i) fx.ReplayPrepared(backing);
+  SrtProf::g.enabled = false;
+  Row row; row.name = path.filename().string(); row.total_ns = ns_plain;
+  for (int k = 0; k < SrtProf::Count; ++k) row.ns[k] = double(SrtProf::g.cycles[k]) / ghz / iterations;
+  row.steps = double(SrtProf::g.steps) / iterations; row.rcalls = double(SrtProf::g.reader_calls) / iterations;
+  row.rwords = double(SrtProf::g.reader_words) / iterations; row.allocs = allocs; row.alloc_bytes = abytes;
+  row.eval_cnt = double(SrtProf::g.count[SrtProf::EvalDesc]) / iterations;
+  rows.push_back(row);
+ }
+ CompiledSrtTest::SetCompiled(false);
+ std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.total_ns > b.total_ns; });
+ const auto print = [&](const Row& r) {
+  std::printf("%s plain_us=%.2f | profiled(us): Mat=%.2f Refresh=%.2f EvalDesc=%.2f (n=%.0f) | Pre=%.2f UD=%.2f Alu=%.2f Read=%.2f[Reader=%.2f MemoW=%.2f] Imm=%.2f Memo=%.2f Flat=%.2f Act=%.2f Cond=%.2f Gath=%.2f End=%.2f | steps=%.0f rcalls=%.0f rwords=%.0f allocs=%.2f (%.0f B)\n",
+   r.name.c_str(), r.total_ns / 1000, r.ns[SrtProf::MatTotal] / 1000, r.ns[SrtProf::Refresh] / 1000, r.ns[SrtProf::EvalDesc] / 1000, r.eval_cnt,
+   r.ns[SrtProf::Preamble] / 1000, r.ns[SrtProf::StepUserData] / 1000, r.ns[SrtProf::StepAlu] / 1000, r.ns[SrtProf::StepRead] / 1000,
+   r.ns[SrtProf::Reader] / 1000, r.ns[SrtProf::MemoWrite] / 1000, r.ns[SrtProf::StepImm] / 1000, r.ns[SrtProf::StepMemo] / 1000,
+   r.ns[SrtProf::StepFlat] / 1000, r.ns[SrtProf::StepActivate] / 1000, r.ns[SrtProf::StepCond] / 1000, r.ns[SrtProf::StepGather] / 1000,
+   r.ns[SrtProf::StepEnd] / 1000, r.steps, r.rcalls, r.rwords, r.allocs, r.alloc_bytes);
+ };
+ for (const auto& r : rows) print(r);
+ Row avg; avg.name = "AVERAGE";
+ for (const auto& r : rows) { avg.total_ns += r.total_ns; for (int k = 0; k < SrtProf::Count; ++k) avg.ns[k] += r.ns[k];
+  avg.steps += r.steps; avg.rcalls += r.rcalls; avg.rwords += r.rwords; avg.allocs += r.allocs; avg.alloc_bytes += r.alloc_bytes; avg.eval_cnt += r.eval_cnt; }
+ const double n = double(rows.size());
+ avg.total_ns /= n; for (auto& v : avg.ns) v /= n; avg.steps /= n; avg.rcalls /= n; avg.rwords /= n; avg.allocs /= n; avg.alloc_bytes /= n; avg.eval_cnt /= n;
+ print(avg);
+ return 0;
+}
+#endif
+
 int main(int argc, char **argv) {
   Common::RuntimeFlags::Refresh(true);
+  // The legacy cases assert exact reader-call counts; the compiled executor merges adjacent loads.
+  // Run them on the existing path and re-apply the requested flag for the modes that measure it.
+  const bool want_compiled = CompiledSrtTest::CompiledRequested();
+  CompiledSrtTest::SetCompiled(false);
   TestResourceSpecializationCacheTransitions();
   TestCfgDescriptorGatherMemoShortcut();
   if ((argc == 3 || argc == 4) && std::strcmp(argv[1], "--benchmark-resource-memo") == 0) {
+    CompiledSrtTest::SetCompiled(want_compiled);
     uint64_t iterations = 1000;
     if (argc == 4) {
       char* end = nullptr;
@@ -2733,14 +2890,41 @@ int main(int argc, char **argv) {
   TestScalarBatchDomainsFailureAndActivity();
   TestScalarBatchFixtureCaptureAndReplay();
   TestScalarBatchMemoCaptureHitAndFlagFlip();
-  if (argc == 3 && std::strcmp(argv[1], "--replay-plan") == 0) return ReplayPlanFixture(argv[2]);
+  CompiledSrtTest::TestChangedRegisterMemoryAndBranch();
+  if (argc == 3 && std::strcmp(argv[1], "--replay-plan") == 0) {
+    CompiledSrtTest::SetCompiled(want_compiled);
+    const int status = ReplayPlanFixture(argv[2]);
+    CompiledSrtTest::SetCompiled(false);
+    if (status != 0) return status;
+    // Same capture through the compiled executor: identical outcome, outputs and read sequence on the
+    // captured inputs and on perturbed registers, memory and branch conditions.
+    return CompiledSrtTest::DifferentialFile(argv[2], 64, true);
+  }
+  if (argc >= 3 && std::strcmp(argv[1], "--compiled-differential") == 0) {
+    const uint32_t perturbations = argc == 4 ? static_cast<uint32_t>(std::strtoul(argv[3], nullptr, 10)) : 200;
+    return CompiledSrtTest::Differential(argv[2], perturbations);
+  }
+#if KYTY_SRT_PROFILE
+  if (argc >= 3 && (std::strcmp(argv[1], "--profile-plans") == 0 || std::strcmp(argv[1], "--profile-plans-compiled") == 0)) {
+    const uint64_t iterations = argc >= 4 ? std::strtoull(argv[3], nullptr, 10) : 3000;
+    return ProfilePlans(argv[2], iterations, std::strcmp(argv[1], "--profile-plans-compiled") == 0, argc >= 5);
+  }
+#endif
+  if ((argc == 3 || argc == 4) && std::strcmp(argv[1], "--dump-trace") == 0) {
+    CompiledSrtTest::SetCompiled(want_compiled);
+    return DumpCfgTrace(argv[2], argc == 4 ? static_cast<uint32_t>(std::strtoul(argv[3], nullptr, 10)) : 120);
+  }
   if ((argc == 3 || argc == 4) && std::strcmp(argv[1], "--benchmark-plans") == 0) {
     char* end = nullptr;
     const uint64_t iterations = argc == 4 ? std::strtoull(argv[3], &end, 10) : 100;
     if (argc == 4 && (!end || *end != '\0')) {
       std::fprintf(stderr, "plan benchmark: invalid iteration count: %s\n", argv[3]); return 2;
     }
-    return BenchmarkResourcePlans(argv[2], iterations);
+    CompiledSrtTest::SetCompiled(want_compiled);
+    const int status = BenchmarkResourcePlans(argv[2], iterations);
+    CompiledSrtTest::SetCompiled(false);
+    if (status != 0) return status;
+    return CompiledSrtTest::Benchmark(argv[2], iterations);
   }
   TestResourcePlanFixture();
   if (argc >= 3 && std::strcmp(argv[1], "--inspect-fixture") == 0) {

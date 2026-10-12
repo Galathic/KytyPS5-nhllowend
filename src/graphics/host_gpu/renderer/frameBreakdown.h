@@ -16,6 +16,7 @@
 
 #include "common/runtimeFlags.h"
 #include "graphics/shader/recompiler/ir/ResourceSnapshot.h"
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 // KYTY_PERF_STATS=1 frame time breakdown. Prints one line about once per second:
 //   NHL27FRAME fps=... frame=... gpu_thread_busy=... wait_gpu=... readback=... faults=...
@@ -1058,6 +1059,35 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 					            per(Take(dl.gen_delete)), per(Take(dl.gen_rebind)), per(Take(dl.gen_dirty_skipped)),
 					            per(Take(dl.gen_untrack_skipped)), per(Take(dl.rej_gen_overlap)),
 						            per(Take(dl.rej_gen_overrun)), per(Take(dl.gen_log_scans)));
+				if (Common::RuntimeFlags::Current().srt_compiled) {
+					static ShaderRecompiler::IR::SrtCompiledStats last_cs {};
+					const auto cs = ShaderRecompiler::IR::GetSrtCompiledStats();
+					const auto d  = [&](uint64_t now, uint64_t before) { return per(now - before); };
+					uint64_t fb_now = 0, fb_before = 0;
+					for (size_t i = 0; i < cs.fallback.size(); ++i) { fb_now += cs.fallback[i]; fb_before += last_cs.fallback[i]; }
+					const double served = static_cast<double>(cs.compiled - last_cs.compiled);
+					const double total  = served + static_cast<double>(fb_now - fb_before);
+					const double mc     = static_cast<double>(cs.mask_calls - last_cs.mask_calls - (cs.mask_first - last_cs.mask_first));
+					const auto   mp     = [&](uint64_t now, uint64_t before) { return mc > 0 ? 100.0 * static_cast<double>(now - before) / mc : 0.0; };
+					std::printf("NHL27COMPILED coverage=%.1f%% compiled=%.1f nocfg=%.1f cfg=%.1f failed=%.1f fb_ineligible=%.1f "
+					            "fb_nocfg_unsup=%.1f fb_cfg_no_trace=%.1f fb_cfg_eval=%.1f fb_cfg_miss=%.1f builds=%.1f "
+					            "reads=%.1f words=%.1f groups_hit=%.1f groups_miss=%.1f spec_recompute=%.1f spec_reuse=%.1f "
+					            "verify_checks=%.1f verify_mismatch=%.1f mask_img=%.1f%% mask_smp=%.1f%% mask_fmt=%.1f%% "
+					            "mask_addr=%.1f%% mask_size=%.1f%% mask_flat=%.1f%% mask_ud=%.1f%% mask_all_same=%.1f%%\n",
+					            total > 0 ? 100.0 * served / total : 0.0, d(cs.compiled, last_cs.compiled), d(cs.nocfg, last_cs.nocfg),
+					            d(cs.cfg, last_cs.cfg), d(cs.failed, last_cs.failed), d(cs.fallback[0], last_cs.fallback[0]),
+					            d(cs.fallback[1], last_cs.fallback[1]), d(cs.fallback[2], last_cs.fallback[2]),
+					            d(cs.fallback[3], last_cs.fallback[3]), d(cs.fallback[4], last_cs.fallback[4]),
+					            d(cs.builds, last_cs.builds), d(cs.reads, last_cs.reads), d(cs.read_words, last_cs.read_words),
+					            d(cs.groups_hit, last_cs.groups_hit), d(cs.groups_miss, last_cs.groups_miss),
+					            d(cs.spec_recomputed, last_cs.spec_recomputed), d(cs.spec_reused, last_cs.spec_reused),
+					            d(cs.verify_checks, last_cs.verify_checks), d(cs.verify_mismatch, last_cs.verify_mismatch),
+					            mp(cs.mask_images, last_cs.mask_images), mp(cs.mask_samplers, last_cs.mask_samplers),
+					            mp(cs.mask_buffer_fmt, last_cs.mask_buffer_fmt), mp(cs.mask_buffer_addr, last_cs.mask_buffer_addr),
+					            mp(cs.mask_buffer_size, last_cs.mask_buffer_size), mp(cs.mask_flat, last_cs.mask_flat),
+					            mp(cs.mask_user_data, last_cs.mask_user_data), mp(cs.mask_all_same, last_cs.mask_all_same));
+					last_cs = cs;
+				}
 			}
 		}
 		std::printf("NHL27BUFFERS vertex_index=%.2fms indirect=%.2fms find=%.2fms bda=%.2fms "

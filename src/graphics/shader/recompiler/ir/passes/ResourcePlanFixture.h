@@ -55,10 +55,18 @@ struct ResourcePlanFixture {
  std::vector<uint8_t> active;
  uint64_t captured_ops = 0;
  uint64_t captured_recursive_ops = 0, captured_tape_ops = 0;
- static uint64_t OpcodeSchema() {
+ // Opcodes added after a capture was recorded (native packed-f16, 2026-10-11) were inserted
+ // mid-enum. Captures from before that point are loaded by skipping them in the schema
+ // and shifting later numeric ids; a skip count of zero is the current schema.
+ static bool LegacyOpcodeSkipped(ValueOpcode op) {
+  return op == ValueOpcode::FPAdd16x2 || op == ValueOpcode::FPMul16x2 ||
+         op == ValueOpcode::FPFma16x2 || op == ValueOpcode::FPClamp16x2;
+ }
+ static uint64_t OpcodeSchema(bool legacy = false) {
   uint64_t hash = 14695981039346656037ull;
   for (uint32_t i = 0; i < static_cast<uint32_t>(ValueOpcode::Count); ++i) {
    const auto op = static_cast<ValueOpcode>(i);
+   if (legacy && LegacyOpcodeSkipped(op)) continue;
    for (unsigned char c : ValueOpcodeName(op)) { hash ^= c; hash *= 1099511628211ull; }
    hash ^= NumArgsOf(op); hash *= 1099511628211ull;
   }
@@ -73,6 +81,8 @@ struct ResourcePlanFixture {
   bool ok = true;
   std::unordered_map<const Inst*, uint32_t> ids;
   std::vector<Inst*> nodes;
+  // Legacy capture: numeric opcodes at or above this id move up by legacy_shift.
+  uint32_t legacy_first = UINT32_MAX, legacy_shift = 0;
   void operator()(bool& v) { uint32_t n = v; (*this)(n); if (n > 1) ok = false; v = n != 0; }
   template<class T> requires(std::is_integral_v<T> && !std::is_same_v<T, bool>)
   void operator()(T& v) {
@@ -187,6 +197,7 @@ struct ResourcePlanFixture {
     uint64_t flags = input ? 0 : nodes[i]->Flags<uint64_t>();
     uint32_t n = input ? 0 : static_cast<uint32_t>(nodes[i]->NumArgs());
     Fields(op,flags,n);
+    if (input && static_cast<uint32_t>(op) >= legacy_first) op = static_cast<ValueOpcode>(static_cast<uint32_t>(op) + legacy_shift);
     if (op >= ValueOpcode::Count || n > 1048576 || (op != ValueOpcode::Phi && n != NumArgsOf(op))) { ok = false; return; }
     arities.push_back(n);
     if (input) { p.value_storage.emplace_back(op,flags); nodes.push_back(&p.value_storage.back()); }
@@ -242,7 +253,15 @@ struct ResourcePlanFixture {
   Archive a {.input = &in}; uint32_t version = 0, opcode_count = 0;
   uint64_t schema = 0;
   a.Fields(version,opcode_count,schema);
-  if (!a.ok || version != 1 || opcode_count != static_cast<uint32_t>(ValueOpcode::Count) || schema != OpcodeSchema()) return false;
+  if (!a.ok || version != 1) return false;
+  if (opcode_count != static_cast<uint32_t>(ValueOpcode::Count) || schema != OpcodeSchema()) {
+   uint32_t skipped = 0, first = UINT32_MAX;
+   for (uint32_t i = 0; i < static_cast<uint32_t>(ValueOpcode::Count); ++i)
+    if (LegacyOpcodeSkipped(static_cast<ValueOpcode>(i))) { ++skipped; first = std::min(first,i); }
+    // The four skipped opcodes are contiguous, so one shift reconstructs the current numbering.
+   if (opcode_count + skipped != static_cast<uint32_t>(ValueOpcode::Count) || schema != OpcodeSchema(true)) return false;
+   a.legacy_first = first; a.legacy_shift = skipped;
+  }
   a.Plan(plan);
   a.Fields(user_data,workgroups,shader_base,ordinary_reader,strict_reader,success,reads,
    expected,specialization,active,captured_ops,captured_recursive_ops,captured_tape_ops);
@@ -266,6 +285,7 @@ struct ResourcePlanFixture {
   ResourceSnapshot actual;
   ResourceSpecialization specialization;
   ResourceSpecializationCache specialization_cache;
+  ResourceDelta delta; // KYTY_SRT_COMPILED part A (only attached while the flag is on)
   uint64_t conflict_count = 0;
   ReplayBacking() = default;
   explicit ReplayBacking(const ResourcePlanFixture& fixture) {
@@ -278,6 +298,36 @@ struct ResourcePlanFixture {
     if (!inserted && (it->second.valid != w.valid || (w.valid && it->second.value != w.value))) ++conflict_count;
    }
   }
+  // Bench-only hashed index (KYTY_SRT_COMPILED comparison): the std::map lookup dominates small plans.
+  struct FastSlot { uint64_t key = ~uint64_t{0}; Word word {0,false}; };
+  std::vector<FastSlot> fast_table;
+  uint64_t fast_mask = 0;
+  bool fast = false;
+  void BuildFast() {
+   size_t size = 16;
+   while (size < words.size() * 2 + 2) size <<= 1;
+   fast_table.assign(size,{}); fast_mask = size - 1;
+   for (const auto& [k,w] : words) {
+    const uint64_t key = k.second | (k.first ? (uint64_t{1} << 63) : 0);
+    size_t at = static_cast<size_t>((key * 0x9e3779b97f4a7c15ull) >> 20) & fast_mask;
+    while (fast_table[at].key != ~uint64_t{0}) at = (at + 1) & fast_mask;
+    fast_table[at] = {key,w};
+   }
+   fast = true;
+  }
+  const Word* Find(bool strict, uint64_t address) const {
+   if (fast && !(address >> 63)) {
+    const uint64_t key = address | (strict ? (uint64_t{1} << 63) : 0);
+    size_t at = static_cast<size_t>((key * 0x9e3779b97f4a7c15ull) >> 20) & fast_mask;
+    while (fast_table[at].key != ~uint64_t{0}) {
+     if (fast_table[at].key == key) return &fast_table[at].word;
+     at = (at + 1) & fast_mask;
+    }
+    return nullptr;
+   }
+   auto found = words.find({strict,address});
+   return found == words.end() ? nullptr : &found->second;
+  }
   bool Read(bool strict, uint64_t address, std::span<uint32_t> out) {
    ++result.requests; result.words += out.size();
    if (strict) ++result.strict_calls; else ++result.ordinary_calls;
@@ -287,9 +337,9 @@ struct ResourcePlanFixture {
    bool failed = false, missing = false;
    scratch.resize(out.size());
    for (size_t i = 0; i < out.size(); ++i) {
-    auto found = words.find({strict,address+i*sizeof(uint32_t)});
-    if (found == words.end()) { missing = true; continue; }
-    failed |= !found->second.valid; scratch[i] = found->second.value;
+    const Word* found = Find(strict,address+i*sizeof(uint32_t));
+    if (!found) { missing = true; continue; }
+    failed |= !found->valid; scratch[i] = found->value;
    }
    if (missing) ++result.missing;
    if (missing || failed) return false;
@@ -299,9 +349,9 @@ struct ResourcePlanFixture {
    if (out.size() > (std::numeric_limits<uint64_t>::max() - address) / sizeof(uint32_t)) return false;
    scratch.resize(out.size());
    for (size_t i = 0; i < out.size(); ++i) {
-    auto found = words.find({strict,address+i*sizeof(uint32_t)});
-    if (found == words.end() || !found->second.valid) return false;
-    scratch[i] = found->second.value;
+    const Word* found = Find(strict,address+i*sizeof(uint32_t));
+    if (!found || !found->valid) return false;
+    scratch[i] = found->value;
    }
    ++result.requests; result.words += out.size();
    if (strict) ++result.strict_calls; else ++result.ordinary_calls;
@@ -316,6 +366,7 @@ struct ResourcePlanFixture {
   SrtRuntime runtime {.user_data=user_data,.shader_base=shader_base,.userdata=&backing,.workgroup_counts=workgroups};
   if (Common::RuntimeFlags::Current().resource_spec_cache)
    runtime.specialization_cache = &backing.specialization_cache;
+  if (Common::RuntimeFlags::Current().srt_compiled) runtime.delta = &backing.delta;
   if (ordinary_reader) runtime.read_memory = +[](void* p,uint64_t a,std::span<uint32_t> v) { return static_cast<ReplayBacking*>(p)->Read(false,a,v); };
   else runtime.read_memory = +[](void* p,uint64_t,std::span<uint32_t>) {
    auto& r = static_cast<ReplayBacking*>(p)->result; ++r.ordinary_calls; ++r.missing; return false;

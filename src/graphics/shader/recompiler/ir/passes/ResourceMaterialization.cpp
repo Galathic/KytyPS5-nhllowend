@@ -1,6 +1,7 @@
 #include "common/runtimeFlags.h"
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "graphics/shader/recompiler/ir/passes/SrtProf.h"
 #include "graphics/shader/recompiler/ir/passes/ResourcePlanFixture.h"
 
 #include "common/assert.h"
@@ -1192,8 +1193,42 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	return plan;
 }
 
-static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& runtime,
+static std::atomic<uint64_t> g_compiled_verify_ticker {0};
+
+// Image typing depends only on image words 1..7 and the null flag when no table is indirect.
+static bool SpecializationReusable(const ResourcePlan& program, const ResourceSpecialization& specialization) {
+	if (specialization.images.size() != program.info.images.size()) return false;
+	for (uint32_t i = 0; i < program.info.images.size(); ++i) {
+		const auto* source = Source(program, program.info.images[i].source);
+		if (source == nullptr || source->indirect_descriptor.has_value() ||
+		    specialization.images[i].indirect_root != ImageResource::NoIndirectImage)
+			return false;
+	}
+	return true;
+}
+
+static bool TryReuseImageSpecialization(const ResourcePlan& program, ResourceDelta& delta,
+                                        ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+	if (!delta.spec_valid || delta.owner != &program || delta.spec_images_in.size() != snapshot.images.size() ||
+	    delta.spec_images_out.size() != snapshot.images.size() ||
+	    !SpecializationReusable(program, specialization))
+		return false;
+	for (size_t i = 0; i < snapshot.images.size(); ++i) {
+		const auto& before = delta.spec_images_in[i];
+		const auto& now    = snapshot.images[i];
+		if (before.dword_count != now.dword_count || NullImageDescriptor(before) != NullImageDescriptor(now)) return false;
+		for (uint32_t d = 1; d < 8; ++d) {
+			if (before.dwords[d] != now.dwords[d]) return false;
+		}
+	}
+	specialization.images = delta.spec_images_out;
+	CompactImages(snapshot.images, [&](size_t index) { return !specialization.images[index].fmask; });
+	return true;
+}
+
+static bool MaterializeResourcesCore(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+	SRT_PROF_SCOPE(SrtProf::MatTotal);
 	const Common::RuntimeFlags::EvaluationScope flags_scope;
 	FrameBreakdown::g_counters.mat_calls.fetch_add(FrameBreakdown::Enabled() ? 1u : 0u, std::memory_order_relaxed);
 	FrameBreakdown::Timer mat_total_timer(FrameBreakdown::g_counters.mat_total_ns);
@@ -1429,9 +1464,157 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 	{
 		FrameBreakdown::Timer timer(FrameBreakdown::g_counters.mat_spec_ns);
-		cache_attempt.success = BuildResourceSpecialization(program, snapshot, specialization, cache);
+		auto* delta = runtime.delta;
+		if (delta != nullptr && TryReuseImageSpecialization(program, *delta, snapshot, specialization)) {
+			// Same image words as the last successful build: the typing is the same function of them.
+			cache_attempt.success = true;
+			SrtCompiledCountSpec(false);
+		} else {
+			if (delta != nullptr) {
+				delta->spec_images_in = snapshot.images;
+				SrtCompiledCountSpec(true);
+			}
+			cache_attempt.success = BuildResourceSpecialization(program, snapshot, specialization, cache);
+			if (delta != nullptr) {
+				delta->owner      = &program;
+				delta->spec_valid = cache_attempt.success && SpecializationReusable(program, specialization);
+				if (delta->spec_valid) delta->spec_images_out = specialization.images;
+			}
+		}
 	}
 	return cache_attempt.success;
+}
+
+namespace {
+
+// The ChangeMask of this call against the same program's previous successful call. Compare-then-copy:
+// unchanged parts cost one pass and no copy.
+template <typename T>
+bool UpdateStored(std::vector<T>& stored, const std::vector<T>& current) {
+	if (stored == current) return false;
+	stored = current;
+	return true;
+}
+
+void UpdateDelta(ResourceDelta& delta, const ResourceSnapshot& snapshot) {
+	ResourceChangeMask mask;
+	mask.valid = delta.have;
+	if (delta.have && delta.buffers.size() == snapshot.buffers.size()) {
+		for (size_t i = 0; i < snapshot.buffers.size(); ++i) {
+			const auto& a = delta.buffers[i];
+			const auto& b = snapshot.buffers[i];
+			mask.buffer_addr |= a.dwords[0] != b.dwords[0] || ((a.dwords[1] ^ b.dwords[1]) & 0xffffu) != 0u;
+			mask.buffer_size |= a.dwords[2] != b.dwords[2];
+			bool fmt = a.dword_count != b.dword_count || ((a.dwords[1] ^ b.dwords[1]) & ~0xffffu) != 0u;
+			for (uint32_t d = 3; d < b.dword_count && d < 8; ++d) fmt |= a.dwords[d] != b.dwords[d];
+			mask.buffer_fmt |= fmt;
+		}
+	} else if (delta.have) {
+		mask.buffer_addr = mask.buffer_size = mask.buffer_fmt = true;
+	}
+	const bool images   = UpdateStored(delta.images, snapshot.images);
+	const bool samplers = UpdateStored(delta.samplers, snapshot.samplers);
+	const bool flat     = UpdateStored(delta.flat, snapshot.flattened_srt);
+	const bool user     = UpdateStored(delta.user_data, snapshot.user_data);
+	mask.images            = delta.have && images;
+	mask.samplers          = delta.have && samplers;
+	mask.flat_changed      = delta.have && flat;
+	mask.user_data_changed = delta.have && user;
+	if (!delta.have || mask.buffer_addr || mask.buffer_size || mask.buffer_fmt) delta.buffers = snapshot.buffers;
+	delta.mask = mask;
+	SrtCompiledCountMask(!delta.have, mask.images, mask.samplers, mask.buffer_fmt, mask.buffer_addr,
+	                     mask.buffer_size, mask.flat_changed, mask.user_data_changed);
+	delta.have = true;
+}
+
+bool SameRangeUnion(const std::vector<std::pair<uint64_t, uint64_t>>& a,
+                    const std::vector<std::pair<uint64_t, uint64_t>>& b) {
+	const auto normalize = [](const auto& ranges, std::vector<std::pair<uint64_t, uint64_t>>& result) {
+		for (const auto& [address, size]: ranges) {
+			if (size != 0u) result.emplace_back(address, address + size);
+		}
+		std::sort(result.begin(), result.end());
+		size_t write = 0;
+		for (size_t i = 0; i < result.size(); ++i) {
+			if (write != 0u && result[i].first <= result[write - 1].second)
+				result[write - 1].second = std::max(result[write - 1].second, result[i].second);
+			else
+				result[write++] = result[i];
+		}
+		result.resize(write);
+	};
+	std::vector<std::pair<uint64_t, uint64_t>> left, right;
+	normalize(a, left);
+	normalize(b, right);
+	return left == right;
+}
+
+// Names the first differing output, or nullptr when the two evaluations are bit-identical.
+const char* FirstDifference(const ResourceSnapshot& a, const ResourceSpecialization& sa,
+                            const ResourceSnapshot& b, const ResourceSpecialization& sb) {
+	if (a.buffers != b.buffers) return "buffers";
+	if (a.images != b.images) return "images";
+	if (a.samplers != b.samplers) return "samplers";
+	if (a.flattened_srt != b.flattened_srt) return "flattened_srt";
+	if (a.user_data != b.user_data) return "user_data";
+	if (!(a.uniform_fill == b.uniform_fill)) return "uniform_fill";
+	if (!(sa == sb)) return "specialization";
+	if (!SameRangeUnion(a.specialization_reads, b.specialization_reads)) return "specialization_reads";
+	return nullptr;
+}
+
+bool CompiledVerifyEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DRAWPREP_VERIFY");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+} // namespace
+
+// KYTY_SRT_COMPILED wrapper: the core evaluation, the per-program ChangeMask, and the sampled
+// KYTY_DRAWPREP_VERIFY check that re-runs the existing (non-compiled) path and compares everything.
+static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& runtime,
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+	if (!runtime.allow_compiled || !Common::RuntimeFlags::Current().srt_compiled)
+		return MaterializeResourcesCore(program, runtime, snapshot, specialization);
+	const bool ok = MaterializeResourcesCore(program, runtime, snapshot, specialization);
+	if (runtime.delta != nullptr) {
+		if (ok) UpdateDelta(*runtime.delta, snapshot);
+		else runtime.delta->Reset();
+	}
+	if (CompiledVerifyEnabled() && (g_compiled_verify_ticker.fetch_add(1, std::memory_order_relaxed) & 63u) == 0u) {
+		ResourceSnapshot       reference;
+		ResourceSpecialization reference_spec;
+		SrtRuntime             old_path = runtime;
+		old_path.allow_compiled         = false;
+		old_path.delta                  = nullptr;
+		old_path.specialization_cache   = nullptr;
+		const auto saved_active = program.active_sources;
+		const bool reference_ok = MaterializeResourcesCore(program, old_path, reference, reference_spec);
+		const char* difference  = nullptr;
+		if (reference_ok != ok) difference = "success";
+		else if (ok) difference = FirstDifference(snapshot, specialization, reference, reference_spec);
+		if (difference == nullptr && ok && program.active_sources != saved_active) difference = "active_sources";
+		SrtCompiledCountVerify(difference != nullptr);
+		if (difference != nullptr) {
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 8u) {
+				std::fprintf(stderr, "SRT compiled verify MISMATCH shader=0x%016llx stage=%u field=%s ok=%d ref_ok=%d\n",
+				             static_cast<unsigned long long>(program.shader_hash),
+				             static_cast<unsigned>(program.stage), difference, ok ? 1 : 0, reference_ok ? 1 : 0);
+			}
+			// The existing path is the reference: adopt its outputs.
+			if (reference_ok) {
+				snapshot       = std::move(reference);
+				specialization = std::move(reference_spec);
+			}
+			if (runtime.delta != nullptr) runtime.delta->Reset();
+			return reference_ok;
+		}
+	}
+	return ok;
 }
 
 ResourceSpecializationCacheStats GetResourceSpecializationCacheStats() {
