@@ -761,12 +761,13 @@ static void SubmitSplitRefresh() {
 	static const uint32_t env_draws = [] {
 		const char* s = std::getenv("KYTY_SUBMIT_SPLIT_DRAWS");
 		const long  n = s != nullptr ? std::atol(s) : 0;
-		return n > 0 ? static_cast<uint32_t>(n) : 48u;
+		// 768 draws / 12 ms measured best on an RX 9070 XT (each split costs a vkQueueSubmit).
+		return n > 0 ? static_cast<uint32_t>(n) : 768u;
 	}();
 	static const int64_t env_us = [] {
 		const char* s = std::getenv("KYTY_SUBMIT_SPLIT_US");
 		const long  n = s != nullptr ? std::atol(s) : 0;
-		return n > 0 ? static_cast<int64_t>(n) : int64_t {750};
+		return n > 0 ? static_cast<int64_t>(n) : int64_t {12000};
 	}();
 	static auto last = std::chrono::steady_clock::time_point {};
 	const auto  now  = std::chrono::steady_clock::now();

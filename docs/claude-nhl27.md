@@ -37,6 +37,16 @@ frame's command buffers. That write faults, and the fault used to download the p
 everything queued on the GPU (11-15 ms per frame). With both switches above the download waits
 only for the writer's submission. Recorded with `KYTY_DBG_TIMELINE` (below).
 
+### Submit split
+
+The merged `submit_split` runtime flag ends a host command buffer early during a long guest
+command buffer so the GPU can start on it. Each split is one more `vkQueueSubmit` (about 65 us on
+Windows), so the default thresholds are now 768 draws or 12 ms (`KYTY_SUBMIT_SPLIT_DRAWS`,
+`KYTY_SUBMIT_SPLIT_US`; `split.ctl` overrides them at runtime): +3.9% paused match against
+48 draws / 0.75 ms. Turning the split off costs 8%. Deferring the submit across queued guest
+submissions (one host command buffer for many of them) lost 16%, because the GPU then idles while
+the GPU thread records.
+
 ## Always on
 
 `KYTY_DISPATCH_ARGS_GUARD` (set to `0` to disable): every indirect dispatch reads its group counts
