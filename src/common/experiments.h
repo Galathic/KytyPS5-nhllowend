@@ -31,6 +31,7 @@ enum Bit : uint32_t {
 	DirectEopInterrupts  = 1u << 19u, // KYTY_DIRECT_EOP_INTERRUPTS (EOP interrupts at CP time, like labels)
 	ReadbackQueue        = 1u << 20u, // KYTY_READBACK_QUEUE (downloads wait only for the buffer's last writer)
 	AsyncSubmit          = 1u << 21u, // KYTY_ASYNC_SUBMIT (vkQueueSubmit on a worker thread, in tick order)
+	LazySharedWrites     = 1u << 22u, // KYTY_LAZY_SHARED_WRITES (CPU writes next to few GPU-written bytes do not wait)
 	// A/B only (no environment variable): selects the code a pending change replaces.
 	AbLegacy = 1u << 31u,
 };

@@ -113,6 +113,8 @@ int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t size, 
                          int memory_type, int64_t* phys_addr_out, bool automatic = false);
 int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
+// Writes the bytes of `data` whose backing still equals `expected` (see LazySharedWrites).
+bool                   TryMergeBacking(uint64_t vaddr, const void* data, const void* expected, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
 // GPU thread only: reads the backing when none of the bytes is GPU-dirty, so the CPU view of

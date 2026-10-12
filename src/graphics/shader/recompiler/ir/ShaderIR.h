@@ -645,6 +645,17 @@ struct ResourcePlan {
 	mutable std::vector<int32_t>       direct_descriptor_offsets;
 	// Flat slots a direct refresh filled (plans with control flow skip unreached blocks).
 	mutable std::vector<uint8_t>       direct_filled;
+	// Direct plans with control flow: each block's read runs (direct_cf_run_begin has one entry
+	// per block plus an end), built for one batching mode, and the sources active on entry.
+	struct DirectCfRun {
+		uint32_t slot  = 0;
+		uint32_t count = 0;
+	};
+	mutable std::vector<DirectCfRun> direct_cf_runs;
+	mutable std::vector<uint32_t>    direct_cf_run_begin;
+	mutable std::vector<uint8_t>     direct_cf_active;
+	mutable int8_t                   direct_cf_batch = -1; // -1 = not built
+	mutable bool                     direct_cf_valid = false;
 	// Linearized SRT read expressions (KYTY_SRT_TAPE=1). Built lazily on the GPU thread,
 	// one per variant: [0] = no clean evaluator, [1] = with clean evaluator. Ops are in the
 	// exact order the recursive walker would evaluate them, so captured reads and failure

@@ -242,8 +242,10 @@ private:
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
-	template <bool async>
+	// merge (async only): the publish keeps bytes the CPU changed since the download was queued.
+	template <bool async, bool merge = false>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool LazySharedWriteEligible(uint64_t vaddr, uint64_t size);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;

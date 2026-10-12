@@ -49,6 +49,7 @@ uint32_t EnvironmentMask() {
 	if (EnvOn("KYTY_DIRECT_EOP_INTERRUPTS")) mask |= DirectEopInterrupts;
 	if (EnvOn("KYTY_READBACK_QUEUE")) mask |= ReadbackQueue;
 	if (EnvOn("KYTY_ASYNC_SUBMIT")) mask |= AsyncSubmit;
+	if (EnvOn("KYTY_LAZY_SHARED_WRITES")) mask |= LazySharedWrites;
 	return mask;
 }
 

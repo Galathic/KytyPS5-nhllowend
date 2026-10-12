@@ -758,16 +758,18 @@ static std::atomic<uint32_t> g_split_draws {0};
 static std::atomic<int64_t>  g_split_us {0};
 
 static void SubmitSplitRefresh() {
+	// Measured best on an RX 9070 XT: 768 draws / 12 ms when each split costs this thread a
+	// vkQueueSubmit, 48 draws / 0.75 ms with experiment AsyncSubmit (+4.5% paused match).
+	const bool            async     = Common::Experiments::Enabled(Common::Experiments::AsyncSubmit);
 	static const uint32_t env_draws = [] {
 		const char* s = std::getenv("KYTY_SUBMIT_SPLIT_DRAWS");
 		const long  n = s != nullptr ? std::atol(s) : 0;
-		// 768 draws / 12 ms measured best on an RX 9070 XT (each split costs a vkQueueSubmit).
-		return n > 0 ? static_cast<uint32_t>(n) : 768u;
+		return n > 0 ? static_cast<uint32_t>(n) : 0u;
 	}();
 	static const int64_t env_us = [] {
 		const char* s = std::getenv("KYTY_SUBMIT_SPLIT_US");
 		const long  n = s != nullptr ? std::atol(s) : 0;
-		return n > 0 ? static_cast<int64_t>(n) : int64_t {12000};
+		return n > 0 ? static_cast<int64_t>(n) : int64_t {0};
 	}();
 	static auto last = std::chrono::steady_clock::time_point {};
 	const auto  now  = std::chrono::steady_clock::now();
@@ -775,8 +777,8 @@ static void SubmitSplitRefresh() {
 		return;
 	}
 	last           = now;
-	uint32_t draws = env_draws;
-	int64_t  us    = env_us;
+	uint32_t draws = env_draws != 0 ? env_draws : async ? 48u : 768u;
+	int64_t  us    = env_us != 0 ? env_us : async ? int64_t {750} : int64_t {12000};
 	if (FILE* file = std::fopen("split.ctl", "r"); file != nullptr) {
 		char line[64];
 		while (std::fgets(line, sizeof(line), file) != nullptr) {

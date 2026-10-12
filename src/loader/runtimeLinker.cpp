@@ -787,6 +787,32 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 				            static_cast<int>(access), static_cast<unsigned long long>(count));
 			}
 		}
+		// KYTY_DBG_SHARED_WRITES=1 (diagnostic): the instruction behind each guest write fault,
+		// first time per instruction address, then at counts 10, 100, 1000, ... (NHL27SHW).
+		static const bool shared_writes = [] {
+			const char* value = std::getenv("KYTY_DBG_SHARED_WRITES");
+			return value != nullptr && value[0] == '1';
+		}();
+		if (shared_writes && access == GpuAccess::Write && !Libs::Graphics::GuestGpu::IsGpuThread()) {
+			static std::mutex                    mutex;
+			static std::map<uint64_t, uint64_t> counts;
+			uint64_t                             count = 0;
+			{
+				std::scoped_lock lock {mutex};
+				count = ++counts[info->exception_address];
+			}
+			if (count == 1 || count == 10 || count == 100 || count % 1000 == 0) {
+				char text[96];
+				if (!Loader::X64InstructionEmulator::DescribeInstruction(info->native_context, text,
+				                                                         sizeof(text))) {
+					std::snprintf(text, sizeof(text), "?");
+				}
+				std::printf("NHL27SHW: rip=0x%016llx vaddr=0x%016llx insn=%s count=%llu\n",
+				            static_cast<unsigned long long>(info->exception_address),
+				            static_cast<unsigned long long>(info->access_violation_vaddr), text,
+				            static_cast<unsigned long long>(count));
+			}
+		}
 		// Experiment FalseShareReads: the GPU thread's own read of bytes the GPU never wrote, on a
 		// page protected for other GPU-written bytes, is served from the backing instead of
 		// downloading the page, which would wait for all queued GPU work.

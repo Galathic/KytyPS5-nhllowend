@@ -26,8 +26,13 @@ On top of the fork's usual flags (`KYTY_PROGRAM_RESOURCE_CACHE=1`, `KYTY_PERF_NO
 | `KYTY_CLEAN_FROM_DIRECT=1` | 262144 | The strict resource-table evaluator (branch conditions, uniform fills, written descriptors) takes words the direct reads already fetched | +3.1% paused match |
 | `KYTY_READBACK_QUEUE=1` | 1048576 | GPU-to-CPU downloads of a buffer last written by an already submitted command buffer run on a second queue and wait only for that submission (about 45 us instead of draining everything queued) | +1.4% paused match |
 | `KYTY_DIRECT_EOP_INTERRUPTS=1` | 524288 | End-of-pipe interrupts are delivered when the CP reaches them, like the labels (`KYTY_EOP_DIRECT_LABELS`) | +0.7% paused match (+0.8% with the readback queue) |
+| `KYTY_FALSE_SHARE_READS=1` | 64 | The GPU thread parses PM4 packets (and serves its own faulting loads) from the backing when the bytes are clean but share a page with GPU-written bytes | +0.5% paused match |
+| `KYTY_ASYNC_SUBMIT=1` | 2097152 | `vkQueueSubmit` runs on a worker thread in tick order (about 65 us of GPU-thread time per submit); submit splits default to 48 draws / 0.75 ms with it | +1.5% paused match, +4.5% more with the finer splits |
+| `KYTY_LAZY_SHARED_WRITES=1` | 4194304 | A guest thread's store into a page where the GPU wrote at most 256 other bytes no longer waits for that GPU work: the download is queued and merged into guest memory later, keeping bytes the CPU changed meanwhile | +7.3% paused match |
 
-Mask for all of the above: `2096131`, plus `KYTY_SRT_BATCH_READS=1` in the environment.
+Mask for all of the above: `8387651`, plus `KYTY_SRT_BATCH_READS=1` in the environment and
+`KYTY_PM4_WRITE_DATA_FAST=1` (pengui07's runtime flag, `flags.ctl` or environment; no measured
+change on its own).
 
 ### Why a frame waits
 
@@ -37,11 +42,19 @@ frame's command buffers. That write faults, and the fault used to download the p
 everything queued on the GPU (11-15 ms per frame). With both switches above the download waits
 only for the writer's submission. Recorded with `KYTY_DBG_TIMELINE` (below).
 
+With direct EOP interrupts the CP no longer waits there; instead the game's own render thread
+then stores its next command buffer into a page that holds 16 bytes a compute shader
+(abce16f02df45052) wrote at the end of the frame, and that store waited for the host GPU to
+finish the frame (about 6 ms per frame). `KYTY_LAZY_SHARED_WRITES` lets the store go ahead and
+merges the 16 bytes afterwards. The merge writes a GPU dword only where guest memory still holds
+the value it had at the fault, so a later CPU store wins, except one that rewrites the very same
+value; a CPU read of those bytes before the merge sees their old value.
+
 ### Submit split
 
 The merged `submit_split` runtime flag ends a host command buffer early during a long guest
 command buffer so the GPU can start on it. Each split is one more `vkQueueSubmit` (about 65 us on
-Windows), so the default thresholds are now 768 draws or 12 ms (`KYTY_SUBMIT_SPLIT_DRAWS`,
+Windows), so without `KYTY_ASYNC_SUBMIT` the default thresholds are now 768 draws or 12 ms (`KYTY_SUBMIT_SPLIT_DRAWS`,
 `KYTY_SUBMIT_SPLIT_US`; `split.ctl` overrides them at runtime): +3.9% paused match against
 48 draws / 0.75 ms. Turning the split off costs 8%. Deferring the submit across queued guest
 submissions (one host command buffer for many of them) lost 16%, because the GPU then idles while
@@ -61,6 +74,9 @@ finishes it and the device is lost. Zeroed dispatches are reported as `NHL27GUAR
 * `KYTY_DBG_BREADCRUMBS=1`: GPU breadcrumbs, now with indirect dispatch arguments, printed on
   device loss.
 * `KYTY_DBG_IMAGE_CHURN=1`: logs image inserts and frees.
+* `KYTY_DBG_SHARED_WRITES=1`: the instruction behind each guest write fault (`NHL27SHW`) and the
+  GPU-written bytes a write fault had to download (`NHL27SHD`).
+* `-DKYTY_LINE_TABLES=ON` (CMake): source lines and inline frames in the PDB, for the sampler.
 * `KYTY_DBG_DIRECT_SRT=1`: counts direct and interpreted resource-table refreshes and why plans fall back (`NHL27SRT`).
 * `KYTY_PERF_FAULT_RIPS=gpu`: host instruction addresses of the GPU thread's page faults.
 * `KYTY_DBG_TIMELINE=<seconds or trigger file>`: records submissions, GPU-thread idle/wake, host
