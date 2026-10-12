@@ -622,6 +622,13 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
 }
 
+void BufferCache::InvalidateCleanWindow(uint64_t vaddr, uint64_t size) {
+	if (!GuestRange {vaddr, size}.Valid()) {
+		return;
+	}
+	m_memory_tracker.InvalidateCleanWindow(vaddr, size);
+}
+
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadCaller caller) {
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
@@ -1045,6 +1052,12 @@ void BufferCache::RunGarbageCollector() {
 	}
 
 	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory;
+	// The scan below revisits every idle GPU-modified buffer, which it cannot collect, after each
+	// guest submission. Experiment SparseBufferGc scans every 16th one unless memory is critical.
+	if (!aggressive && (tick & 15u) != 0 &&
+	    Common::Experiments::Enabled(Common::Experiments::SparseBufferGc)) {
+		return;
+	}
 	// Collection runs after every guest submission, so 160 ticks is only a few frames: buffers
 	// for transient data revisited every few frames were deleted and recreated each frame
 	// (~20 per frame in a paused NHL 27 match). Experiment LongBufferGcAge keeps them 10x longer

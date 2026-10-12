@@ -31,6 +31,9 @@ uint32_t EnvironmentMask() {
 	if (EnvOn("KYTY_IMAGE_LOOKUP_HINT")) mask |= ImageLookupHint;
 	if (EnvOn("KYTY_LONG_BUFFER_GC_AGE")) mask |= LongBufferGcAge;
 	if (EnvOn("KYTY_RENDER_TARGET_MEMO")) mask |= RenderTargetMemo;
+	if (EnvOn("KYTY_ADAPTIVE_RESOURCE_MEMO")) mask |= AdaptiveResourceMemo;
+	if (EnvOn("KYTY_FAULT_COALESCE")) mask |= FaultCoalesce;
+	if (EnvOn("KYTY_SPARSE_BUFFER_GC")) mask |= SparseBufferGc;
 	return mask;
 }
 

@@ -18,6 +18,7 @@
 #include <optional>
 #include <memory>
 #include <span>
+#include <tuple>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -323,6 +324,8 @@ private:
 	};
 	RedundantBindState    m_redundant[2];
 	std::vector<uint64_t> m_descriptor_key;
+	// Ranges this draw writes (image or attachment = true), checked against scalar resource reads.
+	std::vector<std::tuple<uint64_t, uint64_t, bool>> m_written_ranges;
 	std::vector<uint32_t>                 m_image_occurrences;
 
 	friend class CommandProcessor;

@@ -1,12 +1,14 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include "common/assert.h"
+#include "common/experiments.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cstdlib>
 #include <cstdio>
@@ -66,6 +68,20 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	}
 	ProtectStats::CountFault(access == PageFaultAccess::Write);
 	if (access == PageFaultAccess::Write) {
+		if (Common::Experiments::Enabled(Common::Experiments::FaultCoalesce)) {
+			// Games stream per-frame data through CPU-written rings: one fault per page and one
+			// re-protection per upload dominate. Release the clean neighbors of the faulting page
+			// together (KYTY_FAULT_COALESCE_PAGES pages, default 16).
+			static const uint64_t window = [] {
+				const char* value = std::getenv("KYTY_FAULT_COALESCE_PAGES");
+				const auto  pages = value != nullptr ? std::strtoull(value, nullptr, 10) : 16ull;
+				return std::bit_ceil(std::clamp<uint64_t>(pages, 1, 256)) * 4096ull;
+			}();
+			const auto begin = fault_vaddr & ~(window - 1);
+			if (window > 4096 && IsMapped(begin, window)) {
+				m_buffer_cache.InvalidateCleanWindow(begin, window);
+			}
+		}
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 	} else {

@@ -33,6 +33,18 @@ public:
 	[[nodiscard]] uint64_t CpuModificationGeneration() const noexcept {
 		return m_cpu_generation.load(std::memory_order_acquire);
 	}
+	// Marks a CPU-tracked range dirty in one protection change, unless a GPU-modified page lies in
+	// it (those need the flushing path). Marking an unwritten page dirty only costs an upload.
+	void InvalidateCleanWindow(uint64_t vaddr, uint64_t size) noexcept {
+		CheckNotInUploadCallback();
+		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			std::scoped_lock lock(manager->lock);
+			if (manager->IsModified<DirtySource::Gpu>(offset, bytes)) return;
+			QueueCpuDirty(manager);
+			manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
+			m_cpu_generation.fetch_add(1, std::memory_order_release);
+		});
+	}
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {

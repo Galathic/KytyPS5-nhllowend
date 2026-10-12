@@ -1,6 +1,7 @@
 #ifndef KYTY_GRAPHICS_RESOURCE_MEMO_H_
 #define KYTY_GRAPHICS_RESOURCE_MEMO_H_
 
+#include "common/experiments.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 #include <algorithm>
@@ -71,6 +72,18 @@ public:
                  bool enabled, bool& reused, bool probe_only = false) {
         reused = false;
         m_last_miss = Miss::None;
+        // Experiment AdaptiveResourceMemo: when the register inputs change on nearly every
+        // refresh the memo cannot hit, and capturing every read only adds work. Such entries
+        // materialize without capture for a while, then measure again.
+        const bool adaptive = enabled && !probe_only &&
+            Common::Experiments::Enabled(Common::Experiments::AdaptiveResourceMemo);
+        if (adaptive && m_bypass != 0) {
+            --m_bypass;
+            m_valid = false;
+            m_read_count = 0;
+            m_last_miss = Miss::Registers;
+            return ShaderRecompiler::IR::MaterializeResources(plan, runtime, snapshot, specialization);
+        }
         bool inputs_equal = enabled;
         if (enabled) {
             if (!m_valid || m_plan != &plan) m_last_miss = Miss::Cold;
@@ -78,6 +91,14 @@ public:
             else if (!RegisterInputsEqual(runtime.user_data)) m_last_miss = Miss::Registers;
             else if (!std::ranges::equal(m_workgroups, runtime.workgroup_counts)) m_last_miss = Miss::Workgroups;
             inputs_equal = m_last_miss == Miss::None;
+            if (adaptive) {
+                m_input_misses += m_last_miss == Miss::Registers || m_last_miss == Miss::ShaderBase ||
+                                  m_last_miss == Miss::Workgroups;
+                if (++m_window == 32) {
+                    if (m_input_misses >= 31) m_bypass = 224;
+                    m_window = m_input_misses = 0;
+                }
+            }
         }
         if (inputs_equal) {
             bool equal = true;
@@ -136,6 +157,7 @@ public:
 
 private:
     Miss m_last_miss = Miss::None;
+    uint32_t m_window = 0, m_input_misses = 0, m_bypass = 0;
     bool RegisterInputsEqual(std::span<const uint32_t> current) const {
         if (current.size() != m_user_data.size()) return false;
         for (const auto index: m_register_inputs) {

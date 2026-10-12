@@ -9,7 +9,12 @@
 #include <array>
 #include <bit>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <map>
+#include <mutex>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -1029,6 +1034,78 @@ bool DirectSrtReadsEnabled() {
 
 // Decides once per plan whether every SRT read is LoadAddressU32(GetAddressResource(
 // GetUserData(lo), GetUserData(hi)), imm, ...) on a scalar address, and records its operands.
+// KYTY_DBG_DIRECT_SRT=1: why plans fall back to the interpreter and how often they refresh.
+bool DirectSrtDebug() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DBG_DIRECT_SRT");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+std::string DirectShape(Value value, int depth) {
+	value = value.Resolve();
+	if (value.IsImmediate()) return "imm";
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr) return "?";
+	std::string result(ValueOpcodeName(inst->GetOpcode()));
+	if (inst->GetOpcode() == ValueOpcode::ReadConst || inst->GetOpcode() == ValueOpcode::GetUserData)
+		return result;
+	if (depth >= 3) return result + "(...)";
+	result += "(";
+	for (size_t i = 0; i < inst->NumArgs(); ++i) {
+		if (i != 0) result += ",";
+		result += DirectShape(inst->Arg(i), depth + 1);
+	}
+	return result + ")";
+}
+
+struct DirectDebugState {
+	std::mutex                                      lock;
+	std::unordered_map<const ResourcePlan*, std::string> reasons;
+	std::unordered_map<const ResourcePlan*, uint64_t>    refreshes;
+	uint64_t                                        counts[3] {};
+};
+
+DirectDebugState& DirectDebug() {
+	static DirectDebugState state;
+	return state;
+}
+
+bool RejectDirect(const ResourcePlan& program, const char* reason, Value value) {
+	if (DirectSrtDebug()) {
+		auto&            state = DirectDebug();
+		std::scoped_lock lock {state.lock};
+		state.reasons[&program] = std::string(reason) + " reads=" + std::to_string(program.srt_reads.size()) +
+		                          " cf=" + std::to_string(program.control_flow.size()) + " " +
+		                          DirectShape(value, 0).substr(0, 200);
+	}
+	return false;
+}
+
+// kind: 0 direct without control flow, 1 direct with control flow, 2 interpreter.
+void CountDirectRefresh(const ResourcePlan& program, int kind) {
+	auto&            state = DirectDebug();
+	std::scoped_lock lock {state.lock};
+	++state.counts[kind];
+	if (kind == 2) ++state.refreshes[&program];
+	const auto total = state.counts[0] + state.counts[1] + state.counts[2];
+	if (total % 50000u != 0u) return;
+	std::printf("NHL27SRT: refreshes direct=%llu direct_cf=%llu interpreted=%llu\n",
+	            static_cast<unsigned long long>(state.counts[0]),
+	            static_cast<unsigned long long>(state.counts[1]),
+	            static_cast<unsigned long long>(state.counts[2]));
+	std::vector<std::pair<uint64_t, const ResourcePlan*>> hot;
+	for (const auto& [plan, count]: state.refreshes) hot.emplace_back(count, plan);
+	std::sort(hot.rbegin(), hot.rend());
+	for (size_t i = 0; i < hot.size() && i < 10; ++i) {
+		const auto reason = state.reasons.find(hot[i].second);
+		std::printf("NHL27SRT:   %llu %s\n", static_cast<unsigned long long>(hot[i].first),
+		            reason != state.reasons.end() ? reason->second.c_str() : "(no reason)");
+	}
+	std::fflush(stdout);
+}
+
 bool BuildDirectSrtReads(const ResourcePlan& program, std::span<const uint8_t> clean_flat_slots) {
 	auto& direct = program.direct_srt_reads;
 	direct.clear();
@@ -1045,22 +1122,25 @@ bool BuildDirectSrtReads(const ResourcePlan& program, std::span<const uint8_t> c
 	for (const auto& read: program.srt_reads) {
 		const auto value = read.value.Resolve();
 		const auto* inst = value.TryInstruction();
-		if (inst == nullptr || inst->GetOpcode() != ValueOpcode::LoadAddressU32 ||
-		    !IsRawRead(program, *inst) || read.flat_offset >= program.srt_reads.size()) {
-			return false;
+		if (inst == nullptr || inst->GetOpcode() != ValueOpcode::LoadAddressU32) {
+			return RejectDirect(program, "not-load", value);
 		}
+		if (!IsRawRead(program, *inst)) return RejectDirect(program, "not-raw", value);
+		if (read.flat_offset >= program.srt_reads.size()) return RejectDirect(program, "flat", value);
 		const auto* handle = inst->Arg(0).Resolve().TryInstruction();
 		if (handle == nullptr || handle->GetOpcode() != ValueOpcode::GetAddressResource ||
 		    handle->NumArgs() < 2) {
-			return false;
+			return RejectDirect(program, "handle", value);
 		}
 		ResourcePlan::DirectSrtRead entry;
 		if (!user_data_index(handle->Arg(0), entry.low_register) ||
 		    !user_data_index(handle->Arg(1), entry.high_register)) {
-			return false;
+			return RejectDirect(program, "base", value);
 		}
 		const auto offset = inst->Arg(1).Resolve();
-		if (!offset.IsImmediate() || offset.GetType() != Type::U32) return false;
+		if (!offset.IsImmediate() || offset.GetType() != Type::U32) {
+			return RejectDirect(program, "offset", value);
+		}
 		const auto& mem       = program.memory_info[inst->Flags<MemoryFlags>().index];
 		const auto  immediate = static_cast<int64_t>(static_cast<int32_t>(mem.offset));
 		entry.relative = (immediate & ~int64_t {3}) + static_cast<int64_t>(offset.U32() & ~3u);
@@ -1165,6 +1245,9 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 			                                 : ResourcePlan::DirectSrtState::Unsupported;
 		}
 		direct = m_program.direct_srt_state == ResourcePlan::DirectSrtState::Direct;
+		if (DirectSrtDebug()) {
+			CountDirectRefresh(m_program, !direct ? 2 : m_program.control_flow.empty() ? 0 : 1);
+		}
 		if (direct && m_program.control_flow.empty()) {
 			return RefreshDirectFlat(flat);
 		}

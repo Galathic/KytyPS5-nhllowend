@@ -20,8 +20,10 @@ On top of the fork's usual flags (`KYTY_PROGRAM_RESOURCE_CACHE=1`, `KYTY_PERF_NO
 | `KYTY_IMAGE_LOOKUP_HINT=1` | 4096 | Reuses the image a texture last resolved to instead of scanning every page | +2.3% paused match |
 | `KYTY_LONG_BUFFER_GC_AGE=1` | 8192 | Keeps idle cache buffers 10x longer (the collector ages per submission) | +9.2% paused match |
 | `KYTY_RENDER_TARGET_MEMO=1` | 16384 | Memoizes color render-target decoding (registers to image description) | +3.4% paused match |
+| `KYTY_ADAPTIVE_RESOURCE_MEMO=1` | 32768 | Stops capturing resource-table reads for shaders whose inputs change on every draw (the memo can never hit there) | +2.3% paused match |
+| `KYTY_FAULT_COALESCE=1` | 65536 | A CPU write fault on a tracked buffer page releases its whole clean 64 KiB window (`KYTY_FAULT_COALESCE_PAGES`, default 16) | +2.0% paused match, write faults -85% |
 
-Mask for all of the above: `31747`, plus `KYTY_SRT_BATCH_READS=1` in the environment.
+Mask for all of the above: `130051`, plus `KYTY_SRT_BATCH_READS=1` in the environment.
 
 ## Always on
 
@@ -37,6 +39,7 @@ finishes it and the device is lost. Zeroed dispatches are reported as `NHL27GUAR
 * `KYTY_DBG_BREADCRUMBS=1`: GPU breadcrumbs, now with indirect dispatch arguments, printed on
   device loss.
 * `KYTY_DBG_IMAGE_CHURN=1`: logs image inserts and frees.
+* `KYTY_DBG_DIRECT_SRT=1`: counts direct and interpreted resource-table refreshes and why plans fall back (`NHL27SRT`).
 * `KYTY_PERF_FAULT_RIPS=gpu`: host instruction addresses of the GPU thread's page faults.
 * Replay benchmarks on a copy of a `_PipelineCache/*.shaders` record (no Vulkan):
   `shader_recompiler_compute_tests --resource-replay-phases <file> [iterations] [direct]`

@@ -54,6 +54,8 @@ public:
 	// Writes a small CPU-visible label into an existing buffer without a page readback.
 	bool                   TryWriteLabel(uint64_t vaddr, const void* data, uint64_t size);
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+	// Releases a whole clean window around a CPU write fault (experiment FaultCoalesce).
+	void                   InvalidateCleanWindow(uint64_t vaddr, uint64_t size);
 	// Only used to attribute synchronous readbacks in the KYTY_PERF_STATS output.
 	enum class ReadCaller : uint8_t { Other, ColorClear, Fault };
 	enum class PerfEvent : uint8_t {

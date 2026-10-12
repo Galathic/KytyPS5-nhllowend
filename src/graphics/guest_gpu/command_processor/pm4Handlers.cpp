@@ -1983,7 +1983,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	}
 	// Read the requested register bytes, rather than faulting on a GPU-owned page.
 	// The helper downloads actual overlapping GPU writes before exposing backing memory.
-	std::vector<uint32_t> backing_registers(indirect_num_dw * 2u);
+	// Reused per packet (GPU thread only): one allocation instead of one per packet.
+	static thread_local std::vector<uint32_t> backing_registers;
+	backing_registers.resize(indirect_num_dw * 2u);
 	if (LibKernel::Memory::TryReadBufferBacking(reinterpret_cast<uint64_t>(indirect_buffer),
 	                                          backing_registers.data(),
 	                                          backing_registers.size() * sizeof(uint32_t))) {
@@ -2068,7 +2070,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 
 	// Read the requested register bytes, rather than faulting on a GPU-owned page.
 	// The helper downloads actual overlapping GPU writes before exposing backing memory.
-	std::vector<uint32_t> backing_registers(indirect_num_dw * 2u);
+	// Reused per packet (GPU thread only): one allocation instead of one per packet.
+	static thread_local std::vector<uint32_t> backing_registers;
+	backing_registers.resize(indirect_num_dw * 2u);
 	if (LibKernel::Memory::TryReadBufferBacking(reinterpret_cast<uint64_t>(indirect_buffer),
 	                                          backing_registers.data(),
 	                                          backing_registers.size() * sizeof(uint32_t))) {
@@ -2142,7 +2146,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	}
 	// Read the requested register bytes, rather than faulting on a GPU-owned page.
 	// The helper downloads actual overlapping GPU writes before exposing backing memory.
-	std::vector<uint32_t> backing_registers(indirect_num_dw * 2u);
+	// Reused per packet (GPU thread only): one allocation instead of one per packet.
+	static thread_local std::vector<uint32_t> backing_registers;
+	backing_registers.resize(indirect_num_dw * 2u);
 	if (LibKernel::Memory::TryReadBufferBacking(reinterpret_cast<uint64_t>(indirect_buffer),
 	                                          backing_registers.data(),
 	                                          backing_registers.size() * sizeof(uint32_t))) {
