@@ -14,6 +14,9 @@ struct ShaderStageRuntime;
 // Bumped before every compute vkCmdBindPipeline outside the guest dispatch path, so the dispatch
 // path can prove that its previously bound compute pipeline is still the bound one.
 inline std::atomic<uint64_t> g_compute_pipeline_epoch {0};
+// Same for graphics: bumped before every graphics vkCmdBindPipeline / dynamic-state command that is not
+// issued by the guest draw path (KYTY_PIPELINE_MEMO invalidation).
+inline std::atomic<uint64_t> g_graphics_pipeline_epoch {0};
 
 vk::ShaderStageFlagBits NativeShaderStage(ShaderType stage);
 vk::PipelineStageFlags  ShaderPipelineStages(vk::ShaderStageFlags stages);

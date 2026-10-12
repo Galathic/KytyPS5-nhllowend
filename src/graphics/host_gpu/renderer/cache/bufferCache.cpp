@@ -557,6 +557,28 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 	return CreateBuffer(vaddr, size);
 }
 
+BufferId BufferCache::FindBufferMemo(BufferSlotMemo& memo, uint64_t vaddr, uint64_t size, bool& hit) {
+	hit = false;
+	if (vaddr != 0 && memo.valid && memo.registration == m_registration_generation && vaddr >= memo.begin) {
+		const uint64_t length = memo.end - memo.begin;
+		if (size <= length && vaddr - memo.begin <= length - size) {
+			hit = true;
+			return memo.id;
+		}
+	}
+	const auto id = FindBuffer(vaddr, size);
+	if (const auto* buffer = m_slot_buffers.try_get(id); buffer != nullptr && !buffer->is_deleted) {
+		memo.valid        = true;
+		memo.begin        = buffer->CpuAddress();
+		memo.end          = buffer->CpuAddress() + buffer->Size();
+		memo.registration = m_registration_generation;
+		memo.id           = id;
+	} else {
+		memo.valid = false;
+	}
+	return id;
+}
+
 BufferCache::OverlapResult BufferCache::ResolveOverlaps(uint64_t vaddr, uint64_t size) {
 	static constexpr int      StreamLeapThreshold = 16;
 	static constexpr uint64_t StreamLeapSize      = CACHING_PAGESIZE * 128;
@@ -648,18 +670,38 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
+	// NHL27BUFFERS2 (KYTY_PERF_STATS): [0] = rebind lookup scope, [1] = PrepareBda scope.
+	const bool bon = FrameBreakdown::BufOn();
+	const int  bi  = bon ? FrameBreakdown::g_buf_scope - 1 : 0;
+	auto&      bs  = FrameBreakdown::g_buf;
+	if (bon) {
+		bs.sb_calls[bi].fetch_add(1, std::memory_order_relaxed);
+	}
+	FrameBreakdown::Timer walk_timer(bs.sb_walk_ns[bi], bon);
 	m_memory_tracker.ForEachUploadRange(
 	    vaddr, size, is_written,
 	    [&](uint64_t address, uint64_t bytes) noexcept {
 		    copies.emplace_back(total_size, buffer.Offset(address), bytes);
 		    total_size += bytes;
 	    },
-	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
+	    [&]() noexcept {
+		    FrameBreakdown::Timer stage_timer(bs.sb_stage_ns[bi], bon);
+		    source = UploadCopies(buffer, copies, total_size);
+	    });
+	walk_timer.Stop();
 	if (source) {
 		FrameBreakdown::Add(FrameBreakdown::g_counters.sync_uploads);
 		FrameBreakdown::Add(FrameBreakdown::g_counters.sync_bytes, total_size);
+		if (bon) {
+			bs.sb_uploads[bi].fetch_add(1, std::memory_order_relaxed);
+			bs.sb_bytes[bi].fetch_add(total_size, std::memory_order_relaxed);
+		}
 		auto& command = m_scheduler.Current();
-		command.EndRendering();
+		{
+			FrameBreakdown::Timer end_timer(bs.sb_end_ns[bi], bon);
+			command.EndRendering();
+		}
+		FrameBreakdown::Timer rec_timer(bs.sb_rec_ns[bi], bon);
 		const auto native = command.Handle();
 		vk::BufferMemoryBarrier before {};
 		before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
@@ -684,6 +726,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
 	}
 	if (is_texel_buffer && !is_written) {
+		FrameBreakdown::Timer image_timer(bs.sb_image_ns[bi], bon);
 		return SynchronizeBufferFromImage(buffer, vaddr, size);
 	}
 	return false;
@@ -727,25 +770,49 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
 	}
 
-	if (!is_written && size <= CACHING_PAGESIZE &&
-	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
-	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
+	// NHL27BUFFERS2: counted only inside the RebindBuffers lookup scope.
+	const bool bon = FrameBreakdown::BufOn() && FrameBreakdown::g_buf_scope == 1;
+	auto&      bs  = FrameBreakdown::g_buf;
+	if (bon) {
+		bs.ob_calls.fetch_add(1, std::memory_order_relaxed);
+		if (is_written) bs.ob_written.fetch_add(1, std::memory_order_relaxed);
+	}
+	bool stream_candidate = false;
+	{
+		FrameBreakdown::Timer check_timer(bs.ob_stream_check_ns, bon);
+		stream_candidate = !is_written && size <= CACHING_PAGESIZE &&
+		                   !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
+		                   m_memory_tracker.IsRegionCpuModified(vaddr, size);
+	}
+	if (stream_candidate) {
+		FrameBreakdown::Timer copy_timer(bs.ob_stream_copy_ns, bon);
 		const auto alignment = std::max<uint64_t>(
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
 		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
 		if (mapped != nullptr) {
 			std::memcpy(mapped, reinterpret_cast<const void*>(vaddr), size);
 			m_stream_buffer.Commit();
+			if (bon) bs.ob_stream.fetch_add(1, std::memory_order_relaxed);
 			return {&m_stream_buffer, offset};
 		}
 	}
 
 	if (IsBufferInvalid(id) || !m_slot_buffers[id].IsInBounds(vaddr, size)) {
+		FrameBreakdown::Timer find_timer(bs.ob_find_ns, bon);
+		if (bon) bs.ob_find_calls.fetch_add(1, std::memory_order_relaxed);
 		id = FindBuffer(vaddr, size);
 	}
 	auto& buffer = m_slot_buffers[id];
-	TouchBuffer(buffer);
-	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
+	{
+		FrameBreakdown::Timer touch_timer(bs.ob_touch_ns, bon);
+		TouchBuffer(buffer);
+	}
+	{
+		FrameBreakdown::Timer sync_timer(bs.ob_sync_ns, bon);
+		if (bon) bs.ob_syncs.fetch_add(1, std::memory_order_relaxed);
+		(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
+	}
+	FrameBreakdown::Timer book_timer(bs.ob_book_ns, bon);
 	if (is_written || is_texel_buffer) {
 		DropGpuFills(vaddr, size);
 	}

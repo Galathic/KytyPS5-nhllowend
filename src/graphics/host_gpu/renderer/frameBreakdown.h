@@ -168,6 +168,90 @@ struct Counters {
 };
 inline Counters g_counters;
 
+// ---- BEGIN pipeline/buffer sub-bucket probes (NHL27PIPELINE, NHL27BUFFERS2, NHL27BUFDELTA) ----
+// NHL27PIPELINE: split of dp_pipeline_ns (draw) and dc_pipeline_ns / dc_record_ns (dispatch). Sequential
+// scopes inside the pipeline bucket (other = bucket minus the named ones). GPU thread only.
+struct PipelineStats {
+	// draw
+	std::atomic<uint64_t> key_ns {0};        // GetGraphicsPipeline: building the GraphicsPipelineKey
+	std::atomic<uint64_t> lookup_ns {0};     // GetGraphicsPipeline: hash + map lookup (or last-key compare)
+	std::atomic<uint64_t> targets_ns {0};    // AcquireRenderTargets
+	std::atomic<uint64_t> vcommit_ns {0};    // CommitVertexBuffers + CommitIndexBuffer / mesh push constants
+	std::atomic<uint64_t> dyn_ns {0};        // SetGraphicsDynamicParams (+ feedback-loop state)
+	std::atomic<uint64_t> begin_ns {0};      // BeginRendering
+	std::atomic<uint64_t> bind_ns {0};       // vkCmdBindPipeline
+	std::atomic<uint64_t> emit_ns {0};       // breadcrumbs + draw emit + frame-dump / debug hooks up to the draw
+	std::atomic<uint64_t> lookups {0};       // GetGraphicsPipeline calls
+	std::atomic<uint64_t> key_repeats {0};   // key equal to the previous draw's key
+	std::atomic<uint64_t> binds {0};         // vkCmdBindPipeline issued
+	std::atomic<uint64_t> binds_skipped {0}; // elided (KYTY_PIPELINE_MEMO)
+	std::atomic<uint64_t> bind_same {0};     // pipeline equal to the one bound in this recording (elidable)
+	std::atomic<uint64_t> dyn_calls {0};     // SetGraphicsDynamicParams calls
+	std::atomic<uint64_t> dyn_cmds {0};      // individual dynamic-state vkCmd* issued
+	std::atomic<uint64_t> dyn_cmds_skipped {0};
+	std::atomic<uint64_t> memo_verify {0};   // sampled full lookups compared against the memo
+	std::atomic<uint64_t> memo_mismatch {0}; // ... that differed (must be 0)
+	// dispatch
+	std::atomic<uint64_t> cs_get_ns {0};     // GetComputePipeline
+	std::atomic<uint64_t> cs_prep_ns {0};    // PrepareBindings
+	std::atomic<uint64_t> cs_bind_ns {0};    // ShouldBind + vkCmdBindPipeline
+	std::atomic<uint64_t> cs_lookups {0};
+	std::atomic<uint64_t> cs_repeats {0};    // same compute program as the previous dispatch
+	std::atomic<uint64_t> cs_binds {0};
+	std::atomic<uint64_t> cs_skipped {0};
+};
+inline PipelineStats g_pl;
+
+// NHL27BUFFERS2: inside rebind_lookup (RebindBuffers' NativeStorageBuffer / ObtainBufferCached loop) and
+// inside the buffer-cache sync path. Gated on BufScope (held by the draw / dispatch RebindBuffers lookup loop
+// and by PrepareBda); other BufferCache users are not counted.
+struct BufStats {
+	// ObtainBuffer (rebind scope)
+	std::atomic<uint64_t> ob_calls {0}, ob_written {0}, ob_stream {0}, ob_find_calls {0}, ob_syncs {0};
+	std::atomic<uint64_t> ob_stream_check_ns {0};  // stream fast-path GPU/CPU-modified walks (tracker)
+	std::atomic<uint64_t> ob_stream_copy_ns {0};   // stream Map + memcpy + Commit
+	std::atomic<uint64_t> ob_find_ns {0};          // FindBuffer when the supplied id was not usable
+	std::atomic<uint64_t> ob_touch_ns {0};         // TouchBuffer (LRU)
+	std::atomic<uint64_t> ob_sync_ns {0};          // SynchronizeBuffer (whole)
+	std::atomic<uint64_t> ob_book_ns {0};          // DropGpuFills / written bookkeeping
+	std::atomic<uint64_t> ob_invalidate_ns {0};    // InvalidateMemoryFromGPU for written buffers (descriptors.cpp)
+	// SynchronizeBuffer, by context: [0] = rebind (ObtainBuffer), [1] = PrepareBda
+	std::atomic<uint64_t> sb_calls[2] {};
+	std::atomic<uint64_t> sb_uploads[2] {};
+	std::atomic<uint64_t> sb_bytes[2] {};
+	std::atomic<uint64_t> sb_walk_ns[2] {};        // ForEachUploadRange tracker walk, excluding the upload callback
+	std::atomic<uint64_t> sb_stage_ns[2] {};       // UploadCopies: staging Map + memcpy + Commit
+	std::atomic<uint64_t> sb_end_ns[2] {};         // command.EndRendering()
+	std::atomic<uint64_t> sb_rec_ns[2] {};         // barriers + copyBuffer recording
+	std::atomic<uint64_t> sb_image_ns[2] {};       // SynchronizeBufferFromImage (texel buffers)
+	std::atomic<uint64_t> bda_syncs {0};           // PrepareBda calls that ran a sync (not skipped)
+	std::atomic<uint64_t> bda_drain_ns {0};        // sync_ns minus the nested SynchronizeBuffer time
+};
+inline BufStats g_buf;
+inline thread_local int g_buf_scope = 0;  // 1 = rebind lookup, 2 = PrepareBda
+struct BufScope {
+	int prev;
+	explicit BufScope(int v) noexcept: prev(g_buf_scope) { g_buf_scope = v; }
+	~BufScope() { g_buf_scope = prev; }
+	BufScope(const BufScope&)            = delete;
+	BufScope& operator=(const BufScope&) = delete;
+};
+
+// NHL27BUFDELTA (KYTY_BUFFER_DELTA)
+struct BufDeltaStats {
+	std::atomic<uint64_t> slots {0}, memo_hits {0}, memo_miss {0};      // FindBuffers slot memo
+	std::atomic<uint64_t> verify_checks {0}, verify_mismatch {0};       // sampled full FindBuffer compare
+	std::atomic<uint64_t> up_calls {0}, up_reused {0};                  // SRT / shader_data stream uploads
+	std::atomic<uint64_t> up_bytes_saved {0};
+	std::atomic<uint64_t> up_rej_data {0}, up_rej_epoch {0};            // rejected: content differs / ring or recording changed
+	std::atomic<uint64_t> up_verify {0}, up_verify_mismatch {0};        // sampled: staged bytes at the reused offset compared
+};
+inline BufDeltaStats g_bufdelta;
+inline bool BufOn() noexcept {
+	return g_buf_scope > 0 && Enabled();
+}
+// ---- END pipeline/buffer sub-bucket probes ----
+
 // NHL27SPECULATE (Stage 0 of parallel draw prep): how much materialization could have run ahead of time.
 // Seq counts materializations (draws + dispatches). Page tables are direct-mapped by hashed 4K page;
 // aliasing only over-blocks. Everything is gated on Enabled() at the call sites.
@@ -1107,6 +1191,72 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 			            per(bda_calls), per(bda_skips), per(bda_scans), per(bda_regions), per(bda_ranges),
 			            per(bda_pages), bda_lock_ms, 0.0, bda_sync_ms, 0.0, bda_other_ms);
 			std::printf("NHL27SYNC uploads=%.2f kb=%.2f\n", per(sync_uploads), per(sync_bytes) / 1024.0);
+		{
+			// pipeline / buffer sub-bucket lines (see the PipelineStats / BufStats blocks)
+			auto& pl = g_pl;
+			const uint64_t p_key = Take(pl.key_ns), p_lk = Take(pl.lookup_ns), p_tg = Take(pl.targets_ns);
+			const uint64_t p_vc = Take(pl.vcommit_ns), p_dy = Take(pl.dyn_ns), p_bg = Take(pl.begin_ns);
+			const uint64_t p_bd = Take(pl.bind_ns), p_em = Take(pl.emit_ns);
+			const uint64_t p_n = Take(pl.lookups), p_rep = Take(pl.key_repeats), p_b = Take(pl.binds);
+			const uint64_t p_bs = Take(pl.binds_skipped), p_same = Take(pl.bind_same), p_dc = Take(pl.dyn_calls);
+			const uint64_t p_dm = Take(pl.dyn_cmds), p_ds = Take(pl.dyn_cmds_skipped);
+			const uint64_t p_vf = Take(pl.memo_verify), p_vm = Take(pl.memo_mismatch);
+			const uint64_t c_get = Take(pl.cs_get_ns), c_prep = Take(pl.cs_prep_ns), c_bind = Take(pl.cs_bind_ns);
+			const uint64_t c_n = Take(pl.cs_lookups), c_rep = Take(pl.cs_repeats), c_b = Take(pl.cs_binds);
+			const uint64_t c_sk = Take(pl.cs_skipped);
+			const double   p_named = ms(p_key) + ms(p_lk) + ms(p_tg) + ms(p_vc) + ms(p_dy) + ms(p_bg) + ms(p_bd) + ms(p_em);
+			std::printf("NHL27PIPELINE draw: bucket=%.2fms key=%.2fms lookup=%.2fms targets=%.2fms vcommit=%.2fms "
+			            "dynamic=%.2fms begin=%.2fms bind=%.2fms emit=%.2fms other=%.2fms | lookups=%.1f "
+			            "key_repeat=%.1f binds=%.1f bind_skipped=%.1f bind_same=%.1f dyn_calls=%.1f dyn_cmds=%.1f "
+			            "dyn_skipped=%.1f memo_verify=%.2f memo_mismatch=%.2f | dispatch: bucket=%.2fms get=%.2fms "
+			            "prep=%.2fms bind=%.2fms lookups=%.1f repeat=%.1f binds=%.1f skipped=%.1f\n",
+			            ms(dp_pipeline_ns), ms(p_key), ms(p_lk), ms(p_tg), ms(p_vc), ms(p_dy), ms(p_bg), ms(p_bd),
+			            ms(p_em), std::max(0.0, ms(dp_pipeline_ns) - p_named), per(p_n), per(p_rep), per(p_b), per(p_bs),
+			            per(p_same), per(p_dc), per(p_dm), per(p_ds), per(p_vf), per(p_vm), ms(dc_pipeline_ns),
+			            ms(c_get), ms(c_prep), ms(c_bind), per(c_n), per(c_rep), per(c_b), per(c_sk));
+			auto& bf = g_buf;
+			const uint64_t o_calls = Take(bf.ob_calls), o_wr = Take(bf.ob_written), o_st = Take(bf.ob_stream);
+			const uint64_t o_fc = Take(bf.ob_find_calls), o_sy = Take(bf.ob_syncs);
+			const uint64_t o_sck = Take(bf.ob_stream_check_ns), o_scp = Take(bf.ob_stream_copy_ns);
+			const uint64_t o_fn = Take(bf.ob_find_ns), o_tn = Take(bf.ob_touch_ns), o_sn = Take(bf.ob_sync_ns);
+			const uint64_t o_bk = Take(bf.ob_book_ns), o_inv = Take(bf.ob_invalidate_ns);
+			std::printf("NHL27BUFFERS2 rebind_lookup=%.2fms obtain: calls=%.1f written=%.1f stream_path=%.1f "
+			            "find_calls=%.1f syncs=%.1f stream_check=%.2fms stream_copy=%.2fms find=%.2fms touch=%.2fms "
+			            "sync=%.2fms book=%.2fms invalidate_gpu=%.2fms\n",
+			            ms(dp_rebind_lookup_ns), per(o_calls), per(o_wr), per(o_st), per(o_fc), per(o_sy), ms(o_sck),
+			            ms(o_scp), ms(o_fn), ms(o_tn), ms(o_sn), ms(o_bk), ms(o_inv));
+			static const char* const sb_name[2] = {"rebind", "bda"};
+			const uint64_t bda_syncs = Take(bf.bda_syncs);
+			(void)Take(bf.bda_drain_ns);
+			for (int k = 0; k < 2; ++k) {
+				const uint64_t s_c = Take(bf.sb_calls[k]), s_u = Take(bf.sb_uploads[k]), s_b = Take(bf.sb_bytes[k]);
+				const uint64_t s_w = Take(bf.sb_walk_ns[k]), s_s = Take(bf.sb_stage_ns[k]), s_e = Take(bf.sb_end_ns[k]);
+				const uint64_t s_r = Take(bf.sb_rec_ns[k]), s_i = Take(bf.sb_image_ns[k]);
+				// sb_walk_ns holds the whole ForEachUploadRange call (tracker walk + the staging callback).
+				std::printf("NHL27BUFFERS2 sync[%s]: calls=%.1f uploads=%.2f kb=%.1f walk=%.3fms "
+				            "stage_memcpy=%.3fms end_rendering=%.3fms barriers_copy=%.3fms from_image=%.3fms%s",
+				            sb_name[k], per(s_c), per(s_u), per(s_b) / 1024.0, ms(s_w > s_s ? s_w - s_s : 0), ms(s_s),
+				            ms(s_e), ms(s_r), ms(s_i), k == 1 ? "" : "\n");
+				if (k == 1) {
+					const uint64_t inner = s_w + s_e + s_r + s_i;
+					std::printf(" bda_syncs=%.2f drain_and_range_walk=%.3fms (bda_sync_total=%.3fms)\n", per(bda_syncs),
+					            ms(bda_sync_ns > inner ? bda_sync_ns - inner : 0), ms(bda_sync_ns));
+				}
+			}
+			auto& bd = g_bufdelta;
+			const uint64_t d_sl = Take(bd.slots), d_h = Take(bd.memo_hits), d_m = Take(bd.memo_miss);
+			const uint64_t d_vc = Take(bd.verify_checks), d_vm = Take(bd.verify_mismatch);
+			const uint64_t u_c = Take(bd.up_calls), u_r = Take(bd.up_reused), u_by = Take(bd.up_bytes_saved);
+			const uint64_t u_rd = Take(bd.up_rej_data), u_re = Take(bd.up_rej_epoch);
+			const uint64_t u_vc = Take(bd.up_verify), u_vm = Take(bd.up_verify_mismatch);
+			if (Common::RuntimeFlags::Current().buffer_delta) {
+				std::printf("NHL27BUFDELTA slots=%.1f memo_hits=%.1f memo_miss=%.1f verify_checks=%.2f "
+				            "verify_mismatch=%.2f uploads=%.1f reused=%.1f saved_kb=%.1f rej_data=%.1f rej_epoch=%.1f "
+				            "up_verify=%.2f up_verify_mismatch=%.2f\n",
+				            per(d_sl), per(d_h), per(d_m), per(d_vc), per(d_vm), per(u_c), per(u_r),
+				            per(u_by) / 1024.0, per(u_rd), per(u_re), per(u_vc), per(u_vm));
+			}
+		}
 		std::printf("NHL27PROTECT calls=%.2f ms=%.3f\n", per(protect_calls), ms(protect_ns));
 		{
 			auto&          fc  = g_fault_cost;

@@ -274,7 +274,8 @@ static bool ShouldBindComputePipeline(RenderContext& context, vk::CommandBuffer 
 	static vk::Pipeline      last_pipeline {};
 	const uint64_t tick  = context.GetCommandScheduler().CurrentTick();
 	const uint64_t epoch = g_compute_pipeline_epoch.load(std::memory_order_relaxed);
-	const bool     same  = Common::RuntimeFlags::Current().dispatch_fast && last_cmd == cmd &&
+	const auto     flags = Common::RuntimeFlags::Current();
+	const bool     same  = (flags.dispatch_fast || flags.pipeline_memo) && last_cmd == cmd &&
 	                       last_tick == tick && last_epoch == epoch && last_pipeline == pipeline &&
 	                       pipeline != vk::Pipeline {};
 	last_cmd      = cmd;
@@ -283,6 +284,7 @@ static bool ShouldBindComputePipeline(RenderContext& context, vk::CommandBuffer 
 	last_pipeline = pipeline;
 	if (same) {
 		FrameBreakdown::Add(FrameBreakdown::g_counters.dc_bind_skipped);
+		FrameBreakdown::Add(FrameBreakdown::g_pl.cs_skipped);
 	}
 	return !same;
 }
@@ -442,10 +444,14 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	buffer.EndRendering();
 	FrameBreakdown::Timer pipeline_timer(FrameBreakdown::g_counters.dc_pipeline_ns);
+	FrameBreakdown::Timer cs_get_timer(FrameBreakdown::g_pl.cs_get_ns);
 	auto& pipeline =
 	    m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	cs_get_timer.Stop();
 	auto& bindings = m_compute_bindings;
+	FrameBreakdown::Timer cs_prep_timer(FrameBreakdown::g_pl.cs_prep_ns);
 	PrepareBindings(input_info.stage, bindings);
+	cs_prep_timer.Stop();
 	if (program.bindings.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart) {
 		std::copy(std::begin(input_info.dispatch_threads_num), std::end(input_info.dispatch_threads_num),
 		          bindings.shader_data.begin() + program.bindings.dispatch_thread_dword);
@@ -608,8 +614,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 	FrameBreakdown::Timer record_timer(FrameBreakdown::g_counters.dc_record_ns);
-	if (ShouldBindComputePipeline(m_context, vk_buffer, pipeline.pipeline)) {
-		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	{
+		FrameBreakdown::Timer cs_bind_timer(FrameBreakdown::g_pl.cs_bind_ns);
+		if (ShouldBindComputePipeline(m_context, vk_buffer, pipeline.pipeline)) {
+			FrameBreakdown::Add(FrameBreakdown::g_pl.cs_binds);
+			vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+		}
 	}
 	const auto crumb = BreadcrumbBegin(m_context.GetGraphics(), vk_buffer, "dispatch",
 	                                   program.shader_hash,
@@ -699,9 +709,13 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	buffer.EndRendering();
 	FrameBreakdown::Timer pipeline_timer(FrameBreakdown::g_counters.dc_pipeline_ns);
+	FrameBreakdown::Timer cs_get_timer(FrameBreakdown::g_pl.cs_get_ns);
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	cs_get_timer.Stop();
 	auto& bindings = m_compute_bindings;
+	FrameBreakdown::Timer cs_prep_timer(FrameBreakdown::g_pl.cs_prep_ns);
 	PrepareBindings(input_info.stage, bindings);
+	cs_prep_timer.Stop();
 	pipeline_timer.Stop();
 	PreparedBindings* descriptor_stage = &bindings;
 	const auto& program = *input_info.stage.program;
@@ -751,8 +765,12 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	                          1, &barrier, 0, nullptr, 0, nullptr);
 	barrier_timer.Stop();
 	FrameBreakdown::Timer record_timer(FrameBreakdown::g_counters.dc_record_ns);
-	if (ShouldBindComputePipeline(m_context, vk_buffer, pipeline.pipeline)) {
-		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	{
+		FrameBreakdown::Timer cs_bind_timer(FrameBreakdown::g_pl.cs_bind_ns);
+		if (ShouldBindComputePipeline(m_context, vk_buffer, pipeline.pipeline)) {
+			FrameBreakdown::Add(FrameBreakdown::g_pl.cs_binds);
+			vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+		}
 	}
 	const auto crumb = BreadcrumbBegin(m_context.GetGraphics(), vk_buffer, "dispatch-indirect",
 	                                   program.shader_hash, args_addr);

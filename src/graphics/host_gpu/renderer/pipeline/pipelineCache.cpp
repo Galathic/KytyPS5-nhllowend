@@ -1222,6 +1222,14 @@ bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other)
 	return std::memcmp(this, &other, sizeof(*this)) == 0;
 }
 
+static bool PipelineMemoVerifyEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DRAWPREP_VERIFY");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
 PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
     std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
     std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
@@ -1245,6 +1253,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	const auto vs_id = vertex_program.id;
 	const auto ps_id = ps_active ? pixel_program.id : 0;
 
+	FrameBreakdown::Timer key_timer(FrameBreakdown::g_pl.key_ns);
 	GraphicsPipelineKey key {};
 	for (uint32_t i = 0; i < programs.vertex.size(); i++) {
 		key.vertex_shader_ids[i] = programs.vertex[i].id;
@@ -1391,8 +1400,40 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		}
 	}
 
-	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
-		return *iter->second;
+	key_timer.Stop();
+	{
+		FrameBreakdown::Timer lookup_timer(FrameBreakdown::g_pl.lookup_ns);
+		FrameBreakdown::Add(FrameBreakdown::g_pl.lookups);
+		// A key equal to the previous call's key maps to the previous call's pipeline (the map never changes an
+		// existing entry), so the hash + lookup can be skipped. The compare also feeds the key_repeat counter.
+		const bool memo_on = Common::RuntimeFlags::Current().pipeline_memo;
+		if (m_last_pipeline != nullptr && (memo_on || FrameBreakdown::Enabled()) && key == m_last_key) {
+			FrameBreakdown::Add(FrameBreakdown::g_pl.key_repeats);
+			if (memo_on) {
+				static uint32_t verify_tick = 0;
+				if (PipelineMemoVerifyEnabled() && (++verify_tick & 63u) == 0) {
+					const auto full = m_graphics_pipelines.find(key);
+					FrameBreakdown::Add(FrameBreakdown::g_pl.memo_verify);
+					if (full == m_graphics_pipelines.end() || full->second.get() != m_last_pipeline) {
+						FrameBreakdown::Add(FrameBreakdown::g_pl.memo_mismatch);
+						std::fprintf(stderr, "NHL27PIPELINE memo mismatch: graphics key (vs=%" PRIu64 " ps=%" PRIu64 ")\n",
+						             vs_id, ps_id);
+						std::fflush(stderr);
+						if (full != m_graphics_pipelines.end()) {
+							m_last_pipeline = full->second.get();
+						}
+					}
+				}
+				return *m_last_pipeline;
+			}
+		}
+		if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
+			if (memo_on || FrameBreakdown::Enabled()) {
+				m_last_key      = key;
+				m_last_pipeline = iter->second.get();
+			}
+			return *iter->second;
+		}
 	}
 
 	if (graphics_debug_dump_enabled()) {
@@ -1429,6 +1470,11 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	EXIT_IF(!compute_program);
 
+	FrameBreakdown::Add(FrameBreakdown::g_pl.cs_lookups);
+	if (m_last_compute_id == compute_program.id) {
+		FrameBreakdown::Add(FrameBreakdown::g_pl.cs_repeats);
+	}
+	m_last_compute_id = compute_program.id;
 	if (auto iter = m_compute_pipelines.find(compute_program.id);
 	    iter != m_compute_pipelines.end()) {
 		return *iter->second;

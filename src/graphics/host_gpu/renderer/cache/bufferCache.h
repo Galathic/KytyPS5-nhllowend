@@ -26,6 +26,17 @@ class TextureCache;
 using BufferId = Common::SlotId;
 inline constexpr BufferId NULL_BUFFER_ID {0};
 
+// KYTY_BUFFER_DELTA: last FindBuffer result for one buffer slot of one program. Valid while the registration
+// generation is unchanged (the page table and every buffer's bounds are then unchanged) and the new range lies
+// inside the remembered buffer's guest range; FindBuffer would then return the same id.
+struct BufferSlotMemo {
+	bool     valid        = false;
+	uint64_t begin        = 0;
+	uint64_t end          = 0;
+	uint64_t registration = 0;
+	BufferId id {};
+};
+
 class BufferCache {
 public:
 	static constexpr uint32_t CACHING_PAGEBITS  = 14;
@@ -81,6 +92,8 @@ public:
 	void DiscardGpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
+	// FindBuffer with a per-slot memo (KYTY_BUFFER_DELTA); hit is set when the lookup was skipped.
+	[[nodiscard]] BufferId FindBufferMemo(BufferSlotMemo& memo, uint64_t vaddr, uint64_t size, bool& hit);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,
