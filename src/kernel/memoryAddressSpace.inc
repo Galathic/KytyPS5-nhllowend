@@ -486,11 +486,12 @@ public:
 
 private:
 	struct ReadCache {
-		const void* owner  = nullptr;
-		uint64_t    gen    = 0;
-		uint64_t    begin  = 0;
-		uint64_t    length = 0;
-		uint8_t*    host   = nullptr;
+		// No member initializers: a thread_local static is zero-initialized.
+		const void* owner;
+		uint64_t    gen;
+		uint64_t    begin;
+		uint64_t    length;
+		uint8_t*    host;
 	};
 	static inline thread_local ReadCache t_read_cache;
 	static inline std::atomic<uint64_t> s_gen_epoch {0};
