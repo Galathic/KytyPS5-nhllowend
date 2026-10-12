@@ -14,7 +14,7 @@
 
 namespace Common::RuntimeFlags {
 inline constexpr int64_t kIntervalMs = 250;
-inline constexpr unsigned kRevisionShift = 20;
+inline constexpr unsigned kRevisionShift = 21;
 inline constexpr uint64_t kFlagMask = (uint64_t{1} << kRevisionShift) - 1;
 inline constexpr uint32_t kUnpinnedBits = uint32_t{1} << kRevisionShift;
 static_assert(kRevisionShift < 32, "evaluation bits and unpinned sentinel must fit uint32_t");
@@ -39,11 +39,12 @@ struct FlagSet {
  bool srt_source_reuse = false;
  bool dispatch_fast = false;
  bool buffer_fast = false;
+ bool drawprep_prefetch = false;
 };
 inline constexpr const char* kSwitchableFlags[] = {
  "KYTY_RESOURCE_DYNAMIC_DEPS", "KYTY_RESOURCE_MEMO_VERIFY", "KYTY_SRT_CFG_TAPE",
  "KYTY_SRT_CFG_SCHEDULE", "KYTY_PM4_EVENT_CLEAN", "KYTY_PM4_WRITE_DATA_FAST", "KYTY_SHADER_CLEAN_READS", "KYTY_SRT_SCALAR_BATCH", "KYTY_RESOURCE_HASH_FILTER", "KYTY_RESOURCE_MEMO_BYPASS", "KYTY_SRT_CFG_GATHER",
- "KYTY_SRT_CFG_TRACE", "KYTY_FAULT_AHEAD", "KYTY_RESOURCE_SPEC_CACHE", "KYTY_FAULT_PARSE_GATE", "KYTY_IDLE_TRACE", "KYTY_SUBMIT_SPLIT", "KYTY_SRT_SOURCE_REUSE", "KYTY_DISPATCH_FAST", "KYTY_BUFFER_FAST"
+ "KYTY_SRT_CFG_TRACE", "KYTY_FAULT_AHEAD", "KYTY_RESOURCE_SPEC_CACHE", "KYTY_FAULT_PARSE_GATE", "KYTY_IDLE_TRACE", "KYTY_SUBMIT_SPLIT", "KYTY_SRT_SOURCE_REUSE", "KYTY_DISPATCH_FAST", "KYTY_BUFFER_FAST", "KYTY_DRAWPREP_PREFETCH"
 };
 inline uint64_t Bits(const FlagSet& f) {
  return uint64_t(f.resource_dynamic_deps) | (uint64_t(f.resource_memo_verify)<<1) |
@@ -52,7 +53,7 @@ inline uint64_t Bits(const FlagSet& f) {
   (uint64_t(f.resource_hash_filter)<<8) | (uint64_t(f.resource_memo_bypass)<<9) |
   (uint64_t(f.srt_cfg_gather)<<10) | (uint64_t(f.srt_cfg_trace)<<11) | (uint64_t(f.fault_ahead)<<12) |
   (uint64_t(f.resource_spec_cache)<<13) | (uint64_t(f.fault_parse_gate)<<14) | (uint64_t(f.idle_trace)<<15) | (uint64_t(f.submit_split)<<16) |
-  (uint64_t(f.srt_source_reuse)<<17) | (uint64_t(f.dispatch_fast)<<18) | (uint64_t(f.buffer_fast)<<19);
+  (uint64_t(f.srt_source_reuse)<<17) | (uint64_t(f.dispatch_fast)<<18) | (uint64_t(f.buffer_fast)<<19) | (uint64_t(f.drawprep_prefetch)<<20);
 }
 // Low kRevisionShift bits flags; remaining bits revision. One atomic publication.
 inline std::atomic<uint64_t> g_published{0};
@@ -81,7 +82,7 @@ inline FlagSet Current() {
   .resource_hash_filter=bool(bits&256),.resource_memo_bypass=bool(bits&512),
   .srt_cfg_gather=bool(bits&1024),.srt_cfg_trace=bool(bits&2048),.fault_ahead=bool(bits&4096),
   .resource_spec_cache=bool(bits&8192),.fault_parse_gate=bool(bits&16384),.idle_trace=bool(bits&32768),.submit_split=bool(bits&65536),
-  .srt_source_reuse=bool(bits&131072),.dispatch_fast=bool(bits&262144),.buffer_fast=bool(bits&524288)};
+  .srt_source_reuse=bool(bits&131072),.dispatch_fast=bool(bits&262144),.buffer_fast=bool(bits&524288),.drawprep_prefetch=bool(bits&1048576)};
 }
 inline uint64_t Revision() { return g_published.load(std::memory_order_relaxed)>>kRevisionShift; }
 inline int64_t NowMs() {
@@ -116,6 +117,7 @@ inline bool* FieldFor(FlagSet& f,const char* name) {
  if (!std::strcmp(name,kSwitchableFlags[17])) return &f.srt_source_reuse;
  if (!std::strcmp(name,kSwitchableFlags[18])) return &f.dispatch_fast;
  if (!std::strcmp(name,kSwitchableFlags[19])) return &f.buffer_fast;
+ if (!std::strcmp(name,kSwitchableFlags[20])) return &f.drawprep_prefetch;
  return nullptr;
 }
 inline void Trim(std::string& s) {
