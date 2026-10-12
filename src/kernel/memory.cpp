@@ -880,7 +880,7 @@ bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
 }
 
 bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
-	const bool fast = (Common::RuntimeFlags::g_published.load(std::memory_order_relaxed) & (uint64_t {1} << 17)) != 0;
+	const bool fast = (Common::RuntimeFlags::g_published.load(std::memory_order_relaxed) & (uint64_t {1} << Common::RuntimeFlags::kBitSrtSourceReuse)) != 0;
 	return g_guest_address_space != nullptr &&
 	       g_guest_address_space->TryReadBacking(vaddr, data, size, fast);
 }

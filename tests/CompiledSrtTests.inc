@@ -11,12 +11,12 @@ namespace CompiledSrtTest {
 using namespace Libs::Graphics::ShaderRecompiler::IR;
 
 inline void SetCompiled(bool on) {
-  const uint64_t bit = uint64_t{1} << 22;
+  const uint64_t bit = uint64_t{1} << Common::RuntimeFlags::kBitSrtCompiled;
   const auto old = Common::RuntimeFlags::g_published.load(std::memory_order_relaxed);
   Common::RuntimeFlags::g_published.store(on ? (old | bit) : (old & ~bit), std::memory_order_relaxed);
 }
 inline bool CompiledRequested() {
-  return (Common::RuntimeFlags::g_published.load(std::memory_order_relaxed) >> 22 & 1u) != 0u;
+  return (Common::RuntimeFlags::g_published.load(std::memory_order_relaxed) >> Common::RuntimeFlags::kBitSrtCompiled & 1u) != 0u;
 }
 
 // Guest memory: captured words per domain, a deterministic hash for everything else.
@@ -542,7 +542,7 @@ inline void TestChangedRegisterMemoryAndBranch() {
     Check(GetSrtCompiledStats().cfg >= alt_before.cfg + 6, "both recorded CFG paths are served compiled");
     Check(cfg_tally.mismatches == 0, "no CFG differential mismatch");
   }
-  Common::RuntimeFlags::g_published.store(saved_flags & ~(uint64_t{1} << 22), std::memory_order_relaxed);
+  Common::RuntimeFlags::g_published.store(saved_flags & ~(uint64_t{1} << Common::RuntimeFlags::kBitSrtCompiled), std::memory_order_relaxed);
   Check(tally.mismatches == 0, "no pointer-chase differential mismatch");
 }
 

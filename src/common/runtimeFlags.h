@@ -14,54 +14,98 @@
 
 namespace Common::RuntimeFlags {
 inline constexpr int64_t kIntervalMs = 250;
-inline constexpr unsigned kRevisionShift = 26;
+inline constexpr unsigned kRevisionShift = 23;
 inline constexpr uint64_t kFlagMask = (uint64_t{1} << kRevisionShift) - 1;
 inline constexpr uint32_t kUnpinnedBits = uint32_t{1} << kRevisionShift;
 static_assert(kRevisionShift < 32, "evaluation bits and unpinned sentinel must fit uint32_t");
+// A flag's bit is its index in kSwitchableFlags. Defaults live in the FlagSet initializers: a missing
+// environment variable / flags.ctl line means the default, an explicit =0 / =1 overrides it.
 struct FlagSet {
- bool resource_dynamic_deps = false;
+ bool resource_dynamic_deps = true;
  bool resource_memo_verify = false;
- bool srt_cfg_tape = false;
+ bool srt_cfg_tape = true;
  bool srt_cfg_schedule = false;
  bool pm4_event_clean = true;
  bool pm4_write_data_fast = false;
  bool shader_clean_reads = false;
  bool srt_scalar_batch = false;
  bool resource_hash_filter = false;
- bool resource_memo_bypass = false;
- bool srt_cfg_gather = false;
- bool srt_cfg_trace = false;
+ bool resource_memo_bypass = true;
+ bool srt_cfg_gather = true;
+ bool srt_cfg_trace = true;
  bool fault_ahead = false;
  bool resource_spec_cache = false;
  bool fault_parse_gate = false;
  bool idle_trace = false;
  bool submit_split = true;
- bool srt_source_reuse = false;
- bool dispatch_fast = false;
- bool buffer_fast = false;
- bool drawprep_prefetch = false;
- bool drawprep_delta = false;
- bool srt_compiled = false;
- bool buffer_delta = false;
- bool pipeline_memo = false;
- bool dirty_walk_fast = false;
+ bool srt_source_reuse = true;
+ bool dispatch_fast = true;
+ bool buffer_fast = true;
+ bool drawprep_delta = true;
+ bool srt_compiled = true;
+ bool pipeline_memo = true;
 };
 inline constexpr const char* kSwitchableFlags[] = {
- "KYTY_RESOURCE_DYNAMIC_DEPS", "KYTY_RESOURCE_MEMO_VERIFY", "KYTY_SRT_CFG_TAPE",
- "KYTY_SRT_CFG_SCHEDULE", "KYTY_PM4_EVENT_CLEAN", "KYTY_PM4_WRITE_DATA_FAST", "KYTY_SHADER_CLEAN_READS", "KYTY_SRT_SCALAR_BATCH", "KYTY_RESOURCE_HASH_FILTER", "KYTY_RESOURCE_MEMO_BYPASS", "KYTY_SRT_CFG_GATHER",
- "KYTY_SRT_CFG_TRACE", "KYTY_FAULT_AHEAD", "KYTY_RESOURCE_SPEC_CACHE", "KYTY_FAULT_PARSE_GATE", "KYTY_IDLE_TRACE", "KYTY_SUBMIT_SPLIT", "KYTY_SRT_SOURCE_REUSE", "KYTY_DISPATCH_FAST", "KYTY_BUFFER_FAST", "KYTY_DRAWPREP_PREFETCH", "KYTY_DRAWPREP_DELTA", "KYTY_SRT_COMPILED", "KYTY_BUFFER_DELTA", "KYTY_PIPELINE_MEMO", "KYTY_DIRTY_WALK_FAST"
+ "KYTY_RESOURCE_DYNAMIC_DEPS",
+ "KYTY_RESOURCE_MEMO_VERIFY",
+ "KYTY_SRT_CFG_TAPE",
+ "KYTY_SRT_CFG_SCHEDULE",
+ "KYTY_PM4_EVENT_CLEAN",
+ "KYTY_PM4_WRITE_DATA_FAST",
+ "KYTY_SHADER_CLEAN_READS",
+ "KYTY_SRT_SCALAR_BATCH",
+ "KYTY_RESOURCE_HASH_FILTER",
+ "KYTY_RESOURCE_MEMO_BYPASS",
+ "KYTY_SRT_CFG_GATHER",
+ "KYTY_SRT_CFG_TRACE",
+ "KYTY_FAULT_AHEAD",
+ "KYTY_RESOURCE_SPEC_CACHE",
+ "KYTY_FAULT_PARSE_GATE",
+ "KYTY_IDLE_TRACE",
+ "KYTY_SUBMIT_SPLIT",
+ "KYTY_SRT_SOURCE_REUSE",
+ "KYTY_DISPATCH_FAST",
+ "KYTY_BUFFER_FAST",
+ "KYTY_DRAWPREP_DELTA",
+ "KYTY_SRT_COMPILED",
+ "KYTY_PIPELINE_MEMO"
 };
-inline uint64_t Bits(const FlagSet& f) {
- return uint64_t(f.resource_dynamic_deps) | (uint64_t(f.resource_memo_verify)<<1) |
-  (uint64_t(f.srt_cfg_tape)<<2) | (uint64_t(f.srt_cfg_schedule)<<3) |
-  (uint64_t(f.pm4_event_clean)<<4) | (uint64_t(f.pm4_write_data_fast)<<5) | (uint64_t(f.shader_clean_reads)<<6) | (uint64_t(f.srt_scalar_batch)<<7) |
-  (uint64_t(f.resource_hash_filter)<<8) | (uint64_t(f.resource_memo_bypass)<<9) |
-  (uint64_t(f.srt_cfg_gather)<<10) | (uint64_t(f.srt_cfg_trace)<<11) | (uint64_t(f.fault_ahead)<<12) |
-  (uint64_t(f.resource_spec_cache)<<13) | (uint64_t(f.fault_parse_gate)<<14) | (uint64_t(f.idle_trace)<<15) | (uint64_t(f.submit_split)<<16) |
-  (uint64_t(f.srt_source_reuse)<<17) | (uint64_t(f.dispatch_fast)<<18) | (uint64_t(f.buffer_fast)<<19) | (uint64_t(f.drawprep_prefetch)<<20) | (uint64_t(f.drawprep_delta)<<21) | (uint64_t(f.srt_compiled)<<22) | (uint64_t(f.buffer_delta)<<23) | (uint64_t(f.pipeline_memo)<<24) | (uint64_t(f.dirty_walk_fast)<<25);
+static_assert(sizeof(kSwitchableFlags) / sizeof(kSwitchableFlags[0]) == kRevisionShift, "one bit per switchable flag");
+inline constexpr uint64_t Bits(const FlagSet& f) {
+ return (uint64_t(f.resource_dynamic_deps)<<0) |
+  (uint64_t(f.resource_memo_verify)<<1) |
+  (uint64_t(f.srt_cfg_tape)<<2) |
+  (uint64_t(f.srt_cfg_schedule)<<3) |
+  (uint64_t(f.pm4_event_clean)<<4) |
+  (uint64_t(f.pm4_write_data_fast)<<5) |
+  (uint64_t(f.shader_clean_reads)<<6) |
+  (uint64_t(f.srt_scalar_batch)<<7) |
+  (uint64_t(f.resource_hash_filter)<<8) |
+  (uint64_t(f.resource_memo_bypass)<<9) |
+  (uint64_t(f.srt_cfg_gather)<<10) |
+  (uint64_t(f.srt_cfg_trace)<<11) |
+  (uint64_t(f.fault_ahead)<<12) |
+  (uint64_t(f.resource_spec_cache)<<13) |
+  (uint64_t(f.fault_parse_gate)<<14) |
+  (uint64_t(f.idle_trace)<<15) |
+  (uint64_t(f.submit_split)<<16) |
+  (uint64_t(f.srt_source_reuse)<<17) |
+  (uint64_t(f.dispatch_fast)<<18) |
+  (uint64_t(f.buffer_fast)<<19) |
+  (uint64_t(f.drawprep_delta)<<20) |
+  (uint64_t(f.srt_compiled)<<21) |
+  (uint64_t(f.pipeline_memo)<<22);
 }
+// Bit positions for the few call sites that test g_published directly without decoding a FlagSet.
+inline constexpr unsigned kBitIdleTrace = 15;
+inline constexpr unsigned kBitSrtSourceReuse = 17;
+inline constexpr unsigned kBitSrtCompiled = 21;
+static_assert(Bits(FlagSet{.idle_trace=true}) >> kBitIdleTrace & 1, "kBitIdleTrace");
+static_assert(Bits(FlagSet{.srt_source_reuse=true}) >> kBitSrtSourceReuse & 1, "kBitSrtSourceReuse");
+static_assert(Bits(FlagSet{.srt_compiled=true}) >> kBitSrtCompiled & 1, "kBitSrtCompiled");
 // Low kRevisionShift bits flags; remaining bits revision. One atomic publication.
-inline std::atomic<uint64_t> g_published{0};
+// Starts at the defaults (revision 0) so a reader that runs before the first Refresh sees them.
+inline std::atomic<uint64_t> g_published{Bits(FlagSet{})};
 inline std::atomic<int64_t> g_last_poll{0};
 inline std::mutex g_refresh_mutex;
 inline std::string g_control_path;
@@ -81,13 +125,31 @@ public:
 };
 inline FlagSet Current() {
  const auto bits = g_evaluation_bits!=kUnpinnedBits ? g_evaluation_bits : g_published.load(std::memory_order_relaxed);
- return {.resource_dynamic_deps=bool(bits&1),.resource_memo_verify=bool(bits&2),
-  .srt_cfg_tape=bool(bits&4),.srt_cfg_schedule=bool(bits&8),.pm4_event_clean=bool(bits&16),
-  .pm4_write_data_fast=bool(bits&32),.shader_clean_reads=bool(bits&64),.srt_scalar_batch=bool(bits&128),
-  .resource_hash_filter=bool(bits&256),.resource_memo_bypass=bool(bits&512),
-  .srt_cfg_gather=bool(bits&1024),.srt_cfg_trace=bool(bits&2048),.fault_ahead=bool(bits&4096),
-  .resource_spec_cache=bool(bits&8192),.fault_parse_gate=bool(bits&16384),.idle_trace=bool(bits&32768),.submit_split=bool(bits&65536),
-  .srt_source_reuse=bool(bits&131072),.dispatch_fast=bool(bits&262144),.buffer_fast=bool(bits&524288),.drawprep_prefetch=bool(bits&1048576),.drawprep_delta=bool(bits&2097152),.srt_compiled=bool(bits&4194304),.buffer_delta=bool(bits&8388608),.pipeline_memo=bool(bits&16777216),.dirty_walk_fast=bool(bits&33554432)};
+ FlagSet f;
+ f.resource_dynamic_deps=(bits>>0&1u)!=0;
+ f.resource_memo_verify=(bits>>1&1u)!=0;
+ f.srt_cfg_tape=(bits>>2&1u)!=0;
+ f.srt_cfg_schedule=(bits>>3&1u)!=0;
+ f.pm4_event_clean=(bits>>4&1u)!=0;
+ f.pm4_write_data_fast=(bits>>5&1u)!=0;
+ f.shader_clean_reads=(bits>>6&1u)!=0;
+ f.srt_scalar_batch=(bits>>7&1u)!=0;
+ f.resource_hash_filter=(bits>>8&1u)!=0;
+ f.resource_memo_bypass=(bits>>9&1u)!=0;
+ f.srt_cfg_gather=(bits>>10&1u)!=0;
+ f.srt_cfg_trace=(bits>>11&1u)!=0;
+ f.fault_ahead=(bits>>12&1u)!=0;
+ f.resource_spec_cache=(bits>>13&1u)!=0;
+ f.fault_parse_gate=(bits>>14&1u)!=0;
+ f.idle_trace=(bits>>15&1u)!=0;
+ f.submit_split=(bits>>16&1u)!=0;
+ f.srt_source_reuse=(bits>>17&1u)!=0;
+ f.dispatch_fast=(bits>>18&1u)!=0;
+ f.buffer_fast=(bits>>19&1u)!=0;
+ f.drawprep_delta=(bits>>20&1u)!=0;
+ f.srt_compiled=(bits>>21&1u)!=0;
+ f.pipeline_memo=(bits>>22&1u)!=0;
+ return f;
 }
 inline uint64_t Revision() { return g_published.load(std::memory_order_relaxed)>>kRevisionShift; }
 inline int64_t NowMs() {
@@ -122,12 +184,9 @@ inline bool* FieldFor(FlagSet& f,const char* name) {
  if (!std::strcmp(name,kSwitchableFlags[17])) return &f.srt_source_reuse;
  if (!std::strcmp(name,kSwitchableFlags[18])) return &f.dispatch_fast;
  if (!std::strcmp(name,kSwitchableFlags[19])) return &f.buffer_fast;
- if (!std::strcmp(name,kSwitchableFlags[20])) return &f.drawprep_prefetch;
- if (!std::strcmp(name,kSwitchableFlags[21])) return &f.drawprep_delta;
- if (!std::strcmp(name,kSwitchableFlags[22])) return &f.srt_compiled;
- if (!std::strcmp(name,kSwitchableFlags[23])) return &f.buffer_delta;
- if (!std::strcmp(name,kSwitchableFlags[24])) return &f.pipeline_memo;
- if (!std::strcmp(name,kSwitchableFlags[25])) return &f.dirty_walk_fast;
+ if (!std::strcmp(name,kSwitchableFlags[20])) return &f.drawprep_delta;
+ if (!std::strcmp(name,kSwitchableFlags[21])) return &f.srt_compiled;
+ if (!std::strcmp(name,kSwitchableFlags[22])) return &f.pipeline_memo;
  return nullptr;
 }
 inline void Trim(std::string& s) {
@@ -136,20 +195,17 @@ inline void Trim(std::string& s) {
  const auto last=s.find_last_not_of(" \t\r\n"); s=s.substr(first,last-first+1);
 }
 inline FlagSet BuildLocked() {
- FlagSet f;
+ FlagSet f; // defaults come from the FlagSet initializers
  for (auto* name:kSwitchableFlags) {
+  // Environment: only an explicit 0 or 1 overrides the default (unset or anything else keeps it).
   const char* v=std::getenv(name);
-  // pm4_event_clean is on by default: it is the correctness-preserving fix for
-  // EVENT_WRITE payload reads that false-share a 4 KiB page with GPU-written data.
-  // Explicitly set KYTY_PM4_EVENT_CLEAN=0 to force the old faulting read.
-  // pm4_event_clean and submit_split default on; set the flag to 0 to disable.
-  const bool default_on = std::strcmp(name,kSwitchableFlags[4])==0 || std::strcmp(name,kSwitchableFlags[16])==0;
-  *FieldFor(f,name) = default_on ? !(v && v[0]=='0') : (v && v[0]=='1');
+  if (v && (v[0]=='0' || v[0]=='1')) *FieldFor(f,name) = v[0]=='1';
  }
  if (!g_path_set) {
   const char* v=std::getenv("KYTY_FLAG_FILE");
   g_control_path=v && *v ? v : "flags.ctl"; g_path_set=true;
  }
+ // flags.ctl (KEY=VALUE per line): only listed flags are overridden; a missing line means the default.
  std::ifstream file(g_control_path,std::ios::binary); std::string line;
  while (std::getline(file,line)) {
   const auto eq=line.find('='); if (eq==std::string::npos) continue;

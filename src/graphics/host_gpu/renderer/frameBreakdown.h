@@ -18,7 +18,7 @@
 #include "graphics/shader/recompiler/ir/ResourceSnapshot.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
-// KYTY_PERF_STATS=1 frame time breakdown. Prints one line about once per second:
+// KYTY_PERF_STATS=1 frame time breakdown (KYTY_PERF_STATS_VERBOSE=1 adds the heavy sub-bucket lines). Prints one line about once per second:
 //   NHL27FRAME fps=... frame=... gpu_thread_busy=... wait_gpu=... readback=... faults=...
 //              compile=... draw_prep=... draws=... dispatches=...
 //   NHL27DRAWPREP total=... materialize=... textures=... buffers=... descriptors=... pipeline=... other=...
@@ -34,16 +34,24 @@ namespace Libs::Graphics::FrameBreakdown {
 
 using Clock = std::chrono::steady_clock;
 
-// True on the KYTY_DRAWPREP_PREFETCH worker thread. Every probe below is gated on Enabled(), which is
-// false there, so worker materializations never add to (or race with) the GPU-thread statistics.
-inline thread_local bool g_prefetch_worker = false;
-
 inline bool Enabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_PERF_STATS");
 		return value != nullptr && value[0] == '1';
 	}();
-	return enabled && !g_prefetch_worker;
+	return enabled;
+}
+
+// KYTY_PERF_STATS_VERBOSE=1 (with KYTY_PERF_STATS=1): the heavy sub-timers and per-slot counters
+// (NHL27TEXTURES, NHL27PIPELINE, NHL27BUFFERS2, NHL27DELTA, NHL27DELTAREUSE_SPLIT, NHL27DELTAGEN,
+// NHL27SPECULATE). They run thousands of times per frame, so they are off unless asked for; when off the
+// hot paths take no timestamps and touch none of those atomics.
+inline bool Verbose() {
+	static const bool verbose = [] {
+		const char* value = std::getenv("KYTY_PERF_STATS_VERBOSE");
+		return Enabled() && value != nullptr && value[0] == '1';
+	}();
+	return verbose;
 }
 
 // Fine-grained CPU preparation timing is intentionally opt-in; it can perturb hot paths.
@@ -168,7 +176,7 @@ struct Counters {
 };
 inline Counters g_counters;
 
-// ---- BEGIN pipeline/buffer sub-bucket probes (NHL27PIPELINE, NHL27BUFFERS2, NHL27BUFDELTA) ----
+// ---- BEGIN pipeline/buffer sub-bucket probes (NHL27PIPELINE, NHL27BUFFERS2; KYTY_PERF_STATS_VERBOSE) ----
 // NHL27PIPELINE: split of dp_pipeline_ns (draw) and dc_pipeline_ns / dc_record_ns (dispatch). Sequential
 // scopes inside the pipeline bucket (other = bucket minus the named ones). GPU thread only.
 struct PipelineStats {
@@ -230,33 +238,16 @@ struct BufStats {
 inline BufStats g_buf;
 inline thread_local int g_buf_scope = 0;  // 1 = rebind lookup, 2 = PrepareBda
 struct BufScope {
-	int prev;
-	explicit BufScope(int v) noexcept: prev(g_buf_scope) { g_buf_scope = v; }
-	~BufScope() { g_buf_scope = prev; }
+	int  prev;
+	bool on;
+	explicit BufScope(int v) noexcept: prev(g_buf_scope), on(Verbose()) { if (on) g_buf_scope = v; }
+	~BufScope() { if (on) g_buf_scope = prev; }
 	BufScope(const BufScope&)            = delete;
 	BufScope& operator=(const BufScope&) = delete;
 };
 
-// NHL27BUFDELTA (KYTY_BUFFER_DELTA)
-struct BufDeltaStats {
-	std::atomic<uint64_t> slots {0}, memo_hits {0}, memo_miss {0};      // FindBuffers slot memo
-	std::atomic<uint64_t> verify_checks {0}, verify_mismatch {0};       // sampled full FindBuffer compare
-	std::atomic<uint64_t> up_calls {0}, up_reused {0};                  // SRT / shader_data stream uploads
-	std::atomic<uint64_t> up_bytes_saved {0};
-	std::atomic<uint64_t> up_rej_data {0}, up_rej_epoch {0};            // rejected: content differs / ring or recording changed
-	std::atomic<uint64_t> up_verify {0}, up_verify_mismatch {0};        // sampled: staged bytes at the reused offset compared
-};
-inline BufDeltaStats g_bufdelta;
-
-// NHL27DIRTYWALK (KYTY_DIRTY_WALK_FAST): MemoryTracker::ForEachUploadRange fast walk.
-struct DirtyWalkStats {
-	std::atomic<uint64_t> calls {0}, managers_visited {0}, managers_skipped {0}, pages_scanned {0}, runs {0};
-	std::atomic<uint64_t> walk_ns {0};
-	std::atomic<uint64_t> verify_checks {0}, verify_mismatch {0};
-};
-inline DirtyWalkStats g_dirtywalk;
 inline bool BufOn() noexcept {
-	return g_buf_scope > 0 && Enabled();
+	return g_buf_scope > 0;  // g_buf_scope only moves when Verbose()
 }
 // ---- END pipeline/buffer sub-bucket probes ----
 
@@ -270,56 +261,9 @@ struct SpecStats {
 };
 inline SpecStats g_spec;
 
-// NHL27PREFETCH (KYTY_DRAWPREP_PREFETCH): content-validated compute materialization prefetch.
-// Counted on the GPU thread (scans, requests, adopt outcomes) and on the worker (done, aborts, worker_ns).
-struct PrefetchStats {
-	std::atomic<uint64_t> scans {0};            // look-aheads started (one per DISPATCH_DIRECT)
-	std::atomic<uint64_t> candidates {0};       // look-ahead dispatches decoded
-	std::atomic<uint64_t> requests {0};         // requests enqueued for the worker
-	std::atomic<uint64_t> skip_no_plan {0};     // program not seen yet (no plan to materialize against)
-	std::atomic<uint64_t> skip_likely_hit {0};  // the plan's memo already holds these register inputs
-	std::atomic<uint64_t> skip_dup {0};         // same request already pending or done
-	std::atomic<uint64_t> skip_full {0};        // queue or result store full
-	std::atomic<uint64_t> worker_done {0};      // results produced
-	std::atomic<uint64_t> abort_read {0};       // a read was not plainly readable guest backing
-	std::atomic<uint64_t> abort_fail {0};       // materialization reported failure on speculative data
-	std::atomic<uint64_t> abort_exc {0};        // exception in the worker
-	std::atomic<uint64_t> used_direct {0};      // results adopted by the GPU thread (memo-bypass direct path)
-	std::atomic<uint64_t> fb_dirty {0};         // a recorded range was GPU-dirty at use time
-	std::atomic<uint64_t> fb_mismatch {0};      // a recorded range differed (or was unavailable) at use time
-	std::atomic<uint64_t> fb_regs {0};          // program matched but the user-data registers differed
-	std::atomic<uint64_t> fb_notfound {0};      // no result for this (plan, base, workgroups)
-	std::atomic<uint64_t> peek_fail {0};        // look-ahead clean peek failed; scan skipped
-	std::atomic<uint64_t> verify_checked {0};   // KYTY_DRAWPREP_VERIFY: adoptions re-materialized and compared
-	std::atomic<uint64_t> verify_mismatch {0};  // ... of which the adopted state differed (must be 0)
-	std::atomic<uint64_t> unused {0};           // results replaced or dropped without being used
-	std::atomic<uint64_t> validate_ns {0};      // GPU thread: TryDirect attempts that found a candidate (excl. verify)
-	std::atomic<uint64_t> lookup_ns {0};        // ... of which: result lookup under the state mutex
-	std::atomic<uint64_t> ranges_ns {0};        // ... of which: dirty + content validation of the recorded ranges
-	std::atomic<uint64_t> lock_wait_ns {0};     // ... of which: waiting for the plan lock stripe (worker materializing)
-	std::atomic<uint64_t> install_ns {0};       // ... of which: moving the outputs in (after the lock)
-	std::atomic<uint64_t> verify_ns {0};        // KYTY_DRAWPREP_VERIFY re-materialization (NOT in validate_ns)
-	std::atomic<uint64_t> miss_ns {0};          // GPU thread: TryDirect calls that found nothing
-	std::atomic<uint64_t> skip_scanned {0};     // look-ahead dispatch already requested by an earlier scan
-	std::atomic<uint64_t> nf_pending {0};       // no result: request queued or running (not ready yet)
-	std::atomic<uint64_t> nf_reuse {0};         // no result: identical inputs were adopted earlier (result consumed)
-	std::atomic<uint64_t> nf_gone {0};          // no result: requested earlier, result aborted/evicted/stale
-	std::atomic<uint64_t> nf_never {0};         // no result: never requested (not scanned, no plan, or queue full)
-	std::atomic<uint64_t> pred_checked {0};     // dispatches whose look-ahead prediction was compared at execution
-	std::atomic<uint64_t> pred_ok {0};          // ... prediction matched exactly
-	std::atomic<uint64_t> pred_none {0};        // ... no prediction was made for this dispatch
-	std::atomic<uint64_t> pred_base {0};        // ... shader base / user-data count differed
-	std::atomic<uint64_t> pred_regs {0};        // ... a user-data register differed
-	std::atomic<uint64_t> pred_groups {0};      // ... workgroup counts differed
-	std::atomic<uint64_t> pred_regmask {0};     // bitmask of user-data slots that differed (diagnostic)
-	std::atomic<uint64_t> worker_ns {0};        // worker: time spent materializing
-	std::atomic<uint64_t> used_worker_ns {0};   // worker time of the results that were used
-};
-inline PrefetchStats g_prefetch;
-
 // NHL27DELTA (Stage 0 of "delta prep"): how much of each program's materialized output is unchanged since
 // that same program's previous use. Keyed by the program's ResourceSnapshot address (one per SourceEntry,
-// stable). GPU thread only (Enabled() is false on the prefetch worker), measurement only.
+// stable). GPU thread only, measurement only (KYTY_PERF_STATS_VERBOSE).
 struct DeltaStats {
 	std::atomic<uint64_t> calls {0}, first {0}, cmp_calls {0};      // PrepareBindings calls / first use / compared
 	std::atomic<uint64_t> img_slots {0}, img_same {0}, img_reuse {0};
@@ -365,6 +309,7 @@ inline uint64_t DeltaNowNs() {
 }
 // Compare one materialized snapshot against the same program's previous one. Returns the per-program state.
 inline DeltaProg* DeltaCompare(const ShaderRecompiler::IR::ResourceSnapshot& s, size_t used_buffers) {
+	if (!Verbose()) return nullptr;
 	used_buffers = std::min(used_buffers, s.buffers.size());
 	const uint64_t t0 = DeltaNowNs();
 	auto&          st = g_delta;
@@ -476,10 +421,12 @@ inline std::atomic<uint64_t> g_spec_wait_seq {0};
 inline std::atomic<uint64_t> g_spec_epoch {1};
 inline uint64_t SpecIndex(uint64_t page) { return (page ^ (page >> kSpecTableBits)) & (kSpecTableSize - 1); }
 inline void SpecNoteFault(uint64_t vaddr) {
+	if (!Verbose()) return;
 	g_spec_fault_seq[SpecIndex(vaddr >> 12)].store(g_spec_seq.load(std::memory_order_relaxed) + 1,
 	                                               std::memory_order_relaxed);
 }
 inline void SpecNoteGpuWrite(uint64_t vaddr, uint64_t size) {
+	if (!Verbose()) return;
 	const uint64_t first = vaddr >> 12;
 	const uint64_t last  = (vaddr + (size != 0 ? size - 1 : 0)) >> 12;
 	const uint64_t epoch = g_spec_epoch.load(std::memory_order_relaxed);
@@ -488,6 +435,7 @@ inline void SpecNoteGpuWrite(uint64_t vaddr, uint64_t size) {
 	}
 }
 inline void SpecNotePktWrite(uint64_t vaddr, uint64_t size) {
+	if (!Verbose()) return;
 	const uint64_t first = vaddr >> 12;
 	const uint64_t last  = (vaddr + (size != 0 ? size - 1 : 0)) >> 12;
 	const uint64_t at    = g_spec_seq.load(std::memory_order_relaxed) + 1;
@@ -495,10 +443,11 @@ inline void SpecNotePktWrite(uint64_t vaddr, uint64_t size) {
 		g_spec_pkt_seq[SpecIndex(p)].store(at, std::memory_order_relaxed);
 	}
 }
-inline void SpecNoteWait() { g_spec_wait_seq.store(g_spec_seq.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed); }
-inline void SpecNoteSubmit() { g_spec_epoch.fetch_add(1, std::memory_order_relaxed); }
+inline void SpecNoteWait() { if (!Verbose()) return; g_spec_wait_seq.store(g_spec_seq.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed); }
+inline void SpecNoteSubmit() { if (!Verbose()) return; g_spec_epoch.fetch_add(1, std::memory_order_relaxed); }
 // Called once per materialization on the GPU thread with the walker's captured read ranges.
 inline void SpecObserve(const std::vector<std::pair<uint64_t, uint64_t>>& reads) {
+	if (!Verbose()) return;
 	const uint64_t seq   = g_spec_seq.fetch_add(1, std::memory_order_relaxed) + 1;
 	const uint64_t epoch = g_spec_epoch.load(std::memory_order_relaxed);
 	uint64_t       newest_fault = 0, newest_pw = 0;
@@ -653,13 +602,14 @@ struct TexStats {
 inline TexStats g_tex;
 inline thread_local int g_tex_scope = 0;
 struct TexScope {
-	TexScope() noexcept { ++g_tex_scope; }
-	~TexScope() { --g_tex_scope; }
+	bool on;
+	TexScope() noexcept: on(Verbose()) { if (on) ++g_tex_scope; }
+	~TexScope() { if (on) --g_tex_scope; }
 	TexScope(const TexScope&)            = delete;
 	TexScope& operator=(const TexScope&) = delete;
 };
 inline bool TexOn() noexcept {
-	return g_tex_scope > 0 && Enabled();
+	return g_tex_scope > 0;  // g_tex_scope only moves when Verbose()
 }
 inline void TexAdd(std::atomic<uint64_t>& counter) noexcept {
 	if (TexOn()) counter.fetch_add(1, std::memory_order_relaxed);
@@ -667,6 +617,13 @@ inline void TexAdd(std::atomic<uint64_t>& counter) noexcept {
 
 inline void Add(std::atomic<uint64_t>& counter, uint64_t amount = 1) noexcept {
 	if (Enabled()) {
+		counter.fetch_add(amount, std::memory_order_relaxed);
+	}
+}
+
+// Counter for the verbose-only stats: no atomic traffic unless KYTY_PERF_STATS_VERBOSE=1.
+inline void VAdd(std::atomic<uint64_t>& counter, uint64_t amount = 1) noexcept {
+	if (Verbose()) {
 		counter.fetch_add(amount, std::memory_order_relaxed);
 	}
 }
@@ -988,7 +945,7 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 		            "descriptors=%.2fms pipeline=%.2fms other=%.2fms\n",
 		            ms(draw_prep_ns), ms(dp_materialize_ns), ms(dp_textures_ns), ms(dp_buffers_ns),
 		            ms(dp_descriptors_ns), ms(dp_pipeline_ns), other_ms);
-		{
+		if (Verbose()) {
 			auto&          tx = g_tex;
 			const uint64_t t_res = Take(tx.resolve_ns), t_bind = Take(tx.bind_ns), t_reb = Take(tx.rebind_ns);
 			const uint64_t t_rres = Take(tx.rebind_resolve_ns), t_view = Take(tx.view_ns);
@@ -1029,7 +986,7 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 			            mat_flat_trace_hits > 0 ? per(mat_hit_steps) / per(mat_flat_trace_hits) : 0.0,
 			            mat_flat_trace_hits > 0 ? per(mat_hit_reads) / per(mat_flat_trace_hits) : 0.0,
 			            mat_flat_trace_hits > 0 ? per(mat_hit_memo) / per(mat_flat_trace_hits) : 0.0);
-			{
+			if (Verbose()) {
 				auto&          sp  = g_spec;
 				const uint64_t sm  = Take(sp.mats);
 				const uint64_t srg = Take(sp.ranges);
@@ -1042,49 +999,6 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 				            per(Take(sp.blk_cpu8)), per(Take(sp.blk_cpu48)), per(Take(sp.blk_gpu)),
 				            per(Take(sp.noreads)),
 				            sm != 0 ? static_cast<double>(srg) / static_cast<double>(sm) : 0.0);
-			}
-			{
-				// Take() every counter into a local first: printf argument evaluation order is unspecified.
-				auto&          pf      = g_prefetch;
-				const uint64_t used_ns = Take(pf.used_worker_ns), val_ns = Take(pf.validate_ns);
-				const uint64_t work_ns = Take(pf.worker_ns);
-				const uint64_t ab_read = Take(pf.abort_read), ab_fail = Take(pf.abort_fail);
-				const uint64_t ab_exc  = Take(pf.abort_exc);
-				const uint64_t scans = Take(pf.scans), cands = Take(pf.candidates), reqs = Take(pf.requests);
-				const uint64_t sk_plan = Take(pf.skip_no_plan), sk_hit = Take(pf.skip_likely_hit);
-				const uint64_t sk_dup = Take(pf.skip_dup), sk_full = Take(pf.skip_full);
-				const uint64_t done = Take(pf.worker_done), used = Take(pf.used_direct);
-				const uint64_t fb_dirty = Take(pf.fb_dirty), fb_mism = Take(pf.fb_mismatch);
-				const uint64_t fb_regs = Take(pf.fb_regs), nfound = Take(pf.fb_notfound);
-				const uint64_t peek_fail = Take(pf.peek_fail), v_chk = Take(pf.verify_checked);
-				const uint64_t v_bad = Take(pf.verify_mismatch);
-				const uint64_t unused = Take(pf.unused);
-				const uint64_t lk_ns = Take(pf.lookup_ns), rg_ns = Take(pf.ranges_ns), lw_ns = Take(pf.lock_wait_ns);
-				const uint64_t in_ns = Take(pf.install_ns), vf_ns = Take(pf.verify_ns), ms_ns = Take(pf.miss_ns);
-				const uint64_t sk_scan = Take(pf.skip_scanned), nf_pend = Take(pf.nf_pending);
-				const uint64_t nf_reuse = Take(pf.nf_reuse), nf_gone = Take(pf.nf_gone), nf_never = Take(pf.nf_never);
-				const uint64_t pr_chk = Take(pf.pred_checked), pr_ok = Take(pf.pred_ok), pr_none = Take(pf.pred_none);
-				const uint64_t pr_base = Take(pf.pred_base), pr_regs = Take(pf.pred_regs);
-				const uint64_t pr_grp = Take(pf.pred_groups);
-				const uint64_t pr_mask = pf.pred_regmask.exchange(0, std::memory_order_relaxed);
-				std::printf("NHL27PREFETCH scans=%.1f candidates=%.1f requests=%.1f skip_no_plan=%.1f "
-				            "skip_likely_hit=%.1f skip_dup=%.1f skip_full=%.1f worker_done=%.1f "
-				            "worker_aborts=%.1f(read=%.1f fail=%.1f exc=%.1f) used_direct=%.1f fb_dirty=%.1f "
-				            "fb_mismatch=%.1f fb_regs=%.1f fb_notfound=%.1f peek_fail=%.1f verify_checked=%.1f "
-				            "verify_mismatch=%.1f unused=%.1f validate_ns=%.3fms worker=%.3fms saved_est=%.3fms\n",
-				            per(scans), per(cands), per(reqs), per(sk_plan), per(sk_hit), per(sk_dup),
-				            per(sk_full), per(done), per(ab_read + ab_fail + ab_exc), per(ab_read),
-				            per(ab_fail), per(ab_exc), per(used), per(fb_dirty), per(fb_mism), per(fb_regs),
-				            per(nfound), per(peek_fail), per(v_chk), per(v_bad), per(unused),
-				            ms(val_ns), ms(work_ns), ms(used_ns > val_ns ? used_ns - val_ns : 0));
-				std::printf("NHL27PREFETCH2 validate=%.3fms(lookup=%.3f ranges=%.3f lockwait=%.3f install=%.3f) "
-				            "verify=%.3fms miss=%.3fms skip_scanned=%.1f not_found(pending=%.1f reuse=%.1f "
-				            "gone=%.1f never=%.1f) pred(checked=%.1f ok=%.1f none=%.1f base=%.1f regs=%.1f "
-				            "groups=%.1f regmask=0x%llx)\n",
-				            ms(val_ns), ms(lk_ns), ms(rg_ns), ms(lw_ns), ms(in_ns), ms(vf_ns), ms(ms_ns),
-				            per(sk_scan), per(nf_pend), per(nf_reuse), per(nf_gone), per(nf_never), per(pr_chk),
-				            per(pr_ok), per(pr_none), per(pr_base), per(pr_regs), per(pr_grp),
-				            static_cast<unsigned long long>(pr_mask));
 			}
 			std::printf("NHL27TRACE nocfg=%.1f flag_off=%.1f inelig_mode=%.1f empty=%.1f disabled=%.1f tape_nr=%.1f "
 			            "strict=%.1f m_memo=%.1f m_exec=%.1f m_memoslot=%.1f m_cond=%.1f m_eval=%.1f m_condeval=%.1f "
@@ -1116,7 +1030,7 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 				const auto     pct = [](uint64_t a, uint64_t b) {
 					return b != 0 ? 100.0 * static_cast<double>(a) / static_cast<double>(b) : 0.0;
 				};
-				std::printf("NHL27DELTA calls=%.1f img_slots=%.1f img_same=%.1f%% img_reuse=%.1f%% "
+				if (Verbose()) std::printf("NHL27DELTA calls=%.1f img_slots=%.1f img_same=%.1f%% img_reuse=%.1f%% "
 				            "smp_same=%.1f%% buf_addr_same=%.1f%% buf_fmt_same=%.1f%% buf_size_same=%.1f%% call_img_same=%.1f%% "
 				            "call_shape_same=%.1f%% call_all_same=%.1f%% rt_repeat=%.1f%% overhead=%.2fms "
 				            "first=%.1f smp_slots=%.1f buf_slots=%.1f call_smp_same=%.1f%%\n",
@@ -1137,6 +1051,7 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 					const uint64_t c_st = Take(dl.cs_rej_state), c_um = Take(dl.cs_unmemoable), c_sl = Take(dl.cs_slots);
 					const uint64_t d_sl = Take(dl.dr_slots), u_dcc = Take(dl.um_dcc), u_dep = Take(dl.um_depth);
 					const uint64_t u_oth = Take(dl.um_other);
+					if (Verbose()) {
 					std::printf("NHL27DELTAREUSE_SPLIT draw: slots=%.1f eligible=%.1f hits=%.1f rejected_gen=%.1f "
 					            "rejected_state=%.1f unmemoable=%.1f | dispatch: slots=%.1f eligible=%.1f hits=%.1f "
 					            "rejected_gen=%.1f rejected_state=%.1f unmemoable=%.1f | unmemoable_by: dcc_cmask=%.1f "
@@ -1151,6 +1066,7 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 					            per(Take(dl.gen_delete)), per(Take(dl.gen_rebind)), per(Take(dl.gen_dirty_skipped)),
 					            per(Take(dl.gen_untrack_skipped)), per(Take(dl.rej_gen_overlap)),
 						            per(Take(dl.rej_gen_overrun)), per(Take(dl.gen_log_scans)));
+					}
 				if (Common::RuntimeFlags::Current().srt_compiled) {
 					static ShaderRecompiler::IR::SrtCompiledStats last_cs {};
 					const auto cs = ShaderRecompiler::IR::GetSrtCompiledStats();
@@ -1185,9 +1101,7 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 		std::printf("NHL27BUFFERS vertex_index=%.2fms indirect=%.2fms find=%.2fms bda=%.2fms "
 		            "rebind=%.2fms rebind_lookup=%.2fms rebind_upload=%.2fms\n",
 		            ms(dp_vertex_index_ns), ms(dp_indirect_ns), ms(dp_find_buffers_ns), ms(dp_bda_ns),
-		            ms(dp_rebind_ns), ms(dp_rebind_lookup_ns), ms(dp_rebind_upload_ns),
-		            static_cast<unsigned long long>(obtain_cache_hits),
-		            static_cast<unsigned long long>(obtain_cache_misses));
+		            ms(dp_rebind_ns), ms(dp_rebind_lookup_ns), ms(dp_rebind_upload_ns));
 			// drain_ms is always 0: the queue drain runs inside BufferCache::SynchronizeBuffersInRanges,
 			// so its time is counted in sync_ms. pagetable_ms is always 0: PrepareBda never writes the
 			// BDA page table (BufferCache::ChangeRegister does, at buffer registration).
@@ -1199,7 +1113,7 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 			            per(bda_calls), per(bda_skips), per(bda_scans), per(bda_regions), per(bda_ranges),
 			            per(bda_pages), bda_lock_ms, 0.0, bda_sync_ms, 0.0, bda_other_ms);
 			std::printf("NHL27SYNC uploads=%.2f kb=%.2f\n", per(sync_uploads), per(sync_bytes) / 1024.0);
-		{
+		if (Verbose()) {
 			// pipeline / buffer sub-bucket lines (see the PipelineStats / BufStats blocks)
 			auto& pl = g_pl;
 			const uint64_t p_key = Take(pl.key_ns), p_lk = Take(pl.lookup_ns), p_tg = Take(pl.targets_ns);
@@ -1233,6 +1147,7 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 			            "sync=%.2fms book=%.2fms invalidate_gpu=%.2fms\n",
 			            ms(dp_rebind_lookup_ns), per(o_calls), per(o_wr), per(o_st), per(o_fc), per(o_sy), ms(o_sck),
 			            ms(o_scp), ms(o_fn), ms(o_tn), ms(o_sn), ms(o_bk), ms(o_inv));
+			std::printf("NHL27BUFFERS2 obtain_cache: hits=%.1f misses=%.1f\n", per(obtain_cache_hits), per(obtain_cache_misses));
 			static const char* const sb_name[2] = {"rebind", "bda"};
 			const uint64_t bda_syncs = Take(bf.bda_syncs);
 			(void)Take(bf.bda_drain_ns);
@@ -1250,30 +1165,6 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 					std::printf(" bda_syncs=%.2f drain_and_range_walk=%.3fms (bda_sync_total=%.3fms)\n", per(bda_syncs),
 					            ms(bda_sync_ns > inner ? bda_sync_ns - inner : 0), ms(bda_sync_ns));
 				}
-			}
-			auto& bd = g_bufdelta;
-			const uint64_t d_sl = Take(bd.slots), d_h = Take(bd.memo_hits), d_m = Take(bd.memo_miss);
-			const uint64_t d_vc = Take(bd.verify_checks), d_vm = Take(bd.verify_mismatch);
-			const uint64_t u_c = Take(bd.up_calls), u_r = Take(bd.up_reused), u_by = Take(bd.up_bytes_saved);
-			const uint64_t u_rd = Take(bd.up_rej_data), u_re = Take(bd.up_rej_epoch);
-			const uint64_t u_vc = Take(bd.up_verify), u_vm = Take(bd.up_verify_mismatch);
-			if (Common::RuntimeFlags::Current().buffer_delta) {
-				std::printf("NHL27BUFDELTA slots=%.1f memo_hits=%.1f memo_miss=%.1f verify_checks=%.2f "
-				            "verify_mismatch=%.2f uploads=%.1f reused=%.1f saved_kb=%.1f rej_data=%.1f rej_epoch=%.1f "
-				            "up_verify=%.2f up_verify_mismatch=%.2f\n",
-				            per(d_sl), per(d_h), per(d_m), per(d_vc), per(d_vm), per(u_c), per(u_r),
-				            per(u_by) / 1024.0, per(u_rd), per(u_re), per(u_vc), per(u_vm));
-			}
-		}
-		{
-			auto& dw = g_dirtywalk;
-			const uint64_t w_c = Take(dw.calls), w_v = Take(dw.managers_visited), w_s = Take(dw.managers_skipped);
-			const uint64_t w_p = Take(dw.pages_scanned), w_r = Take(dw.runs), w_n = Take(dw.walk_ns);
-			const uint64_t w_vc = Take(dw.verify_checks), w_vm = Take(dw.verify_mismatch);
-			if (Common::RuntimeFlags::Current().dirty_walk_fast) {
-				std::printf("NHL27DIRTYWALK calls=%.1f managers_visited=%.1f managers_skipped=%.1f pages_scanned=%.1f "
-				            "runs=%.1f walk_ms=%.3f verify_checks=%.2f verify_mismatch=%.2f\n",
-				            per(w_c), per(w_v), per(w_s), per(w_p), per(w_r), ms(w_n), per(w_vc), per(w_vm));
 			}
 		}
 		std::printf("NHL27PROTECT calls=%.2f ms=%.3f\n", per(protect_calls), ms(protect_ns));

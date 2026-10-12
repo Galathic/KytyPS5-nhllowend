@@ -142,9 +142,6 @@ public:
 		m_data[last_word] &= end_mask;
 	}
 
-	static constexpr size_t Words() { return WORD_COUNT; }
-	[[nodiscard]] constexpr uint64_t WordAt(size_t index) const { return m_data[index]; }
-
 	constexpr void Clear() { m_data.fill(0); }
 	constexpr void Fill() { m_data.fill(~uint64_t {0}); }
 

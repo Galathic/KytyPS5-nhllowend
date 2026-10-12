@@ -336,25 +336,10 @@ private:
 		uint32_t                                     key = 0;
 		vk::Sampler                                  sampler = nullptr;
 	};
-	// KYTY_BUFFER_DELTA: previous stream upload of one per-stage block (flattened SRT or shader data). The staged
-	// offset is reusable while the bytes are identical and nothing could have overwritten the stream ring region:
-	// same command-buffer recording (handle + scheduler tick) and no ring wrap since (stream WrapEpoch).
-	struct UploadSlotMemo {
-		bool                     valid = false;
-		std::vector<uint32_t>    data;
-		vk::DescriptorBufferInfo info;
-		vk::CommandBuffer        cmd {};
-		uint64_t                 tick       = 0;
-		uint64_t                 wrap_epoch = 0;
-	};
 	struct StageBindingMemo {
 		std::vector<ImageSlotMemo>   images;
 		std::vector<SamplerSlotMemo> samplers;
-		std::vector<BufferSlotMemo>  buffers;   // KYTY_BUFFER_DELTA: FindBuffers result per buffer slot
-		UploadSlotMemo               srt_upload;
-		UploadSlotMemo               data_upload;
 	};
-	[[nodiscard]] vk::DescriptorBufferInfo UploadMemoized(UploadSlotMemo* memo, std::span<const uint32_t> data);
 	std::unordered_map<const void*, StageBindingMemo> m_binding_memos;
 	// CommitBindings scratch: ranges written by bound images / shader buffers.
 	std::vector<std::pair<uint64_t, uint64_t>> m_written_image_ranges;

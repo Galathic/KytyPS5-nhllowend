@@ -99,16 +99,9 @@ public:
 		}
 		auto& bits = GetBits<source>();
 		if constexpr (enable) {
-			// Summary first (over-report), then the page bits; see cpu_summary.
-			if constexpr (source == DirtySource::Cpu) {
-				cpu_summary.fetch_or(PageWordMask(start, end), std::memory_order_release);
-			}
 			bits.SetRange(start, end);
 		} else {
 			bits.UnsetRange(start, end);
-			if constexpr (source == DirtySource::Cpu) {
-				RefreshCpuSummary();
-			}
 		}
 		if constexpr (source == DirtySource::Cpu) {
 			UpdateProtection<!enable, false>();
@@ -128,7 +121,6 @@ public:
 		if constexpr (clear) {
 			bits.UnsetRange(start, end);
 			if constexpr (source == DirtySource::Cpu) {
-				RefreshCpuSummary();
 				UpdateProtection<true, false>();
 			} else {
 				UpdateProtection<false, true>();
@@ -140,44 +132,11 @@ public:
 	}
 
 	TrackingSpinLock lock;
-
-	// KYTY_DIRTY_WALK_FAST: one bit per 64-page word of m_cpu_dirty (16 bits for 1024 pages).
-	// Invariant: bit w is set whenever any CPU-dirty page bit in word w is set (it may over-report
-	// transiently, never under-report). All m_cpu_dirty mutations hold `lock`. Setters fetch_or the
-	// summary (release) BEFORE setting page bits; clearers recompute it exactly AFTER clearing
-	// (under the lock). A lock-free reader that acquires a zero summary for its word span therefore
-	// observed a state in which every CPU-dirty marking whose ChangeState completed before the
-	// reader's walk started is either absent from the span or already visible (the marking thread
-	// published through the same lock / release chain the walk already relies on). A marking still
-	// inside ChangeState concurrently with the walk is racing with the walk today as well and is
-	// also queued (QueueCpuDirty precedes it) for the next drain.
-	std::atomic_uint32_t cpu_summary {(1u << (TRACKER_REGION_PAGES / 64)) - 1u};
-	static_assert(TRACKER_REGION_PAGES / 64 <= 32);
-
-	// Mask of summary words covering the byte span [offset, offset + bytes), bytes > 0.
-	[[nodiscard]] static uint32_t SpanWordMask(uint64_t offset, uint64_t bytes) {
-		return PageWordMask(static_cast<size_t>(offset / TRACKER_PAGE_SIZE),
-		                    static_cast<size_t>((offset + bytes + TRACKER_PAGE_SIZE - 1) / TRACKER_PAGE_SIZE));
-	}
-	// Caller holds `lock`: exact summary computed from the page bits.
-	[[nodiscard]] uint32_t ExactCpuSummary() const {
-		uint32_t summary = 0;
-		for (size_t w = 0; w < RegionBits::Words(); ++w) {
-			summary |= (m_cpu_dirty.WordAt(w) != 0 ? 1u : 0u) << w;
-		}
-		return summary;
-	}
 	// Intrusive pending-upload list: fault handlers never allocate or take a queue mutex.
 	std::atomic_bool cpu_dirty_queued {false};
 	RegionManager* cpu_dirty_next = nullptr;
 
 private:
-	[[nodiscard]] static uint32_t PageWordMask(size_t start, size_t end) {
-		const size_t first = start / 64, last = (end - 1) / 64;
-		return ((2u << last) - 1u) & ~((1u << first) - 1u);
-	}
-	void RefreshCpuSummary() { cpu_summary.store(ExactCpuSummary(), std::memory_order_release); }
-
 	template <bool track, bool is_read>
 	void UpdateProtection() {
 		const auto protection = is_read ? ~m_gpu_dirty : m_cpu_dirty;

@@ -1238,7 +1238,7 @@ static bool MaterializeResourcesCore(const ResourcePlan& program, const SrtRunti
 		const ResourceSnapshot&                    snap;
 		std::vector<std::pair<uint64_t, uint64_t>> collected;
 		std::vector<std::pair<uint64_t, uint64_t>>* previous = nullptr;
-		bool                                       active   = FrameBreakdown::Enabled();
+		bool                                       active   = FrameBreakdown::Verbose();
 		SpecScope(const ResourceSnapshot& s) : snap(s) {
 			if (active) {
 				previous                      = FrameBreakdown::g_spec_collect;
@@ -1623,8 +1623,6 @@ ResourceSpecializationCacheStats GetResourceSpecializationCacheStats() {
 
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
- // KYTY_DRAWPREP_PREFETCH: the plan's mutable scratch is shared with the prefetch worker.
- const PlanAccessGuard plan_access(program);
  // Separate opt-in from the legacy process-wide .arb recorder: those files lack
  // plan identity and combine changing memory from many evaluations.
  static const std::string directory = [] {

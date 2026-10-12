@@ -369,13 +369,13 @@ template <typename T>
 static bool DynNeedsSet(DynSlot<T>* slot, const T& value) {
 	if (slot != nullptr) {
 		if (slot->valid && std::memcmp(&slot->value, &value, sizeof(T)) == 0) {
-			FrameBreakdown::Add(FrameBreakdown::g_pl.dyn_cmds_skipped);
+			FrameBreakdown::VAdd(FrameBreakdown::g_pl.dyn_cmds_skipped);
 			return false;
 		}
 		slot->valid = true;
 		slot->value = value;
 	}
-	FrameBreakdown::Add(FrameBreakdown::g_pl.dyn_cmds);
+	FrameBreakdown::VAdd(FrameBreakdown::g_pl.dyn_cmds);
 	return true;
 }
 
@@ -384,7 +384,7 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
                                      const RenderDepthInfo& depth, const RenderState& rendering,
                                      GfxDynMemo* memo = nullptr) {
 	KYTY_PROFILER_FUNCTION();
-	FrameBreakdown::Add(FrameBreakdown::g_pl.dyn_calls);
+	FrameBreakdown::VAdd(FrameBreakdown::g_pl.dyn_calls);
 	const auto slot = [memo](auto GfxDynMemo::*field) {
 		return memo != nullptr ? &(memo->*field) : nullptr;
 	};
@@ -1246,8 +1246,8 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		}
 	}
 	mrt_mask &= color_output_mask;
-	if (FrameBreakdown::Enabled()) {
-		// NHL27DELTA: hash of the CB/DB register state feeding the render targets (counters only).
+	if (FrameBreakdown::Verbose()) {
+		// NHL27DELTA (KYTY_PERF_STATS_VERBOSE): hash of the CB/DB register state feeding the render targets (counters only).
 		const uint64_t t0 = FrameBreakdown::DeltaNowNs();
 		const auto&    hw = buffer.GetRegisters();
 		uint64_t       h  = 0xcbf29ce484222325ull;
@@ -1543,7 +1543,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
 	    state.programs);
 	vk::ImageAspectFlags feedback_aspects;
-	FrameBreakdown::Timer targets_timer(FrameBreakdown::g_pl.targets_ns);
+	FrameBreakdown::Timer targets_timer(FrameBreakdown::g_pl.targets_ns, FrameBreakdown::Verbose());
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
 	                         feedback_aspects, stages);
@@ -1555,7 +1555,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	auto vk_buffer = buffer.Handle();
 	SetDrawDebugPhase(buffer, submit_id, draw, draw.IsIndexed() ? 0x100u : 0x200u);
 	if (!mesh_active) {
-		FrameBreakdown::Timer vcommit_timer(FrameBreakdown::g_pl.vcommit_ns);
+		FrameBreakdown::Timer vcommit_timer(FrameBreakdown::g_pl.vcommit_ns, FrameBreakdown::Verbose());
 		CommitVertexBuffers(vk_buffer, vertex_bindings);
 	}
 	if (state.ps_active && !draw.IsIndexed()) {
@@ -1568,7 +1568,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	pipeline_timer.emplace(FrameBreakdown::g_counters.dp_pipeline_ns);
 	std::optional<FrameBreakdown::Timer> vcommit2_timer;
-	vcommit2_timer.emplace(FrameBreakdown::g_pl.vcommit_ns);
+	vcommit2_timer.emplace(FrameBreakdown::g_pl.vcommit_ns, FrameBreakdown::Verbose());
 	if (mesh_active) {
 		const uint32_t draw_data[] {
 		    draw.index_count,
@@ -1608,11 +1608,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		gfx_bound.dyn = GfxDynMemo {};
 	}
 	if (same_bound) {
-		FrameBreakdown::Add(FrameBreakdown::g_pl.bind_same);
+		FrameBreakdown::VAdd(FrameBreakdown::g_pl.bind_same);
 	}
 
 	{
-		FrameBreakdown::Timer dyn_timer(FrameBreakdown::g_pl.dyn_ns);
+		FrameBreakdown::Timer dyn_timer(FrameBreakdown::g_pl.dyn_ns, FrameBreakdown::Verbose());
 		SetGraphicsDynamicParams(buffer, vk_buffer, vertex_stages.back(), state.depth_info, rendering,
 		                         same_bound && pipeline_memo ? &gfx_bound.dyn : nullptr);
 		if (m_context.GetGraphics().attachment_feedback_loop_enabled) {
@@ -1625,18 +1625,18 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
 	}
 	{
-		FrameBreakdown::Timer begin_timer(FrameBreakdown::g_pl.begin_ns);
+		FrameBreakdown::Timer begin_timer(FrameBreakdown::g_pl.begin_ns, FrameBreakdown::Verbose());
 		m_context.GetCommandScheduler().BeginRendering(rendering);
 	}
 	if (same_bound && pipeline_memo) {
-		FrameBreakdown::Add(FrameBreakdown::g_pl.binds_skipped);
+		FrameBreakdown::VAdd(FrameBreakdown::g_pl.binds_skipped);
 	} else {
-		FrameBreakdown::Timer bind_timer(FrameBreakdown::g_pl.bind_ns);
-		FrameBreakdown::Add(FrameBreakdown::g_pl.binds);
+		FrameBreakdown::Timer bind_timer(FrameBreakdown::g_pl.bind_ns, FrameBreakdown::Verbose());
+		FrameBreakdown::VAdd(FrameBreakdown::g_pl.binds);
 		vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
 	}
 	std::optional<FrameBreakdown::Timer> emit_timer;
-	emit_timer.emplace(FrameBreakdown::g_pl.emit_ns);
+	emit_timer.emplace(FrameBreakdown::g_pl.emit_ns, FrameBreakdown::Verbose());
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}

@@ -133,7 +133,7 @@ inline void WriteCsv(uint32_t count) {
 
 // Call from a submit/frame safe point after RuntimeFlags::Refresh().
 inline void Poll() {
-	const bool flag = (RuntimeFlags::g_published.load(std::memory_order_relaxed) & (uint64_t {1} << 15)) != 0;
+	const bool flag = (RuntimeFlags::g_published.load(std::memory_order_relaxed) & (uint64_t {1} << RuntimeFlags::kBitIdleTrace)) != 0;
 	if (g_capturing.load(std::memory_order_relaxed)) {
 		if (NowNs() - g_start_ns < kDurationNs && g_index.load(std::memory_order_relaxed) < kCapacity) {
 			return;

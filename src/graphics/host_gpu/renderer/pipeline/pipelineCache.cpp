@@ -15,7 +15,6 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
-#include "graphics/host_gpu/renderer/pipeline/drawPrepPrefetch.h"
 #include "graphics/host_gpu/renderer/pipeline/resourceMemo.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineRecord.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -477,14 +476,6 @@ struct PipelineCache::ProgramCache {
             if (!ok && replaying == nullptr) EXIT("Resource materialization failed\n");
             return ok;
         };
-        // KYTY_DRAWPREP_PREFETCH: teach the compute look-ahead which plan serves this program (any memo mode).
-        const auto note_plan = [&]([[maybe_unused]] SourceEntry& source) {
-            if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
-                if (runtime_flags.drawprep_prefetch) {
-                    DrawPrepPrefetch::NotePlan(params.Base(), user_data.size(), &source.resource_plan);
-                }
-            }
-        };
         const auto native_plan_safe = [&](const ShaderRecompiler::IR::ResourcePlan& plan) {
 			if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 				if (input_info.native_draw.Enabled()) {
@@ -511,7 +502,6 @@ struct PipelineCache::ProgramCache {
 			if (!check_native_plan(*entry)) return {};
 			bool reused = false;
 			if (!refresh(*entry, reused)) return {};
-			note_plan(*entry);
 			resource_hits += reused;
 			materializations += !reused;
 			if (memo_enabled && !reused) ++resource_misses[static_cast<size_t>(entry->resource_memo.LastMiss())];
@@ -601,7 +591,6 @@ struct PipelineCache::ProgramCache {
 			if (!check_native_plan(*entry)) return {};
 			bool reused = false;
 			if (!refresh(*entry, reused)) return {};
-			note_plan(*entry);
 			++materializations;
 		}
 
@@ -739,8 +728,6 @@ struct PipelineCache::ProgramCache {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {
-		// The KYTY_DRAWPREP_PREFETCH worker holds raw pointers to the plans owned by `programs`.
-		DrawPrepPrefetch::Shutdown();
 		for (const auto& [key, entry]: programs) {
 			(void)key;
 			for (const auto& permutation: entry.permutations) {
@@ -1253,7 +1240,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	const auto vs_id = vertex_program.id;
 	const auto ps_id = ps_active ? pixel_program.id : 0;
 
-	FrameBreakdown::Timer key_timer(FrameBreakdown::g_pl.key_ns);
+	FrameBreakdown::Timer key_timer(FrameBreakdown::g_pl.key_ns, FrameBreakdown::Verbose());
 	GraphicsPipelineKey key {};
 	for (uint32_t i = 0; i < programs.vertex.size(); i++) {
 		key.vertex_shader_ids[i] = programs.vertex[i].id;
@@ -1402,20 +1389,20 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 
 	key_timer.Stop();
 	{
-		FrameBreakdown::Timer lookup_timer(FrameBreakdown::g_pl.lookup_ns);
-		FrameBreakdown::Add(FrameBreakdown::g_pl.lookups);
+		FrameBreakdown::Timer lookup_timer(FrameBreakdown::g_pl.lookup_ns, FrameBreakdown::Verbose());
+		FrameBreakdown::VAdd(FrameBreakdown::g_pl.lookups);
 		// A key equal to the previous call's key maps to the previous call's pipeline (the map never changes an
 		// existing entry), so the hash + lookup can be skipped. The compare also feeds the key_repeat counter.
 		const bool memo_on = Common::RuntimeFlags::Current().pipeline_memo;
-		if (m_last_pipeline != nullptr && (memo_on || FrameBreakdown::Enabled()) && key == m_last_key) {
-			FrameBreakdown::Add(FrameBreakdown::g_pl.key_repeats);
+		if (m_last_pipeline != nullptr && (memo_on || FrameBreakdown::Verbose()) && key == m_last_key) {
+			FrameBreakdown::VAdd(FrameBreakdown::g_pl.key_repeats);
 			if (memo_on) {
 				static uint32_t verify_tick = 0;
 				if (PipelineMemoVerifyEnabled() && (++verify_tick & 63u) == 0) {
 					const auto full = m_graphics_pipelines.find(key);
-					FrameBreakdown::Add(FrameBreakdown::g_pl.memo_verify);
+					FrameBreakdown::VAdd(FrameBreakdown::g_pl.memo_verify);
 					if (full == m_graphics_pipelines.end() || full->second.get() != m_last_pipeline) {
-						FrameBreakdown::Add(FrameBreakdown::g_pl.memo_mismatch);
+						FrameBreakdown::VAdd(FrameBreakdown::g_pl.memo_mismatch);
 						std::fprintf(stderr, "NHL27PIPELINE memo mismatch: graphics key (vs=%" PRIu64 " ps=%" PRIu64 ")\n",
 						             vs_id, ps_id);
 						std::fflush(stderr);
@@ -1428,7 +1415,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 			}
 		}
 		if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
-			if (memo_on || FrameBreakdown::Enabled()) {
+			if (memo_on || FrameBreakdown::Verbose()) {
 				m_last_key      = key;
 				m_last_pipeline = iter->second.get();
 			}
@@ -1470,9 +1457,9 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	EXIT_IF(!compute_program);
 
-	FrameBreakdown::Add(FrameBreakdown::g_pl.cs_lookups);
+	FrameBreakdown::VAdd(FrameBreakdown::g_pl.cs_lookups);
 	if (m_last_compute_id == compute_program.id) {
-		FrameBreakdown::Add(FrameBreakdown::g_pl.cs_repeats);
+		FrameBreakdown::VAdd(FrameBreakdown::g_pl.cs_repeats);
 	}
 	m_last_compute_id = compute_program.id;
 	if (auto iter = m_compute_pipelines.find(compute_program.id);

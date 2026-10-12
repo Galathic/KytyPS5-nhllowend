@@ -952,12 +952,13 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.samplers.clear();
 	prepared.shader_data.clear();
 	// NHL27DELTA (KYTY_PERF_STATS): compare this program's outputs with its previous use. Counters only.
-	auto* const delta = FrameBreakdown::Enabled() ? FrameBreakdown::DeltaCompare(snapshot, program.info.buffers.size())
+	auto* const delta = FrameBreakdown::Verbose() ? FrameBreakdown::DeltaCompare(snapshot, program.info.buffers.size())
 	                                                  : nullptr;
 	// KYTY_DRAWPREP_DELTA: reuse the previous ResolveTexture / sampler lookup of this program's slot when
 	// its inputs and the texture cache are provably unchanged (see TextureCache::Generation()).
 	const bool delta_on    = Common::RuntimeFlags::Current().drawprep_delta;
 	const bool delta_stats = delta_on && FrameBreakdown::Enabled();
+	const bool delta_split = delta_stats && FrameBreakdown::Verbose();  // KYTY_PERF_STATS_VERBOSE: per-slot split counters
 	const bool is_cs       = program.stage == ShaderType::Compute;
 	StageBindingMemo* memo_stage = nullptr;
 	if (delta_on) {
@@ -972,7 +973,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		for (uint32_t i = 0; i < program.info.images.size(); i++) {
 			TextureBinding binding;
 			ImageSlotMemo* memo      = memo_stage != nullptr ? &memo_stage->images[i] : nullptr;
-				if (delta_stats) {
+				if (delta_split) {
 					(is_cs ? FrameBreakdown::g_delta.cs_slots : FrameBreakdown::g_delta.dr_slots)
 					    .fetch_add(1, std::memory_order_relaxed);
 				}
@@ -983,7 +984,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 				if (memo->valid && memo->resource_key == memo_key && memo->words == snapshot.images[i]) {
 					if (delta_stats) {
 						FrameBreakdown::g_delta.reuse_eligible.fetch_add(1, std::memory_order_relaxed);
-						if (is_cs) FrameBreakdown::g_delta.cs_eligible.fetch_add(1, std::memory_order_relaxed);
+						if (delta_split && is_cs) FrameBreakdown::g_delta.cs_eligible.fetch_add(1, std::memory_order_relaxed);
 					}
 					bool gen_ok = memo->generation == texture_cache.Generation();
 					if (!gen_ok) {
@@ -991,11 +992,11 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 						uint64_t current = 0;
 						const auto check = texture_cache.CheckGenerationLog(memo->generation, memo->range_begin,
 						                                                    memo->range_end, current);
-						if (delta_stats) FrameBreakdown::g_delta.gen_log_scans.fetch_add(1, std::memory_order_relaxed);
+						if (delta_split) FrameBreakdown::g_delta.gen_log_scans.fetch_add(1, std::memory_order_relaxed);
 						if (check == TextureCache::GenCheck::Clean) {
 							memo->generation = current;
 							gen_ok           = true;
-						} else if (delta_stats) {
+						} else if (delta_split) {
 							(check == TextureCache::GenCheck::Overlap ? FrameBreakdown::g_delta.rej_gen_overlap
 							                                          : FrameBreakdown::g_delta.rej_gen_overrun)
 							    .fetch_add(1, std::memory_order_relaxed);
@@ -1004,13 +1005,13 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 					if (!gen_ok) {
 						if (delta_stats) {
 							FrameBreakdown::g_delta.reuse_rej_gen.fetch_add(1, std::memory_order_relaxed);
-							if (is_cs) FrameBreakdown::g_delta.cs_rej_gen.fetch_add(1, std::memory_order_relaxed);
+							if (delta_split && is_cs) FrameBreakdown::g_delta.cs_rej_gen.fetch_add(1, std::memory_order_relaxed);
 						}
 					} else if (const auto* cached = texture_cache.m_slot_images.try_get(memo->image_id);
 					           cached == nullptr || !cached->registered || cached->binding.needs_rebind) {
 						if (delta_stats) {
 							FrameBreakdown::g_delta.reuse_rej_state.fetch_add(1, std::memory_order_relaxed);
-							if (is_cs) FrameBreakdown::g_delta.cs_rej_state.fetch_add(1, std::memory_order_relaxed);
+							if (delta_split && is_cs) FrameBreakdown::g_delta.cs_rej_state.fetch_add(1, std::memory_order_relaxed);
 						}
 					} else {
 						// FindImage's remaining per-call side effects on a hit: last-access tick + LRU touch.
@@ -1020,7 +1021,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 						reused           = true;
 						if (delta_stats) {
 								FrameBreakdown::g_delta.reuse_hits.fetch_add(1, std::memory_order_relaxed);
-								if (is_cs) FrameBreakdown::g_delta.cs_hits.fetch_add(1, std::memory_order_relaxed);
+								if (delta_split && is_cs) FrameBreakdown::g_delta.cs_hits.fetch_add(1, std::memory_order_relaxed);
 							}
 						static uint32_t verify_tick = 0;
 						if (DrawPrepDeltaVerifyEnabled() && (++verify_tick & 63u) == 0) {
@@ -1083,11 +1084,13 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 						memo->desc         = binding.desc;
 					} else if (delta_stats) {
 						FrameBreakdown::g_delta.reuse_unmemoable.fetch_add(1, std::memory_order_relaxed);
-						if (is_cs) FrameBreakdown::g_delta.cs_unmemoable.fetch_add(1, std::memory_order_relaxed);
-						(is_dcc ? FrameBreakdown::g_delta.um_dcc
-						        : (resolved != nullptr && resolved->info.IsDepth()) ? FrameBreakdown::g_delta.um_depth
-						                                                            : FrameBreakdown::g_delta.um_other)
-						    .fetch_add(1, std::memory_order_relaxed);
+						if (delta_split) {
+							if (is_cs) FrameBreakdown::g_delta.cs_unmemoable.fetch_add(1, std::memory_order_relaxed);
+							(is_dcc ? FrameBreakdown::g_delta.um_dcc
+							        : (resolved != nullptr && resolved->info.IsDepth()) ? FrameBreakdown::g_delta.um_depth
+							                                                            : FrameBreakdown::g_delta.um_other)
+							    .fetch_add(1, std::memory_order_relaxed);
+						}
 					}
 				}
 			}
@@ -1151,7 +1154,6 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 	                                 FrameBreakdown::DetailEnabled());
 	KYTY_PROFILER_FUNCTION();
 	auto& cache = m_context.GetBufferCache();
-	const bool buffer_delta = Common::RuntimeFlags::Current().buffer_delta;
 	for (auto* stage: stages) {
 		auto& prepared = *stage;
 		EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
@@ -1164,17 +1166,7 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 		}
 		const auto& resources = layout.descriptors.front().resources;
 		prepared.buffer_sources.reserve(resources.size());
-		// KYTY_BUFFER_DELTA: per-program, per-slot FindBuffer memo (see BufferSlotMemo).
-		StageBindingMemo* stage_memo = nullptr;
-		if (buffer_delta) {
-			stage_memo = &m_binding_memos[&snapshot];
-			if (stage_memo->buffers.size() < resources.size()) {
-				stage_memo->buffers.resize(resources.size());
-			}
-		}
-		size_t slot_counter = 0;
 		for (const auto resource: resources) {
-			const size_t slot_index = slot_counter++;
 			const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[resource]);
 			const auto address = descriptor.Base48();
 			auto size = descriptor.GetSize();
@@ -1213,31 +1205,7 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 				std::fflush(stderr);
 			}
 			size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
-			if (stage_memo == nullptr) {
-				prepared.buffer_sources.push_back({address, size, cache.FindBuffer(address, size)});
-				continue;
-			}
-			bool hit    = false;
-			auto found  = cache.FindBufferMemo(stage_memo->buffers[slot_index], address, size, hit);
-			FrameBreakdown::Add(FrameBreakdown::g_bufdelta.slots);
-			FrameBreakdown::Add(hit ? FrameBreakdown::g_bufdelta.memo_hits : FrameBreakdown::g_bufdelta.memo_miss);
-			static uint32_t verify_tick = 0;
-			if (hit && DrawPrepDeltaVerifyEnabled() && (++verify_tick & 63u) == 0) {
-				// Full lookup on 1 of 64 memo hits; FindBuffer is pure on a hit, so this changes nothing.
-				const auto full = cache.FindBuffer(address, size);
-				FrameBreakdown::Add(FrameBreakdown::g_bufdelta.verify_checks);
-				if (full != found) {
-					FrameBreakdown::Add(FrameBreakdown::g_bufdelta.verify_mismatch);
-					std::fprintf(stderr, "NHL27BUFDELTA verify mismatch: shader=0x%016" PRIx64
-					             " slot=%zu addr=0x%016" PRIx64 " size=0x%" PRIx64 " memo=%u:%u full=%u:%u\n",
-					             program.shader_hash, slot_index, address, size, found.index, found.generation,
-					             full.index, full.generation);
-					std::fflush(stderr);
-					found = full;
-					stage_memo->buffers[slot_index].valid = false;
-				}
-			}
-			prepared.buffer_sources.push_back({address, size, found});
+			prepared.buffer_sources.push_back({address, size, cache.FindBuffer(address, size)});
 		}
 	}
 }
@@ -1276,68 +1244,14 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	}
 	lookup_timer.Stop();
 	FrameBreakdown::Timer upload_timer(FrameBreakdown::g_counters.dp_rebind_upload_ns);
-	StageBindingMemo* upload_memo = Common::RuntimeFlags::Current().buffer_delta ? &m_binding_memos[&snapshot] : nullptr;
 	if (ShaderRecompiler::IR::FindBinding(
 	        layout, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) != nullptr) {
-		prepared.flattened_srt = UploadMemoized(upload_memo != nullptr ? &upload_memo->srt_upload : nullptr,
-		                                        snapshot.flattened_srt);
+		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
 	}
 	if (ShaderRecompiler::IR::FindBinding(
 	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::ShaderData) != nullptr) {
-		prepared.shader_data_buffer = UploadMemoized(upload_memo != nullptr ? &upload_memo->data_upload : nullptr,
-		                                             prepared.shader_data);
+		prepared.shader_data_buffer = NativeUpload(m_context, prepared.shader_data);
 	}
-}
-
-// NativeUpload with the KYTY_BUFFER_DELTA staged-offset reuse (memo == nullptr: plain upload). Exact: the new bytes
-// are memcmp-equal to the bytes staged earlier, and the staged region cannot have been overwritten since because
-// the stream ring has not wrapped (WrapEpoch) and the recording is the same one that received the earlier bytes
-// (VkCommandBuffer handle + scheduler tick; the tick advances on every submit). The GPU therefore reads the
-// same bytes it would have read from a fresh copy.
-vk::DescriptorBufferInfo RenderExecutor::UploadMemoized(UploadSlotMemo* memo, std::span<const uint32_t> data) {
-	if (memo == nullptr) {
-		return NativeUpload(m_context, data);
-	}
-	EXIT_IF(data.empty());
-	auto& scheduler = m_context.GetCommandScheduler();
-	auto& stream    = m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
-	FrameBreakdown::Add(FrameBreakdown::g_bufdelta.up_calls);
-	if (memo->valid) {
-		const bool same_data = memo->data.size() == data.size() &&
-		                       std::memcmp(memo->data.data(), data.data(), data.size_bytes()) == 0;
-		const bool same_env = memo->cmd == scheduler.Current().Handle() && memo->tick == scheduler.CurrentTick() &&
-		                      memo->wrap_epoch == stream.WrapEpoch();
-		if (same_data && same_env) {
-			FrameBreakdown::Add(FrameBreakdown::g_bufdelta.up_reused);
-			FrameBreakdown::Add(FrameBreakdown::g_bufdelta.up_bytes_saved, data.size_bytes());
-			static uint32_t verify_tick = 0;
-			if (DrawPrepDeltaVerifyEnabled() && (++verify_tick & 63u) == 0) {
-				// The staged bytes at the reused offset must still equal the data.
-				FrameBreakdown::Add(FrameBreakdown::g_bufdelta.up_verify);
-				const auto mapped = stream.Mapped();
-				if (memo->info.offset + data.size_bytes() > mapped.size() ||
-				    std::memcmp(mapped.data() + memo->info.offset, data.data(), data.size_bytes()) != 0) {
-					FrameBreakdown::Add(FrameBreakdown::g_bufdelta.up_verify_mismatch);
-					std::fprintf(stderr, "NHL27BUFDELTA upload verify mismatch: offset=0x%" PRIx64 " bytes=%zu\n",
-					             static_cast<uint64_t>(memo->info.offset), data.size_bytes());
-					std::fflush(stderr);
-					memo->valid = false;
-					return UploadMemoized(memo, data);
-				}
-			}
-			return memo->info;
-		}
-		FrameBreakdown::Add(same_data ? FrameBreakdown::g_bufdelta.up_rej_epoch : FrameBreakdown::g_bufdelta.up_rej_data);
-	}
-	const auto info = NativeUpload(m_context, data);
-	// Stamp after the copy: the copy itself can wrap the ring or flush the recording.
-	memo->valid      = true;
-	memo->data.assign(data.begin(), data.end());
-	memo->info       = info;
-	memo->cmd        = scheduler.Current().Handle();
-	memo->tick       = scheduler.CurrentTick();
-	memo->wrap_epoch = stream.WrapEpoch();
-	return info;
 }
 
 void RenderExecutor::RebindImages(PreparedBindings& prepared) {

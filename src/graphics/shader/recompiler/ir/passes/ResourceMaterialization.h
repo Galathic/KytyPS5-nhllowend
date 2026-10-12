@@ -106,34 +106,6 @@ struct ResourceDelta {
 	}
 };
 
-// A ResourcePlan carries mutable evaluation scratch (value memo, tapes, CFG traces, active_sources,
-// Value::evaluation_index). It is single-threaded by design. The KYTY_DRAWPREP_PREFETCH worker
-// materializes plans off the GPU thread, so every access to a plan's mutable state (any
-// MaterializeResources call and any read/write of plan.active_sources) happens under this guard.
-// Locks are striped by plan address (two plans may share a stripe; that only serializes them) and
-// recursive, so nested guards on one thread are fine. A thread never holds two stripes at once.
-// Inactive (no lock traffic at all) until a prefetch worker has been started.
-inline std::atomic<bool> g_plan_access_enabled {false};
-inline std::recursive_mutex g_plan_access_stripes[64];
-class PlanAccessGuard {
-public:
-	explicit PlanAccessGuard(const ResourcePlan& plan) noexcept {
-		if (g_plan_access_enabled.load(std::memory_order_acquire)) {
-			const auto hash = std::hash<const void*> {}(&plan);
-			m_mutex = &g_plan_access_stripes[(hash >> 4u) % 64u];
-			m_mutex->lock();
-		}
-	}
-	~PlanAccessGuard() {
-		if (m_mutex != nullptr) m_mutex->unlock();
-	}
-	PlanAccessGuard(const PlanAccessGuard&)            = delete;
-	PlanAccessGuard& operator=(const PlanAccessGuard&) = delete;
-
-private:
-	std::recursive_mutex* m_mutex = nullptr;
-};
-
 // Extracts the descriptor/SRT value graph before resource specialization. The returned plan owns
 // its values and is independent of the translated shader CFG.
 ResourcePlan ExtractResourcePlan(const Program& program);

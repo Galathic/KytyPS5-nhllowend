@@ -233,7 +233,7 @@ void RenderContext::PrepareBda() {
 			{
 				FrameBreakdown::Timer sync_timer(FrameBreakdown::g_counters.bda_sync_ns);
 				FrameBreakdown::BufScope buf_scope(2);
-				FrameBreakdown::Add(FrameBreakdown::g_buf.bda_syncs);
+				FrameBreakdown::VAdd(FrameBreakdown::g_buf.bda_syncs);
 				drained = m_buffer_cache.SynchronizeBuffersInRanges(m_mapped_ranges, full);
 			}
 		} else {
@@ -241,7 +241,7 @@ void RenderContext::PrepareBda() {
 			FrameBreakdown::Add(FrameBreakdown::g_counters.bda_scans);
 			FrameBreakdown::Timer sync_timer(FrameBreakdown::g_counters.bda_sync_ns);
 			FrameBreakdown::BufScope buf_scope(2);
-			FrameBreakdown::Add(FrameBreakdown::g_buf.bda_syncs);
+			FrameBreakdown::VAdd(FrameBreakdown::g_buf.bda_syncs);
 			m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
 				FrameBreakdown::Add(FrameBreakdown::g_counters.bda_ranges);
 				FrameBreakdown::Add(FrameBreakdown::g_counters.bda_pages, PagesIn(start, end));

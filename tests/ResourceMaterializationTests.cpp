@@ -471,8 +471,7 @@ void TestResourceMemoHitVerifier() {
 
 void TestResourceMemoTracksConsumedRegisters() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
-  const char *dynamic_flag = std::getenv("KYTY_RESOURCE_DYNAMIC_DEPS");
-  const bool dynamic = dynamic_flag != nullptr && dynamic_flag[0] == '1';
+  const bool dynamic = Common::RuntimeFlags::Current().resource_dynamic_deps;
   ResourcePlan plan;
   plan.stage = Libs::Graphics::ShaderType::Compute;
   plan.srt_plan_complete = plan.resource_tracking_complete = true;
@@ -581,8 +580,7 @@ void TestResourceMemoTracksConsumedRegisters() {
 
 void TestResourceMemoLazySelectDependencies() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
-  const char *flag = std::getenv("KYTY_RESOURCE_DYNAMIC_DEPS");
-  const bool dynamic = flag != nullptr && flag[0] == '1';
+  const bool dynamic = Common::RuntimeFlags::Current().resource_dynamic_deps;
   Program program;
   program.stage = Libs::Graphics::ShaderType::Compute;
   program.srt_plan_complete = program.resource_tracking_complete = true;
@@ -1219,9 +1217,8 @@ void TestVectorLoadUsesCleanDependencies(bool through_read_const, bool cfg = fal
 
 void TestCfgTapeVerifierRejectsCorruption() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
-  const char *cfg = std::getenv("KYTY_SRT_CFG_TAPE");
   const char *verify = std::getenv("KYTY_SRT_TAPE_VERIFY");
-  if (cfg == nullptr || cfg[0] != '1' || verify == nullptr || verify[0] != '1') return;
+  if (!Common::RuntimeFlags::Current().srt_cfg_tape || verify == nullptr || verify[0] != '1') return;
   const auto verifier_before = GetSrtTapeStats();
   auto plan = SrtPlan(0x2000u);
   const Value raw = plan.srt_reads[0].value;
@@ -1403,8 +1400,7 @@ void TestCfgTapeDemandRoots() {
     sgpr[0] += 0x1000u;
     ++reads.value;
   }
-  const char *cfg_flag = std::getenv("KYTY_SRT_CFG_TAPE");
-  if (cfg_flag != nullptr && cfg_flag[0] == '1') {
+  if (Common::RuntimeFlags::Current().srt_cfg_tape) {
     const auto &tape = plan.cfg_srt_tapes[1];
     Check(tape.state == ResourcePlan::SrtTape::State::Ready &&
               tape.slot_ops[0] != UINT32_MAX && tape.slot_ops[3] == UINT32_MAX &&

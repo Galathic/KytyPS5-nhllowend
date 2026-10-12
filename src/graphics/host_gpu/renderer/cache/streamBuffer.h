@@ -103,9 +103,6 @@ public:
 	                                                bool allow_wait = true);
 	void                                        Commit();
 	[[nodiscard]] uint64_t Copy(const void* source, uint64_t size, uint64_t alignment = 0);
-	// Number of ring wraps so far. Bytes written at an offset stay untouched until this changes
-	// (KYTY_BUFFER_DELTA reuses staged offsets within one epoch).
-	[[nodiscard]] uint64_t WrapEpoch() const noexcept { return m_wrap_epoch; }
 
 private:
 	friend struct StreamBufferTestAccess;
@@ -124,7 +121,6 @@ private:
 
 	uint64_t              m_offset      = 0;
 	uint64_t              m_mapped_size = 0;
-	uint64_t              m_wrap_epoch  = 0;
 	std::vector<Watch>    m_current_watches;
 	size_t                m_current_watch_cursor = 0;
 	std::optional<size_t> m_invalidation_mark;

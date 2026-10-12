@@ -233,7 +233,7 @@ TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 
 namespace {
 inline void GenCount(std::atomic<uint64_t>& counter) noexcept {
-	if (FrameBreakdown::Enabled()) counter.fetch_add(1, std::memory_order_relaxed);
+	if (FrameBreakdown::Verbose()) counter.fetch_add(1, std::memory_order_relaxed);
 }
 } // namespace
 

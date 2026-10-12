@@ -557,28 +557,6 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 	return CreateBuffer(vaddr, size);
 }
 
-BufferId BufferCache::FindBufferMemo(BufferSlotMemo& memo, uint64_t vaddr, uint64_t size, bool& hit) {
-	hit = false;
-	if (vaddr != 0 && memo.valid && memo.registration == m_registration_generation && vaddr >= memo.begin) {
-		const uint64_t length = memo.end - memo.begin;
-		if (size <= length && vaddr - memo.begin <= length - size) {
-			hit = true;
-			return memo.id;
-		}
-	}
-	const auto id = FindBuffer(vaddr, size);
-	if (const auto* buffer = m_slot_buffers.try_get(id); buffer != nullptr && !buffer->is_deleted) {
-		memo.valid        = true;
-		memo.begin        = buffer->CpuAddress();
-		memo.end          = buffer->CpuAddress() + buffer->Size();
-		memo.registration = m_registration_generation;
-		memo.id           = id;
-	} else {
-		memo.valid = false;
-	}
-	return id;
-}
-
 BufferCache::OverlapResult BufferCache::ResolveOverlaps(uint64_t vaddr, uint64_t size) {
 	static constexpr int      StreamLeapThreshold = 16;
 	static constexpr uint64_t StreamLeapSize      = CACHING_PAGESIZE * 128;
@@ -844,10 +822,10 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferCached(uint64_t vaddr, uin
 		entry.cpu_generation = cpu;
 		auto& buffer         = m_slot_buffers[entry.id];
 		TouchBuffer(buffer);
-		FrameBreakdown::Add(FrameBreakdown::g_counters.obtain_cache_hits);
+		FrameBreakdown::VAdd(FrameBreakdown::g_counters.obtain_cache_hits);
 		return {&buffer, entry.offset};
 	}
-	FrameBreakdown::Add(FrameBreakdown::g_counters.obtain_cache_misses);
+	FrameBreakdown::VAdd(FrameBreakdown::g_counters.obtain_cache_misses);
 	// Stamp before the lookup so a CPU write racing with it forces a recheck on the next hit.
 	const auto registration = m_registration_generation;
 	const auto result       = ObtainBuffer(vaddr, size, false, false, id);

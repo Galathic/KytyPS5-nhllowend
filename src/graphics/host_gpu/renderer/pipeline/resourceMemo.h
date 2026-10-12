@@ -310,11 +310,6 @@ class ResourceMemoEntry {
     }
 
 public:
-    // Exposed for KYTY_DRAWPREP_VERIFY (drawPrepPrefetch.h): same equivalence the memo's own verifier uses.
-    static bool SameResourceSnapshot(const ShaderRecompiler::IR::ResourceSnapshot& left,
-                                     const ShaderRecompiler::IR::ResourceSnapshot& right) {
-        return SameSnapshot(left, right);
-    }
     struct RegisterTraceState {
         const ShaderRecompiler::IR::ResourcePlan* plan = nullptr;
         uint64_t shader_base = 0;
@@ -372,14 +367,6 @@ public:
         m_register_state_hash = HashRegisterState(m_register_inputs, m_user_data);
         m_hash_metadata_ready = true;
     }
-    // GPU thread only. True when this entry would take the register-input fast path for these inputs
-    // (it says nothing about guest memory). Used to skip prefetching work the memo already covers.
-    bool InputsMatch(const ShaderRecompiler::IR::ResourcePlan& plan, uint64_t shader_base,
-                     std::span<const uint32_t> user_data, std::span<const uint32_t> workgroups) const {
-        return m_valid && m_plan == &plan && m_shader_base == shader_base &&
-               m_dynamic_dependencies == DynamicDependenciesEnabled() &&
-               RegisterInputsEqual(user_data) && std::ranges::equal(m_workgroups, workgroups);
-    }
     enum class Miss {
         None, Cold, ShaderBase, Registers, Workgroups, ReadFailed, MemoryChanged,
         VerifyMismatch, VerifyInconclusive, Count
@@ -403,10 +390,6 @@ public:
                  ShaderRecompiler::IR::ResourceSpecialization& specialization,
                  bool enabled, bool& reused, bool probe_only = false,
                  bool update_push_data = true) {
-        // KYTY_DRAWPREP_PREFETCH: plan.active_sources and the plan's evaluation scratch are shared with the
-        // prefetch worker. Hold the plan's stripe across the whole refresh so a hit's restore of
-        // active_sources and a miss's materialize-then-snapshot of it cannot interleave with the worker.
-        const ShaderRecompiler::IR::PlanAccessGuard plan_access(plan);
         reused = false;
         m_last_miss = Miss::None;
         const bool dynamic_dependencies = DynamicDependenciesEnabled();
@@ -608,17 +591,6 @@ private:
     bool m_hash_metadata_ready = false, m_register_inputs_valid = false;
 };
 
-// KYTY_DRAWPREP_PREFETCH: set by the prefetch worker's start-up (drawPrepPrefetch.h). Called on the GPU
-// thread from ResourceMemo::Refresh's memo-disabled branch (compute stage, no replay) to replace the
-// materialization by a worker-built result whose register inputs and recorded guest reads were just
-// re-validated against the clean backing. On success snapshot, specialization and plan.active_sources are
-// exactly what a fresh materialization would have produced. On failure nothing has been modified.
-using PrefetchDirectFn = bool (*)(const ShaderRecompiler::IR::ResourcePlan& plan,
-                                  const ShaderRecompiler::IR::SrtRuntime& runtime,
-                                  ShaderRecompiler::IR::ResourceSnapshot& snapshot,
-                                  ShaderRecompiler::IR::ResourceSpecialization& specialization);
-inline std::atomic<PrefetchDirectFn> g_prefetch_direct {nullptr};
-
 // Keep multiple validated states so alternating materials do not evict each other.
 // Never cache solely by pointer: each candidate still replays its dependency reads.
 class ResourceMemo {
@@ -634,13 +606,6 @@ public:
     }
     using Miss = ResourceMemoEntry::Miss;
     Miss LastMiss() const { return m_last_miss; }
-    // GPU thread only; see ResourceMemoEntry::InputsMatch. Single-entry memo only.
-    bool InputsMatchLast(const ShaderRecompiler::IR::ResourcePlan& plan, uint64_t shader_base,
-                         std::span<const uint32_t> user_data, std::span<const uint32_t> workgroups) const {
-        return m_capacity == 1 && !m_entries.empty() &&
-               m_entries.front().memo.InputsMatch(plan, shader_base, user_data, workgroups);
-    }
-    bool SingleEntry() const { return m_capacity == 1; }
     bool Refresh(const ShaderRecompiler::IR::ResourcePlan& plan,
                  const ShaderRecompiler::IR::SrtRuntime& runtime,
                  ShaderRecompiler::IR::ResourceSnapshot& snapshot,
@@ -662,11 +627,6 @@ public:
             m_dependency_groups_ready = false;
             m_last_hit = SIZE_MAX;
             reused = false;
-            // KYTY_DRAWPREP_PREFETCH: a plain runtime (no replay readers) may adopt a worker result.
-            if (flags.drawprep_prefetch && runtime.userdata == nullptr) {
-                const auto direct = g_prefetch_direct.load(std::memory_order_acquire);
-                if (direct != nullptr && direct(plan, runtime, snapshot, specialization)) return true;
-            }
             return ShaderRecompiler::IR::MaterializeResources(plan, runtime, snapshot, specialization);
         }
         if (m_capacity == 1) {
