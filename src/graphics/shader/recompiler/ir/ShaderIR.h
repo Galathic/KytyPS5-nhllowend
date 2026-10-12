@@ -685,6 +685,40 @@ struct ResourcePlan {
 	};
 	mutable std::array<CfgTrace, 2> cfg_traces;
 	mutable std::vector<CfgTrace::Step> cfg_trace_scratch;
+	// KYTY_SRT_COMPILED: a flat step program compiled from the straight-line tape (non-CFG plans) or from
+	// the recorded CFG trace trie. It re-executes every operation, user-data read and guest read on every
+	// call; nothing observed in a previous call is trusted. Same indexing as the tape: `out`/`args` address
+	// the evaluator value array, immediates are folded into `consts`.
+	struct CompiledSrt {
+		enum class State : uint8_t { Unbuilt, Ready, Unsupported };
+		enum class Code : uint8_t { UserData, ShaderBase, Alu, Read, Flat, Activate, Cond, CondTri, Memo, Gather, End };
+		struct Step {
+			Code                    code   = Code::End;
+			uint8_t                 clean  = 0;
+			// Read: number of adjacent same-pointer scalar loads starting here that may be fetched in
+			// one reader call when their addresses are contiguous (1 = single read).
+			uint8_t                 group  = 1;
+			ValueOpcode             opcode {};
+			uint32_t                out    = 0;           // value index written (Exec), read (Flat/Cond/Memo)
+			uint32_t                memo   = UINT32_MAX;  // evaluator memo slot (UINT32_MAX = none)
+			uint32_t                aux    = 0;           // UserData: register; Read: memory_info; Flat: flat offset;
+			                                              // Activate: block; Gather: descriptor source
+			std::array<uint32_t, 5> args {};
+			uint64_t                imm    = 0;
+			std::array<uint32_t, 3> next {UINT32_MAX, UINT32_MAX, UINT32_MAX};
+		};
+		std::vector<Step>                         steps;
+		std::vector<std::pair<uint32_t, uint64_t>> consts;
+		State    state        = State::Unbuilt;
+		uint8_t  reason       = 0;   // why Unsupported (see SrtCompiledReasonName)
+		uint32_t value_count  = 0;
+		uint32_t source_steps = 0;  // CFG: trace size this program was compiled from
+		uint32_t source_paths = 0;
+		uint32_t read_steps   = 0;  // statistics: Read steps / merged groups
+		uint32_t group_steps  = 0;
+	};
+	mutable std::array<CompiledSrt, 2> compiled_nocfg;
+	mutable std::array<CompiledSrt, 2> compiled_cfg;
 	// KYTY_SRT_SOURCE_REUSE: previous gather-path output per descriptor source (GPU thread only).
 	mutable std::vector<DescriptorValue> source_reuse_last;
 	mutable std::vector<uint8_t>         source_reuse_valid;

@@ -2633,6 +2633,7 @@ void TestResourcePlanFixture() {
 #include "ScalarBatchFixtureTests.inc"
 #include "ScalarBatchMemoTests.inc"
 #include "ResourceSpecializationCacheTests.inc"
+#include "CompiledSrtTests.inc"
 void TestCfgDescriptorGatherMemoShortcut() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   struct Reads { std::vector<uint64_t> addresses; } reads;
@@ -2712,9 +2713,14 @@ void TestCfgDescriptorGatherMemoShortcut() {
 
 int main(int argc, char **argv) {
   Common::RuntimeFlags::Refresh(true);
+  // The legacy cases assert exact reader-call counts; the compiled executor merges adjacent loads.
+  // Run them on the existing path and re-apply the requested flag for the modes that measure it.
+  const bool want_compiled = CompiledSrtTest::CompiledRequested();
+  CompiledSrtTest::SetCompiled(false);
   TestResourceSpecializationCacheTransitions();
   TestCfgDescriptorGatherMemoShortcut();
   if ((argc == 3 || argc == 4) && std::strcmp(argv[1], "--benchmark-resource-memo") == 0) {
+    CompiledSrtTest::SetCompiled(want_compiled);
     uint64_t iterations = 1000;
     if (argc == 4) {
       char* end = nullptr;
@@ -2733,14 +2739,31 @@ int main(int argc, char **argv) {
   TestScalarBatchDomainsFailureAndActivity();
   TestScalarBatchFixtureCaptureAndReplay();
   TestScalarBatchMemoCaptureHitAndFlagFlip();
-  if (argc == 3 && std::strcmp(argv[1], "--replay-plan") == 0) return ReplayPlanFixture(argv[2]);
+  CompiledSrtTest::TestChangedRegisterMemoryAndBranch();
+  if (argc == 3 && std::strcmp(argv[1], "--replay-plan") == 0) {
+    CompiledSrtTest::SetCompiled(want_compiled);
+    const int status = ReplayPlanFixture(argv[2]);
+    CompiledSrtTest::SetCompiled(false);
+    if (status != 0) return status;
+    // Same capture through the compiled executor: identical outcome, outputs and read sequence on the
+    // captured inputs and on perturbed registers, memory and branch conditions.
+    return CompiledSrtTest::DifferentialFile(argv[2], 64, true);
+  }
+  if (argc >= 3 && std::strcmp(argv[1], "--compiled-differential") == 0) {
+    const uint32_t perturbations = argc == 4 ? static_cast<uint32_t>(std::strtoul(argv[3], nullptr, 10)) : 200;
+    return CompiledSrtTest::Differential(argv[2], perturbations);
+  }
   if ((argc == 3 || argc == 4) && std::strcmp(argv[1], "--benchmark-plans") == 0) {
     char* end = nullptr;
     const uint64_t iterations = argc == 4 ? std::strtoull(argv[3], &end, 10) : 100;
     if (argc == 4 && (!end || *end != '\0')) {
       std::fprintf(stderr, "plan benchmark: invalid iteration count: %s\n", argv[3]); return 2;
     }
-    return BenchmarkResourcePlans(argv[2], iterations);
+    CompiledSrtTest::SetCompiled(want_compiled);
+    const int status = BenchmarkResourcePlans(argv[2], iterations);
+    CompiledSrtTest::SetCompiled(false);
+    if (status != 0) return status;
+    return CompiledSrtTest::Benchmark(argv[2], iterations);
   }
   TestResourcePlanFixture();
   if (argc >= 3 && std::strcmp(argv[1], "--inspect-fixture") == 0) {
