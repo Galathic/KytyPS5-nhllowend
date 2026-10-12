@@ -48,6 +48,9 @@ struct PerfStats {
 	std::atomic<uint64_t> events[static_cast<size_t>(BufferCache::PerfEvent::Count)] {};
 	std::atomic<uint32_t> pm4_op {0};
 	std::atomic<uint64_t> created_bytes {0};
+	std::atomic<uint64_t> memory_used {0};
+	std::atomic<uint64_t> texture_trigger {0};
+	std::atomic<uint64_t> buffer_trigger {0};
 	std::atomic<uint64_t> timer_count[static_cast<size_t>(BufferCache::PerfTimer::Count)] {};
 	std::atomic<uint64_t> timer_ns[static_cast<size_t>(BufferCache::PerfTimer::Count)] {};
 	// Only touched from the GPU thread.
@@ -103,6 +106,13 @@ void BufferCache::PerfAddTime(PerfTimer timer, uint64_t ns) {
 	const auto index = static_cast<size_t>(timer);
 	g_perf.timer_count[index].fetch_add(1, std::memory_order_relaxed);
 	g_perf.timer_ns[index].fetch_add(ns, std::memory_order_relaxed);
+}
+
+void BufferCache::PerfSetMemoryUsage(uint64_t used, uint64_t texture_trigger, uint64_t buffer_trigger) {
+	if (!PerfStatsEnabled()) return;
+	g_perf.memory_used.store(used, std::memory_order_relaxed);
+	if (texture_trigger != 0) g_perf.texture_trigger.store(texture_trigger, std::memory_order_relaxed);
+	if (buffer_trigger != 0) g_perf.buffer_trigger.store(buffer_trigger, std::memory_order_relaxed);
 }
 
 uint64_t BufferCache::PerfFlipCount() {
@@ -210,7 +220,9 @@ void BufferCache::PerfMaybePrint() {
 		            per_frame(PerfTimer::GpuWait), per_frame(PerfTimer::Submit));
 		std::printf("NHL27DRAW: ms/frame bind_prepare=%.1f bind_resolve=%.1f vertex=%.1f "
 		            "pipeline=%.1f attachments=%.1f commit=%.1f record=%.1f | per frame: "
-		            "buffer_creates=%.1f (%.1f MiB) buffer_deletes=%.1f (gc %.1f) buffer_uploads=%.1f\n",
+		            "buffer_creates=%.1f (%.1f MiB) buffer_deletes=%.1f (gc %.1f) buffer_uploads=%.1f "
+		            "image_inserts=%.1f image_gc_frees=%.1f image_uploads=%.1f | memory %.0f MiB, gc triggers "
+		            "texture %.0f buffer %.0f MiB\n",
 		            per_frame(PerfTimer::DrawBindPrepare), per_frame(PerfTimer::DrawBindResolve),
 		            per_frame(PerfTimer::DrawVertex), per_frame(PerfTimer::DrawPipeline),
 		            per_frame(PerfTimer::DrawAttachments), per_frame(PerfTimer::DrawCommit),
@@ -219,7 +231,13 @@ void BufferCache::PerfMaybePrint() {
 		            flips != 0 ? static_cast<double>(created_bytes) / (1024.0 * 1024.0) / flips : 0.0,
 		            flips != 0 ? static_cast<double>(events[static_cast<size_t>(PerfEvent::BufferDelete)]) / flips : 0.0,
 		            flips != 0 ? static_cast<double>(events[static_cast<size_t>(PerfEvent::BufferGcDelete)]) / flips : 0.0,
-		            flips != 0 ? static_cast<double>(events[static_cast<size_t>(PerfEvent::BufferUpload)]) / flips : 0.0);
+		            flips != 0 ? static_cast<double>(events[static_cast<size_t>(PerfEvent::BufferUpload)]) / flips : 0.0,
+		            flips != 0 ? static_cast<double>(events[static_cast<size_t>(PerfEvent::ImageInsert)]) / flips : 0.0,
+		            flips != 0 ? static_cast<double>(events[static_cast<size_t>(PerfEvent::ImageGcFree)]) / flips : 0.0,
+		            flips != 0 ? static_cast<double>(events[static_cast<size_t>(PerfEvent::ImageUpload)]) / flips : 0.0,
+		            static_cast<double>(g_perf.memory_used.load(std::memory_order_relaxed)) / (1024.0 * 1024.0),
+		            static_cast<double>(g_perf.texture_trigger.load(std::memory_order_relaxed)) / (1024.0 * 1024.0),
+		            static_cast<double>(g_perf.buffer_trigger.load(std::memory_order_relaxed)) / (1024.0 * 1024.0));
 	}
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	{
@@ -1021,12 +1039,19 @@ void BufferCache::RunGarbageCollector() {
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
+	PerfSetMemoryUsage(m_total_used_memory, 0, m_trigger_gc_memory);
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
 
 	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory;
-	const uint64_t age        = std::min<uint64_t>(aggressive ? 80 : 160, tick);
+	// Collection runs after every guest submission, so 160 ticks is only a few frames: buffers
+	// for transient data revisited every few frames were deleted and recreated each frame
+	// (~20 per frame in a paused NHL 27 match). Experiment LongBufferGcAge keeps them 10x longer
+	// unless memory is critical.
+	const uint64_t normal_age =
+	    Common::Experiments::Enabled(Common::Experiments::LongBufferGcAge) ? 1600 : 160;
+	const uint64_t age        = std::min<uint64_t>(aggressive ? 80 : normal_age, tick);
 	const size_t   limit      = aggressive ? 64 : 32;
 
 	std::vector<BufferId> dirty_buffers;

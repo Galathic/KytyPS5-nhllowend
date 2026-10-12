@@ -22,6 +22,7 @@ enum Bit : uint32_t {
 	DirectSrtReads     = 1u << 10u, // KYTY_DIRECT_SRT_READS (SRT reads without the IR walk)
 	TextureDescCache   = 1u << 11u, // KYTY_TEXTURE_DESC_CACHE (memoized T# decoding per draw)
 	ImageLookupHint    = 1u << 12u, // KYTY_IMAGE_LOOKUP_HINT (skip the region scan for known images)
+	LongBufferGcAge    = 1u << 13u, // KYTY_LONG_BUFFER_GC_AGE (keep unused buffers 10x longer)
 };
 
 [[nodiscard]] bool Enabled(Bit bit) noexcept;

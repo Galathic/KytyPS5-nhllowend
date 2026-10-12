@@ -29,6 +29,7 @@ uint32_t EnvironmentMask() {
 	if (EnvOn("KYTY_DIRECT_SRT_READS")) mask |= DirectSrtReads;
 	if (EnvOn("KYTY_TEXTURE_DESC_CACHE")) mask |= TextureDescCache;
 	if (EnvOn("KYTY_IMAGE_LOOKUP_HINT")) mask |= ImageLookupHint;
+	if (EnvOn("KYTY_LONG_BUFFER_GC_AGE")) mask |= LongBufferGcAge;
 	return mask;
 }
 

@@ -230,7 +230,28 @@ TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 	return image.usage.storage ? BindingType::Storage : BindingType::Texture;
 }
 
+// Diagnostic: KYTY_DBG_IMAGE_CHURN=1 prints image inserts and frees (first 4000).
+static bool ImageChurnLogLine() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DBG_IMAGE_CHURN");
+		return value != nullptr && value[0] == '1';
+	}();
+	static std::atomic<uint32_t> lines {0};
+	return enabled && lines.fetch_add(1, std::memory_order_relaxed) < 4000;
+}
+
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
+	BufferCache::PerfCount(BufferCache::PerfEvent::ImageInsert);
+	if (ImageChurnLogLine()) {
+		std::printf("NHL27IMAGE: insert addr=0x%llx size=0x%llx fmt=%s %ux%ux%u levels=%u layers=%u "
+		            "tile=%u samples=%u frame=%llu\n",
+		            static_cast<unsigned long long>(info.data.address),
+		            static_cast<unsigned long long>(info.data.size),
+		            vk::to_string(info.pixel_format).c_str(), info.extent.width, info.extent.height,
+		            info.extent.depth, info.resources.levels, info.resources.layers,
+		            static_cast<uint32_t>(info.tile_mode), info.samples,
+		            static_cast<unsigned long long>(BufferCache::PerfFlipCount()));
+	}
 	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
 	if (!info.data.Empty()) {
 		RegisterImage(id);
@@ -391,6 +412,14 @@ bool TextureCache::WriteBackAliasedImage(ImageId id) {
 
 void TextureCache::FreeImage(ImageId id) {
 	auto& image = m_slot_images[id];
+	if (ImageChurnLogLine()) {
+		std::printf("NHL27IMAGE: free addr=0x%llx size=0x%llx fmt=%s %ux%u gpu_modified=%d frame=%llu\n",
+		            static_cast<unsigned long long>(image.info.data.address),
+		            static_cast<unsigned long long>(image.info.data.size),
+		            vk::to_string(image.info.pixel_format).c_str(), image.info.extent.width,
+		            image.info.extent.height, image.IsGpuModified() ? 1 : 0,
+		            static_cast<unsigned long long>(BufferCache::PerfFlipCount()));
+	}
 	if (image.IsGpuModified()) {
 		// Only overlap/alias frees write back. Unmap and GC frees must not enqueue guest writes.
 		if (AliasWritebackEnabled() && m_alias_free_in_progress) {
@@ -1178,6 +1207,7 @@ TextureCache::ImageDownload TextureCache::BuildDownload(const Image& image) cons
 }
 
 void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_offset) {
+	BufferCache::PerfCount(BufferCache::PerfEvent::ImageUpload);
 	auto& destination = image.depth_id ? m_slot_images[image.depth_id] : image;
 	const auto binding = image.depth_id ? BindingType::DepthTarget : UploadBinding(image);
 	const auto  upload  = [&](std::vector<vk::BufferImageCopy>& copies, TileManager::Result linear) {
@@ -2287,6 +2317,7 @@ void TextureCache::RunGarbageCollector() {
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
+	BufferCache::PerfSetMemoryUsage(m_total_used_memory, m_trigger_gc_memory, 0);
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
@@ -2324,6 +2355,7 @@ void TextureCache::RunGarbageCollector() {
 					continue;
 				}
 			}
+			BufferCache::PerfCount(BufferCache::PerfEvent::ImageGcFree);
 			FreeImage(id);
 			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
 				deletions >>= 2;

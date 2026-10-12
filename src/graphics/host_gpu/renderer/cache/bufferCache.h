@@ -73,6 +73,9 @@ public:
 		BufferUpload,
 		BufferDelete,
 		BufferGcDelete,
+		ImageInsert,
+		ImageGcFree,
+		ImageUpload,
 		Count
 	};
 	// KYTY_GUEST_SYNC=1 (experiment): compute dispatches rely on the guest's own partial-flush,
@@ -82,6 +85,8 @@ public:
 	[[nodiscard]] static bool PerfNoSyncReadback();
 	static void               PerfCount(PerfEvent event);
 	[[nodiscard]] static uint64_t PerfFlipCount();
+	// KYTY_PERF_STATS: device memory use the texture/buffer collectors last saw.
+	static void PerfSetMemoryUsage(uint64_t used, uint64_t texture_trigger, uint64_t buffer_trigger);
 	static void               PerfSetPm4Op(uint32_t opcode);
 	// KYTY_PERF_STATS: host time spent beginning command buffers, submitting them and waiting
 	// for the GPU on the GPU thread.
