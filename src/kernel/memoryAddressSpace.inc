@@ -210,6 +210,24 @@ public:
 		    });
 	}
 
+	// Compares backing bytes with `expected` without copying them. Same mapping validation as TryReadBacking:
+	// false (equal untouched) when the span is unavailable or crosses a gap.
+	bool TryCompareBacking(uint64_t vaddr, const void* expected, uint64_t size, bool& equal) {
+		if (expected == nullptr) {
+			return false;
+		}
+		const auto* source = static_cast<const uint8_t*>(expected);
+		bool        same   = true;
+		const bool  ok     = TryTransferBacking(
+		    vaddr, size, [source, &same](uint8_t* backing, uint64_t data_offset, size_t bytes) {
+			    same = same && std::memcmp(backing, source + data_offset, bytes) == 0;
+		    });
+		if (ok) {
+			equal = same;
+		}
+		return ok;
+	}
+
 	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
 		if (!IsAvailable() || data == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
@@ -809,6 +827,10 @@ public:
 
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size, bool fast = false) {
 		return m_backing->TryReadBacking(vaddr, data, size, fast);
+	}
+
+	bool TryCompareBacking(uint64_t vaddr, const void* expected, uint64_t size, bool& equal) {
+		return m_backing->TryCompareBacking(vaddr, expected, size, equal);
 	}
 
 	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {

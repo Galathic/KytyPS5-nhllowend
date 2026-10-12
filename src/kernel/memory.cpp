@@ -956,6 +956,17 @@ bool TryReadCleanBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
+CleanBackingCompare TryValidateCleanBacking(uint64_t vaddr, const void* expected, uint64_t size) {
+	if (g_gpu_resources == nullptr || g_guest_address_space == nullptr || !Graphics::GuestGpu::IsGpuThread() ||
+	    expected == nullptr || !Graphics::GuestRange {vaddr, size}.Valid()) {
+		return CleanBackingCompare::Unavailable;
+	}
+	if (GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size)) return CleanBackingCompare::Dirty;
+	bool equal = false;
+	if (!g_guest_address_space->TryCompareBacking(vaddr, expected, size, equal)) return CleanBackingCompare::Unavailable;
+	return equal ? CleanBackingCompare::Equal : CleanBackingCompare::Different;
+}
+
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(g_virtual_ranges == nullptr);
 
