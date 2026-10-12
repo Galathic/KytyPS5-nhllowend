@@ -19,6 +19,7 @@ enum Bit : uint32_t {
 	SrtBatchReads      = 1u << 7u, // KYTY_SRT_BATCH_READS (also read directly by the program cache)
 	ResourceMultiCache = 1u << 8u, // KYTY_RESOURCE_MULTI_CACHE (16-state resource memo)
 	BackingReadCache   = 1u << 9u, // KYTY_BACKING_READ_CACHE (lock-free per-thread backing reads)
+	DirectSrtReads     = 1u << 10u, // KYTY_DIRECT_SRT_READS (SRT reads without the IR walk)
 };
 
 [[nodiscard]] bool Enabled(Bit bit) noexcept;

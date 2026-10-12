@@ -603,6 +603,22 @@ struct ResourcePlan {
 	mutable std::vector<uint32_t>           material_keys;
 	// Dense evaluation index of each srt_reads[slot].value, filled on first batched refresh.
 	mutable std::vector<uint32_t>           srt_evaluation_indices;
+	// When every SRT read is a raw dword load from a user-data pointer pair plus an immediate
+	// offset, RefreshFlatBuffer computes the addresses directly instead of walking the IR.
+	struct DirectSrtRead {
+		uint32_t low_register     = 0; // user-data index of the pointer's low half
+		uint32_t high_register    = 0;
+		int64_t  relative         = 0; // dword-aligned immediate offset, as RawReadAddress applies it
+		uint32_t evaluation_index = 0;
+		uint32_t run              = 1; // contiguous slots starting here (0 inside a run)
+		bool     clean            = false;
+	};
+	enum class DirectSrtState : uint8_t { Unknown, Direct, Unsupported };
+	mutable DirectSrtState             direct_srt_state = DirectSrtState::Unknown;
+	mutable std::vector<DirectSrtRead> direct_srt_reads;
+	// Per descriptor source, 8 entries: the flat offset a dword copies (ReadConst of one slot),
+	// or -1 when the dword needs the IR walk. Built with direct_srt_reads.
+	mutable std::vector<int32_t>       direct_descriptor_offsets;
 };
 
 struct Program: ResourcePlan {

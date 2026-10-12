@@ -33,6 +33,10 @@ struct SrtRuntime {
 
 enum class RuntimeValueType { Any, Integer };
 
+// Direct SRT reads (experiment DirectSrtReads, KYTY_DIRECT_SRT_READS): tests force them on (1),
+// off (0) or follow the experiment mask (-1, default).
+void SetDirectSrtReadsOverride(int value);
+
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
                           RuntimeValueType type = RuntimeValueType::Any);
 // Uses the strict reader for values that affect shader specialization.
@@ -63,6 +67,7 @@ private:
 	bool EvaluateRawRead(const Inst& inst, uint64_t& result);
 	bool RawReadAddress(const Inst& inst, uint64_t& address, uint64_t bytes, bool& zero);
 	bool RefreshReadBatch(uint32_t slot, uint32_t count, std::vector<uint32_t>& flat);
+	bool RefreshDirectFlat(std::vector<uint32_t>& flat);
 	bool EvaluateInst(const Inst& inst, uint64_t& result);
 
 	const ResourcePlan&              m_program;
@@ -70,6 +75,8 @@ private:
 	std::span<const uint8_t>         m_clean_flat_slots;
 	SrtWalker*                      m_clean_evaluator = nullptr;
 	Value                           m_active_mask;
+	// Set once a direct refresh filled the flat buffer; descriptor words copy it directly.
+	const std::vector<uint32_t>*    m_direct_flat = nullptr;
 	uint64_t                        m_cycle_count = 0;
 	ResourcePlan::EvaluationContext& m_context;
 };

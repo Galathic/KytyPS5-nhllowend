@@ -26,6 +26,7 @@ uint32_t EnvironmentMask() {
 	if (EnvOn("KYTY_SRT_BATCH_READS")) mask |= SrtBatchReads;
 	if (EnvOn("KYTY_RESOURCE_MULTI_CACHE")) mask |= ResourceMultiCache;
 	if (EnvOn("KYTY_BACKING_READ_CACHE")) mask |= BackingReadCache;
+	if (EnvOn("KYTY_DIRECT_SRT_READS")) mask |= DirectSrtReads;
 	return mask;
 }
 
