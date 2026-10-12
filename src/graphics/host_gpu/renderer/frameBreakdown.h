@@ -189,11 +189,16 @@ struct PrefetchStats {
 	std::atomic<uint64_t> abort_read {0};       // a read was not plainly readable guest backing
 	std::atomic<uint64_t> abort_fail {0};       // materialization reported failure on speculative data
 	std::atomic<uint64_t> abort_exc {0};        // exception in the worker
-	std::atomic<uint64_t> used {0};             // results adopted by the GPU thread
-	std::atomic<uint64_t> validate_fail {0};    // a result was found but its inputs or read set changed
-	std::atomic<uint64_t> not_found {0};        // memo miss with no matching result
+	std::atomic<uint64_t> used_direct {0};      // results adopted by the GPU thread (memo-bypass direct path)
+	std::atomic<uint64_t> fb_dirty {0};         // a recorded range was GPU-dirty at use time
+	std::atomic<uint64_t> fb_mismatch {0};      // a recorded range differed (or was unavailable) at use time
+	std::atomic<uint64_t> fb_regs {0};          // program matched but the user-data registers differed
+	std::atomic<uint64_t> fb_notfound {0};      // no result for this (plan, base, workgroups)
+	std::atomic<uint64_t> peek_fail {0};        // look-ahead clean peek failed; scan skipped
+	std::atomic<uint64_t> verify_checked {0};   // KYTY_DRAWPREP_VERIFY: adoptions re-materialized and compared
+	std::atomic<uint64_t> verify_mismatch {0};  // ... of which the adopted state differed (must be 0)
 	std::atomic<uint64_t> unused {0};           // results replaced or dropped without being used
-	std::atomic<uint64_t> validate_ns {0};      // GPU thread: time spent in adopt attempts that found a result
+	std::atomic<uint64_t> validate_ns {0};      // GPU thread: time spent in TryDirect attempts that found a result
 	std::atomic<uint64_t> worker_ns {0};        // worker: time spent materializing
 	std::atomic<uint64_t> used_worker_ns {0};   // worker time of the results that were used
 };
@@ -753,16 +758,21 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 				const uint64_t scans = Take(pf.scans), cands = Take(pf.candidates), reqs = Take(pf.requests);
 				const uint64_t sk_plan = Take(pf.skip_no_plan), sk_hit = Take(pf.skip_likely_hit);
 				const uint64_t sk_dup = Take(pf.skip_dup), sk_full = Take(pf.skip_full);
-				const uint64_t done = Take(pf.worker_done), used = Take(pf.used);
-				const uint64_t vfail = Take(pf.validate_fail), nfound = Take(pf.not_found);
+				const uint64_t done = Take(pf.worker_done), used = Take(pf.used_direct);
+				const uint64_t fb_dirty = Take(pf.fb_dirty), fb_mism = Take(pf.fb_mismatch);
+				const uint64_t fb_regs = Take(pf.fb_regs), nfound = Take(pf.fb_notfound);
+				const uint64_t peek_fail = Take(pf.peek_fail), v_chk = Take(pf.verify_checked);
+				const uint64_t v_bad = Take(pf.verify_mismatch);
 				const uint64_t unused = Take(pf.unused);
 				std::printf("NHL27PREFETCH scans=%.1f candidates=%.1f requests=%.1f skip_no_plan=%.1f "
 				            "skip_likely_hit=%.1f skip_dup=%.1f skip_full=%.1f worker_done=%.1f "
-				            "worker_aborts=%.1f(read=%.1f fail=%.1f exc=%.1f) used=%.1f validate_fail=%.1f "
-				            "not_found=%.1f unused=%.1f validate=%.3fms worker=%.3fms saved_est=%.3fms\n",
+				            "worker_aborts=%.1f(read=%.1f fail=%.1f exc=%.1f) used_direct=%.1f fb_dirty=%.1f "
+				            "fb_mismatch=%.1f fb_regs=%.1f fb_notfound=%.1f peek_fail=%.1f verify_checked=%.1f "
+				            "verify_mismatch=%.1f unused=%.1f validate_ns=%.3fms worker=%.3fms saved_est=%.3fms\n",
 				            per(scans), per(cands), per(reqs), per(sk_plan), per(sk_hit), per(sk_dup),
 				            per(sk_full), per(done), per(ab_read + ab_fail + ab_exc), per(ab_read),
-				            per(ab_fail), per(ab_exc), per(used), per(vfail), per(nfound), per(unused),
+				            per(ab_fail), per(ab_exc), per(used), per(fb_dirty), per(fb_mism), per(fb_regs),
+				            per(nfound), per(peek_fail), per(v_chk), per(v_bad), per(unused),
 				            ms(val_ns), ms(work_ns), ms(used_ns > val_ns ? used_ns - val_ns : 0));
 			}
 			std::printf("NHL27TRACE nocfg=%.1f flag_off=%.1f inelig_mode=%.1f empty=%.1f disabled=%.1f tape_nr=%.1f "

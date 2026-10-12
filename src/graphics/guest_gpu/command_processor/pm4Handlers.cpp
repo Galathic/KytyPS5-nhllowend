@@ -1361,6 +1361,20 @@ void CommandProcessor::PrefetchComputeLookahead(const uint32_t* next, uint32_t r
 	if (!Prefetch::Active() || !GuestGpu::IsGpuThread()) return;
 	FrameBreakdown::g_prefetch.scans.fetch_add(1, std::memory_order_relaxed);
 
+	// Never dereference the command stream directly (KYTY_PM4_CLEAN_BACKING/METADATA exist because such
+	// loads can fault on GPU-owned pages): bulk-copy the next dwords through the clean-backing peek and scan
+	// the copy. A refused peek (dirty, unmapped, out of range) skips the scan.
+	constexpr uint32_t        kPeekDwords = 256u;
+	std::array<uint32_t, kPeekDwords> window;
+	const uint32_t            avail_dw = std::min(remaining_dw, kPeekDwords);
+	if (avail_dw == 0) return;
+	if (!TryPeekCleanBackingBytes(next, window.data(), static_cast<uint64_t>(avail_dw) * sizeof(uint32_t))) {
+		FrameBreakdown::g_prefetch.peek_fail.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	next         = window.data();
+	remaining_dw = avail_dw;
+
 	HW::ComputeShaderInfo cs = m_sh_ctx.GetCs();
 	uint32_t              work = 0, pos = 0;
 	for (uint32_t scanned = 0; pos < remaining_dw && work < Prefetch::kLookaheadWork && scanned < 256u;
