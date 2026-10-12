@@ -1361,6 +1361,24 @@ void CommandProcessor::PrefetchComputeLookahead(const uint32_t* next, uint32_t r
 	if (!Prefetch::Active() || !GuestGpu::IsGpuThread()) return;
 	FrameBreakdown::g_prefetch.scans.fetch_add(1, std::memory_order_relaxed);
 
+	// Compare the prediction made for THIS dispatch (the packet just before `next`) with what it executes with.
+	{
+		const uint32_t* self = next - 5;
+		const auto&     cur  = m_sh_ctx.GetCs();
+		if (cur.cs_regs.data_addr != 0 && self[1] != 0 && self[2] != 0 && self[3] != 0) {
+			std::array<uint32_t, 3> groups {self[1], self[2], self[3]};
+			if ((self[4] & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0) {
+				const uint32_t sizes[] = {cur.cs_regs.num_thread_x, cur.cs_regs.num_thread_y, cur.cs_regs.num_thread_z};
+				for (uint32_t axis = 0; axis < 3u; ++axis) {
+					const auto size = std::max(sizes[axis], 1u);
+					groups[axis]    = groups[axis] / size + (groups[axis] % size != 0u);
+				}
+			}
+			Prefetch::CheckPrediction(reinterpret_cast<uint64_t>(self), cur.cs_regs.data_addr,
+			                          std::span<const uint32_t>(cur.cs_user_sgpr.value, cur.cs_regs.user_sgpr), groups);
+		}
+	}
+
 	// Never dereference the command stream directly (KYTY_PM4_CLEAN_BACKING/METADATA exist because such
 	// loads can fault on GPU-owned pages): bulk-copy the next dwords through the clean-backing peek and scan
 	// the copy. A refused peek (dirty, unmapped, out of range) skips the scan.
@@ -1372,6 +1390,7 @@ void CommandProcessor::PrefetchComputeLookahead(const uint32_t* next, uint32_t r
 		FrameBreakdown::g_prefetch.peek_fail.fetch_add(1, std::memory_order_relaxed);
 		return;
 	}
+	const uint32_t* const stream = next; // original stream address of window[0]; identifies packets
 	next         = window.data();
 	remaining_dw = avail_dw;
 
@@ -1411,7 +1430,7 @@ void CommandProcessor::PrefetchComputeLookahead(const uint32_t* next, uint32_t r
 						groups[axis]    = groups[axis] / size + (groups[axis] % size != 0u);
 					}
 				}
-				Prefetch::RequestCompute(cs.cs_regs.data_addr,
+				Prefetch::RequestCompute(reinterpret_cast<uint64_t>(stream + pos), cs.cs_regs.data_addr,
 				                         std::span<const uint32_t>(cs.cs_user_sgpr.value, cs.cs_regs.user_sgpr),
 				                         groups);
 				break;

@@ -198,7 +198,25 @@ struct PrefetchStats {
 	std::atomic<uint64_t> verify_checked {0};   // KYTY_DRAWPREP_VERIFY: adoptions re-materialized and compared
 	std::atomic<uint64_t> verify_mismatch {0};  // ... of which the adopted state differed (must be 0)
 	std::atomic<uint64_t> unused {0};           // results replaced or dropped without being used
-	std::atomic<uint64_t> validate_ns {0};      // GPU thread: time spent in TryDirect attempts that found a result
+	std::atomic<uint64_t> validate_ns {0};      // GPU thread: TryDirect attempts that found a candidate (excl. verify)
+	std::atomic<uint64_t> lookup_ns {0};        // ... of which: result lookup under the state mutex
+	std::atomic<uint64_t> ranges_ns {0};        // ... of which: dirty + content validation of the recorded ranges
+	std::atomic<uint64_t> lock_wait_ns {0};     // ... of which: waiting for the plan lock stripe (worker materializing)
+	std::atomic<uint64_t> install_ns {0};       // ... of which: moving the outputs in (after the lock)
+	std::atomic<uint64_t> verify_ns {0};        // KYTY_DRAWPREP_VERIFY re-materialization (NOT in validate_ns)
+	std::atomic<uint64_t> miss_ns {0};          // GPU thread: TryDirect calls that found nothing
+	std::atomic<uint64_t> skip_scanned {0};     // look-ahead dispatch already requested by an earlier scan
+	std::atomic<uint64_t> nf_pending {0};       // no result: request queued or running (not ready yet)
+	std::atomic<uint64_t> nf_reuse {0};         // no result: identical inputs were adopted earlier (result consumed)
+	std::atomic<uint64_t> nf_gone {0};          // no result: requested earlier, result aborted/evicted/stale
+	std::atomic<uint64_t> nf_never {0};         // no result: never requested (not scanned, no plan, or queue full)
+	std::atomic<uint64_t> pred_checked {0};     // dispatches whose look-ahead prediction was compared at execution
+	std::atomic<uint64_t> pred_ok {0};          // ... prediction matched exactly
+	std::atomic<uint64_t> pred_none {0};        // ... no prediction was made for this dispatch
+	std::atomic<uint64_t> pred_base {0};        // ... shader base / user-data count differed
+	std::atomic<uint64_t> pred_regs {0};        // ... a user-data register differed
+	std::atomic<uint64_t> pred_groups {0};      // ... workgroup counts differed
+	std::atomic<uint64_t> pred_regmask {0};     // bitmask of user-data slots that differed (diagnostic)
 	std::atomic<uint64_t> worker_ns {0};        // worker: time spent materializing
 	std::atomic<uint64_t> used_worker_ns {0};   // worker time of the results that were used
 };
@@ -764,6 +782,14 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 				const uint64_t peek_fail = Take(pf.peek_fail), v_chk = Take(pf.verify_checked);
 				const uint64_t v_bad = Take(pf.verify_mismatch);
 				const uint64_t unused = Take(pf.unused);
+				const uint64_t lk_ns = Take(pf.lookup_ns), rg_ns = Take(pf.ranges_ns), lw_ns = Take(pf.lock_wait_ns);
+				const uint64_t in_ns = Take(pf.install_ns), vf_ns = Take(pf.verify_ns), ms_ns = Take(pf.miss_ns);
+				const uint64_t sk_scan = Take(pf.skip_scanned), nf_pend = Take(pf.nf_pending);
+				const uint64_t nf_reuse = Take(pf.nf_reuse), nf_gone = Take(pf.nf_gone), nf_never = Take(pf.nf_never);
+				const uint64_t pr_chk = Take(pf.pred_checked), pr_ok = Take(pf.pred_ok), pr_none = Take(pf.pred_none);
+				const uint64_t pr_base = Take(pf.pred_base), pr_regs = Take(pf.pred_regs);
+				const uint64_t pr_grp = Take(pf.pred_groups);
+				const uint64_t pr_mask = pf.pred_regmask.exchange(0, std::memory_order_relaxed);
 				std::printf("NHL27PREFETCH scans=%.1f candidates=%.1f requests=%.1f skip_no_plan=%.1f "
 				            "skip_likely_hit=%.1f skip_dup=%.1f skip_full=%.1f worker_done=%.1f "
 				            "worker_aborts=%.1f(read=%.1f fail=%.1f exc=%.1f) used_direct=%.1f fb_dirty=%.1f "
@@ -774,6 +800,14 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 				            per(ab_fail), per(ab_exc), per(used), per(fb_dirty), per(fb_mism), per(fb_regs),
 				            per(nfound), per(peek_fail), per(v_chk), per(v_bad), per(unused),
 				            ms(val_ns), ms(work_ns), ms(used_ns > val_ns ? used_ns - val_ns : 0));
+				std::printf("NHL27PREFETCH2 validate=%.3fms(lookup=%.3f ranges=%.3f lockwait=%.3f install=%.3f) "
+				            "verify=%.3fms miss=%.3fms skip_scanned=%.1f not_found(pending=%.1f reuse=%.1f "
+				            "gone=%.1f never=%.1f) pred(checked=%.1f ok=%.1f none=%.1f base=%.1f regs=%.1f "
+				            "groups=%.1f regmask=0x%llx)\n",
+				            ms(val_ns), ms(lk_ns), ms(rg_ns), ms(lw_ns), ms(in_ns), ms(vf_ns), ms(ms_ns),
+				            per(sk_scan), per(nf_pend), per(nf_reuse), per(nf_gone), per(nf_never), per(pr_chk),
+				            per(pr_ok), per(pr_none), per(pr_base), per(pr_regs), per(pr_grp),
+				            static_cast<unsigned long long>(pr_mask));
 			}
 			std::printf("NHL27TRACE nocfg=%.1f flag_off=%.1f inelig_mode=%.1f empty=%.1f disabled=%.1f tape_nr=%.1f "
 			            "strict=%.1f m_memo=%.1f m_exec=%.1f m_memoslot=%.1f m_cond=%.1f m_eval=%.1f m_condeval=%.1f "

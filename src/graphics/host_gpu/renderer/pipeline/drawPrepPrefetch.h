@@ -61,8 +61,8 @@ using Snapshot       = ShaderRecompiler::IR::ResourceSnapshot;
 using Specialization = ShaderRecompiler::IR::ResourceSpecialization;
 
 inline constexpr size_t   kMaxUserData      = 32;   // HW::UserSgprInfo::SGPRS_MAX
-inline constexpr size_t   kMaxPending       = 16;
-inline constexpr size_t   kMaxResults       = 24;
+inline constexpr size_t   kMaxPending       = 128;
+inline constexpr size_t   kMaxResults       = 64;
 inline constexpr size_t   kMaxRecordedWords = 4096; // retention limit for one result's recorded reads
 inline constexpr uint32_t kLookaheadWork    = 8;
 inline constexpr uint32_t kVerifyEvery      = 8;
@@ -74,14 +74,29 @@ struct Key {
 	uint32_t    user_count  = 0;
 	uint32_t    workgroups[3] = {0, 0, 0};
 	uint32_t    user_data[kMaxUserData] = {};
+	uint64_t    hash = 0; // InputHash of (shader_base, workgroups, user data); a pre-filter, never a proof
 };
+
+// FNV-1a over the inputs a materialization depends on (plan excluded: it is a function of base + count).
+inline uint64_t InputHash(uint64_t shader_base, const uint32_t* workgroups, const uint32_t* user_data,
+                          size_t user_count) {
+	uint64_t   h   = 1469598103934665603ull;
+	const auto mix = [&h](uint64_t v) { h = (h ^ v) * 1099511628211ull; };
+	mix(shader_base);
+	mix(workgroups[0]);
+	mix(workgroups[1]);
+	mix(workgroups[2]);
+	mix(user_count);
+	for (size_t i = 0; i < user_count; ++i) mix(user_data[i]);
+	return h == 0 ? 1 : h;
+}
 
 inline bool SameProgram(const Key& a, const Key& b) {
 	return a.plan == b.plan && a.shader_base == b.shader_base && a.workgroups[0] == b.workgroups[0] &&
 	       a.workgroups[1] == b.workgroups[1] && a.workgroups[2] == b.workgroups[2];
 }
 inline bool SameInputs(const Key& a, const Key& b) {
-	return SameProgram(a, b) && a.user_count == b.user_count &&
+	return a.hash == b.hash && SameProgram(a, b) && a.user_count == b.user_count &&
 	       std::equal(a.user_data, a.user_data + a.user_count, b.user_data);
 }
 
@@ -110,6 +125,12 @@ struct State {
 	Key                                  in_flight {};
 	bool                                 has_in_flight = false;
 	std::vector<std::unique_ptr<Result>> results;
+	// Adopted results are handed back so the worker (their allocator) frees them, not the GPU thread.
+	std::vector<std::unique_ptr<Result>> graveyard;
+	// Diagnostics (read only under KYTY_DRAWPREP_VERIFY): input hashes recently requested / adopted.
+	uint64_t                             requested_ring[256] = {};
+	uint64_t                             adopted_ring[256]   = {};
+	uint32_t                             requested_n = 0, adopted_n = 0;
 	std::atomic<uint32_t>                result_count {0};
 	bool                                 stop  = false;
 	bool                                 alive = false;
@@ -301,8 +322,10 @@ inline void WorkerMain() {
 			st.has_in_flight  = true;
 		}
 		auto result = Produce(key);
+		std::vector<std::unique_ptr<Result>> dead;
 		{
 			std::lock_guard lock(st.mutex);
+			dead.swap(st.graveyard);
 			st.has_in_flight = false;
 			if (result != nullptr && !st.stop) {
 				if (st.results.size() >= kMaxResults) {
@@ -319,24 +342,73 @@ inline void WorkerMain() {
 	st.stopped.notify_all();
 }
 
+// ---- prediction bookkeeping (GPU thread only) ----------------------------------------------------------
+// One slot per look-ahead dispatch (direct-mapped by stream address). It makes the scan-once decision (a dispatch
+// already requested with identical inputs is not looked up again) and lets the executing dispatch check the
+// prediction it was scanned with (counters pred_*): a mismatch there is a look-ahead modelling bug.
+struct Prediction {
+	uint64_t address;
+	uint64_t hash;
+	uint64_t shader_base;
+	uint32_t user_count;
+	uint32_t workgroups[3];
+	uint32_t user_data[kMaxUserData];
+	bool     requested;
+};
+inline Prediction g_predictions[256];
+
+inline Prediction& PredictionSlot(uint64_t address) {
+	return g_predictions[(address >> 2u) & 255u];
+}
+
+// Called when the dispatch whose packet is at `address` is about to execute with these actual inputs.
+inline void CheckPrediction(uint64_t address, uint64_t shader_base, std::span<const uint32_t> user_data,
+                            const std::array<uint32_t, 3>& workgroups) {
+	auto& pf   = FrameBreakdown::g_prefetch;
+	auto& slot = PredictionSlot(address);
+	pf.pred_checked.fetch_add(1, std::memory_order_relaxed);
+	if (slot.address != address) {
+		pf.pred_none.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	slot.address = 0; // consumed: stream buffers are reused at the same addresses
+	if (slot.shader_base != shader_base || slot.user_count != user_data.size()) {
+		pf.pred_base.fetch_add(1, std::memory_order_relaxed);
+	} else if (!std::equal(workgroups.begin(), workgroups.end(), slot.workgroups)) {
+		pf.pred_groups.fetch_add(1, std::memory_order_relaxed);
+	} else if (!std::equal(user_data.begin(), user_data.end(), slot.user_data)) {
+		pf.pred_regs.fetch_add(1, std::memory_order_relaxed);
+		uint64_t mask = 0;
+		for (size_t i = 0; i < user_data.size() && i < 64; ++i) {
+			if (user_data[i] != slot.user_data[i]) mask |= uint64_t {1} << i;
+		}
+		pf.pred_regmask.fetch_or(mask, std::memory_order_relaxed);
+	} else {
+		pf.pred_ok.fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
 // ---- GPU thread side ---------------------------------------------------------------------------------
 
 // GPU thread, from ResourceMemo::Refresh's memo-disabled branch (see PrefetchDirectFn). On success the
 // outputs and plan.active_sources are exactly what a fresh materialization would have produced; on failure
 // nothing has been modified.
 inline bool TryDirect(const Plan& plan, const Runtime& runtime, Snapshot& snapshot, Specialization& specialization) {
+	using Clock = std::chrono::steady_clock;
 	auto& st = GetState();
 	auto& pf = FrameBreakdown::g_prefetch;
 	if (runtime.workgroup_counts.size() != 3) return false; // not a compute stage
-	if (st.result_count.load(std::memory_order_relaxed) == 0) {
+	const bool diag = VerifyEnabled();
+	if (!diag && st.result_count.load(std::memory_order_relaxed) == 0) {
 		pf.fb_notfound.fetch_add(1, std::memory_order_relaxed);
 		return false;
 	}
-	const auto start = std::chrono::steady_clock::now();
-	const auto elapsed = [&] {
-		return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-		                                 std::chrono::steady_clock::now() - start).count());
+	const auto ns_between = [](Clock::time_point from, Clock::time_point to) {
+		return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(to - from).count());
 	};
+	const auto     t0   = Clock::now();
+	const uint64_t hash = InputHash(runtime.shader_base, runtime.workgroup_counts.data(), runtime.user_data.data(),
+	                                runtime.user_data.size());
 	std::unique_ptr<Result> candidate;
 	bool                    program_seen = false;
 	{
@@ -351,7 +423,7 @@ inline bool TryDirect(const Plan& plan, const Runtime& runtime, Snapshot& snapsh
 			}
 			program_seen = true;
 			// ALL user-data registers, count included: they are inputs of the walk (and of push data).
-			if (key.user_count == runtime.user_data.size() &&
+			if (key.hash == hash && key.user_count == runtime.user_data.size() &&
 			    std::equal(runtime.user_data.begin(), runtime.user_data.end(), key.user_data)) {
 				candidate = std::move(*it);
 				st.results.erase(it);
@@ -359,9 +431,29 @@ inline bool TryDirect(const Plan& plan, const Runtime& runtime, Snapshot& snapsh
 			}
 		}
 		st.result_count.store(static_cast<uint32_t>(st.results.size()), std::memory_order_relaxed);
+		if (candidate != nullptr) {
+			st.adopted_ring[st.adopted_n++ & 255u] = hash;
+		} else if (diag && !program_seen) {
+			const auto holds = [&](const uint64_t* ring) { return std::find(ring, ring + 256, hash) != ring + 256; };
+			const auto same  = [&](const Key& key) {
+				return key.hash == hash && key.plan == &plan && key.shader_base == runtime.shader_base;
+			};
+			if ((st.has_in_flight && same(st.in_flight)) ||
+			    std::ranges::any_of(st.queue, [&](const Key& queued) { return same(queued); })) {
+				pf.nf_pending.fetch_add(1, std::memory_order_relaxed);
+			} else if (holds(st.adopted_ring)) {
+				pf.nf_reuse.fetch_add(1, std::memory_order_relaxed);
+			} else if (holds(st.requested_ring)) {
+				pf.nf_gone.fetch_add(1, std::memory_order_relaxed);
+			} else {
+				pf.nf_never.fetch_add(1, std::memory_order_relaxed);
+			}
+		}
 	}
+	const auto t1 = Clock::now();
 	if (candidate == nullptr) {
 		(program_seen ? pf.fb_regs : pf.fb_notfound).fetch_add(1, std::memory_order_relaxed);
+		pf.miss_ns.fetch_add(ns_between(t0, t1), std::memory_order_relaxed);
 		return false;
 	}
 	// Every byte the walk read must still be there, clean (not GPU-dirty) and equal.
@@ -372,14 +464,21 @@ inline bool TryDirect(const Plan& plan, const Runtime& runtime, Snapshot& snapsh
 		(verdict == Libs::LibKernel::Memory::CleanBackingCompare::Dirty ? pf.fb_dirty : pf.fb_mismatch)
 		    .fetch_add(1, std::memory_order_relaxed);
 		pf.unused.fetch_add(1, std::memory_order_relaxed);
-		pf.validate_ns.fetch_add(elapsed(), std::memory_order_relaxed);
+		const auto t2 = Clock::now();
+		pf.lookup_ns.fetch_add(ns_between(t0, t1), std::memory_order_relaxed);
+		pf.ranges_ns.fetch_add(ns_between(t1, t2), std::memory_order_relaxed);
+		pf.validate_ns.fetch_add(ns_between(t0, t2), std::memory_order_relaxed);
 		return false;
 	}
+	const auto t2 = Clock::now();
+	uint64_t   lock_wait = 0, install = 0;
 
 	candidate->snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 	static uint32_t adoptions = 0; // GPU thread only
-	if (VerifyEnabled() && (adoptions++ % kVerifyEvery) == 0) {
-		// Reference: the normal materialization with the caller's real readers, into scratch.
+	if (diag && (adoptions++ % kVerifyEvery) == 0) {
+		// Reference: the normal materialization with the caller's real readers, into scratch. Timed
+		// separately (verify_ns); it is not part of the adoption cost.
+		const auto     v0 = Clock::now();
 		Snapshot       fresh_snapshot;
 		Specialization fresh_specialization;
 		bool           same         = false;
@@ -392,6 +491,7 @@ inline bool TryDirect(const Plan& plan, const Runtime& runtime, Snapshot& snapsh
 			       ResourceMemoEntry::SameResourceSnapshot(candidate->snapshot, fresh_snapshot) &&
 			       candidate->specialization == fresh_specialization;
 		}
+		pf.verify_ns.fetch_add(ns_between(v0, Clock::now()), std::memory_order_relaxed);
 		if (!materialized) return false; // let the caller's own materialization report it
 		pf.verify_checked.fetch_add(1, std::memory_order_relaxed);
 		if (!same) pf.verify_mismatch.fetch_add(1, std::memory_order_relaxed);
@@ -399,16 +499,30 @@ inline bool TryDirect(const Plan& plan, const Runtime& runtime, Snapshot& snapsh
 		snapshot       = std::move(fresh_snapshot);
 		specialization = std::move(fresh_specialization);
 	} else {
+		const auto l0 = Clock::now();
 		{
 			const ShaderRecompiler::IR::PlanAccessGuard plan_access(plan);
+			lock_wait           = ns_between(l0, Clock::now());
 			plan.active_sources = std::move(candidate->active_sources);
 		}
 		snapshot       = std::move(candidate->snapshot);
 		specialization = std::move(candidate->specialization);
+		install        = ns_between(l0, Clock::now()) - lock_wait;
 	}
 	pf.used_direct.fetch_add(1, std::memory_order_relaxed);
 	pf.used_worker_ns.fetch_add(candidate->worker_ns, std::memory_order_relaxed);
-	pf.validate_ns.fetch_add(elapsed(), std::memory_order_relaxed);
+	{
+		// The emptied shell (ranges, recorded bytes) is freed by the worker thread that allocated it.
+		const auto      f0 = Clock::now();
+		std::lock_guard lock(st.mutex);
+		st.graveyard.push_back(std::move(candidate));
+		install += ns_between(f0, Clock::now());
+	}
+	pf.lookup_ns.fetch_add(ns_between(t0, t1), std::memory_order_relaxed);
+	pf.ranges_ns.fetch_add(ns_between(t1, t2), std::memory_order_relaxed);
+	pf.lock_wait_ns.fetch_add(lock_wait, std::memory_order_relaxed);
+	pf.install_ns.fetch_add(install, std::memory_order_relaxed);
+	pf.validate_ns.fetch_add(ns_between(t0, t2) + lock_wait + install, std::memory_order_relaxed);
 	return true;
 }
 
@@ -442,13 +556,29 @@ inline void EnsureStarted(State& st) {
 	std::thread(WorkerMain).detach();
 }
 
-// GPU thread: a look-ahead found a DISPATCH_DIRECT that will run with these compute inputs.
-inline void RequestCompute(uint64_t shader_base, std::span<const uint32_t> user_data,
+// GPU thread: a look-ahead found a DISPATCH_DIRECT (its packet is at `stream_address`) that will run with
+// these compute inputs. A dispatch already requested with identical inputs by an earlier scan is skipped
+// without taking any lock (scan-once).
+inline void RequestCompute(uint64_t stream_address, uint64_t shader_base, std::span<const uint32_t> user_data,
                            const std::array<uint32_t, 3>& workgroups) {
 	auto& st = GetState();
 	auto& pf = FrameBreakdown::g_prefetch;
 	pf.candidates.fetch_add(1, std::memory_order_relaxed);
 	if (user_data.size() > kMaxUserData) return;
+	const uint64_t hash = InputHash(shader_base, workgroups.data(), user_data.data(), user_data.size());
+	auto&          slot = PredictionSlot(stream_address);
+	if (slot.address == stream_address && slot.hash == hash && slot.requested) {
+		pf.skip_scanned.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	slot.address     = stream_address;
+	slot.hash        = hash;
+	slot.shader_base = shader_base;
+	slot.user_count  = static_cast<uint32_t>(user_data.size());
+	std::copy(workgroups.begin(), workgroups.end(), slot.workgroups);
+	std::copy(user_data.begin(), user_data.end(), slot.user_data);
+	slot.requested = false;
+
 	const auto found = st.registry.find(RegistryKey(shader_base, user_data.size()));
 	if (found == st.registry.end()) {
 		pf.skip_no_plan.fetch_add(1, std::memory_order_relaxed);
@@ -459,6 +589,7 @@ inline void RequestCompute(uint64_t shader_base, std::span<const uint32_t> user_
 	key.plan        = &plan;
 	key.shader_base = shader_base;
 	key.user_count  = static_cast<uint32_t>(user_data.size());
+	key.hash        = hash;
 	std::copy(workgroups.begin(), workgroups.end(), key.workgroups);
 	std::copy(user_data.begin(), user_data.end(), key.user_data);
 
@@ -470,6 +601,7 @@ inline void RequestCompute(uint64_t shader_base, std::span<const uint32_t> user_
 		return std::ranges::any_of(st.results, [&](const auto& result) { return SameInputs(result->key, key); });
 	}();
 	if (dup) {
+		slot.requested = true;
 		pf.skip_dup.fetch_add(1, std::memory_order_relaxed);
 		return;
 	}
@@ -478,6 +610,8 @@ inline void RequestCompute(uint64_t shader_base, std::span<const uint32_t> user_
 		return;
 	}
 	st.queue.push_back(key);
+	st.requested_ring[st.requested_n++ & 255u] = hash;
+	slot.requested                             = true;
 	pf.requests.fetch_add(1, std::memory_order_relaxed);
 	st.wake.notify_one();
 }
@@ -495,6 +629,7 @@ inline void Shutdown() {
 	st.stop = false;
 	st.queue.clear();
 	st.results.clear();
+	st.graveyard.clear();
 	st.result_count.store(0, std::memory_order_relaxed);
 	st.registry.clear();
 }

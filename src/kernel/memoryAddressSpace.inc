@@ -218,10 +218,27 @@ public:
 		}
 		const auto* source = static_cast<const uint8_t*>(expected);
 		bool        same   = true;
+		{
+			// Lock-free hit on this thread's last single-mapping access (see TryReadBacking): the
+			// compare is valid only if the map generation is unchanged before and after it.
+			auto&      c  = t_read_cache;
+			const auto g0 = m_map_gen.load(std::memory_order_acquire);
+			if (c.owner == this && c.gen == g0 && size != 0 && vaddr >= c.begin && vaddr - c.begin < c.length &&
+			    size <= c.length - (vaddr - c.begin)) {
+				const bool match = std::memcmp(c.host + (vaddr - c.begin), source, size) == 0;
+				std::atomic_thread_fence(std::memory_order_acquire);
+				if (m_map_gen.load(std::memory_order_relaxed) == g0) {
+					equal = match;
+					return true;
+				}
+			}
+		}
 		const bool  ok     = TryTransferBacking(
-		    vaddr, size, [source, &same](uint8_t* backing, uint64_t data_offset, size_t bytes) {
+		    vaddr, size,
+		    [source, &same](uint8_t* backing, uint64_t data_offset, size_t bytes) {
 			    same = same && std::memcmp(backing, source + data_offset, bytes) == 0;
-		    });
+		    },
+		    true);
 		if (ok) {
 			equal = same;
 		}
