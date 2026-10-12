@@ -300,6 +300,19 @@ inline bool Adopt(ResourceMemoEntry& memo, const Plan& plan, const Runtime& runt
 	return false;
 }
 
+// Process exit (EXIT paths run static destructors but not ~ProgramCache): stop the detached worker before
+// the memory subsystem and the plans go away. Bounded wait, so a wedged worker can never hang shutdown.
+inline void StopForExit() {
+	auto& st = GetState();
+	g_disabled.store(true, std::memory_order_relaxed);
+	std::unique_lock lock(st.mutex);
+	g_prefetch_adopt.store(nullptr, std::memory_order_release);
+	if (!st.alive) return;
+	st.stop = true;
+	st.wake.notify_all();
+	st.stopped.wait_for(lock, std::chrono::milliseconds(500), [&] { return !st.alive; });
+}
+
 // Starts the worker on first use. Order matters: plan locking must be on before the worker (and the adopt
 // hook) can exist, and this runs on the GPU thread outside any materialization.
 inline void EnsureStarted(State& st) {
@@ -307,6 +320,11 @@ inline void EnsureStarted(State& st) {
 	if (st.alive) return;
 	ShaderRecompiler::IR::g_plan_access_enabled.store(true, std::memory_order_release);
 	g_prefetch_adopt.store(&Adopt, std::memory_order_release);
+	static const bool registered = [] {
+		std::atexit(StopForExit);
+		return true;
+	}();
+	(void)registered;
 	st.stop  = false;
 	st.alive = true;
 	std::thread(WorkerMain).detach();
