@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
+#include "graphics/host_gpu/renderer/pipeline/drawPrepPrefetch.h"
 #include "graphics/host_gpu/renderer/pipeline/resourceMemo.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineRecord.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -472,6 +473,15 @@ struct PipelineCache::ProgramCache {
             if (!ok && replaying == nullptr) EXIT("Resource materialization failed\n");
             return ok;
         };
+        // KYTY_DRAWPREP_PREFETCH: teach the compute look-ahead which plan (and memo) serves this program.
+        const auto note_plan = [&]([[maybe_unused]] SourceEntry& source) {
+            if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+                if (memo_enabled && runtime_flags.drawprep_prefetch) {
+                    DrawPrepPrefetch::NotePlan(params.Base(), user_data.size(), &source.resource_plan,
+                                               &source.resource_memo);
+                }
+            }
+        };
         const auto native_plan_safe = [&](const ShaderRecompiler::IR::ResourcePlan& plan) {
 			if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 				if (input_info.native_draw.Enabled()) {
@@ -498,6 +508,7 @@ struct PipelineCache::ProgramCache {
 			if (!check_native_plan(*entry)) return {};
 			bool reused = false;
 			if (!refresh(*entry, reused)) return {};
+			note_plan(*entry);
 			resource_hits += reused;
 			materializations += !reused;
 			if (memo_enabled && !reused) ++resource_misses[static_cast<size_t>(entry->resource_memo.LastMiss())];
@@ -587,6 +598,7 @@ struct PipelineCache::ProgramCache {
 			if (!check_native_plan(*entry)) return {};
 			bool reused = false;
 			if (!refresh(*entry, reused)) return {};
+			note_plan(*entry);
 			++materializations;
 		}
 
@@ -724,6 +736,8 @@ struct PipelineCache::ProgramCache {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {
+		// The KYTY_DRAWPREP_PREFETCH worker holds raw pointers to the plans owned by `programs`.
+		DrawPrepPrefetch::Shutdown();
 		for (const auto& [key, entry]: programs) {
 			(void)key;
 			for (const auto& permutation: entry.permutations) {

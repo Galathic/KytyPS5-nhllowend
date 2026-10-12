@@ -7,6 +7,7 @@
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/pipeline/drawPrepPrefetch.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/videoOut.h"
@@ -1319,6 +1320,113 @@ KYTY_CP_OP_PARSER(CpOpAcquireMem) {
 	return (cmd_id == 0xc0061050 ? 7 : 6);
 }
 
+// ---- KYTY_DRAWPREP_PREFETCH compute look-ahead -----------------------------------------------------------
+// Everything below is a prediction. The worker's result is only used after the real dispatch re-validates
+// plan, shader base, workgroup counts, dependency registers and every recorded guest read, so a gap in this
+// model can cost a wasted request but can never change what is rendered.
+
+// Applies one SET_SH_REG packet to a copy of the compute shadow, exactly as the handlers above would.
+// Returns false when the packet touches compute state in a way this model does not reproduce (stop scanning).
+static bool PrefetchApplyShRegs(HW::ComputeShaderInfo& cs, const uint32_t* packet, uint32_t len) {
+	constexpr uint32_t kComputeBegin = 0x200u;
+	constexpr uint32_t kComputeEnd   = Pm4::COMPUTE_USER_DATA_15 + 1u;
+	const uint32_t offset = packet[1];
+	const uint32_t num    = len - 2u;
+	if (offset == Pm4::SH_NOP) return true;
+	if (num == 0 || offset >= Pm4::SH_NUM || num > Pm4::SH_NUM - offset) return false;
+	const uint32_t end = offset + num;
+	if (end <= kComputeBegin || offset >= kComputeEnd) return true; // cannot reach the compute shadow
+	if (offset < kComputeBegin) return false;                       // straddles into compute space
+	const uint32_t* values = packet + 2;
+	if (offset >= Pm4::COMPUTE_USER_ACCUM_0 && end <= Pm4::COMPUTE_USER_ACCUM_0 + 4u) return true; // ignored
+	if (offset >= Pm4::COMPUTE_USER_DATA_0) { // HwShSetCsUserSgpr
+		const uint32_t slot = offset - Pm4::COMPUTE_USER_DATA_0;
+		if (slot >= 16u || num > 16u - slot) return false;
+		for (uint32_t i = 0; i < num; i++) {
+			cs.cs_user_sgpr.value[slot + i] = values[i];
+			cs.cs_user_sgpr.count           = std::max(cs.cs_user_sgpr.count, slot + i + 1u);
+		}
+		return true;
+	}
+	auto cs_regs = cs.cs_regs;
+	for (uint32_t i = 0; i < num; i++) {
+		if (!ApplyCsRegister(cs_regs, offset + i, values[i])) return false;
+	}
+	cs.cs_regs = cs_regs;
+	return true;
+}
+
+void CommandProcessor::PrefetchComputeLookahead(const uint32_t* next, uint32_t remaining_dw) {
+	namespace Prefetch = DrawPrepPrefetch;
+	if (!Prefetch::Active() || !GuestGpu::IsGpuThread()) return;
+	FrameBreakdown::g_prefetch.scans.fetch_add(1, std::memory_order_relaxed);
+
+	HW::ComputeShaderInfo cs = m_sh_ctx.GetCs();
+	uint32_t              work = 0, pos = 0;
+	for (uint32_t scanned = 0; pos < remaining_dw && work < Prefetch::kLookaheadWork && scanned < 256u;
+	     ++scanned) {
+		const uint32_t header = next[pos];
+		if (header == 0x80000000u) { // padding, as in ProcessPm4
+			++pos;
+			continue;
+		}
+		// Only plain, unpredicated type-3 packets that fit in this buffer. Anything else ends the scan.
+		if ((header >> 30u) != 3u || (header & 1u) != 0u || remaining_dw - pos < 2u) break;
+		const uint32_t len = KYTY_PM4_LEN(header);
+		if (len > remaining_dw - pos) break;
+		const uint32_t  opcode = (header >> 8u) & 0xffu;
+		const uint32_t* packet = next + pos;
+		bool            stop   = false;
+		switch (opcode) {
+			case Pm4::IT_SET_SH_REG: stop = !PrefetchApplyShRegs(cs, packet, len); break;
+			case Pm4::IT_DISPATCH_DIRECT: {
+				if (len != 5u) {
+					stop = true;
+					break;
+				}
+				++work;
+				const uint32_t mode = packet[4];
+				cs.cs_regs.wave_size = Pm4::ComputeWaveSize(mode); // DispatchDirect does this first
+				if (cs.cs_regs.data_addr == 0 || packet[1] == 0 || packet[2] == 0 || packet[3] == 0) break;
+				std::array<uint32_t, 3> groups {packet[1], packet[2], packet[3]};
+				if ((mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0) {
+					const uint32_t sizes[] = {cs.cs_regs.num_thread_x, cs.cs_regs.num_thread_y,
+					                          cs.cs_regs.num_thread_z};
+					for (uint32_t axis = 0; axis < 3u; ++axis) {
+						const auto size = std::max(sizes[axis], 1u);
+						groups[axis]    = groups[axis] / size + (groups[axis] % size != 0u);
+					}
+				}
+				Prefetch::RequestCompute(cs.cs_regs.data_addr,
+				                         std::span<const uint32_t>(cs.cs_user_sgpr.value, cs.cs_regs.user_sgpr),
+				                         groups);
+				break;
+			}
+			// Draws do not touch the compute shadow; they only use up look-ahead budget.
+			case Pm4::IT_DRAW_INDEX_AUTO:
+			case Pm4::IT_DRAW_INDEX_2:
+			case Pm4::IT_DRAW_INDEX_OFFSET_2:
+			case Pm4::IT_DRAW_INDIRECT:
+			case Pm4::IT_DRAW_INDEX_INDIRECT:
+			case Pm4::IT_DRAW_INDIRECT_MULTI:
+			case Pm4::IT_DRAW_INDEX_INDIRECT_MULTI: ++work; break;
+			// State packets that cannot alter compute registers or order guest memory.
+			case Pm4::IT_SET_CONTEXT_REG:
+			case Pm4::IT_SET_UCONFIG_REG:
+			case Pm4::IT_INDEX_TYPE:
+			case Pm4::IT_NUM_INSTANCES:
+			case Pm4::IT_INDEX_BASE:
+			case Pm4::IT_INDEX_BUFFER_SIZE: break;
+			// Plain NOP padding only; custom R-coded NOPs (release-mem, flips, waits) end the scan.
+			case Pm4::IT_NOP: stop = KYTY_PM4_R(header) != 0u; break;
+			// Waits, barriers, events, DMA, indirect buffers, indirect dispatch/SH writes, ...: stop.
+			default: stop = true; break;
+		}
+		if (stop) break;
+		pos += len;
+	}
+}
+
 KYTY_CP_OP_PARSER(CpOpDispatchDirect) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -1330,6 +1438,8 @@ KYTY_CP_OP_PARSER(CpOpDispatchDirect) {
 	uint32_t thread_group_z = buffer[2];
 	uint32_t mode           = buffer[3];
 
+	// Start the worker on the following dispatches before this one's own (long) preparation begins.
+	cp.PrefetchComputeLookahead(buffer + 4, dw - 5u);
 	cp.DispatchDirect(thread_group_x, thread_group_y, thread_group_z, mode);
 
 	return KYTY_PM4_LEN(cmd_id) - 1;

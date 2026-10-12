@@ -367,6 +367,14 @@ public:
         m_register_state_hash = HashRegisterState(m_register_inputs, m_user_data);
         m_hash_metadata_ready = true;
     }
+    // GPU thread only. True when this entry would take the register-input fast path for these inputs
+    // (it says nothing about guest memory). Used to skip prefetching work the memo already covers.
+    bool InputsMatch(const ShaderRecompiler::IR::ResourcePlan& plan, uint64_t shader_base,
+                     std::span<const uint32_t> user_data, std::span<const uint32_t> workgroups) const {
+        return m_valid && m_plan == &plan && m_shader_base == shader_base &&
+               m_dynamic_dependencies == DynamicDependenciesEnabled() &&
+               RegisterInputsEqual(user_data) && std::ranges::equal(m_workgroups, workgroups);
+    }
     enum class Miss {
         None, Cold, ShaderBase, Registers, Workgroups, ReadFailed, MemoryChanged,
         VerifyMismatch, VerifyInconclusive, Count
@@ -390,6 +398,10 @@ public:
                  ShaderRecompiler::IR::ResourceSpecialization& specialization,
                  bool enabled, bool& reused, bool probe_only = false,
                  bool update_push_data = true) {
+        // KYTY_DRAWPREP_PREFETCH: plan.active_sources and the plan's evaluation scratch are shared with the
+        // prefetch worker. Hold the plan's stripe across the whole refresh so a hit's restore of
+        // active_sources and a miss's materialize-then-snapshot of it cannot interleave with the worker.
+        const ShaderRecompiler::IR::PlanAccessGuard plan_access(plan);
         reused = false;
         m_last_miss = Miss::None;
         const bool dynamic_dependencies = DynamicDependenciesEnabled();
@@ -591,6 +603,17 @@ private:
     bool m_hash_metadata_ready = false, m_register_inputs_valid = false;
 };
 
+// KYTY_DRAWPREP_PREFETCH: set by the prefetch worker's start-up (drawPrepPrefetch.h). Called on the GPU
+// thread, with the single-entry memo already known to miss, to replace the entry by a worker-built one
+// whose register inputs and recorded guest reads were just re-validated with the real readers. On
+// success the memo entry, snapshot and specialization are exactly what a fresh materialization would
+// have produced. On failure nothing has been modified.
+using PrefetchAdoptFn = bool (*)(ResourceMemoEntry& memo, const ShaderRecompiler::IR::ResourcePlan& plan,
+                                 const ShaderRecompiler::IR::SrtRuntime& runtime,
+                                 ShaderRecompiler::IR::ResourceSnapshot& snapshot,
+                                 ShaderRecompiler::IR::ResourceSpecialization& specialization);
+inline std::atomic<PrefetchAdoptFn> g_prefetch_adopt {nullptr};
+
 // Keep multiple validated states so alternating materials do not evict each other.
 // Never cache solely by pointer: each candidate still replays its dependency reads.
 class ResourceMemo {
@@ -606,6 +629,13 @@ public:
     }
     using Miss = ResourceMemoEntry::Miss;
     Miss LastMiss() const { return m_last_miss; }
+    // GPU thread only; see ResourceMemoEntry::InputsMatch. Single-entry memo only.
+    bool InputsMatchLast(const ShaderRecompiler::IR::ResourcePlan& plan, uint64_t shader_base,
+                         std::span<const uint32_t> user_data, std::span<const uint32_t> workgroups) const {
+        return m_capacity == 1 && !m_entries.empty() &&
+               m_entries.front().memo.InputsMatch(plan, shader_base, user_data, workgroups);
+    }
+    bool SingleEntry() const { return m_capacity == 1; }
     bool Refresh(const ShaderRecompiler::IR::ResourcePlan& plan,
                  const ShaderRecompiler::IR::SrtRuntime& runtime,
                  ShaderRecompiler::IR::ResourceSnapshot& snapshot,
@@ -644,7 +674,22 @@ public:
                     m_diag_specialization = specialization;
                 }
             }
-            const bool ok = memo.Refresh(plan, runtime, snapshot, specialization, true, reused);
+            bool ok;
+            const auto adopt = flags.drawprep_prefetch ? g_prefetch_adopt.load(std::memory_order_acquire) : nullptr;
+            if (adopt != nullptr) {
+                // Probe first: a register/memory hit needs no prefetched result. Only a miss tries to adopt.
+                ok = memo.Refresh(plan, runtime, snapshot, specialization, true, reused, true);
+                if (!ok) {
+                    if (adopt(memo, plan, runtime, snapshot, specialization)) {
+                        ok = true;
+                        reused = false;
+                    } else {
+                        ok = memo.Refresh(plan, runtime, snapshot, specialization, true, reused);
+                    }
+                }
+            } else {
+                ok = memo.Refresh(plan, runtime, snapshot, specialization, true, reused);
+            }
             m_last_miss = memo.LastMiss();
             if (diag && ok && diag_changed != 0 && m_last_miss == Miss::Registers) {
                 ResourceMissDiag::Record(diag_first, diag_changed, m_diag_snapshot, m_diag_specialization,
