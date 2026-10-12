@@ -681,8 +681,7 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 				const uint64_t srg = Take(sp.ranges);
 				std::printf("NHL27SPECULATE mats=%.1f spec8=%.1f spec48=%.1f blocked_gpu_write=%.1f "
 				            "blocked_cpu_fault8=%.1f blocked_cpu_fault48=%.1f blocked_wait8=%.1f "
-				            "blocked_wait48=%.1f no_reads=%.1f avg_ranges=%.2f
-",
+				            "blocked_wait48=%.1f no_reads=%.1f avg_ranges=%.2f\n",
 				            per(sm), per(Take(sp.spec8)), per(Take(sp.spec48)), per(Take(sp.blk_gpu)),
 				            per(Take(sp.blk_cpu8)), per(Take(sp.blk_cpu48)), per(Take(sp.blk_wait8)),
 				            per(Take(sp.blk_wait48)), per(Take(sp.noreads)),
