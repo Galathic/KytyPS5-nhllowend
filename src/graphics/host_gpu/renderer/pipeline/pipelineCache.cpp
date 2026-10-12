@@ -113,6 +113,7 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
 	// Scalar and unformatted buffer dependencies use the same backing as native raw loads.
 	// Image synchronization belongs to formatted buffer bindings, not these reads.
+	if (FrameBreakdown::g_spec_collect != nullptr) FrameBreakdown::SpecCollectRead(address, values.size_bytes());
 	return !values.empty() &&
 	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
 }
@@ -122,6 +123,7 @@ bool ReadShaderOrdinaryBacking(void*, uint64_t address, std::span<uint32_t> valu
 	// Read only the requested bytes through its alias, synchronizing actual GPU
 	// writes rather than unrelated bytes sharing the protection page. Non-backed
 	// pointers retain the original memcpy/fault behavior; strict reads still fail.
+	if (FrameBreakdown::g_spec_collect != nullptr) FrameBreakdown::SpecCollectRead(address, values.size_bytes());
 	if (!values.empty() && Libs::LibKernel::Memory::TryReadBufferBacking(
 	        address, values.data(), values.size_bytes())) {
 		return true;
@@ -133,6 +135,7 @@ bool ReadShaderOrdinaryBacking(void*, uint64_t address, std::span<uint32_t> valu
 bool PeekShaderCleanSpan(void*, uint64_t address, std::span<uint32_t> values) {
 	// This capability declines dirty or unavailable ranges without synchronizing
 	// them. The walker then performs its original ordered scalar reads.
+	if (FrameBreakdown::g_spec_collect != nullptr) FrameBreakdown::SpecCollectRead(address, values.size_bytes());
 	return !values.empty() && Libs::LibKernel::Memory::TryReadCleanBufferBacking(
 	    address, values.data(), values.size_bytes());
 }
@@ -142,6 +145,7 @@ bool ReadShaderNativeSpan(void*, uint64_t address, std::span<uint32_t> values) {
 	    !GuestRange{address, values.size_bytes()}.Valid()) return false;
 	// This completes the original ordinary native reads; it does not certify the
 	// range clean. Protected GPU-owned bytes follow existing fault/readback handling.
+	if (FrameBreakdown::g_spec_collect != nullptr) FrameBreakdown::SpecCollectRead(address, values.size_bytes());
 	// After access begins, failures keep native fault behavior rather than returning false.
 	std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
 	return true;

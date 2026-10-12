@@ -167,12 +167,26 @@ inline Counters g_counters;
 struct SpecStats {
 	std::atomic<uint64_t> mats {0}, spec8 {0}, spec48 {0}, blk_gpu {0}, blk_cpu8 {0}, blk_cpu48 {0};
 	std::atomic<uint64_t> blk_wait8 {0}, blk_wait48 {0}, ranges {0}, noreads {0};
+	std::atomic<uint64_t> blk_pw8 {0}, blk_pw48 {0};
 };
 inline SpecStats g_spec;
 inline constexpr uint64_t kSpecTableBits = 18;
 inline constexpr uint64_t kSpecTableSize = 1ull << kSpecTableBits;
 inline std::atomic<uint64_t> g_spec_fault_seq[kSpecTableSize];  // page -> seq of last CPU write fault
 inline std::atomic<uint64_t> g_spec_gpu_epoch[kSpecTableSize];  // page -> batch epoch of last GPU write
+inline std::atomic<uint64_t> g_spec_pkt_seq[kSpecTableSize];    // page -> seq of last PM4 packet guest-memory write
+// Measurement-only read collector for the materialization in progress on this thread (fed from the
+// low-level shader memory readers; null outside NHL27SPECULATE materialization).
+inline thread_local std::vector<std::pair<uint64_t, uint64_t>>* g_spec_collect = nullptr;
+inline void SpecCollectRead(uint64_t addr, uint64_t size) {
+	auto* c = g_spec_collect;
+	if (c == nullptr) return;
+	if (!c->empty() && c->back().first + c->back().second == addr) {
+		c->back().second += size;
+		return;
+	}
+	if (c->size() < 4096) c->emplace_back(addr, size);
+}
 inline std::atomic<uint64_t> g_spec_seq {0};
 inline std::atomic<uint64_t> g_spec_wait_seq {0};
 inline std::atomic<uint64_t> g_spec_epoch {1};
@@ -189,13 +203,21 @@ inline void SpecNoteGpuWrite(uint64_t vaddr, uint64_t size) {
 		g_spec_gpu_epoch[SpecIndex(p)].store(epoch, std::memory_order_relaxed);
 	}
 }
+inline void SpecNotePktWrite(uint64_t vaddr, uint64_t size) {
+	const uint64_t first = vaddr >> 12;
+	const uint64_t last  = (vaddr + (size != 0 ? size - 1 : 0)) >> 12;
+	const uint64_t at    = g_spec_seq.load(std::memory_order_relaxed) + 1;
+	for (uint64_t p = first; p <= last && p - first < 4096; ++p) {
+		g_spec_pkt_seq[SpecIndex(p)].store(at, std::memory_order_relaxed);
+	}
+}
 inline void SpecNoteWait() { g_spec_wait_seq.store(g_spec_seq.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed); }
 inline void SpecNoteSubmit() { g_spec_epoch.fetch_add(1, std::memory_order_relaxed); }
 // Called once per materialization on the GPU thread with the walker's captured read ranges.
 inline void SpecObserve(const std::vector<std::pair<uint64_t, uint64_t>>& reads) {
 	const uint64_t seq   = g_spec_seq.fetch_add(1, std::memory_order_relaxed) + 1;
 	const uint64_t epoch = g_spec_epoch.load(std::memory_order_relaxed);
-	uint64_t       newest_fault = 0;
+	uint64_t       newest_fault = 0, newest_pw = 0;
 	bool           gpu = false;
 	for (const auto& [addr, size] : reads) {
 		const uint64_t first = addr >> 12;
@@ -203,6 +225,7 @@ inline void SpecObserve(const std::vector<std::pair<uint64_t, uint64_t>>& reads)
 		for (uint64_t p = first; p <= last && p - first < 256; ++p) {
 			const uint64_t i = SpecIndex(p);
 			newest_fault     = std::max(newest_fault, g_spec_fault_seq[i].load(std::memory_order_relaxed));
+			newest_pw        = std::max(newest_pw, g_spec_pkt_seq[i].load(std::memory_order_relaxed));
 			gpu |= g_spec_gpu_epoch[i].load(std::memory_order_relaxed) == epoch;
 		}
 	}
@@ -210,6 +233,7 @@ inline void SpecObserve(const std::vector<std::pair<uint64_t, uint64_t>>& reads)
 	const auto     within = [seq](uint64_t at, uint64_t n) { return at != 0 && seq - at < n; };
 	const bool cpu8 = within(newest_fault, 8), cpu48 = within(newest_fault, 48);
 	const bool w8 = within(wait, 8), w48 = within(wait, 48);
+	const bool pw8 = within(newest_pw, 8), pw48 = within(newest_pw, 48);
 	auto& st = g_spec;
 	st.mats.fetch_add(1, std::memory_order_relaxed);
 	st.ranges.fetch_add(reads.size(), std::memory_order_relaxed);
@@ -217,10 +241,12 @@ inline void SpecObserve(const std::vector<std::pair<uint64_t, uint64_t>>& reads)
 	if (gpu) st.blk_gpu.fetch_add(1, std::memory_order_relaxed);
 	if (cpu8) st.blk_cpu8.fetch_add(1, std::memory_order_relaxed);
 	if (cpu48) st.blk_cpu48.fetch_add(1, std::memory_order_relaxed);
+	if (pw8) st.blk_pw8.fetch_add(1, std::memory_order_relaxed);
+	if (pw48) st.blk_pw48.fetch_add(1, std::memory_order_relaxed);
 	if (w8) st.blk_wait8.fetch_add(1, std::memory_order_relaxed);
 	if (w48) st.blk_wait48.fetch_add(1, std::memory_order_relaxed);
-	if (!gpu && !cpu8 && !w8) st.spec8.fetch_add(1, std::memory_order_relaxed);
-	if (!gpu && !cpu48 && !w48) st.spec48.fetch_add(1, std::memory_order_relaxed);
+	if (!gpu && !cpu8 && !w8 && !pw8) st.spec8.fetch_add(1, std::memory_order_relaxed);
+	if (!gpu && !cpu48 && !w48 && !pw48) st.spec48.fetch_add(1, std::memory_order_relaxed);
 }
 
 // NHL27FAULTCOST: breakdown of guest page-fault handling (RenderContext::HandleFault), all threads.
@@ -679,12 +705,15 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 				auto&          sp  = g_spec;
 				const uint64_t sm  = Take(sp.mats);
 				const uint64_t srg = Take(sp.ranges);
-				std::printf("NHL27SPECULATE mats=%.1f spec8=%.1f spec48=%.1f blocked_gpu_write=%.1f "
-				            "blocked_cpu_fault8=%.1f blocked_cpu_fault48=%.1f blocked_wait8=%.1f "
-				            "blocked_wait48=%.1f no_reads=%.1f avg_ranges=%.2f\n",
-				            per(sm), per(Take(sp.spec8)), per(Take(sp.spec48)), per(Take(sp.blk_gpu)),
-				            per(Take(sp.blk_cpu8)), per(Take(sp.blk_cpu48)), per(Take(sp.blk_wait8)),
-				            per(Take(sp.blk_wait48)), per(Take(sp.noreads)),
+				std::printf("NHL27SPECULATE mats=%.1f spec8=%.1f spec48=%.1f blocked_pkt_write8=%.1f "
+				            "blocked_pkt_write48=%.1f blocked_wait8=%.1f blocked_wait48=%.1f "
+				            "blocked_cpu_fault8=%.1f blocked_cpu_fault48=%.1f blocked_gpu_write=%.1f "
+				            "no_reads=%.1f avg_ranges=%.2f
+",
+				            per(sm), per(Take(sp.spec8)), per(Take(sp.spec48)), per(Take(sp.blk_pw8)),
+				            per(Take(sp.blk_pw48)), per(Take(sp.blk_wait8)), per(Take(sp.blk_wait48)),
+				            per(Take(sp.blk_cpu8)), per(Take(sp.blk_cpu48)), per(Take(sp.blk_gpu)),
+				            per(Take(sp.noreads)),
 				            sm != 0 ? static_cast<double>(srg) / static_cast<double>(sm) : 0.0);
 			}
 			std::printf("NHL27TRACE nocfg=%.1f flag_off=%.1f inelig_mode=%.1f empty=%.1f disabled=%.1f tape_nr=%.1f "

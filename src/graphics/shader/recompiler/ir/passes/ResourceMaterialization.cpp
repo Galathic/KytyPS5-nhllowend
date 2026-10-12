@@ -1197,10 +1197,23 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 	const Common::RuntimeFlags::EvaluationScope flags_scope;
 	FrameBreakdown::g_counters.mat_calls.fetch_add(FrameBreakdown::Enabled() ? 1u : 0u, std::memory_order_relaxed);
 	FrameBreakdown::Timer mat_total_timer(FrameBreakdown::g_counters.mat_total_ns);
+	// Measurement only: the low-level readers feed g_spec_collect, so straight-line (tape) reads
+	// that never reach snapshot.specialization_reads are still observed.
 	struct SpecScope {
-		const ResourceSnapshot& snap;
+		const ResourceSnapshot&                    snap;
+		std::vector<std::pair<uint64_t, uint64_t>> collected;
+		std::vector<std::pair<uint64_t, uint64_t>>* previous = nullptr;
+		bool                                       active   = FrameBreakdown::Enabled();
+		SpecScope(const ResourceSnapshot& s) : snap(s) {
+			if (active) {
+				previous                      = FrameBreakdown::g_spec_collect;
+				FrameBreakdown::g_spec_collect = &collected;
+			}
+		}
 		~SpecScope() {
-			if (FrameBreakdown::Enabled()) FrameBreakdown::SpecObserve(snap.specialization_reads);
+			if (!active) return;
+			FrameBreakdown::g_spec_collect = previous;
+			FrameBreakdown::SpecObserve(collected.empty() ? snap.specialization_reads : collected);
 		}
 	} spec_scope {snapshot};
 	auto* cache = runtime.specialization_cache;

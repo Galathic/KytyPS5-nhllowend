@@ -338,6 +338,7 @@ void CommandProcessor::WriteConstRam(uint32_t offset, const uint32_t* src, uint3
 }
 
 void CommandProcessor::DumpConstRam(uint32_t* dst, uint32_t offset, uint32_t dw_num) {
+	if (FrameBreakdown::Enabled()) FrameBreakdown::SpecNotePktWrite(reinterpret_cast<uint64_t>(dst), static_cast<uint64_t>(dw_num) * 4);
 	memcpy(dst, m_const_ram + offset / 4, static_cast<size_t>(dw_num) * 4);
 }
 
@@ -423,6 +424,11 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	if (dw_num == 0) {
 		return;
 	}
+	if (FrameBreakdown::Enabled()) {
+		FrameBreakdown::SpecNotePktWrite(reinterpret_cast<uint64_t>(dst),
+		                                 write_one_address ? sizeof(uint32_t)
+		                                                   : static_cast<uint64_t>(dw_num) * sizeof(uint32_t));
+	}
 
 	// Labels commonly share a protected page with GPU-written data. Update both
 	// copies through the existing exact-range label path, without downloading or
@@ -464,6 +470,7 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 		EXIT("invalid reference-clock copy, dst=0x%016" PRIx64 " size=%u\n", dst_address,
 		     num_bytes);
 	}
+	if (FrameBreakdown::Enabled()) FrameBreakdown::SpecNotePktWrite(dst_address, num_bytes);
 	const auto value = Sync::ReadReferenceClock();
 	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
 	static std::atomic<uint32_t> clock_log_count {0};
@@ -510,6 +517,9 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 	bool dst_gds = false;
 	if (!decode_gds(dst_sel, dst_gds)) {
 		EXIT("unsupported dmaData destination selector 0x%02" PRIx8 "\n", dst_sel);
+	}
+	if (!dst_gds && FrameBreakdown::Enabled()) {
+		FrameBreakdown::SpecNotePktWrite(dst_address_or_offset, num_bytes);
 	}
 	auto& buffer_cache = m_renderer.GetBufferCache();
 	{
@@ -975,6 +985,7 @@ void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands,
 
 void CommandProcessor::SuspendPm4() {
 	EXIT_IF(g_current_execution == nullptr);
+	if (FrameBreakdown::Enabled()) FrameBreakdown::SpecNoteWait();
 	g_current_execution->m_suspended = true;
 }
 
@@ -1079,11 +1090,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		BufferCache::PerfSetPm4Op(opcode);
 		uint32_t packet_dw;
 		{
-			const auto packet_bucket = PacketBusyBucket(opcode);
-			if (packet_bucket == FrameBreakdown::GB_SYNC_PKT && FrameBreakdown::Enabled()) {
-				FrameBreakdown::SpecNoteWait();
-			}
-			FrameBreakdown::GpuBusyScope busy_scope(packet_bucket);
+			FrameBreakdown::GpuBusyScope busy_scope(PacketBusyBucket(opcode));
 			packet_dw = handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 		}
 		EXIT_IF(packet_dw > remaining_dw);
@@ -1538,6 +1545,9 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
                                         uint32_t interrupt_context_id) {
 	static_assert(sizeof(T) == sizeof(uint32_t) || sizeof(T) == sizeof(uint64_t));
 
+	if (dst_gpu_addr != nullptr && FrameBreakdown::Enabled()) {
+		FrameBreakdown::SpecNotePktWrite(reinterpret_cast<uint64_t>(dst_gpu_addr), sizeof(T));
+	}
 	auto& command = CurrentBuffer();
 
 	if (GraphicsRunDebugDumpEnabled()) {
