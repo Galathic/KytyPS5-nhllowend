@@ -34,7 +34,7 @@ struct FlagSet {
  bool srt_cfg_gather = true;
  bool srt_cfg_trace = true;
  bool fault_ahead = false;
- bool resource_spec_cache = false;
+ bool resource_spec_cache = true;
  bool fault_parse_gate = false;
  bool idle_trace = false;
  bool submit_split = true;
@@ -44,15 +44,15 @@ struct FlagSet {
  bool drawprep_delta = true;
  bool srt_compiled = true;
  bool pipeline_memo = true;
- bool guest_sync = false;
- bool guest_barrier_dedup = false;
+ bool guest_sync = true;
+ bool guest_barrier_dedup = true;
  bool dispatch_args_guard = true;
  bool long_buffer_gc_age = false;
- bool rt_decode_memo = false;
- bool bda_batch = false;
+ bool rt_decode_memo = true;
+ bool bda_batch = true;
  bool readback_queue = false;
  bool direct_eop_interrupts = false;
- bool fault_coalesce = false;
+ bool fault_coalesce = true;
  bool sparse_buffer_gc = false;
 };
 inline constexpr const char* kSwitchableFlags[] = {
