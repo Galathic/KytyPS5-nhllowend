@@ -484,6 +484,10 @@ add_executable(resource_materialization_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
 )
 target_link_libraries(resource_materialization_tests fmt::fmt)
+if(KYTY_SRT_PROFILE)
+	# Offline TSC accumulators (SrtProf.h); never enabled for the emulator.
+	target_compile_definitions(resource_materialization_tests PRIVATE KYTY_SRT_PROFILE=1)
+endif()
 target_include_directories(resource_materialization_tests PRIVATE ${inc_headers})
 if(KYTY_CLANG_CL)
 	# Symbols for stack-sampling the offline plan benchmark (--benchmark-plans).

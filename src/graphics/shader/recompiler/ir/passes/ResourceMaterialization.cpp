@@ -1,6 +1,7 @@
 #include "common/runtimeFlags.h"
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "graphics/shader/recompiler/ir/passes/SrtProf.h"
 #include "graphics/shader/recompiler/ir/passes/ResourcePlanFixture.h"
 
 #include "common/assert.h"
@@ -1227,6 +1228,7 @@ static bool TryReuseImageSpecialization(const ResourcePlan& program, ResourceDel
 
 static bool MaterializeResourcesCore(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+	SRT_PROF_SCOPE(SrtProf::MatTotal);
 	const Common::RuntimeFlags::EvaluationScope flags_scope;
 	FrameBreakdown::g_counters.mat_calls.fetch_add(FrameBreakdown::Enabled() ? 1u : 0u, std::memory_order_relaxed);
 	FrameBreakdown::Timer mat_total_timer(FrameBreakdown::g_counters.mat_total_ns);

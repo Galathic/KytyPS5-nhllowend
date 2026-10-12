@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceFixture.h"
+#include "graphics/shader/recompiler/ir/passes/SrtProf.h"
 
 #include <algorithm>
 #include <bit>
@@ -1427,6 +1428,7 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 	return false;
 }
 bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
+	SRT_PROF_SCOPE(SrtProf::EvalDesc);
 	if (source >= m_program.descriptor_sources.size()) {
 		return false;
 	}
@@ -1709,6 +1711,7 @@ bool SrtWalker::VerifyCfgRefresh(std::vector<uint32_t>& flat) {
 }
 
 bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
+	SRT_PROF_SCOPE(SrtProf::Refresh);
 	// KYTY_PERF_STATS: one clock pair per call, split by how the refresh was served.
 	struct FlatCallTimer {
 		bool                         active = FrameBreakdown::Enabled();
@@ -2921,6 +2924,9 @@ int SrtWalker::ReplayCfgTrace(std::vector<uint32_t>& flat) {
 		return -1;
 	}
 	int miss_why = 0;
+	SRT_PROF_STEPPER(prof);
+	SRT_PROF_TICK(prof, SrtProf::Preamble);
+	SRT_PROF_COUNT(replays, 1);
 	auto& values = m_context.tape_values;
 	if (values.size() < tape.ops.size()) values.resize(tape.ops.size());
 	{
@@ -2939,6 +2945,7 @@ int SrtWalker::ReplayCfgTrace(std::vector<uint32_t>& flat) {
 	auto& published = m_context.tape_pending;
 	published.clear();
 	const auto miss = [&] {
+		SRT_PROF_FINISH(prof);
 		if (FrameBreakdown::Enabled()) FrameBreakdown::g_counters.mat_tr_why[miss_why].fetch_add(1, std::memory_order_relaxed);
 		for (const auto& [index, unused]: published) {
 			const auto& op = tape.ops[index];
@@ -2964,6 +2971,28 @@ int SrtWalker::ReplayCfgTrace(std::vector<uint32_t>& flat) {
 	if (reuse) published.reserve(tape.ops.size());
 	for (uint32_t pc = 0;;) {
 		const auto& step = reuse ? steps_ptr[pc] : trace.steps[pc];
+#if KYTY_SRT_PROFILE
+		{
+			int slot = SrtProf::StepEnd;
+			switch (step.kind) {
+				case TraceKind::Exec: {
+					const auto k = tape.ops[step.a].kind;
+					slot = k == ResourcePlan::SrtTape::Kind::RawRead ? SrtProf::StepRead
+					       : k == ResourcePlan::SrtTape::Kind::Inst ? SrtProf::StepAlu
+					       : k == ResourcePlan::SrtTape::Kind::Immediate ? SrtProf::StepImm : SrtProf::StepUserData;
+					break;
+				}
+				case TraceKind::Memo: slot = SrtProf::StepMemo; break;
+				case TraceKind::Flat: slot = SrtProf::StepFlat; break;
+				case TraceKind::Activate: slot = SrtProf::StepActivate; break;
+				case TraceKind::Cond:
+				case TraceKind::CondTri: slot = SrtProf::StepCond; break;
+				case TraceKind::Gather: slot = SrtProf::StepGather; break;
+				default: break;
+			}
+			SRT_PROF_TICK(prof, slot);
+		}
+#endif
 		if (stats) ++n_steps;
 		switch (step.kind) {
 			case TraceKind::Exec: {
@@ -3046,6 +3075,7 @@ int SrtWalker::ReplayCfgTrace(std::vector<uint32_t>& flat) {
 				break;
 			}
 			case TraceKind::End:
+				SRT_PROF_FINISH(prof);
 				++trace.hits;
 				if (stats) {
 					auto& fc = FrameBreakdown::g_counters;
@@ -3454,7 +3484,11 @@ bool SrtWalker::ExecuteTapeOp(const ResourcePlan::SrtTape::Op& op,
 			const bool is_vector = op.opcode == ValueOpcode::LoadBufferU32;
 			const auto reader = (is_vector || op.clean) ? m_runtime.read_specialization_memory
 			                                            : m_runtime.read_memory;
+			SRT_PROF_COUNT(reader_calls, 1);
+			SRT_PROF_COUNT(reader_words, 1);
+			SRT_PROF_LOG(address, 1, is_vector || op.clean);
 			if (reader != nullptr) {
+				SRT_PROF_SCOPE(SrtProf::Reader);
 				if (FrameBreakdown::Enabled()) {
 					auto& fc = FrameBreakdown::g_counters;
 					fc.mat_flat_reads.fetch_add(1, std::memory_order_relaxed);
@@ -3483,6 +3517,7 @@ bool SrtWalker::ExecuteTapeOp(const ResourcePlan::SrtTape::Op& op,
 	}
 
 	values[index] = result;
+	SRT_PROF_SCOPE(SrtProf::MemoWrite);
 	// A clean op belongs to the clean walker context only. The same IR instruction
 	// may have a separate ordinary op with a different memory-reader domain.
 	if (op.memo_index != UINT32_MAX && op.clean && m_clean_evaluator != nullptr) {
@@ -3678,6 +3713,32 @@ bool CompileTrace(const ResourcePlan::SrtTape& tape, const ResourcePlan::CfgTrac
 		}
 		kept[pc] = keep ? 1u : 0u;
 	}
+	// Flat copies and activity marks only consume finished values, so within a straight-line segment
+	// they can be deferred to its end. That makes the loads of one descriptor table adjacent steps,
+	// which FormReadGroups then fetches with one reader call per contiguous run. Segments end at
+	// branches, Gather (its flat slots must be written before it runs) and End, which never move.
+	{
+		std::vector<uint32_t> order(src.size());
+		for (size_t i = 0; i < order.size(); ++i) order[i] = static_cast<uint32_t>(i);
+		size_t seg = 0;
+		for (size_t pc = 0; pc < src.size(); ++pc) {
+			const auto kind = src[pc].kind;
+			if (kind != TraceKind::Cond && kind != TraceKind::CondTri && kind != TraceKind::Gather &&
+			    kind != TraceKind::End)
+				continue;
+			std::stable_partition(order.begin() + static_cast<ptrdiff_t>(seg), order.begin() + static_cast<ptrdiff_t>(pc),
+			                      [&](uint32_t i) { return src[i].kind != TraceKind::Flat && src[i].kind != TraceKind::Activate; });
+			seg = pc + 1;
+		}
+		std::vector<CompiledSrt::Step> lowered_ordered(src.size());
+		std::vector<uint8_t>           kept_ordered(src.size());
+		for (size_t pc = 0; pc < src.size(); ++pc) {
+			lowered_ordered[pc] = lowered[order[pc]];
+			kept_ordered[pc]    = kept[order[pc]];
+		}
+		lowered = std::move(lowered_ordered);
+		kept    = std::move(kept_ordered);
+	}
 	std::vector<uint32_t> landing(src.size(), UINT32_MAX);
 	uint32_t              kept_count = 0;
 	for (size_t pc = 0; pc < src.size(); ++pc) kept_count += kept[pc];
@@ -3815,7 +3876,11 @@ bool SrtWalker::ReadCompiledGroup(const CompiledSrt::Step* steps, uint32_t count
 		uint32_t run = 1;
 		while (first + run < count && addresses[first + run] == addresses[first] + run * 4u) ++run;
 		const std::span<uint32_t> out(words.data() + first, run);
+		SRT_PROF_COUNT(reader_calls, 1);
+		SRT_PROF_COUNT(reader_words, run);
+		SRT_PROF_LOG(addresses[first], run, head.clean != 0);
 		if (reader != nullptr) {
+			SRT_PROF_SCOPE(SrtProf::Reader);
 			if (!reader(m_runtime.userdata, addresses[first], out)) return false;
 		} else {
 			std::memcpy(out.data(), reinterpret_cast<const void*>(addresses[first]), out.size_bytes());
@@ -3824,6 +3889,7 @@ bool SrtWalker::ReadCompiledGroup(const CompiledSrt::Step* steps, uint32_t count
 		first += run;
 	}
 	g_compiled_stats.read_words.fetch_add(count, std::memory_order_relaxed);
+	SRT_PROF_SCOPE(SrtProf::MemoWrite);
 	for (uint32_t i = 0; i < count; ++i) {
 		const auto& step = steps[i];
 		values[step.out] = words[i];
@@ -3902,6 +3968,9 @@ int SrtWalker::TryCompiled(std::vector<uint32_t>& flat, bool cfg) {
 		tape_ptr = &tape;
 	}
 	const auto& tape = *tape_ptr;
+	SRT_PROF_STEPPER(prof);
+	SRT_PROF_TICK(prof, SrtProf::Preamble);
+	SRT_PROF_COUNT(replays, 1);
 	auto&       values = m_context.tape_values;
 	if (values.size() < program->value_count) values.resize(program->value_count);
 	for (const auto& [index, imm]: program->consts) values[index] = imm;
@@ -3919,6 +3988,7 @@ int SrtWalker::TryCompiled(std::vector<uint32_t>& flat, bool cfg) {
 	};
 	const auto store_memo = [&](const CompiledSrt::Step& step, uint64_t result) {
 		if (step.memo == UINT32_MAX) return;
+		SRT_PROF_SCOPE(SrtProf::MemoWrite);
 		auto& context = context_for(step);
 		if (step.memo >= context.values.size()) context.values.resize(m_program.evaluation_value_count);
 		context.values[step.memo].value      = result;
@@ -3931,6 +4001,7 @@ int SrtWalker::TryCompiled(std::vector<uint32_t>& flat, bool cfg) {
 	// A divergence restores the memo slots this replay published, so the recording DFS sees the
 	// same state as after a failed ReplayCfgTrace.
 	const auto miss = [&](bool count_cfg_miss) {
+		SRT_PROF_FINISH(prof);
 		for (const auto& [index, unused]: published) {
 			const auto& op = tape.ops[index];
 			(op.clean && m_clean_evaluator != nullptr ? m_clean_evaluator->m_context : m_context)
@@ -3953,6 +4024,7 @@ int SrtWalker::TryCompiled(std::vector<uint32_t>& flat, bool cfg) {
 		return -2;
 	};
 	const auto fail = [&]() {
+		SRT_PROF_FINISH(prof);
 		g_compiled_stats.steps.fetch_add(executed, std::memory_order_relaxed);
 		g_compiled_stats.failed.fetch_add(1, std::memory_order_relaxed);
 		g_compiled_stats.compiled.fetch_add(1, std::memory_order_relaxed);
@@ -3961,6 +4033,25 @@ int SrtWalker::TryCompiled(std::vector<uint32_t>& flat, bool cfg) {
 	};
 	for (uint32_t pc = 0;;) {
 		const auto& step = steps[pc];
+#if KYTY_SRT_PROFILE
+		{
+			int slot = SrtProf::StepEnd;
+			switch (step.code) {
+				case Code::UserData:
+				case Code::ShaderBase: slot = SrtProf::StepUserData; break;
+				case Code::Alu: slot = SrtProf::StepAlu; break;
+				case Code::Read: slot = SrtProf::StepRead; break;
+				case Code::Memo: slot = SrtProf::StepMemo; break;
+				case Code::Flat: slot = SrtProf::StepFlat; break;
+				case Code::Activate: slot = SrtProf::StepActivate; break;
+				case Code::Cond:
+				case Code::CondTri: slot = SrtProf::StepCond; break;
+				case Code::Gather: slot = SrtProf::StepGather; break;
+				default: break;
+			}
+			SRT_PROF_TICK(prof, slot);
+		}
+#endif
 		switch (step.code) {
 			case Code::UserData: {
 				if (cfg && step.memo != UINT32_MAX) {
@@ -4074,6 +4165,7 @@ int SrtWalker::TryCompiled(std::vector<uint32_t>& flat, bool cfg) {
 				++pc;
 				break;
 			case Code::End: {
+				SRT_PROF_FINISH(prof);
 				if (m_runtime.evaluation_counts) m_runtime.evaluation_counts->tape_ops += executed;
 				if (FrameBreakdown::Enabled()) {
 					auto& fc = FrameBreakdown::g_counters;
