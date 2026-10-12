@@ -26,6 +26,7 @@ struct DiffMemory {
   uint64_t seed = 1;
   bool unknown_fails = false;
   std::vector<std::pair<bool, uint64_t>> log;
+  std::vector<uint32_t> observed;  // user-data registers reported through observe_user_data
   uint64_t calls = 0;
   uint32_t Hash(uint64_t address) const {
     uint64_t x = (address >> 2) * 0x9e3779b97f4a7c15ull ^ seed * 0xbf58476d1ce4e5b9ull;
@@ -54,6 +55,7 @@ struct Outcome {
   ResourceSpecialization specialization;
   std::vector<uint8_t> active;
   std::vector<std::pair<bool, uint64_t>> reads;
+  std::vector<uint32_t> observed;  // sorted, unique
   uint64_t calls = 0;
 };
 
@@ -61,9 +63,12 @@ inline Outcome Run(const ResourcePlan& plan, const ResourcePlanFixture& fx, Diff
                    const std::vector<uint32_t>& user_data, bool compiled, ResourceDelta* delta) {
   SetCompiled(compiled);
   memory.log.clear();
+  memory.observed.clear();
   memory.calls = 0;
   SrtRuntime runtime {.user_data = user_data, .shader_base = fx.shader_base, .userdata = &memory,
                       .workgroup_counts = fx.workgroups};
+  runtime.observe_user_data = +[](void* p, uint32_t index) { static_cast<DiffMemory*>(p)->observed.push_back(index); };
+  runtime.user_data_observer_userdata = &memory;
   runtime.read_memory = +[](void* p, uint64_t a, std::span<uint32_t> v) {
     return static_cast<DiffMemory*>(p)->Read(false, a, v);
   };
@@ -76,6 +81,9 @@ inline Outcome Run(const ResourcePlan& plan, const ResourcePlanFixture& fx, Diff
   result.ok = MaterializeResources(plan, runtime, result.snapshot, result.specialization);
   result.active = plan.active_sources;
   result.reads = memory.log;
+  result.observed = memory.observed;
+  std::sort(result.observed.begin(), result.observed.end());
+  result.observed.erase(std::unique(result.observed.begin(), result.observed.end()), result.observed.end());
   result.calls = memory.calls;
   return result;
 }
@@ -84,6 +92,7 @@ inline const char* Differ(const Outcome& a, const Outcome& b) {
   if (a.ok != b.ok) return "success";
   if (!a.ok) return nullptr;  // a declined merged read is retried as single reads, so failed calls may repeat reads
   if (a.reads != b.reads) return "read sequence";
+  if (a.observed != b.observed) return "observed user data";
   if (a.snapshot.buffers != b.snapshot.buffers) return "buffers";
   if (a.snapshot.images != b.snapshot.images) return "images";
   if (a.snapshot.samplers != b.snapshot.samplers) return "samplers";
@@ -201,7 +210,8 @@ inline void PrintDifferential(size_t plans, const Tally& total, const SrtCompile
   const auto after = GetSrtCompiledStats();
   std::printf("compiled differential: plans=%zu runs=%llu both_ok=%llu both_fail=%llu mismatches=0 "
               "compiled_calls=%llu (nocfg=%llu cfg=%llu) fallbacks: ineligible=%llu nocfg_unsupported=%llu "
-              "cfg_no_trace=%llu cfg_eval=%llu cfg_miss=%llu groups_hit=%llu groups_miss=%llu\n",
+              "cfg_no_trace=%llu cfg_eval=%llu cfg_miss=%llu groups_hit=%llu groups_miss=%llu "
+              "desc_reuse=%llu desc_eval=%llu memo_skipped=%llu\n",
               plans, static_cast<unsigned long long>(total.runs),
               static_cast<unsigned long long>(total.both_ok), static_cast<unsigned long long>(total.both_fail),
               static_cast<unsigned long long>(after.compiled - before.compiled),
@@ -213,7 +223,10 @@ inline void PrintDifferential(size_t plans, const Tally& total, const SrtCompile
               static_cast<unsigned long long>(after.fallback[3] - before.fallback[3]),
               static_cast<unsigned long long>(after.fallback[4] - before.fallback[4]),
               static_cast<unsigned long long>(after.groups_hit - before.groups_hit),
-              static_cast<unsigned long long>(after.groups_miss - before.groups_miss));
+              static_cast<unsigned long long>(after.groups_miss - before.groups_miss),
+              static_cast<unsigned long long>(after.desc_reuse - before.desc_reuse),
+              static_cast<unsigned long long>(after.desc_eval - before.desc_eval),
+              static_cast<unsigned long long>(after.memo_skipped - before.memo_skipped));
 }
 
 inline int DifferentialFile(const char* path, uint32_t perturbations, bool report) {
@@ -357,7 +370,10 @@ inline int Benchmark(const char* directory, uint64_t iterations) {
 
 // Pointer chase: user data 0/1 is a pointer to {lo, hi, a, b}; the second window holds a buffer
 // descriptor base. Adjacent loads from one pointer exercise the merged read.
-inline ResourcePlan ChasePlan() {
+// variant 0: the descriptor dwords are the second-window loads themselves; 1: arithmetic over them; 2: arithmetic plus one
+// user-data dword (impure, never reusable). With `cfg` the plan gets a branch on user_data[2] (block 1 reads both
+// windows and activates the source, block 2 only the first window) and keeps its descriptor gather.
+inline ResourcePlan ChasePlan(int variant = 0, bool cfg = false) {
   Program program;
   program.stage = Libs::Graphics::ShaderType::Compute;
   program.srt_plan_complete = true;
@@ -392,13 +408,34 @@ inline ResourcePlan ChasePlan() {
   DescriptorSource source;
   for (uint32_t i = 0; i < 4; ++i) {
     auto& flat = block.AppendNewInst(ValueOpcode::ReadConst, {Value(&srt), Value(4u + i)});
-    source.dwords[i] = Value(&flat);
+    if (variant == 0) {
+      source.dwords[i] = Value(&flat);
+    } else if (variant == 2 && i == 3) {
+      auto& user = block.AppendNewInst(ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(2))});
+      source.dwords[i] = Value(&user);
+    } else {
+      auto& sum = block.AppendNewInst(ValueOpcode::IAdd32, {Value(&flat), Value(3u + i)});
+      source.dwords[i] = Value(&sum);
+    }
   }
   source.dword_count = 4;
   program.descriptor_sources.push_back(source);
   auto plan = ExtractResourcePlan(program);
   plan.info.buffers.push_back({.source = 0});
-  plan.descriptor_gathers.clear();
+  if (!cfg) {
+    plan.descriptor_gathers.clear();
+    return plan;
+  }
+  plan.capture_specialization_reads = true;
+  plan.clean_flat_slots = {1u, 1u, 0u, 0u, 0u, 0u, 0u, 0u};
+  auto& condition = plan.value_storage.emplace_back(ValueOpcode::GetUserData);
+  condition.SetArg(0, Value(static_cast<ScalarReg>(2)));
+  plan.control_flow.resize(3);
+  plan.control_flow[0].condition = Value(&condition);
+  plan.control_flow[0].successors = {1, 2};
+  plan.control_flow[1].srt_reads = {0, 1, 2, 3, 4, 5, 6, 7};
+  plan.control_flow[1].sources = {0};
+  plan.control_flow[2].srt_reads = {0, 1, 2, 3};
   return plan;
 }
 
@@ -544,6 +581,168 @@ inline void TestChangedRegisterMemoryAndBranch() {
   }
   Common::RuntimeFlags::g_published.store(saved_flags & ~(uint64_t{1} << Common::RuntimeFlags::kBitSrtCompiled), std::memory_order_relaxed);
   Check(tally.mismatches == 0, "no pointer-chase differential mismatch");
+}
+
+
+// --- input-keyed descriptor reuse and dead-memo elimination --------------------------------------
+// Every step runs the flag-off path and the compiled path on identical inputs and demands identical
+// outputs, read sequences and observed user-data registers. The cases perturb exactly what a reused
+// descriptor depends on (a leaf word, an unrelated word, a register, a pointer, a failing word) and, for
+// the branching plan, flip the branch so the compiled trace misses after steps that skipped their memo
+// publication. The checks on the statistics prove the mechanisms actually ran.
+inline uint32_t BufferDword(const Outcome& outcome, uint32_t index) {
+  return outcome.snapshot.buffers.empty() ? 0xdeadbeefu : outcome.snapshot.buffers[0].dwords[index];
+}
+
+inline void SetWindowWord(ChaseWorld& world, uint64_t address, uint32_t value) {
+  for (int d = 0; d < 2; ++d) world.memory.words[d][address] = value;
+}
+
+inline void TestDescriptorReuseAndDeadMemo() {
+  // The A/B switches turn the mechanisms off on purpose; the statistics checks below would then fail.
+  if (std::getenv("KYTY_SRT_KEEP_MEMO") != nullptr || std::getenv("KYTY_SRT_NO_DESC_REUSE") != nullptr) return;
+  const auto saved_flags = Common::RuntimeFlags::g_published.load(std::memory_order_relaxed);
+  Common::RuntimeFlags::g_published.store(saved_flags | (uint64_t{1} << 2) | (uint64_t{1} << 10) | (uint64_t{1} << 11),
+                                          std::memory_order_relaxed);
+  Tally tally;
+  // Straight-line plans: gather-shaped (0), arithmetic (1), arithmetic with a user-data dword (2).
+  for (int variant = 0; variant < 3; ++variant) {
+    const auto old_plan = ChasePlan(variant);
+    const auto new_plan = ChasePlan(variant);
+    ChaseWorld world;
+    world.regs = {0x10000, 0, 0x55};
+    ResourcePlanFixture fx;
+    ResourceDelta delta;
+    Outcome a, b;
+    const uint32_t add2 = variant == 0 ? 0u : 5u;
+    const auto expect_word2 = [&](uint32_t base) { return base + add2; };
+    for (int i = 0; i < 3; ++i) {
+      world.Build(0x20000);
+      Check(Compare("reuse warm-up", old_plan, new_plan, fx, world.memory, world.regs, delta, tally, &a, &b) && a.ok,
+            "reuse plan: warm-up calls match the existing path");
+    }
+    Check(BufferDword(b, 2) == expect_word2(0x40), "reuse plan: descriptor carries the memory words");
+    auto before = GetSrtCompiledStats();
+    world.Build(0x20000);
+    Check(Compare("reuse steady", old_plan, new_plan, fx, world.memory, world.regs, delta, tally, &a, &b),
+          "reuse plan: unchanged inputs match the existing path");
+    if (variant < 2) {
+      Check(GetSrtCompiledStats().desc_reuse > before.desc_reuse, "unchanged descriptor inputs reuse the stored descriptor");
+    } else {
+      Check(GetSrtCompiledStats().desc_reuse == before.desc_reuse, "a source that reads user data is never reused");
+    }
+    // A word the descriptor does not depend on changes: still reusable, still identical.
+    before = GetSrtCompiledStats();
+    world.Build(0x20000);
+    SetWindowWord(world, 0x10000 + 8, 0x99);
+    Check(Compare("reuse unrelated word", old_plan, new_plan, fx, world.memory, world.regs, delta, tally, &a, &b) &&
+              b.snapshot.flattened_srt[2] == 0x99 && BufferDword(b, 2) == expect_word2(0x40),
+          "reuse plan: an unrelated flat word changes the flat buffer but not the descriptor");
+    if (variant < 2)
+      Check(GetSrtCompiledStats().desc_reuse > before.desc_reuse, "an unrelated change keeps the descriptor reusable");
+    // A leaf word changes: the stored descriptor must not be used.
+    world.Build(0x20000, 0x44);
+    Check(Compare("reuse leaf change", old_plan, new_plan, fx, world.memory, world.regs, delta, tally, &a, &b) &&
+              BufferDword(b, 2) == expect_word2(0x44),
+          "reuse plan: a changed input word produces the new descriptor");
+    // Alternate two states: an entry stored for one must never answer the other.
+    for (int i = 0; i < 8; ++i) {
+      const uint32_t word2 = (i & 1) ? 0x48u : 0x40u;
+      world.Build(0x20000, word2);
+      Check(Compare("reuse alternate", old_plan, new_plan, fx, world.memory, world.regs, delta, tally, &a, &b) &&
+                BufferDword(b, 2) == expect_word2(word2),
+            "reuse plan: alternating inputs match the existing path every call");
+    }
+    // The user-data register behind the impure dword changes.
+    world.Build(0x20000);
+    world.regs[2] = 0x66;
+    Check(Compare("reuse register", old_plan, new_plan, fx, world.memory, world.regs, delta, tally, &a, &b) &&
+              (variant != 2 || BufferDword(b, 3) == 0x66u),
+          "reuse plan: a changed user-data register is observed");
+    // The whole chase moves to another window.
+    world.regs[0] = 0x30000;
+    world.Build(0x50000, 0x4c);
+    Check(Compare("reuse pointer", old_plan, new_plan, fx, world.memory, world.regs, delta, tally, &a, &b) &&
+              BufferDword(b, 2) == expect_word2(0x4c),
+          "reuse plan: a moved pointer is followed and not answered from the stored descriptor");
+    // A failing read: both fail, and the next call recovers.
+    world.Build(0x50000, 0x4c);
+    world.memory.invalid[0].insert(0x50000 + 8);
+    world.memory.invalid[1].insert(0x50000 + 8);
+    Check(Compare("reuse failure", old_plan, new_plan, fx, world.memory, world.regs, delta, tally, &a, &b) && !a.ok && !b.ok,
+          "reuse plan: a failing read fails both paths");
+    world.Build(0x50000, 0x4c);
+    Check(Compare("reuse recovery", old_plan, new_plan, fx, world.memory, world.regs, delta, tally, &a, &b) && b.ok &&
+              BufferDword(b, 2) == expect_word2(0x4c),
+          "reuse plan: the call after a failure is evaluated, not reused");
+  }
+  // Branching plans: the dead user-data ops skip their publication; a branch flip misses the compiled trace after
+  // them and the recording DFS must see the same state as without the elimination.
+  for (int variant = 0; variant < 2; ++variant) {
+    const auto old_plan = ChasePlan(variant, true);
+    const auto new_plan = ChasePlan(variant, true);
+    ChaseWorld world;
+    world.regs = {0x10000, 0, 1};
+    ResourcePlanFixture fx;
+    fx.strict_reader = true;
+    ResourceDelta delta;
+    Outcome a, b;
+    const uint32_t add2 = variant == 0 ? 0u : 5u;
+    const auto before = GetSrtCompiledStats();
+    for (int i = 0; i < 5; ++i) {
+      world.Build(0x20000);
+      Check(Compare("cfg reuse taken", old_plan, new_plan, fx, world.memory, world.regs, delta, tally, &a, &b) && a.ok,
+            "cfg reuse plan: taken branch matches the existing path");
+    }
+    const auto steady = GetSrtCompiledStats();
+    Check(steady.cfg > before.cfg, "cfg reuse plan: recorded trace is served compiled");
+    Check(steady.memo_skipped > before.memo_skipped, "cfg reuse plan: dead memo publications are skipped");
+    Check(steady.desc_reuse > before.desc_reuse, "cfg reuse plan: descriptors are answered without full evaluation");
+    Check(BufferDword(b, 2) == 0x40 + add2, "cfg reuse plan: descriptor carries the second window");
+    // Flip: the unrecorded outcome misses after the shared prefix published (or skipped) its steps.
+    world.regs[2] = 0;
+    world.Build(0x20000);
+    const auto miss_before = GetSrtCompiledStats();
+    Check(Compare("cfg reuse flip", old_plan, new_plan, fx, world.memory, world.regs, delta, tally, &a, &b),
+          "cfg reuse plan: a branch flip after skipped publications matches the existing path");
+    Check(GetSrtCompiledStats().fallback[4] > miss_before.fallback[4], "cfg reuse plan: the flip is a trace miss");
+    for (int i = 0; i < 12; ++i) {
+      world.regs[2] = (i & 1) ? 1u : 0u;
+      world.Build(0x20000, (i & 2) ? 0x44u : 0x40u);
+      Check(Compare("cfg reuse alternate", old_plan, new_plan, fx, world.memory, world.regs, delta, tally, &a, &b) &&
+                ((i & 1) == 0 || BufferDword(b, 2) == ((i & 2) ? 0x44u : 0x40u) + add2),
+            "cfg reuse plan: alternating branches and inputs match the existing path");
+    }
+    // Memory changes under the taken branch, with a miss forced right after by flipping back.
+    for (int i = 0; i < 6; ++i) {
+      world.regs[2] = 1;
+      world.Build(0x20000, 0x50 + 4 * i);
+      SetWindowWord(world, 0x10000 + 8, 0x90 + i);
+      Check(Compare("cfg reuse memory", old_plan, new_plan, fx, world.memory, world.regs, delta, tally, &a, &b) &&
+                BufferDword(b, 2) == 0x50u + 4u * i + add2,
+            "cfg reuse plan: changed window words produce the new descriptor");
+      world.regs[2] = 0;
+      Check(Compare("cfg reuse memory flip", old_plan, new_plan, fx, world.memory, world.regs, delta, tally, &a, &b),
+            "cfg reuse plan: flipping away after a change matches the existing path");
+    }
+    // The pointer moves, a read fails, and the call after the failure recovers.
+    world.regs[2] = 1;
+    world.regs[0] = 0x30000;
+    world.Build(0x50000, 0x4c);
+    Check(Compare("cfg reuse pointer", old_plan, new_plan, fx, world.memory, world.regs, delta, tally, &a, &b) &&
+              BufferDword(b, 2) == 0x4cu + add2,
+          "cfg reuse plan: a moved pointer is followed");
+    world.memory.invalid[0].insert(0x50000 + 8);
+    world.memory.invalid[1].insert(0x50000 + 8);
+    Check(Compare("cfg reuse failure", old_plan, new_plan, fx, world.memory, world.regs, delta, tally, &a, &b) && !a.ok && !b.ok,
+          "cfg reuse plan: a failing read fails both paths");
+    world.Build(0x50000, 0x4c);
+    Check(Compare("cfg reuse recovery", old_plan, new_plan, fx, world.memory, world.regs, delta, tally, &a, &b) && b.ok &&
+              BufferDword(b, 2) == 0x4cu + add2,
+          "cfg reuse plan: recovery after a failed call");
+  }
+  Common::RuntimeFlags::g_published.store(saved_flags & ~(uint64_t{1} << 22), std::memory_order_relaxed);
+  Check(tally.mismatches == 0, "no descriptor reuse / dead memo differential mismatch");
 }
 
 } // namespace CompiledSrtTest

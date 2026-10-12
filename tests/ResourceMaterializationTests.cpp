@@ -2835,6 +2835,7 @@ static int ProfilePlans(const char* directory, uint64_t iterations, bool compile
   row.steps = double(SrtProf::g.steps) / iterations; row.rcalls = double(SrtProf::g.reader_calls) / iterations;
   row.rwords = double(SrtProf::g.reader_words) / iterations; row.allocs = allocs; row.alloc_bytes = abytes;
   row.eval_cnt = double(SrtProf::g.count[SrtProf::EvalDesc]) / iterations;
+  std::printf("evalmix %s: gather=%.1f recursive=%.1f reused=%.1f\n", path.filename().string().c_str(), double(SrtProf::g.eval_gather) / iterations, double(SrtProf::g.eval_recursive) / iterations, double(SrtProf::g.eval_reused) / iterations);
   rows.push_back(row);
  }
  CompiledSrtTest::SetCompiled(false);
@@ -2887,6 +2888,7 @@ int main(int argc, char **argv) {
   TestScalarBatchFixtureCaptureAndReplay();
   TestScalarBatchMemoCaptureHitAndFlagFlip();
   CompiledSrtTest::TestChangedRegisterMemoryAndBranch();
+  CompiledSrtTest::TestDescriptorReuseAndDeadMemo();
   if (argc == 3 && std::strcmp(argv[1], "--replay-plan") == 0) {
     CompiledSrtTest::SetCompiled(want_compiled);
     const int status = ReplayPlanFixture(argv[2]);

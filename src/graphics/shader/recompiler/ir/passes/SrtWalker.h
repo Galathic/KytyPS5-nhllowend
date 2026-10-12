@@ -101,6 +101,9 @@ struct SrtCompiledStats {
 	uint64_t spec_reused = 0;     // BuildResourceSpecialization skipped by the ChangeMask
 	uint64_t verify_checks = 0;
 	uint64_t verify_mismatch = 0;
+	uint64_t desc_reuse = 0;      // EvaluateDescriptor answered without its full evaluation (see EvaluateDescriptor)
+	uint64_t desc_eval = 0;       // EvaluateDescriptor that ran the full gather / recursive evaluation
+	uint64_t memo_skipped = 0;    // compiled steps whose memo publication was eliminated as dead
 	// ChangeMask counters: calls compared against a previous output, then calls where each part changed.
 	uint64_t mask_calls = 0, mask_first = 0, mask_images = 0, mask_samplers = 0, mask_buffer_fmt = 0;
 	uint64_t mask_buffer_addr = 0, mask_buffer_size = 0, mask_flat = 0, mask_user_data = 0, mask_all_same = 0;
@@ -109,6 +112,7 @@ struct SrtCompiledStats {
 SrtCompiledStats GetSrtCompiledStats();
 const char* SrtCompiledFallbackName(size_t reason);
 void SrtCompiledCountSpec(bool recomputed);
+void SrtCompiledCountDesc(uint64_t reuse, uint64_t eval, uint64_t skipped);
 void SrtCompiledCountMask(bool first, bool images, bool samplers, bool buffer_fmt, bool buffer_addr,
                           bool buffer_size, bool flat, bool user_data);
 void SrtCompiledCountVerify(bool mismatch);
@@ -152,7 +156,7 @@ private:
 	int  ReplayCfgTrace(std::vector<uint32_t>& flat);
 	void MergeCfgTrace();
 	bool ExecuteTapeOp(const ResourcePlan::SrtTape::Op& op, std::vector<uint64_t>& values,
-	                   uint32_t index);
+	                   uint32_t index, bool publish = true);
 	// KYTY_SRT_COMPILED. 1 = refreshed, 0 = failed (same as the tape), -1 = not served (run the
 	// existing path), -2 = CFG divergence: state restored, go straight to the recording DFS.
 	int  TryCompiled(std::vector<uint32_t>& flat, bool cfg);
@@ -176,7 +180,16 @@ private:
 	bool                            m_compiled_enabled = false;
 	// Set while a CFG refresh records its trace; cleared by anything the replay cannot reproduce.
 	bool                            m_cfg_trace_recording = false;
-	std::vector<uint8_t>            m_cfg_gather_ready_sources;
+	// 0 = not ready, 1 = marked by the recording DFS / trace replay, >= 2 = compiled Gather step id + 2.
+	std::vector<uint32_t>           m_cfg_gather_ready_sources;
+	// Set by a compiled refresh that completed, cleared at the start of the next RefreshFlatBuffer:
+	// the evaluator mode (-1 none, 0 ordinary without clean partner, 1 ordinary with clean partner,
+	// 2 the clean partner of a mode-1 walker), the tape that refresh executed and the CFG program.
+	int                             m_served_mode = -1;
+	const ResourcePlan::SrtTape*    m_served_tape = nullptr;
+	ResourcePlan::CompiledSrt*      m_served_cfg  = nullptr;
+	uint64_t                        m_memo_skipped = 0;
+	uint64_t                        m_desc_reuse = 0, m_desc_eval = 0;
 	uint64_t                        m_cycle_count = 0;
 	ResourcePlan::EvaluationContext& m_context;
 };

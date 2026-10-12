@@ -99,10 +99,21 @@ struct ResourceDelta {
 	std::vector<ResourceSpecialization::Image> spec_images_out;
 	bool                                        spec_valid = false;
 	uint64_t                                    verify_ticker = 0;
+	// Input-keyed descriptor reuse (SrtWalker::EvaluateDescriptor): per descriptor source, the exact memo
+	// values the last successful recursive evaluation consumed and the descriptor it produced.
+	struct SourceReuse {
+		bool                  valid = false;
+		uint8_t               mode  = 0;
+		uint64_t              plan_serial = 0;
+		std::vector<uint64_t> inputs;
+		DescriptorValue       output;
+	};
+	std::vector<SourceReuse>                    sources;
 	void Reset() {
 		have = spec_valid = false;
 		mask = {};
 		owner = nullptr;
+		for (auto& entry: sources) entry.valid = false;
 	}
 };
 
