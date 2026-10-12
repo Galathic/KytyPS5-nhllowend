@@ -473,12 +473,11 @@ struct PipelineCache::ProgramCache {
             if (!ok && replaying == nullptr) EXIT("Resource materialization failed\n");
             return ok;
         };
-        // KYTY_DRAWPREP_PREFETCH: teach the compute look-ahead which plan (and memo) serves this program.
+        // KYTY_DRAWPREP_PREFETCH: teach the compute look-ahead which plan serves this program (any memo mode).
         const auto note_plan = [&]([[maybe_unused]] SourceEntry& source) {
             if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
-                if (memo_enabled && runtime_flags.drawprep_prefetch) {
-                    DrawPrepPrefetch::NotePlan(params.Base(), user_data.size(), &source.resource_plan,
-                                               &source.resource_memo);
+                if (runtime_flags.drawprep_prefetch) {
+                    DrawPrepPrefetch::NotePlan(params.Base(), user_data.size(), &source.resource_plan);
                 }
             }
         };

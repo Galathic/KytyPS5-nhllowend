@@ -310,6 +310,11 @@ class ResourceMemoEntry {
     }
 
 public:
+    // Exposed for KYTY_DRAWPREP_VERIFY (drawPrepPrefetch.h): same equivalence the memo's own verifier uses.
+    static bool SameResourceSnapshot(const ShaderRecompiler::IR::ResourceSnapshot& left,
+                                     const ShaderRecompiler::IR::ResourceSnapshot& right) {
+        return SameSnapshot(left, right);
+    }
     struct RegisterTraceState {
         const ShaderRecompiler::IR::ResourcePlan* plan = nullptr;
         uint64_t shader_base = 0;
@@ -604,15 +609,15 @@ private:
 };
 
 // KYTY_DRAWPREP_PREFETCH: set by the prefetch worker's start-up (drawPrepPrefetch.h). Called on the GPU
-// thread, with the single-entry memo already known to miss, to replace the entry by a worker-built one
-// whose register inputs and recorded guest reads were just re-validated with the real readers. On
-// success the memo entry, snapshot and specialization are exactly what a fresh materialization would
-// have produced. On failure nothing has been modified.
-using PrefetchAdoptFn = bool (*)(ResourceMemoEntry& memo, const ShaderRecompiler::IR::ResourcePlan& plan,
-                                 const ShaderRecompiler::IR::SrtRuntime& runtime,
-                                 ShaderRecompiler::IR::ResourceSnapshot& snapshot,
-                                 ShaderRecompiler::IR::ResourceSpecialization& specialization);
-inline std::atomic<PrefetchAdoptFn> g_prefetch_adopt {nullptr};
+// thread from ResourceMemo::Refresh's memo-disabled branch (compute stage, no replay) to replace the
+// materialization by a worker-built result whose register inputs and recorded guest reads were just
+// re-validated against the clean backing. On success snapshot, specialization and plan.active_sources are
+// exactly what a fresh materialization would have produced. On failure nothing has been modified.
+using PrefetchDirectFn = bool (*)(const ShaderRecompiler::IR::ResourcePlan& plan,
+                                  const ShaderRecompiler::IR::SrtRuntime& runtime,
+                                  ShaderRecompiler::IR::ResourceSnapshot& snapshot,
+                                  ShaderRecompiler::IR::ResourceSpecialization& specialization);
+inline std::atomic<PrefetchDirectFn> g_prefetch_direct {nullptr};
 
 // Keep multiple validated states so alternating materials do not evict each other.
 // Never cache solely by pointer: each candidate still replays its dependency reads.
@@ -657,6 +662,11 @@ public:
             m_dependency_groups_ready = false;
             m_last_hit = SIZE_MAX;
             reused = false;
+            // KYTY_DRAWPREP_PREFETCH: a plain runtime (no replay readers) may adopt a worker result.
+            if (flags.drawprep_prefetch && runtime.userdata == nullptr) {
+                const auto direct = g_prefetch_direct.load(std::memory_order_acquire);
+                if (direct != nullptr && direct(plan, runtime, snapshot, specialization)) return true;
+            }
             return ShaderRecompiler::IR::MaterializeResources(plan, runtime, snapshot, specialization);
         }
         if (m_capacity == 1) {
@@ -674,22 +684,7 @@ public:
                     m_diag_specialization = specialization;
                 }
             }
-            bool ok;
-            const auto adopt = flags.drawprep_prefetch ? g_prefetch_adopt.load(std::memory_order_acquire) : nullptr;
-            if (adopt != nullptr) {
-                // Probe first: a register/memory hit needs no prefetched result. Only a miss tries to adopt.
-                ok = memo.Refresh(plan, runtime, snapshot, specialization, true, reused, true);
-                if (!ok) {
-                    if (adopt(memo, plan, runtime, snapshot, specialization)) {
-                        ok = true;
-                        reused = false;
-                    } else {
-                        ok = memo.Refresh(plan, runtime, snapshot, specialization, true, reused);
-                    }
-                }
-            } else {
-                ok = memo.Refresh(plan, runtime, snapshot, specialization, true, reused);
-            }
+            const bool ok = memo.Refresh(plan, runtime, snapshot, specialization, true, reused);
             m_last_miss = memo.LastMiss();
             if (diag && ok && diag_changed != 0 && m_last_miss == Miss::Registers) {
                 ResourceMissDiag::Record(diag_first, diag_changed, m_diag_snapshot, m_diag_specialization,
