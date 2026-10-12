@@ -263,7 +263,28 @@ TextureCache::GenCheck TextureCache::CheckGenerationLog(uint64_t memo_gen, uint6
 	return GenCheck::Clean;
 }
 
+// Diagnostic: KYTY_DBG_IMAGE_CHURN=1 prints image inserts and frees (first 4000).
+static bool ImageChurnLogLine() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DBG_IMAGE_CHURN");
+		return value != nullptr && value[0] == '1';
+	}();
+	static std::atomic<uint32_t> lines {0};
+	return enabled && lines.fetch_add(1, std::memory_order_relaxed) < 4000;
+}
+
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
+	BufferCache::PerfCount(BufferCache::PerfEvent::ImageInsert);
+	if (ImageChurnLogLine()) {
+		std::printf("NHL27IMAGE: insert addr=0x%llx size=0x%llx fmt=%s %ux%ux%u levels=%u layers=%u "
+		            "tile=%u samples=%u frame=%llu\n",
+		            static_cast<unsigned long long>(info.data.address),
+		            static_cast<unsigned long long>(info.data.size),
+		            vk::to_string(info.pixel_format).c_str(), info.extent.width, info.extent.height,
+		            info.extent.depth, info.resources.levels, info.resources.layers,
+		            static_cast<uint32_t>(info.tile_mode), info.samples,
+		            static_cast<unsigned long long>(BufferCache::PerfFlipCount()));
+	}
 	// A new image can become the answer for any T# overlapping its guest range (FindImagesInRegion /
 	// ResolveOverlap candidates are exactly the registered images overlapping the T# range). Images without
 	// guest data are never registered, so no T# lookup can find them.
@@ -450,6 +471,14 @@ bool TextureCache::WriteBackAliasedImage(ImageId id) {
 void TextureCache::FreeImage(ImageId id) {
 	GenCount(FrameBreakdown::g_delta.gen_free);  // DeleteImage -> UnregisterImage logs the range
 	auto& image = m_slot_images[id];
+	if (ImageChurnLogLine()) {
+		std::printf("NHL27IMAGE: free addr=0x%llx size=0x%llx fmt=%s %ux%u gpu_modified=%d frame=%llu\n",
+		            static_cast<unsigned long long>(image.info.data.address),
+		            static_cast<unsigned long long>(image.info.data.size),
+		            vk::to_string(image.info.pixel_format).c_str(), image.info.extent.width,
+		            image.info.extent.height, image.IsGpuModified() ? 1 : 0,
+		            static_cast<unsigned long long>(BufferCache::PerfFlipCount()));
+	}
 	if (image.IsGpuModified()) {
 		// Only overlap/alias frees write back. Unmap and GC frees must not enqueue guest writes.
 		if (AliasWritebackEnabled() && m_alias_free_in_progress) {
@@ -1254,6 +1283,7 @@ TextureCache::ImageDownload TextureCache::BuildDownload(const Image& image) cons
 }
 
 void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_offset) {
+	BufferCache::PerfCount(BufferCache::PerfEvent::ImageUpload);
 	auto& destination = image.depth_id ? m_slot_images[image.depth_id] : image;
 	const auto binding = image.depth_id ? BindingType::DepthTarget : UploadBinding(image);
 	const auto  upload  = [&](std::vector<vk::BufferImageCopy>& copies, TileManager::Result linear) {
@@ -1669,6 +1699,45 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	return result;
 }
 
+ImageId TextureCache::FindImageHinted(ImageDesc& desc, bool exact_format, ImageId hint,
+                                      bool& exact) {
+	exact = false;
+	const auto metadata_base_layer = desc.view_info.base_layer;
+	const auto matches             = [&](const Image& image) {
+		return image.registered && !(desc.type == BindingType::RenderTarget && image.depth_id) &&
+		       SameBacking(image.info, desc.info, exact_format) &&
+		       !(image.info.resources < desc.info.resources) &&
+		       (!exact_format || image.info.pixel_format == desc.info.pixel_format);
+	};
+	if (hint && desc.type != BindingType::VideoOut && !desc.info.data.Empty() &&
+	    !m_scheduler.Current().IsInvalid()) {
+		bool hit = false;
+		{
+			std::scoped_lock lock {m_lock};
+			if (auto* image = m_slot_images.try_get(hint); image != nullptr && matches(*image)) {
+				image->tick_accessed_last = m_scheduler.CurrentTick();
+				TouchImage(*image);
+				hit = true;
+			}
+		}
+		if (hit) {
+			MaterializeColorClear(hint, desc, metadata_base_layer);
+			exact = true;
+			return hint;
+		}
+	}
+	const auto base_level = desc.view_info.base_level;
+	const auto id         = FindImage(desc, exact_format);
+	{
+		std::scoped_lock lock {m_lock};
+		const auto* image = m_slot_images.try_get(id);
+		exact = image != nullptr && desc.type != BindingType::VideoOut && !desc.info.data.Empty() &&
+		        desc.view_info.base_level == base_level &&
+		        desc.view_info.base_layer == metadata_base_layer && matches(*image);
+	}
+	return id;
+}
+
 void TextureCache::NoteImageUse(ImageId id) {
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
@@ -1761,7 +1830,30 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 			break;
 		default: EXIT("TextureCache: invalid texture binding\n");
 	}
+	if (desc.type == BindingType::Storage && image.NeedsStorageShadow() &&
+	    desc.view_info.level_count == 1 && vk::blockExtent(desc.view_info.format)[0] == 1 &&
+	    vk::blockSize(desc.view_info.format) == image.info.bytes_per_block) {
+		if (std::find(m_shadowed_images.begin(), m_shadowed_images.end(), id) ==
+		    m_shadowed_images.end()) {
+			m_shadowed_images.push_back(id);
+			m_storage_shadows_pending.store(true, std::memory_order_release);
+		}
+		return image.PrepareShadowStorage(desc.view_info);
+	}
 	return image.FindView(desc.view_info);
+}
+
+void TextureCache::FlushStorageShadows() {
+	// Most draws have no block-storage writes; avoid taking the cache lock for them.
+	if (!m_storage_shadows_pending.load(std::memory_order_acquire)) return;
+	std::scoped_lock lock {m_lock};
+	for (const auto id: m_shadowed_images) {
+		if (auto* image = m_slot_images.try_get(id); image != nullptr) {
+			image->FlushShadowStorage();
+		}
+	}
+	m_shadowed_images.clear();
+	m_storage_shadows_pending.store(false, std::memory_order_release);
 }
 
 vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) {
@@ -2335,6 +2427,7 @@ void TextureCache::RunGarbageCollector() {
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
+	BufferCache::PerfSetMemoryUsage(m_total_used_memory, m_trigger_gc_memory, 0);
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
@@ -2372,6 +2465,7 @@ void TextureCache::RunGarbageCollector() {
 					continue;
 				}
 			}
+			BufferCache::PerfCount(BufferCache::PerfEvent::ImageGcFree);
 			FreeImage(id);
 			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
 				deletions >>= 2;

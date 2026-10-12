@@ -15,6 +15,7 @@
 #include <chrono>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
@@ -29,6 +30,30 @@ namespace {
 constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
 constexpr uint64_t MaxIndirectDescriptorProbes = 65536u;
 thread_local ResourceSpecializationCacheStats g_specialization_cache_stats;
+
+class MaterializationTimer {
+public:
+	explicit MaterializationTimer(MaterializationTimings* timings): m_timings(timings) {
+		if (m_timings != nullptr) {
+			++m_timings->calls;
+			m_begin = std::chrono::steady_clock::now();
+		}
+	}
+	~MaterializationTimer() { Step(m_phase); }
+	void Step(MaterializationTimings::Phase phase) {
+		if (m_timings == nullptr) return;
+		const auto now = std::chrono::steady_clock::now();
+		m_timings->ns[static_cast<size_t>(m_phase)] +=
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(now - m_begin).count();
+		m_phase = phase;
+		m_begin = now;
+	}
+
+private:
+	MaterializationTimings*               m_timings;
+	MaterializationTimings::Phase         m_phase = MaterializationTimings::Phase::Setup;
+	std::chrono::steady_clock::time_point m_begin {};
+};
 
 bool SpecializationFail(std::string_view message) {
 	std::fprintf(stderr, "shader resource specialization failed: %.*s\n",
@@ -892,6 +917,77 @@ static std::optional<std::array<uint64_t, 3>> FillIndex(Value value, uint32_t ax
 	return left;
 }
 
+// One buffer store whose data is a load of the same element from another buffer at the same
+// invocation index: dst[i] = src[i]. Both accesses are raw, index-addressed and unconditional
+// for the whole dispatch, so the copied range follows from the descriptors and dispatch size.
+static UniformCopy AnalyzeUniformCopy(const Program& program) {
+	if (program.stage != ShaderType::Compute || program.blocks.empty() ||
+	    program.blocks.size() != program.block_info.size() || program.info.uses_dma ||
+	    !program.info.samplers.empty() || !program.info.images.empty() ||
+	    program.info.buffers.size() != 2) {
+		return {};
+	}
+	std::unordered_set<uint32_t> visited;
+	uint32_t                     index = 0;
+	const Inst*                  store = nullptr;
+	for (;;) {
+		if (!visited.insert(index).second) return {};
+		for (const auto& inst: *program.blocks[index]) {
+			if (AddressOpcodeInfoOf(inst.GetOpcode()).access != AddressAccess::None) return {};
+			if (!inst.MayHaveSideEffects()) continue;
+			if (store != nullptr || BufferAccessOf(inst.GetOpcode()) != BufferAccess::Write) return {};
+			store = &inst;
+		}
+		const auto& term = program.block_info[index].terminator;
+		if (term.kind == CFG::TerminatorKind::Return) break;
+		if (term.kind != CFG::TerminatorKind::Branch) return {};
+		const auto next = std::ranges::find(program.block_info, term.true_block, &BlockInfo::id);
+		if (next == program.block_info.end()) return {};
+		index = static_cast<uint32_t>(next - program.block_info.begin());
+	}
+	if (store == nullptr || visited.size() != program.blocks.size()) return {};
+	constexpr std::array stores {ValueOpcode::StoreBufferU32, ValueOpcode::StoreBufferU32x2,
+	                             ValueOpcode::StoreBufferU32x3, ValueOpcode::StoreBufferU32x4};
+	constexpr std::array loads {ValueOpcode::LoadBufferU32, ValueOpcode::LoadBufferU32x2,
+	                            ValueOpcode::LoadBufferU32x3, ValueOpcode::LoadBufferU32x4};
+	const auto store_op = std::ranges::find(stores, store->GetOpcode());
+	if (store_op == stores.end() || store->Arg(2).Resolve() != Value(0u) ||
+	    store->Arg(3).Resolve() != Value(0u))
+		return {};
+	const auto words = static_cast<uint32_t>(store_op - stores.begin() + 1);
+	const auto guard = store->Arg(5).Resolve();
+	if (!IsFullDispatchPredicate(guard)) return {};
+	const auto* load = store->Arg(4).Resolve().TryInstruction();
+	if (load == nullptr || load->GetOpcode() != loads[words - 1] ||
+	    load->Arg(2).Resolve() != Value(0u) || load->Arg(3).Resolve() != Value(0u))
+		return {};
+	const auto load_guard = load->Arg(4).Resolve();
+	if (load_guard != Value(true) && load_guard != guard) return {};
+	const auto& dst = program.memory_info.at(store->Flags<MemoryFlags>().index);
+	const auto& src = program.memory_info.at(load->Flags<MemoryFlags>().index);
+	const auto  raw = [words](const MemoryInfo& memory) {
+		return !memory.formatted && !memory.typed && memory.idxen && !memory.offen &&
+		       memory.offset == 0 && memory.data_bits == 32 && memory.data_dwords == words;
+	};
+	if (!raw(dst) || !raw(src) || dst.resource == src.resource ||
+	    dst.resource >= program.info.buffers.size() || src.resource >= program.info.buffers.size())
+		return {};
+	const auto& src_buffer = program.info.buffers[src.resource];
+	const auto& dst_buffer = program.info.buffers[dst.resource];
+	if (!src_buffer.read || src_buffer.written || dst_buffer.read || !dst_buffer.written) return {};
+	// The load and the store must address the same element.
+	if (ResolveActiveU32(load->Arg(1), guard) != ResolveActiveU32(store->Arg(1), guard)) return {};
+	const auto address = FillIndex(store->Arg(1), 0, guard);
+	if (!address || (*address)[0] != 0 || (*address)[1] != 1 || (*address)[2] == 0) return {};
+	UniformCopy result;
+	result.valid        = true;
+	result.source       = src.resource;
+	result.destination  = dst.resource;
+	result.words        = words;
+	result.group_stride = static_cast<uint32_t>((*address)[2]);
+	return result;
+}
+
 static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 	if (program.stage != ShaderType::Compute || program.blocks.empty() ||
 	    program.blocks.size() != program.block_info.size() || program.info.uses_dma ||
@@ -1156,6 +1252,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	};
 	plan.control_flow = ResourceControlFlow(program, ClonePredicate);
 	plan.uniform_fill = AnalyzeUniformFill(program);
+	plan.uniform_copy = AnalyzeUniformCopy(program);
 	for (uint32_t i = 0; i < plan.uniform_fill.fill.words; ++i) {
 		plan.uniform_fill.values[i] = Clone(plan.uniform_fill.values[i]);
 	}
@@ -1190,6 +1287,47 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		}
 	}
 	if (capture_indirect_reads) plan.resource_tracking_complete &= !program.has_address_writes;
+	// Runtime traversal limits these candidates to consecutive reads in a reached block.
+	// Descriptor/offset expressions, reader semantics and bytes must all match.
+	{
+		plan.srt_batch_counts.assign(plan.srt_reads.size(), 1u);
+		const auto raw = [&](uint32_t slot) -> const Inst* {
+			const auto* inst = plan.srt_reads[slot].value.Resolve().TryInstruction();
+			if (inst == nullptr ||
+			    (inst->GetOpcode() != ValueOpcode::LoadAddressU32 &&
+			     inst->GetOpcode() != ValueOpcode::ReadConstBuffer)) return nullptr;
+			if (inst->NumArgs() != (inst->GetOpcode() == ValueOpcode::LoadAddressU32 ? 4u : 2u)) return nullptr;
+			const auto index = inst->Flags<MemoryFlags>().index;
+			if (index >= plan.memory_info.size()) return nullptr;
+			const auto kind = inst->GetOpcode() == ValueOpcode::LoadAddressU32
+			                      ? ResourceKind::ScalarAddress : ResourceKind::ScalarBuffer;
+			return plan.memory_info[index].kind == kind ? inst : nullptr;
+		};
+		for (uint32_t first = 0; first < plan.srt_reads.size();) {
+			const auto* head = raw(first);
+			uint32_t count = 1;
+			if (head != nullptr && plan.srt_reads[first].flat_offset < plan.clean_flat_slots.size()) {
+				const auto start_offset = static_cast<int64_t>(static_cast<int32_t>(
+				    plan.memory_info[head->Flags<MemoryFlags>().index].offset)) & ~int64_t{3};
+				const auto flat_offset = plan.srt_reads[first].flat_offset;
+				while (count < 64 && first + count < plan.srt_reads.size()) {
+					const auto* next = raw(first + count);
+					if (next == nullptr || next->GetOpcode() != head->GetOpcode() ||
+					    next->Arg(0).Resolve() != head->Arg(0).Resolve() ||
+					    next->Arg(1).Resolve() != head->Arg(1).Resolve() ||
+					    plan.srt_reads[first + count].flat_offset != flat_offset + count ||
+					    flat_offset + count >= plan.clean_flat_slots.size() ||
+					    plan.clean_flat_slots[flat_offset + count] != plan.clean_flat_slots[flat_offset]) break;
+					const auto offset = static_cast<int64_t>(static_cast<int32_t>(
+					    plan.memory_info[next->Flags<MemoryFlags>().index].offset)) & ~int64_t{3};
+					if (offset != start_offset + count * 4u) break;
+					++count;
+				}
+			}
+			for (uint32_t i = 0; i < count; ++i) plan.srt_batch_counts[first + i] = count - i;
+			first += count;
+		}
+	}
 	return plan;
 }
 
@@ -1278,6 +1416,7 @@ static bool MaterializeResourcesCore(const ResourcePlan& program, const SrtRunti
 	    (program.requires_specialization_memory && runtime.read_specialization_memory == nullptr)) {
 		return false;
 	}
+	MaterializationTimer timer(runtime.materialization_timings);
 	const bool capture_reads = program.capture_specialization_reads;
 	auto& reads = snapshot.specialization_reads;
 	reads.clear();
@@ -1296,6 +1435,7 @@ static bool MaterializeResourcesCore(const ResourcePlan& program, const SrtRunti
 	SrtWalker clean(program, CleanRuntime(observed));
 	SrtWalker walker(program, observed, program.clean_flat_slots,
 	                 capture_reads || program.requires_specialization_memory ? &clean : nullptr);
+	timer.Step(MaterializationTimings::Phase::Flat);
 	bool flat_ok;
 	{
 		FrameBreakdown::Timer timer(FrameBreakdown::g_counters.mat_flat_ns);
@@ -1304,8 +1444,10 @@ static bool MaterializeResourcesCore(const ResourcePlan& program, const SrtRunti
 	if (!flat_ok) {
 		return false;
 	}
+	timer.Step(MaterializationTimings::Phase::Fill);
 	const auto active = std::span<const uint8_t>(program.active_sources);
 	snapshot.uniform_fill = {};
+	snapshot.uniform_copy = program.uniform_copy;
 	const auto& fill = program.uniform_fill;
 	const auto words = fill.fill.words;
 	std::array<uint32_t, 4> stored {};
@@ -1330,6 +1472,7 @@ static bool MaterializeResourcesCore(const ResourcePlan& program, const SrtRunti
 		value.dword_count = program.descriptor_sources[source].dword_count;
 		return true;
 	};
+	timer.Step(MaterializationTimings::Phase::Buffers);
 	snapshot.buffers.resize(program.info.buffers.size());
 	specialization.buffers.assign(program.info.buffers.size(), {});
 	for (uint32_t i = 0; i < snapshot.buffers.size(); ++i) {
@@ -1398,6 +1541,7 @@ static bool MaterializeResourcesCore(const ResourcePlan& program, const SrtRunti
 		buffer.zero_stride_oob    = descriptor.OutOfBounds() == 0u && stride == 0u;
 		if (cached != nullptr) *cached = {.key = cache_key, .value = buffer, .valid = true};
 	}
+	timer.Step(MaterializationTimings::Phase::Images);
 	snapshot.images.resize(program.info.images.size());
 	specialization.images.resize(program.info.images.size());
 	for (uint32_t i = 0; i < program.info.images.size(); ++i) {
@@ -1445,6 +1589,7 @@ static bool MaterializeResourcesCore(const ResourcePlan& program, const SrtRunti
 			}
 		}
 	}
+	timer.Step(MaterializationTimings::Phase::Samplers);
 	snapshot.samplers.resize(program.info.samplers.size());
 	for (uint32_t i = 0; i < program.info.samplers.size(); ++i) {
 		if (!evaluate(program.info.samplers[i].source, snapshot.samplers[i])) {
@@ -1462,6 +1607,7 @@ static bool MaterializeResourcesCore(const ResourcePlan& program, const SrtRunti
 		}
 	}
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
+	timer.Step(MaterializationTimings::Phase::Specialization);
 	{
 		FrameBreakdown::Timer timer(FrameBreakdown::g_counters.mat_spec_ns);
 		auto* delta = runtime.delta;

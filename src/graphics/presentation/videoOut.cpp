@@ -14,6 +14,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/tile.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -547,6 +548,7 @@ static int ReserveFlipRequest(VideoOutDriver::Impl& driver, int handle, int inde
 	if (!driver.GetFlipQueue().Reserve(*video_out, index, flip_arg, source, request_id)) {
 		return VIDEO_OUT_ERROR_FLIP_QUEUE_FULL;
 	}
+	Graphics::BufferCache::PerfCount(Graphics::BufferCache::PerfEvent::Flip);
 	return OK;
 }
 
@@ -1476,6 +1478,10 @@ KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer
 	     buffer_index_start, buffer_num, set_index, attribute->pixel_format, attribute->tiling_mode,
 	     attribute->aspect_ratio, attribute->width, attribute->height, attribute->pitch_in_pixel,
 	     attribute->option, category);
+	std::printf("NHL27VIDEO: register buffers set=%d count=%d %ux%u format=0x%llx\n", set_index,
+	            buffer_num, attribute->width, attribute->height,
+	            static_cast<unsigned long long>(attribute->pixel_format));
+	std::fflush(stdout);
 
 	if (option != nullptr) {
 		return VIDEO_OUT_ERROR_INVALID_OPTION;

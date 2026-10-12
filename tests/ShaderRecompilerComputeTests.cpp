@@ -80,8 +80,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <functional>
 #include <initializer_list>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -92,6 +95,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
@@ -206,6 +210,13 @@ struct StreamBufferTestAccess {
 };
 
 struct ImageTestAccess {
+  static VulkanImage& StorageShadow(Image& image, uint32_t level) {
+    return image.ShadowLevelAt(level).image;
+  }
+  static void ShadowTransferWrite(Image& image, uint32_t level, vk::CommandBuffer command) {
+    image.ShadowBarrier(image.ShadowLevelAt(level), command,
+        vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
+  }
   static uint32_t CopyRows(uint64_t row_size, uint32_t rows,
                            uint64_t capacity) {
     return Image::CopyRows(row_size, rows, capacity);
@@ -982,7 +993,7 @@ std::string Hex(u32 value) {
 void Require(const char *shader_name, const char *stage, bool value,
              const std::string &message);
 
-void EnsureConfigInitialized(bool renderdoc = false) {
+void EnsureConfigInitialized(bool renderdoc = false, bool guest_memory = true) {
   static bool config_initialized = false;
   if (!config_initialized) {
     static Common::Subsystems subsystems;
@@ -994,7 +1005,7 @@ void EnsureConfigInitialized(bool renderdoc = false) {
     options.renderdoc_enabled = renderdoc;
     Config::Load(options);
     subsystems.Initialize<Log::Lifecycle>();
-    subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
+    if (guest_memory) subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
     ShaderInit();
     config_initialized = true;
   }
@@ -1350,6 +1361,7 @@ struct TestCase {
   u32 dispatch_z = 1;
   std::array<u32, 64> user_data{};
   bool has_user_data = false;
+  bool gpu_scalar_data = false;
   u32 image_descriptor_swizzle = DstSel(4, 5, 6, 7);
   bool compile_only = false;
   size_t storage_buffer_range_bytes = 0;
@@ -1634,6 +1646,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   ShaderRecompiler::CompileOptions options;
   options.stage = ShaderType::Compute;
   options.dump_ir = true;
+  options.gpu_scalar_data = test.gpu_scalar_data;
   auto compute_info = test.compute_info;
   compute_info.host_subgroup_size = host_subgroup_size;
   options.input_info.compute = &compute_info;
@@ -2002,6 +2015,8 @@ public:
     EnsureRuntimeContext();
     return Renderer();
   }
+
+  #include "BlockStorageShadowTests.inc"
 
   void CheckHostImageAllocation() {
     constexpr const char *name = "HostImageAllocation";
@@ -41799,6 +41814,8 @@ void CheckPm4CeCompletion(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", "Pm4CeCompletion");
 }
 
+#include "ResourceReplayBenchmark.inc"
+
 } // namespace
 } // namespace Libs::Graphics
 
@@ -41818,10 +41835,51 @@ int main(int argc, char **argv) {
 #endif
   const bool renderdoc_smoke =
       argc == 2 && std::strcmp(argv[1], "--renderdoc-only") == 0;
+  if (argc == 3 && std::strcmp(argv[1], "--resource-replay-benchmark") == 0) {
+    EnsureConfigInitialized(false, false);
+    return ResourceReplayBenchmark(argv[2]);
+  }
+  if (argc == 4 && std::strcmp(argv[1], "--resource-replay-dump") == 0) {
+    EnsureConfigInitialized(false, false);
+    return ResourceReplayDump(argv[2], std::strtoull(argv[3], nullptr, 16));
+  }
+  if (argc == 3 && std::strcmp(argv[1], "--resource-replay-shapes") == 0) {
+    EnsureConfigInitialized(false, false);
+    return ResourceReplayShapes(argv[2]);
+  }
+  if ((argc >= 3 && argc <= 5) && std::strcmp(argv[1], "--resource-replay-phases") == 0) {
+    EnsureConfigInitialized(false, false);
+    return ResourceReplayPhases(argv[2], argc >= 4 ? static_cast<unsigned>(std::strtoul(argv[3], nullptr, 10)) : 20u,
+                                argc == 5 ? std::atoi(argv[4]) : 0);
+  }
+  if (argc == 3 && std::strcmp(argv[1], "--resource-scalar-gpu-replay") == 0) {
+    EnsureConfigInitialized(false, false);
+    return ResourceReplayBenchmark(argv[2], true);
+  }
+  if (argc == 3 && std::strcmp(argv[1], "--resource-scalar-gpu-compile") == 0) {
+    EnsureConfigInitialized(false, false);
+    return ResourceReplayBenchmark(argv[2], true, true);
+  }
   EnsureConfigInitialized(renderdoc_smoke);
   if (argc == 2 && std::strcmp(argv[1], "--wave-reduction-only") == 0) {
     VulkanHarness vulkan;
     CheckWaveReduction(vulkan);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--gpu-scalar-data-only") == 0) {
+    VulkanHarness vulkan;
+    for (auto test : {ScalarMemoryLoadVariants(), ScalarLoadSignedImmediateOffsetAddsSoffset()}) {
+      test.gpu_scalar_data = true;
+      test.bda_mappings = {{0, 0}};
+      if (std::strcmp(test.name, "ScalarMemoryLoadVariants") == 0)
+        test.forbidden_spirv.push_back("flattened_srt");
+      RunCase(&vulkan, test);
+    }
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--block-storage-shadow-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckBlockStorageShadow();
     return 0;
   }
   if (renderdoc_smoke) {

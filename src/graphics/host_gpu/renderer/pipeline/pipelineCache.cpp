@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
+#include "common/experiments.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -34,6 +35,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
+#include <fstream>
 #include <limits>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
@@ -343,6 +345,9 @@ struct PipelineCache::ProgramCache {
 		size_t                                     last_permutation = std::numeric_limits<size_t>::max();
 		bool                                       native_plan_checked = false;
 		bool                                       native_plan_allowed = false;
+		uint64_t                                   refresh_ns = 0;
+		uint64_t                                   refresh_calls = 0;
+		uint64_t                                   refresh_hits = 0;
 	};
 
 	struct ProgramKeyHash {
@@ -418,6 +423,7 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 
+		ApplyExperiments();
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
 		lookup_key.stage           = stage;
 		lookup_key.hash            = params.hash;
@@ -464,7 +470,10 @@ struct PipelineCache::ProgramCache {
             runtime.try_read_specialization_span = nullptr;
         }
         const bool memo_enabled = reuse_enabled && replaying == nullptr && !runtime_flags.resource_memo_bypass;
+		runtime.batch_reads = batch_reads;
         const auto refresh = [&](SourceEntry& source, bool& reused) {
+            const auto begin = resource_timing ? std::chrono::steady_clock::now()
+                                               : std::chrono::steady_clock::time_point {};
             auto observed_runtime = runtime;
             observed_runtime.specialization_cache = runtime_flags.resource_spec_cache
                 ? &source.specialization_cache : nullptr;
@@ -473,6 +482,12 @@ struct PipelineCache::ProgramCache {
             observed_runtime.delta = runtime_flags.srt_compiled && replaying == nullptr ? &source.delta : nullptr;
             const bool ok = source.resource_memo.Refresh(source.resource_plan, observed_runtime,
                 source.resources, source.specialization, memo_enabled, reused);
+            if (resource_timing) {
+                source.refresh_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - begin).count();
+                ++source.refresh_calls;
+                source.refresh_hits += reused;
+            }
             if (!ok && replaying == nullptr) EXIT("Resource materialization failed\n");
             return ok;
         };
@@ -563,6 +578,11 @@ struct PipelineCache::ProgramCache {
 		options.back_code      = params.back_code;
 		options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
 		options.early_dump  = options.dump_ir;
+		static const bool gpu_scalar_data = [] {
+			const char* value = std::getenv("KYTY_GPU_SCALAR_DATA");
+			return value != nullptr && value[0] == '1' && value[1] == 0;
+		}();
+		options.gpu_scalar_data = gpu_scalar_data;
 		options.dump_label  = label;
 		options.input_info  = stage_input;
 
@@ -650,21 +670,23 @@ struct PipelineCache::ProgramCache {
 			const char* value = std::getenv("KYTY_PERF_STATS");
 			return value != nullptr && value[0] == '1';
 		}();
-		if (!stats || (lookups & 16383u) != 0) return;
+		if ((!stats && !resource_timing) || (lookups & 16383u) != 0) return;
 		const auto now = std::chrono::steady_clock::now();
 		if (now - last_stats < std::chrono::seconds(5)) return;
-		std::printf("NHL27PROGRAM: cache=%d lookups=%llu source_hits=%llu resource_hits=%llu materialize=%llu perm_hits=%llu\n",
+		if (stats) std::printf("NHL27PROGRAM: cache=%d lookups=%llu source_hits=%llu resource_hits=%llu materialize=%llu perm_hits=%llu\n",
 		    enabled, static_cast<unsigned long long>(lookups), static_cast<unsigned long long>(source_hits),
 		    static_cast<unsigned long long>(resource_hits), static_cast<unsigned long long>(materializations),
 		    static_cast<unsigned long long>(permutation_hits));
-		const auto spec = ShaderRecompiler::IR::GetResourceSpecializationCacheStats();
-		std::printf("NHL27SPECCACHE: enabled=%d calls=%llu buffers=%llu/%llu images=%llu/%llu indirect_uncached=%llu\n",
-		    Common::RuntimeFlags::Current().resource_spec_cache,
-		    static_cast<unsigned long long>(spec.calls),
-		    static_cast<unsigned long long>(spec.buffer_hits), static_cast<unsigned long long>(spec.buffer_misses),
-		    static_cast<unsigned long long>(spec.image_hits), static_cast<unsigned long long>(spec.image_misses),
-		    static_cast<unsigned long long>(spec.indirect_uncached));
-		if (enabled) {
+		if (stats) {
+			const auto spec = ShaderRecompiler::IR::GetResourceSpecializationCacheStats();
+			std::printf("NHL27SPECCACHE: enabled=%d calls=%llu buffers=%llu/%llu images=%llu/%llu indirect_uncached=%llu\n",
+			    Common::RuntimeFlags::Current().resource_spec_cache,
+			    static_cast<unsigned long long>(spec.calls),
+			    static_cast<unsigned long long>(spec.buffer_hits), static_cast<unsigned long long>(spec.buffer_misses),
+			    static_cast<unsigned long long>(spec.image_hits), static_cast<unsigned long long>(spec.image_misses),
+			    static_cast<unsigned long long>(spec.indirect_uncached));
+		}
+		if (stats && enabled) {
 			std::printf("NHL27PROGRAMMISS: cold=%llu base=%llu regs=%llu groups=%llu read_failed=%llu memory_changed=%llu\n",
 			    static_cast<unsigned long long>(resource_misses[static_cast<size_t>(ResourceMemo::Miss::Cold)]),
 			    static_cast<unsigned long long>(resource_misses[static_cast<size_t>(ResourceMemo::Miss::ShaderBase)]),
@@ -721,11 +743,80 @@ struct PipelineCache::ProgramCache {
 			    static_cast<unsigned long long>(tape.cfg_trace_misses),
 			    static_cast<unsigned long long>(tape.cfg_trace_recorded));
 		}
+		if (resource_timing) {
+			std::vector<std::pair<const ProgramKey*, SourceEntry*>> measured;
+			uint64_t total_ns = 0;
+			for (auto& [key, source]: programs) {
+				total_ns += source.refresh_ns;
+				if (source.refresh_calls != 0) measured.emplace_back(&key, &source);
+			}
+			std::ranges::sort(measured, {}, [](const auto& item) {
+				return UINT64_MAX - item.second->refresh_ns;
+			});
+			std::printf("NHL27RESOURCE: window=%.2f s refresh=%.2f ms sources=%zu\n",
+			    std::chrono::duration<double>(now - last_stats).count(), total_ns / 1e6, measured.size());
+			for (size_t i = 0; i < std::min<size_t>(15, measured.size()); ++i) {
+				const auto& [key, source] = measured[i];
+				const auto& plan = source->resource_plan;
+				const auto batches = std::ranges::count_if(plan.srt_batch_counts, [](uint32_t count) { return count > 1; });
+				std::printf("NHL27RESOURCE: hash=%016llx stage=%u ms=%.2f n=%llu hits=%llu avg=%.2f us values=%zu srt=%zu sources=%zu flat=%zu batch_starts=%zu\n",
+				    static_cast<unsigned long long>(key->hash), static_cast<unsigned>(key->stage),
+				    source->refresh_ns / 1e6, static_cast<unsigned long long>(source->refresh_calls),
+				    static_cast<unsigned long long>(source->refresh_hits),
+				    source->refresh_ns / 1e3 / source->refresh_calls, plan.value_storage.size(),
+				    plan.srt_reads.size(), plan.descriptor_sources.size(), source->resources.flattened_srt.size(), static_cast<size_t>(batches));
+			}
+			for (const auto& item: measured) {
+				item.second->refresh_ns = item.second->refresh_calls = item.second->refresh_hits = 0;
+			}
+			// Diagnostic A/B control runs on the sole cache-owning GPU thread. Changing
+			// policy invalidates memo states and retains compiled shaders/pipelines.
+			if (!cache_control_file.empty()) {
+				unsigned capacity = 0;
+				std::ifstream control(cache_control_file);
+				if (control >> capacity && (capacity == 1 || capacity == 16)) {
+					if (capacity != cache_control_capacity) {
+						size_t changed = 0;
+						// The merged resource memo keeps one state per shader; capacity is informational.
+						cache_control_capacity = capacity;
+						std::printf("NHL27RESOURCE: cache_capacity=%u changed=%zu\n", capacity, changed);
+					}
+					unsigned batch = 0;
+					if (control >> batch && batch <= 1 && (batch != batch_reads || !batch_policy_reported)) {
+						batch_reads = batch != 0;
+						batch_policy_reported = true;
+						std::printf("NHL27RESOURCE: batch_reads=%u\n", batch);
+					}
+				}
+			}
+		}
 		last_stats = now;
+		std::fflush(stdout);
+	}
+
+	// Runtime experiment SrtBatchReads (KYTY_EXPERIMENT_FILE) switches scalar read batching inside
+	// one match; compiled shaders and pipelines are kept.
+	void ApplyExperiments() {
+		constexpr uint32_t Bits = Common::Experiments::SrtBatchReads;
+		const uint32_t mask = Common::Experiments::Mask() & Bits;
+		if (mask == applied_experiments) return;
+		applied_experiments = mask;
+		batch_reads = env_batch_reads || (mask & Common::Experiments::SrtBatchReads) != 0;
+		std::printf("NHL27RESOURCE: experiments batch_reads=%d\n", batch_reads ? 1 : 0);
 	}
 
 	explicit ProgramCache(vk::Device device): device(device) {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
+		const char* timing = std::getenv("KYTY_PERF_RESOURCE_TIMING");
+		resource_timing = timing != nullptr && timing[0] == '1';
+		// Default on: only an explicit KYTY_SRT_BATCH_READS=0 disables it. env_batch_reads (an
+		// explicit 1) keeps it on when a KYTY_EXPERIMENT_FILE mask turns the bit off.
+		const char* batch = std::getenv("KYTY_SRT_BATCH_READS");
+		batch_reads = Common::Experiments::Enabled(Common::Experiments::SrtBatchReads);
+		env_batch_reads = batch != nullptr && batch[0] == '1';
+		if (resource_timing) {
+			if (const char* path = std::getenv("KYTY_RESOURCE_CACHE_CONTROL_FILE")) cache_control_file = path;
+		}
 	}
 	~ProgramCache() {
 		for (const auto& [key, entry]: programs) {
@@ -741,6 +832,13 @@ struct PipelineCache::ProgramCache {
 	struct LastSource { const ProgramKey* key = nullptr; SourceEntry* source = nullptr; };
 	std::array<LastSource, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> last_sources {};
 	uint64_t lookups = 0, source_hits = 0, resource_hits = 0, materializations = 0, permutation_hits = 0;
+	bool resource_timing = false;
+	bool batch_reads = false;
+	bool env_batch_reads = false;
+	uint32_t applied_experiments = 0;
+	bool batch_policy_reported = false;
+	std::string cache_control_file;
+	unsigned cache_control_capacity = 0;
 	std::array<uint64_t, static_cast<size_t>(ResourceMemo::Miss::Count)> resource_misses {};
 	std::chrono::steady_clock::time_point last_stats = std::chrono::steady_clock::now();
 	vk::Device                                                  device;
@@ -1014,10 +1112,13 @@ void PipelineCache::WarmUp(PipelineRecord::Records& records) {
         }
         if (handles[index]) m_program_cache->ordinals[handles[index].id] = static_cast<uint32_t>(index);
     }
-    std::unordered_map<uint64_t, const ShaderRecompiler::IR::CompiledShaderInfo*> compiled;
+    // Replay records omit runtime pointers. Rebind both parts of the stage after
+    // all permutations have been inserted, since insertion can move their programs.
+    std::unordered_map<uint64_t, ShaderStageRuntime> compiled;
     for (const auto& [key, entry]: m_program_cache->programs)
         for (const auto& permutation: entry.permutations)
-            compiled[permutation.handle.id] = &permutation.program;
+            compiled[permutation.handle.id] = {.program = &permutation.program,
+                                              .resources = &entry.resources};
     size_t graphics_count = 0, compute_count = 0;
     for (auto& record: records.graphics) {
         const auto vertex = handles[record.vertex_program];
@@ -1030,12 +1131,8 @@ void PipelineCache::WarmUp(PipelineRecord::Records& records) {
         key.static_params = record.static_params;
         if (m_graphics_pipelines.contains(key)) continue;
         GraphicsPrograms programs; programs.vertex[0] = vertex; programs.pixel = pixel;
-        record.vertex.stage.program = compiled.at(vertex.id);
-        record.vertex.stage.resources = &snapshots[record.vertex_program];
-        if (ps_active) {
-            record.pixel.stage.program = compiled.at(pixel.id);
-            record.pixel.stage.resources = &snapshots[record.pixel_program];
-        }
+        record.vertex.stage = compiled.at(vertex.id);
+        if (ps_active) record.pixel.stage = compiled.at(pixel.id);
         auto pipeline = std::make_unique<Pipeline>();
         CreatePipelineInternal(m_graphics, *pipeline, key.rendering, key.vertex_input,
             std::span<const ShaderVertexInputInfo>(&record.vertex, 1),
@@ -1045,8 +1142,7 @@ void PipelineCache::WarmUp(PipelineRecord::Records& records) {
     for (auto& record: records.compute) {
         const auto program = handles[record.program];
         if (!program || m_compute_pipelines.contains(program.id)) continue;
-        record.compute.stage.program = compiled.at(program.id);
-        record.compute.stage.resources = &snapshots[record.program];
+        record.compute.stage = compiled.at(program.id);
         record.compute.host_subgroup_size = records.programs[record.program].compute.host_subgroup_size;
         record.compute.lds_storage = records.programs[record.program].compute.lds_storage;
         auto pipeline = std::make_unique<Pipeline>();

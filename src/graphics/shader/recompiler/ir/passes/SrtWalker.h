@@ -3,6 +3,7 @@
 
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
+#include <array>
 #include <span>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -24,6 +25,13 @@ struct SrtEvaluationCounts {
 	uint64_t cfg_gather_hits = 0;
 };
 
+// Optional per-phase CPU timing of MaterializeResources (diagnostics and replay benchmarks).
+struct MaterializationTimings {
+	enum class Phase : uint8_t { Setup, Flat, ScalarRanges, Fill, Buffers, Images, Samplers, Specialization, Count };
+	std::array<uint64_t, static_cast<size_t>(Phase::Count)> ns {};
+	uint64_t calls = 0;
+};
+
 struct SrtRuntime {
 	std::span<const uint32_t> user_data;
 	uint64_t                  shader_base                = 0;
@@ -31,6 +39,9 @@ struct SrtRuntime {
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
 	std::span<const uint32_t> workgroup_counts;
+	bool                      batch_reads = false;
+	// Caller-owned diagnostics; absent during ordinary rendering.
+	MaterializationTimings*   materialization_timings = nullptr;
 	// Independent from userdata, which belongs to the memory-reader callbacks.
 	SrtUserDataObserver       observe_user_data = nullptr;
 	void*                     user_data_observer_userdata = nullptr;
@@ -49,6 +60,10 @@ struct SrtRuntime {
 };
 
 enum class RuntimeValueType { Any, Integer };
+
+// Direct SRT reads (experiment DirectSrtReads, KYTY_DIRECT_SRT_READS): tests force them on (1),
+// off (0) or follow the experiment mask (-1, default).
+void SetDirectSrtReadsOverride(int value);
 
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
                           RuntimeValueType type = RuntimeValueType::Any);
@@ -141,6 +156,11 @@ private:
 	bool EvaluatePhi(const Inst& inst, uint64_t& result);
 	bool EvaluateExtract(const Inst& inst, uint64_t& result);
 	bool EvaluateRawRead(const Inst& inst, uint64_t& result);
+	bool RefreshDirectFlat(std::vector<uint32_t>& flat);
+	bool RefreshDirectControlFlow(std::vector<uint32_t>& flat);
+	bool DirectReadRun(uint32_t slot, uint32_t count, std::vector<uint32_t>& flat);
+	// Lets the strict evaluator take resource-table words the direct reads fetched.
+	void ShareDirectFlat(const std::vector<uint32_t>& flat, const std::vector<uint8_t>* filled);
 	size_t TryScalarReadBatch(std::span<const Value> values, bool strict,
 	                          std::span<uint32_t> output);
 	size_t TryFlatScalarBatch(std::span<const uint32_t> slots, uint32_t sequential_slot,
@@ -169,6 +189,10 @@ private:
 	std::span<const uint8_t>         m_clean_flat_slots;
 	SrtWalker*                      m_clean_evaluator = nullptr;
 	Value                           m_active_mask;
+	// Set once a direct refresh filled the flat buffer; descriptor words copy it directly.
+	const std::vector<uint32_t>*    m_direct_flat = nullptr;
+	// When set, only these flat slots were filled by the direct refresh.
+	const std::vector<uint8_t>*     m_direct_filled = nullptr;
 	bool                            m_skip_tape = false;
 	bool                            m_cfg_verifying = false;
 	bool                            m_cfg_tape_enabled = false;

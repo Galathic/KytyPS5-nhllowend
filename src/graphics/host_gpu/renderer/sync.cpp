@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/experiments.h"
 #include "common/logging/log.h"
 #include "common/runtimeFlags.h"
 #include "graphics/host_gpu/renderer/frameBreakdown.h"

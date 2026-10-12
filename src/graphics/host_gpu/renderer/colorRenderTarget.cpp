@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 
 #include "common/assert.h"
+#include "common/experiments.h"
 #include "common/runtimeFlags.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -16,6 +17,8 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <cstring>
+#include <unordered_map>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -46,11 +49,9 @@ static bool DccAlphaOnMsb(const HW::ColorInfo& info) {
 
 namespace {
 
-// KYTY_RT_DECODE_MEMO: the register -> image-description decode below is a pure function of the slot's
-// render-target registers and the call arguments (it reads nothing else: no memory, no device state,
-// every EXIT is a function of the same inputs). The memo keeps the description exactly as it is handed
-// to TextureCache::FindImage; the image lookup (which may adjust desc.view_info) still runs per draw.
-static_assert(std::is_trivially_copyable_v<HW::RenderTarget>);
+// Experiment RenderTargetMemo memoizes render-target descriptions: the decoding below is a
+// pure function of the slot's registers and the call arguments. The image lookup still runs per
+// draw (with the ImageLookupHint fast path).
 struct ColorTargetKey {
 	std::array<uint8_t, sizeof(HW::RenderTarget)> registers {};
 	uint32_t slice_offset = 0;
@@ -73,8 +74,13 @@ struct ColorTargetKeyHash {
 	}
 };
 
-std::unordered_map<ColorTargetKey, RenderColorInfo, ColorTargetKeyHash>& ColorTargetMemo() {
-	static std::unordered_map<ColorTargetKey, RenderColorInfo, ColorTargetKeyHash> memo;
+struct CachedColorTarget {
+	RenderColorInfo info;
+	ImageId         last_image {};
+};
+
+std::unordered_map<ColorTargetKey, CachedColorTarget, ColorTargetKeyHash>& ColorTargetMemo() {
+	static std::unordered_map<ColorTargetKey, CachedColorTarget, ColorTargetKeyHash> memo;
 	return memo;
 }
 
@@ -95,6 +101,32 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	if (ignore_target_mask && rt.base.addr != 0 && mask == 0) {
 		mask = 0x0f;
 	}
+	const bool memoize = Common::RuntimeFlags::Current().rt_decode_memo &&
+	                     rt.base.addr != 0 && mask != 0;
+	ColorTargetKey key;
+	if (memoize) {
+		std::memcpy(key.registers.data(), &rt, sizeof(rt));
+		key.slice_offset = render_target_slice_offset;
+		key.slot         = rt_slot;
+		key.mask         = mask;
+		key.ignore_mask  = ignore_target_mask;
+		key.exact_format = exact_format;
+		auto& memo = ColorTargetMemo();
+		if (auto found = memo.find(key); found != memo.end()) {
+			r = found->second.info;
+			auto& texture_cache = m_context.GetTextureCache();
+			if (Common::Experiments::Enabled(Common::Experiments::ImageLookupHint)) {
+				bool exact = false;
+				r.image_id = texture_cache.FindImageHinted(r.desc, exact_format,
+				                                           found->second.last_image, exact);
+				found->second.last_image = exact ? r.image_id : ImageId {};
+			} else {
+				r.image_id = texture_cache.FindImage(r.desc, exact_format);
+			}
+			BindRenderTarget(r.image_id);
+			return;
+		}
+	}
 
 	r             = {};
 	r.target_slot = rt_slot;
@@ -113,25 +145,6 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		}
 
 		return;
-	}
-	const bool memoize = Common::RuntimeFlags::Current().rt_decode_memo;
-	ColorTargetKey memo_key;
-	if (memoize) {
-		std::memcpy(memo_key.registers.data(), &rt, sizeof(rt));
-		memo_key.slice_offset = render_target_slice_offset;
-		memo_key.slot         = rt_slot;
-		memo_key.mask         = mask;
-		memo_key.ignore_mask  = ignore_target_mask;
-		memo_key.exact_format = exact_format;
-		auto& memo = ColorTargetMemo();
-		if (const auto found = memo.find(memo_key); found != memo.end()) {
-			r = found->second;
-			FrameBreakdown::Add(FrameBreakdown::g_counters.port_rt_memo_hits);
-			r.image_id = m_context.GetTextureCache().FindImage(r.desc, exact_format);
-			BindRenderTarget(r.image_id);
-			return;
-		}
-		FrameBreakdown::Add(FrameBreakdown::g_counters.port_rt_memo_misses);
 	}
 	const auto samples = render_sample_count(rt.attrib.num_fragments);
 	if (samples == 0 || rt.attrib.num_samples != rt.attrib.num_fragments) {
@@ -397,15 +410,16 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	auto& texture_cache        = m_context.GetTextureCache();
 	r.guest_mip_level          = rt.view.current_mip_level;
 	r.guest_array_layer        = view.base_layer;
-	r.export_mapping           = target_format.export_mapping;
 	if (memoize) {
 		auto& memo = ColorTargetMemo();
 		if (memo.size() > 16384u) memo.clear();
-		auto& cached    = memo[memo_key];
-		cached          = r;
-		cached.image_id = {};
+		auto& cached = memo[key];
+		cached.info                = r;
+		cached.info.export_mapping = target_format.export_mapping;
+		cached.last_image          = {};
 	}
 	r.image_id                 = texture_cache.FindImage(r.desc, exact_format);
+	r.export_mapping           = target_format.export_mapping;
 	BindRenderTarget(r.image_id);
 }
 

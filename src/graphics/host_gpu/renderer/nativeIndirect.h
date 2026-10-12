@@ -21,10 +21,9 @@ private:
  vk::PipelineLayout m_layout = nullptr;
  vk::Pipeline m_pipeline = nullptr;
 };
-// KYTY_DISPATCH_ARGS_GUARD: indirect dispatch group counts above the device limits (NHL 27
-// occasionally dispatches 0xffffffff x3 groups during match loads) never complete and cost a
-// device loss. Each indirect dispatch reads its counts through a GPU-side copy that zeroes such
-// records. No CPU readback is involved.
+// Indirect dispatch group counts above the device limits (NHL 27 occasionally dispatches
+// 0xffffffff x3 groups during match loads) never complete and cost a device loss. Each indirect
+// dispatch reads its counts through a GPU-side copy that zeroes such records.
 class DispatchArgsGuard {
 public:
  DispatchArgsGuard(GraphicContext& graphics, CommandScheduler& scheduler);

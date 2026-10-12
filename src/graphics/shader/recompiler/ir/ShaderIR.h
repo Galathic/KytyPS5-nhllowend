@@ -607,6 +607,8 @@ struct ResourcePlan {
 	std::vector<DescriptorGather>       descriptor_gathers;
 	std::vector<ResourceBlock>          control_flow;
 	std::vector<SrtRead>                srt_reads;
+	// Contiguous scalar reads eligible for one backing read, indexed by first slot.
+	std::vector<uint32_t>               srt_batch_counts;
 	std::vector<uint8_t>                clean_flat_slots;
 	bool                                requires_specialization_memory = false;
 	bool                                capture_specialization_reads = false;
@@ -614,6 +616,7 @@ struct ResourcePlan {
 	bool                                resource_tracking_complete = false;
 	ShaderInfo                          info;
 	UniformFillPlan                     uniform_fill;
+	UniformCopy                         uniform_copy;
 	// GPU-thread scratch for nested clean/EXEC memos, activity and material keys.
 	mutable std::deque<EvaluationContext> evaluation_contexts;
 	mutable uint32_t                       evaluation_value_count = 0;
@@ -622,6 +625,26 @@ struct ResourcePlan {
 	mutable std::vector<uint8_t>            visited_blocks;
 	mutable std::vector<uint32_t>           pending_blocks;
 	mutable std::vector<uint32_t>           material_keys;
+	// Dense evaluation index of each srt_reads[slot].value, filled on first batched refresh.
+	mutable std::vector<uint32_t>           srt_evaluation_indices;
+	// When every SRT read is a raw dword load from a user-data pointer pair plus an immediate
+	// offset, RefreshFlatBuffer computes the addresses directly instead of walking the IR.
+	struct DirectSrtRead {
+		uint32_t low_register     = 0; // user-data index of the pointer's low half
+		uint32_t high_register    = 0;
+		int64_t  relative         = 0; // dword-aligned immediate offset, as RawReadAddress applies it
+		uint32_t evaluation_index = 0;
+		uint32_t run              = 1; // contiguous slots starting here (0 inside a run)
+		bool     clean            = false;
+	};
+	enum class DirectSrtState : uint8_t { Unknown, Direct, Unsupported };
+	mutable DirectSrtState             direct_srt_state = DirectSrtState::Unknown;
+	mutable std::vector<DirectSrtRead> direct_srt_reads;
+	// Per descriptor source, 8 entries: the flat offset a dword copies (ReadConst of one slot),
+	// or -1 when the dword needs the IR walk. Built with direct_srt_reads.
+	mutable std::vector<int32_t>       direct_descriptor_offsets;
+	// Flat slots a direct refresh filled (plans with control flow skip unreached blocks).
+	mutable std::vector<uint8_t>       direct_filled;
 	// Linearized SRT read expressions (KYTY_SRT_TAPE=1). Built lazily on the GPU thread,
 	// one per variant: [0] = no clean evaluator, [1] = with clean evaluator. Ops are in the
 	// exact order the recursive walker would evaluate them, so captured reads and failure

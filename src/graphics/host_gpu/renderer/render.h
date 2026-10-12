@@ -316,6 +316,7 @@ private:
 		vk::Format                          pixel_format      = vk::Format::eUndefined;
 		vk::Format                          view_format       = vk::Format::eUndefined;
 		uint64_t                            size              = 0;
+		ImageId                             last_image {}; // ImageLookupHint: exact image of the last lookup
 	};
 	std::vector<TextureDescMemo> m_texture_desc_memo = std::vector<TextureDescMemo>(1024);
 	// KYTY_DRAWPREP_DELTA: per-program (keyed by the stage's ResourceSnapshot address) memo of the last
@@ -349,6 +350,21 @@ private:
 	std::vector<vk::DescriptorBufferInfo> m_descriptor_buffers;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
+	// KYTY_SKIP_REDUNDANT_BINDS: last push-descriptor/push-constant contents per bind point
+	// (0 graphics, 1 compute) within the current command buffer.
+	struct RedundantBindState {
+		uint64_t              tick   = UINT64_MAX;
+		uint64_t              epoch  = UINT64_MAX;
+		vk::CommandBuffer     buffer = nullptr;
+		vk::PipelineLayout    layout = nullptr;
+		std::vector<uint64_t> descriptors;
+		bool                  descriptors_valid = false;
+		std::vector<uint32_t> push;
+		vk::ShaderStageFlags  push_stages {};
+		bool                  push_valid = false;
+	};
+	RedundantBindState    m_redundant[2];
+	std::vector<uint64_t> m_descriptor_key;
 	std::vector<uint32_t>                 m_image_occurrences;
 
 	friend class CommandProcessor;

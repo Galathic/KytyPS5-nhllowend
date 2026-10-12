@@ -6,7 +6,9 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
+#include "common/experiments.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/renderer/bindEpoch.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -941,6 +943,32 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 				}
 			}
 		}
+	}
+	return TryReadBacking(vaddr, data, size);
+}
+
+bool TryReadCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
+	if (g_gpu_resources == nullptr || !Graphics::GuestGpu::IsGpuThread() ||
+	    GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size)) {
+		return false;
+	}
+	// Each served read costs a fault. A page read over and over (a command stream, a table walk)
+	// is cheaper to download once, which also unprotects it, so cap the reads per page per
+	// ~4096 draws and dispatches.
+	struct PageReads {
+		uint64_t page  = 0;
+		uint64_t epoch = 0;
+		uint32_t count = 0;
+	};
+	static std::array<PageReads, 256> recent {};
+	const uint64_t page  = vaddr >> 12u;
+	const uint64_t epoch = (Graphics::WorkEpoch() >> 12u) + 1u;
+	auto&          slot  = recent[page & (recent.size() - 1u)];
+	if (slot.page != page || slot.epoch != epoch) {
+		slot = {page, epoch, 0};
+	}
+	if (++slot.count > 64u) {
+		return false;
 	}
 	return TryReadBacking(vaddr, data, size);
 }

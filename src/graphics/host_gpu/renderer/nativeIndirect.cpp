@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/nativeIndirect.h"
+#include "graphics/host_gpu/renderer/bindEpoch.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
@@ -29,22 +30,6 @@ NativeIndirectPrep::NativeIndirectPrep(GraphicContext& graphics): m_graphics(gra
 NativeIndirectPrep::~NativeIndirectPrep() {
  m_graphics.device.destroyPipeline(m_pipeline, nullptr);
  m_graphics.device.destroyPipelineLayout(m_layout, nullptr);
-}
-void NativeIndirectPrep::Record(CommandBuffer& buffer, const NativeIndirectDraw& source) {
- const auto command = buffer.Handle();
- vk::MemoryBarrier ready {};
- ready.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
- ready.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
- command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eComputeShader,
-                         {}, 1, &ready, 0, nullptr, 0, nullptr);
- struct Params { uint64_t address; uint32_t stride, maximum, limit, reserved; };
- static_assert(sizeof(Params) == 24);
- const Params params {source.snapshot->BufferDeviceAddress(), source.stride / 4,
-                      source.max_count, source.index_count_limit, 0};
- Libs::Graphics::g_compute_pipeline_epoch.fetch_add(1, std::memory_order_relaxed);
- command.bindPipeline(vk::PipelineBindPoint::eCompute, m_pipeline);
- command.pushConstants(m_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(params), &params);
- command.dispatch((source.max_count + 63u) / 64u, 1, 1);
 }
 DispatchArgsGuard::DispatchArgsGuard(GraphicContext& graphics, CommandScheduler& scheduler)
     : m_graphics(graphics) {
@@ -105,9 +90,10 @@ std::pair<vk::Buffer, uint64_t> DispatchArgsGuard::Record(CommandBuffer& buffer,
                       m_trips->BufferDeviceAddress(), guest_address,
                       limits.maxComputeWorkGroupCount[0], limits.maxComputeWorkGroupCount[1],
                       limits.maxComputeWorkGroupCount[2], 0};
- // Binding another compute pipeline invalidates the elided-bind cache of the dispatch path.
+ // Binding another compute pipeline invalidates the elided-bind caches of the dispatch path.
  Libs::Graphics::g_compute_pipeline_epoch.fetch_add(1, std::memory_order_relaxed);
  command.bindPipeline(vk::PipelineBindPoint::eCompute, m_pipeline);
+ InvalidateRedundantBinds();
  command.pushConstants(m_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(params), &params);
  command.dispatch(1, 1, 1);
  vk::MemoryBarrier guarded {};
@@ -116,5 +102,22 @@ std::pair<vk::Buffer, uint64_t> DispatchArgsGuard::Record(CommandBuffer& buffer,
  command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eDrawIndirect,
                          {}, 1, &guarded, 0, nullptr, 0, nullptr);
  return {m_ring->Handle(), slot};
+}
+void NativeIndirectPrep::Record(CommandBuffer& buffer, const NativeIndirectDraw& source) {
+ const auto command = buffer.Handle();
+ vk::MemoryBarrier ready {};
+ ready.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+ ready.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+ command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eComputeShader,
+                         {}, 1, &ready, 0, nullptr, 0, nullptr);
+ struct Params { uint64_t address; uint32_t stride, maximum, limit, reserved; };
+ static_assert(sizeof(Params) == 24);
+ const Params params {source.snapshot->BufferDeviceAddress(), source.stride / 4,
+                      source.max_count, source.index_count_limit, 0};
+ Libs::Graphics::g_compute_pipeline_epoch.fetch_add(1, std::memory_order_relaxed);
+ command.bindPipeline(vk::PipelineBindPoint::eCompute, m_pipeline);
+ InvalidateRedundantBinds();
+ command.pushConstants(m_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(params), &params);
+ command.dispatch((source.max_count + 63u) / 64u, 1, 1);
 }
 }

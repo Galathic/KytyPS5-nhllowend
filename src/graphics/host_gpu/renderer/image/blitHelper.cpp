@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
+#include "graphics/host_gpu/renderer/bindEpoch.h"
 
 #include "common/assert.h"
 #include "gpu_blit_shaders/gpu_blit_color_to_ms_depth_spv.h"
@@ -177,6 +178,7 @@ void BlitHelper::ReinterpretColorAsMsDepth(Image& source, Image& destination) {
 	descriptor_write.descriptorCount = 1;
 	descriptor_write.descriptorType  = vk::DescriptorType::eSampledImage;
 	descriptor_write.pImageInfo      = &descriptor_image;
+	InvalidateRedundantBinds();
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, m_pipeline_layout, 0, 1,
 	                             &descriptor_write);
 	Libs::Graphics::g_graphics_pipeline_epoch.fetch_add(1, std::memory_order_relaxed);

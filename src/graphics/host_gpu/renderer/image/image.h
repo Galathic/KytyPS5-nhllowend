@@ -9,6 +9,7 @@
 
 #include <compare>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <span>
 #include <utility>
@@ -53,6 +54,19 @@ public:
 	KYTY_CLASS_NO_COPY(Image);
 
 	[[nodiscard]] vk::ImageView FindView(const ImageViewInfo& view_info);
+
+	// Hosts may refuse storage usage for some block formats (AMD: BC5, BC6H), so a shader
+	// cannot write such an image through an uncompressed view. Those writes go to an
+	// uncompressed shadow image with one texel per block instead.
+	[[nodiscard]] bool NeedsStorageShadow() const noexcept {
+		return info.IsBlock() && backing.image != nullptr &&
+		       !(backing.usage & vk::ImageUsageFlagBits::eStorage);
+	}
+	// Copies the view's subresources (a single mip level) into the shadow and returns a storage
+	// view of them.
+	[[nodiscard]] vk::ImageView PrepareShadowStorage(const ImageViewInfo& view_info);
+	// Copies shadow subresources prepared since the last flush back into the block image.
+	void FlushShadowStorage();
 	using Barriers = std::vector<vk::ImageMemoryBarrier2>;
 	[[nodiscard]] Barriers GetBarriers(vk::ImageLayout                      destination_layout,
 	                                   vk::AccessFlags2                     destination_access,
@@ -163,6 +177,23 @@ private:
 	[[nodiscard]] static std::pair<uint32_t, uint32_t>
 	SanitizeCopyLayers(const Image& source, const Image& destination, uint32_t depth);
 
+	// One uncompressed image per block mip level (one texel per block): a single mip chain
+	// derived from the level-0 block count does not match the block counts of smaller levels.
+	struct ShadowLevel {
+		VulkanImage                  image;
+		std::vector<CachedImageView> views;
+		bool                         initialized = false;
+	};
+	struct StorageShadow {
+		std::vector<std::unique_ptr<ShadowLevel>> levels;
+		std::vector<ImageSubresourceRange>        pending;
+	};
+	ShadowLevel& ShadowLevelAt(uint32_t level);
+	void ShadowBarrier(ShadowLevel& shadow, vk::CommandBuffer command,
+	                   vk::PipelineStageFlags2 destination_stage, vk::AccessFlags2 destination_access);
+	void CopyStorageShadow(const ImageSubresourceRange& range, bool to_shadow,
+	                       vk::CommandBuffer command);
+
 	GraphicContext&   m_graphics;
 	CommandScheduler& m_scheduler;
 	uint64_t          m_maybe_cpu_hash   = 0;
@@ -171,6 +202,7 @@ private:
 	bool              m_maybe_hash_valid = false;
 	bool              m_gpu_modified     = false;
 	bool              m_buffer_modified  = false;
+	std::unique_ptr<StorageShadow> m_shadow;
 };
 
 namespace ImageOps {

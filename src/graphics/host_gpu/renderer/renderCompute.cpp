@@ -1,9 +1,11 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
+#include "common/experiments.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/runtimeFlags.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -11,6 +13,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/bindEpoch.h"
 #include "graphics/host_gpu/renderer/depthAliasLog.h"
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/host_gpu/renderer/frameDump.h"
@@ -27,13 +30,16 @@
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/shader.h"
 #include "kernel/eventQueue.h"
+#include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <tuple>
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -129,6 +135,59 @@ bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t grou
 	resolved_descriptor = descriptor;
 	resolved_clear      = fill.value;
 	resolved_size       = size;
+	return true;
+}
+
+// KYTY_CPU_COPY_FORWARD=1: a proven dst[i] = src[i] copy dispatch (UniformCopy) over contiguous,
+// in-bounds, disjoint ranges. The dispatch still runs on the GPU; the emulator also copies the
+// bytes in guest memory so CPU readers of the destination need no GPU readback.
+static bool CpuCopyForwardEnabled() {
+	return Common::Experiments::Enabled(Common::Experiments::CpuCopyForward);
+}
+
+static bool ResolveComputeBufferCopy(const ShaderComputeInputInfo& input, uint32_t group_x,
+                                     uint32_t group_y, uint32_t group_z, uint32_t mode,
+                                     uint64_t& source, uint64_t& destination, uint64_t& size) {
+	const auto& resources = *input.stage.resources;
+	const auto& copy      = resources.uniform_copy;
+	if (!copy.valid || copy.words == 0 || copy.words > 4 ||
+	    copy.source >= resources.buffers.size() || copy.destination >= resources.buffers.size()) {
+		return false;
+	}
+	const uint32_t element = copy.words * sizeof(uint32_t);
+	const auto     src = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[copy.source]);
+	const auto     dst =
+	    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[copy.destination]);
+	for (const auto* d: {&src, &dst}) {
+		if (d->Stride() != element || d->SwizzleEnabled() || d->IndexStride() != 0 || d->AddTid() ||
+		    d->Base48() == 0) {
+			return false;
+		}
+	}
+	if (input.threads_num[0] == 0 || input.threads_num[0] != copy.group_stride ||
+	    input.threads_num[1] != 1 || input.threads_num[2] != 1 || group_x == 0 || group_y != 1 ||
+	    group_z != 1 || mode != (input.dispatch_thread_dimensions ? 0x61u : 0x41u)) {
+		return false;
+	}
+	const uint64_t invocations = input.dispatch_thread_dimensions
+	                                 ? group_x
+	                                 : static_cast<uint64_t>(group_x) * input.threads_num[0];
+	if (input.dispatch_thread_dimensions &&
+	    (group_x % input.threads_num[0] != 0 || input.dispatch_threads_num[0] != group_x ||
+	     input.dispatch_threads_num[1] != 1 || input.dispatch_threads_num[2] != 1)) {
+		return false;
+	}
+	// Every invocation must be in bounds for both buffers, so each one copies exactly one element.
+	if (invocations == 0 || invocations > src.NumRecords() || invocations > dst.NumRecords()) {
+		return false;
+	}
+	size        = invocations * element;
+	source      = src.Base48();
+	destination = dst.Base48();
+	if (size > (uint64_t {256} << 20u) ||
+	    !(source + size <= destination || destination + size <= source)) {
+		return false;
+	}
 	return true;
 }
 
@@ -294,6 +353,7 @@ static bool ShouldBindComputePipeline(RenderContext& context, vk::CommandBuffer 
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode) {
+	BufferCache::PerfTimerScope phase_timer(BufferCache::PerfTimer::Dispatch);
 	EXIT_IF(buffer.IsInvalid());
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ctx    = buffer.GetRegisters();
@@ -363,10 +423,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			input_info.workgroup_counts[axis] = threads / size + (threads % size != 0u);
 		}
 	}
+	BufferCache::PerfTimerScope program_timer(BufferCache::PerfTimer::DispatchProgram);
 	const auto compute_program = [&] {
 		FrameBreakdown::Timer materialize_timer(FrameBreakdown::g_counters.dc_materialize_ns);
 		return m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
 	}();
+	program_timer.Stop();
 	if (!compute_program) {
 		// NHL debugging: the shader failed to build (KYTY_DBG_SKIP_BAD_SHADERS=1); skip the dispatch.
 		ResetBindings();
@@ -399,6 +461,14 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		                             mode, fill_descriptor, known_fill_value, known_fill_size)) {
 			known_fill_address = fill_descriptor.Base48();
 		}
+	}
+	uint64_t copy_source      = 0;
+	uint64_t copy_destination = 0;
+	uint64_t copy_size        = 0;
+	if (CpuCopyForwardEnabled() && resources.specialization_reads.empty() &&
+	    !ResolveComputeBufferCopy(input_info, thread_group_x, thread_group_y, thread_group_z, mode,
+	                              copy_source, copy_destination, copy_size)) {
+		copy_size = 0;
 	}
 
 	if (use_thread_dimensions) {
@@ -494,20 +564,13 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		                           ShaderRecompiler::IR::ImageResourceClass::Storage;
 	                }) ||
 	    has_storage_writes;
-	// KYTY_GUEST_SYNC: the automatic barriers around each dispatch are dropped; the guest's own
-	// partial-flush / release-mem / acquire-mem packets (EmitGlobalBarrier) order the work instead.
-	const bool guest_sync = Common::RuntimeFlags::Current().guest_sync;
-	g_work_epoch.fetch_add(1, std::memory_order_relaxed);
-	if (has_storage_writes) {
-		if (guest_sync) {
-			FrameBreakdown::Add(FrameBreakdown::g_counters.port_auto_barriers_skipped);
-		} else {
-			// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
-			// while allowing the queue to execute asynchronously.
-			FrameBreakdown::Timer barrier_timer(FrameBreakdown::g_counters.dc_barrier_ns);
-			ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
-			FrameBreakdown::Add(FrameBreakdown::g_counters.port_auto_barriers);
-		}
+	BufferCache::PerfCount(BufferCache::PerfEvent::Dispatch);
+	NoteShaderWork();
+	if (has_storage_writes && !BufferCache::GuestSyncOnly()) {
+		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
+		// while allowing the queue to execute asynchronously.
+		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		BufferCache::PerfCount(BufferCache::PerfEvent::AutoDispatchBarrier);
 	}
 	if (Config::GraphicsDebugDumpEnabled()) {
 		const auto sampled_images = std::count_if(
@@ -641,15 +704,13 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	FrameBreakdown::Add(FrameBreakdown::g_counters.dc_handled);
 	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 	BreadcrumbEnd(m_context.GetGraphics(), vk_buffer, crumb);
+	m_context.GetTextureCache().FlushStorageShadows();
 	record_timer.Stop();
 
 	// The removed host fence also ordered read-only dispatches before later writers.
-	if (guest_sync) {
-		FrameBreakdown::Add(FrameBreakdown::g_counters.port_auto_barriers_skipped);
-	} else {
-		FrameBreakdown::Timer barrier_timer(FrameBreakdown::g_counters.dc_barrier_ns);
+	if (!BufferCache::GuestSyncOnly()) {
 		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
-		FrameBreakdown::Add(FrameBreakdown::g_counters.port_auto_barriers);
+		BufferCache::PerfCount(BufferCache::PerfEvent::AutoDispatchBarrier);
 	}
 	if (FrameDump::TraceEnabled()) {
 		for (size_t i = 0; i < bindings.images.size() && i < program.info.images.size(); i++) {
@@ -682,6 +743,28 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		m_context.GetBufferCache().RecordGpuFill(known_fill_address, known_fill_size,
 		                                         known_fill_value);
 	}
+	if (copy_size != 0) {
+		auto& cache = m_context.GetBufferCache();
+		// Only when the source bytes in guest memory are what the GPU reads: no pending GPU
+		// writes to the source. Its CPU writes were uploaded when the source was bound above.
+		if (!cache.HasGpuDirtyBytes(copy_source, copy_size)) {
+			std::vector<uint8_t> bytes(static_cast<size_t>(copy_size));
+			if (LibKernel::Memory::TryReadBacking(copy_source, bytes.data(), bytes.size())) {
+				LibKernel::Memory::WriteBacking(copy_destination, bytes.data(), bytes.size());
+				cache.ForgetGpuWrite(copy_destination, copy_size);
+				static std::atomic<uint64_t> forwarded {0};
+				const auto n = forwarded.fetch_add(1, std::memory_order_relaxed) + 1;
+				if (n <= 4 || n % 5000 == 0) {
+					std::printf("NHL27COPY: forwarded #%llu cs=%016llx 0x%llx -> 0x%llx (%llu bytes)\n",
+					            static_cast<unsigned long long>(n),
+					            static_cast<unsigned long long>(program.shader_hash),
+					            static_cast<unsigned long long>(copy_source),
+					            static_cast<unsigned long long>(copy_destination),
+					            static_cast<unsigned long long>(copy_size));
+				}
+			}
+		}
+	}
 	if (gds_trace_now) {
 		uint32_t gds_after[4] {};
 		m_context.GetCommandScheduler().Wait(m_context.GetCommandScheduler().CurrentTick());
@@ -700,6 +783,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
                                       uint64_t args_addr, uint32_t mode) {
 	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0 ||
 	        (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0);
+	BufferCache::PerfTimerScope phase_timer(BufferCache::PerfTimer::Dispatch);
 	m_context.GetCommandScheduler().PopPendingOperations();
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchIndirect), submit_id,
 	                    static_cast<uint32_t>(args_addr), static_cast<uint32_t>(args_addr >> 32u),
@@ -711,11 +795,13 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 	ShaderComputeInputInfo input_info {};
+	BufferCache::PerfTimerScope program_timer(BufferCache::PerfTimer::DispatchProgram);
 	const auto compute_program = [&] {
 		FrameBreakdown::Timer materialize_timer(FrameBreakdown::g_counters.dc_materialize_ns);
 		return m_context.GetPipelineCache().GetComputeProgram(
 		    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
 	}();
+	program_timer.Stop();
 	if (!compute_program) {
 		// NHL debugging: the shader failed to build (KYTY_DBG_SKIP_BAD_SHADERS=1); skip the dispatch.
 		ResetBindings();
@@ -751,20 +837,17 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
-	// KYTY_DISPATCH_ARGS_GUARD: read the group counts through a GPU pass that zeroes counts above the
-	// device limits (they never complete and lose the device). Recorded before the bindings are committed,
-	// since it binds its own compute pipeline and push constants.
-	const auto port_flags = Common::RuntimeFlags::Current();
+	// KYTY_DISPATCH_ARGS_GUARD (runtime flag, default on; =0 disables) is the GPU-side check of the group counts.
+	const bool guard_args = Common::RuntimeFlags::Current().dispatch_args_guard;
 	vk::Buffer indirect_buffer = args_buffer->Handle();
 	uint64_t   indirect_offset = args_offset;
-	if (port_flags.dispatch_args_guard) {
+	if (guard_args) {
 		if (!m_dispatch_guard) {
 			m_dispatch_guard = std::make_shared<DispatchArgsGuard>(m_context.GetGraphics(),
 			                                                       m_context.GetCommandScheduler());
 		}
 		std::tie(indirect_buffer, indirect_offset) =
 		    m_dispatch_guard->Record(buffer, *args_buffer, args_offset, args_addr);
-		FrameBreakdown::Add(FrameBreakdown::g_counters.port_guard_dispatches);
 	}
 	RebindBuffers(bindings);
 	args_timer.Stop();
@@ -781,15 +864,11 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		                                ShaderRecompiler::IR::ImageResourceClass::Storage;
 	    });
 	FrameBreakdown::Timer barrier_timer(FrameBreakdown::g_counters.dc_barrier_ns);
-	const bool guest_sync = port_flags.guest_sync;
-	g_work_epoch.fetch_add(1, std::memory_order_relaxed);
-	if (has_storage_writes) {
-		if (guest_sync) {
-			FrameBreakdown::Add(FrameBreakdown::g_counters.port_auto_barriers_skipped);
-		} else {
-			ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
-			FrameBreakdown::Add(FrameBreakdown::g_counters.port_auto_barriers);
-		}
+	BufferCache::PerfCount(BufferCache::PerfEvent::Dispatch);
+	NoteShaderWork();
+	if (has_storage_writes && !BufferCache::GuestSyncOnly()) {
+		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		BufferCache::PerfCount(BufferCache::PerfEvent::AutoDispatchBarrier);
 	}
 	// Kept under KYTY_GUEST_SYNC: it makes earlier writes of the argument record visible to the
 	// indirect read, and the guest cannot be relied on to order the host-side argument staging.
@@ -813,15 +892,15 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	const auto crumb = BreadcrumbBegin(m_context.GetGraphics(), vk_buffer, "dispatch-indirect",
 	                                   program.shader_hash, args_addr);
 	FrameBreakdown::Add(FrameBreakdown::g_counters.dc_handled);
+	BreadcrumbCaptureArgs(vk_buffer, crumb, args_buffer->Handle(), args_offset,
+	                      sizeof(vk::DispatchIndirectCommand));
 	vk_buffer.dispatchIndirect(indirect_buffer, indirect_offset);
 	BreadcrumbEnd(m_context.GetGraphics(), vk_buffer, crumb);
+	m_context.GetTextureCache().FlushStorageShadows();
 	record_timer.Stop();
-	FrameBreakdown::Timer access_timer(FrameBreakdown::g_counters.dc_barrier_ns);
-	if (guest_sync) {
-		FrameBreakdown::Add(FrameBreakdown::g_counters.port_auto_barriers_skipped);
-	} else {
+	if (!BufferCache::GuestSyncOnly()) {
 		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
-		FrameBreakdown::Add(FrameBreakdown::g_counters.port_auto_barriers);
+		BufferCache::PerfCount(BufferCache::PerfEvent::AutoDispatchBarrier);
 	}
 	ResetBindings();
 }

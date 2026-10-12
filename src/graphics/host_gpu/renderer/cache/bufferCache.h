@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <array>
+#include <chrono>
 #include <map>
 #include <span>
 #include <utility>
@@ -60,11 +61,86 @@ public:
 	}
 	// Only used to attribute synchronous readbacks in the KYTY_PERF_STATS output.
 	enum class ReadCaller : uint8_t { Other, ColorClear, Fault };
-	enum class PerfEvent : uint8_t { ColorClearShadowHit, WaitRegMemBackingRead };
+	enum class PerfEvent : uint8_t {
+		ColorClearShadowHit,
+		WaitRegMemBackingRead,
+		Dispatch,
+		Draw,
+		AutoDispatchBarrier,
+		GuestBarrier,
+		AcquireMem,
+		RenderPassBegin,
+		Flip,
+		BarrierSkipped,
+		FalseShareRead,
+		Pm4ShadowPacket,
+		BufferCreate,
+		BufferUpload,
+		BufferDelete,
+		BufferGcDelete,
+		ImageInsert,
+		ImageGcFree,
+		ImageUpload,
+		Count
+	};
+	// KYTY_GUEST_SYNC (runtime flag, default on): compute dispatches rely on the guest's own partial-flush,
+	// cache and ACQUIRE_MEM packets for ordering instead of a full barrier around each dispatch.
+	[[nodiscard]] static bool GuestSyncOnly();
 	// KYTY_PERF_NO_SYNC_READBACK=1 enables the readback-avoidance paths (default: off).
 	[[nodiscard]] static bool PerfNoSyncReadback();
 	static void               PerfCount(PerfEvent event);
+	[[nodiscard]] static uint64_t PerfFlipCount();
+	// KYTY_PERF_STATS: device memory use the texture/buffer collectors last saw.
+	static void PerfSetMemoryUsage(uint64_t used, uint64_t texture_trigger, uint64_t buffer_trigger);
 	static void               PerfSetPm4Op(uint32_t opcode);
+	// KYTY_PERF_STATS: host time spent beginning command buffers, submitting them and waiting
+	// for the GPU on the GPU thread.
+	enum class PerfTimer : uint8_t {
+		CommandBegin,
+		Submit,
+		GpuWait,
+		// GPU-thread phases (inclusive): PM4 processing, then within it draw program lookup and
+		// resource materialization, render-target resolution, draw execution, whole dispatches
+		// and their program lookup.
+		Pm4,
+		DrawPrograms,
+		DrawTargets,
+		DrawExecute,
+		Dispatch,
+		DispatchProgram,
+		// Sections of draw execution.
+		DrawBindPrepare,
+		DrawBindResolve,
+		DrawVertex,
+		DrawPipeline,
+		DrawAttachments,
+		DrawCommit,
+		DrawRecord,
+		Count
+	};
+	[[nodiscard]] static bool PerfTimersEnabled();
+	static void               PerfAddTime(PerfTimer timer, uint64_t ns);
+	class PerfTimerScope {
+	public:
+		explicit PerfTimerScope(PerfTimer timer): m_timer(timer), m_active(PerfTimersEnabled()) {
+			if (m_active) m_start = std::chrono::steady_clock::now();
+		}
+		~PerfTimerScope() { Stop(); }
+		KYTY_CLASS_NO_COPY(PerfTimerScope);
+		void Stop() {
+			if (!m_active) return;
+			m_active = false;
+			PerfAddTime(m_timer, static_cast<uint64_t>(
+			                         std::chrono::duration_cast<std::chrono::nanoseconds>(
+			                             std::chrono::steady_clock::now() - m_start)
+			                             .count()));
+		}
+
+	private:
+		PerfTimer                             m_timer;
+		bool                                  m_active;
+		std::chrono::steady_clock::time_point m_start {};
+	};
 	// Labels the next GPU writes (KYTY_PERF_STATS fault diagnostics only).
 	void SetWriterTag(const char* kind, uint64_t hash) {
 		m_writer_kind = kind;
@@ -79,6 +155,9 @@ public:
 	// Drops GPU ownership of whole pages without a download. The caller must be about to
 	// overwrite the CPU backing of the range and mark it CPU-modified.
 	void DiscardGpuModified(uint64_t vaddr, uint64_t size);
+	// The bytes were published to guest memory by the CPU with the same values the GPU writes,
+	// so they no longer need a readback. Pages keep GPU ownership while other bytes on them do.
+	void ForgetGpuWrite(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
@@ -110,6 +189,8 @@ public:
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	// Changes whenever new GPU-dirty bytes are recorded (GPU thread).
+	[[nodiscard]] uint64_t GpuDirtyGeneration() const noexcept { return m_gpu_dirty_generation; }
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
@@ -172,6 +253,7 @@ private:
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
+	uint64_t                                          m_gpu_dirty_generation = 0;
 	MemoryTracker                                     m_memory_tracker;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;

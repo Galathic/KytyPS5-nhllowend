@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include "common/assert.h"
+#include "common/experiments.h"
 #include "common/runtimeFlags.h"
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -16,6 +17,7 @@
 #include <cstring>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -1097,6 +1099,16 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 			    slot.U32() >= m_program.srt_reads.size()) {
 				return false;
 			}
+			if (m_direct_flat != nullptr) {
+				// A direct refresh already fetched this word (and captured the read).
+				const auto offset = m_program.srt_reads[slot.U32()].flat_offset;
+				if (offset < m_direct_flat->size() &&
+				    (m_direct_filled == nullptr ||
+				     (offset < m_direct_filled->size() && (*m_direct_filled)[offset] != 0u))) {
+					result = (*m_direct_flat)[offset];
+					return true;
+				}
+			}
 			if (slot.U32() < m_clean_flat_slots.size() &&
 			    m_clean_flat_slots[slot.U32()] != 0u && m_clean_evaluator != nullptr) {
 				return m_clean_evaluator->EvaluateWide(m_program.srt_reads[slot.U32()].value,
@@ -1579,6 +1591,23 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 	const auto& descriptor = m_program.descriptor_sources[source];
 	result = {};
 	result.dword_count = descriptor.dword_count;
+	if (m_direct_flat != nullptr && m_program.direct_descriptor_offsets.size() >= (source + 1u) * 8u) {
+		const int32_t* direct = m_program.direct_descriptor_offsets.data() + source * 8u;
+		for (uint32_t index = 0; index < descriptor.dword_count; ++index) {
+			if (index < 8u && direct[index] >= 0 &&
+			    static_cast<size_t>(direct[index]) < m_direct_flat->size() &&
+			    (m_direct_filled == nullptr ||
+			     (static_cast<size_t>(direct[index]) < m_direct_filled->size() &&
+			      (*m_direct_filled)[static_cast<size_t>(direct[index])] != 0u))) {
+				result.dwords[index] = (*m_direct_flat)[static_cast<size_t>(direct[index])];
+				continue;
+			}
+			if (!Evaluate(descriptor.dwords[index], result.dwords[index])) {
+				return false;
+			}
+		}
+		return true;
+	}
 	if (source < m_program.descriptor_gathers.size()) {
 		const auto& gather = m_program.descriptor_gathers[source];
 		const auto* flat = m_context.refreshed_flat;
@@ -1921,6 +1950,289 @@ bool SrtWalker::VerifyCfgRefresh(std::vector<uint32_t>& flat) {
 	return tape_ok;
 }
 
+namespace {
+
+std::atomic<int> g_direct_srt_override {-1};
+
+bool DirectSrtReadsEnabled() {
+	const int forced = g_direct_srt_override.load(std::memory_order_relaxed);
+	return forced >= 0 ? forced != 0 : Common::Experiments::Enabled(Common::Experiments::DirectSrtReads);
+}
+
+// Decides once per plan whether every SRT read is LoadAddressU32(GetAddressResource(
+// GetUserData(lo), GetUserData(hi)), imm, ...) on a scalar address, and records its operands.
+// KYTY_DBG_DIRECT_SRT=1: why plans fall back to the interpreter and how often they refresh.
+bool DirectSrtDebug() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DBG_DIRECT_SRT");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+std::string DirectShape(Value value, int depth) {
+	value = value.Resolve();
+	if (value.IsImmediate()) return "imm";
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr) return "?";
+	std::string result(ValueOpcodeName(inst->GetOpcode()));
+	if (inst->GetOpcode() == ValueOpcode::ReadConst || inst->GetOpcode() == ValueOpcode::GetUserData)
+		return result;
+	if (depth >= 3) return result + "(...)";
+	result += "(";
+	for (size_t i = 0; i < inst->NumArgs(); ++i) {
+		if (i != 0) result += ",";
+		result += DirectShape(inst->Arg(i), depth + 1);
+	}
+	return result + ")";
+}
+
+struct DirectDebugState {
+	std::mutex                                      lock;
+	std::unordered_map<const ResourcePlan*, std::string> reasons;
+	std::unordered_map<const ResourcePlan*, uint64_t>    refreshes;
+	uint64_t                                        counts[3] {};
+};
+
+DirectDebugState& DirectDebug() {
+	static DirectDebugState state;
+	return state;
+}
+
+bool RejectDirect(const ResourcePlan& program, const char* reason, Value value) {
+	if (DirectSrtDebug()) {
+		auto&            state = DirectDebug();
+		std::scoped_lock lock {state.lock};
+		state.reasons[&program] = std::string(reason) + " reads=" + std::to_string(program.srt_reads.size()) +
+		                          " cf=" + std::to_string(program.control_flow.size()) + " " +
+		                          DirectShape(value, 0).substr(0, 200);
+	}
+	return false;
+}
+
+// kind: 0 direct without control flow, 1 direct with control flow, 2 interpreter.
+void CountDirectRefresh(const ResourcePlan& program, int kind) {
+	auto&            state = DirectDebug();
+	std::scoped_lock lock {state.lock};
+	++state.counts[kind];
+	if (kind == 2) ++state.refreshes[&program];
+	const auto total = state.counts[0] + state.counts[1] + state.counts[2];
+	if (total % 50000u != 0u) return;
+	std::printf("NHL27SRT: refreshes direct=%llu direct_cf=%llu interpreted=%llu\n",
+	            static_cast<unsigned long long>(state.counts[0]),
+	            static_cast<unsigned long long>(state.counts[1]),
+	            static_cast<unsigned long long>(state.counts[2]));
+	std::vector<std::pair<uint64_t, const ResourcePlan*>> hot;
+	for (const auto& [plan, count]: state.refreshes) hot.emplace_back(count, plan);
+	std::sort(hot.rbegin(), hot.rend());
+	for (size_t i = 0; i < hot.size() && i < 10; ++i) {
+		const auto reason = state.reasons.find(hot[i].second);
+		std::printf("NHL27SRT:   %llu %s\n", static_cast<unsigned long long>(hot[i].first),
+		            reason != state.reasons.end() ? reason->second.c_str() : "(no reason)");
+	}
+	std::fflush(stdout);
+}
+
+bool BuildDirectSrtReads(const ResourcePlan& program, std::span<const uint8_t> clean_flat_slots) {
+	auto& direct = program.direct_srt_reads;
+	direct.clear();
+	direct.reserve(program.srt_reads.size());
+	const auto user_data_index = [&](Value value, uint32_t& index) {
+		value = value.Resolve();
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr || inst->GetOpcode() != ValueOpcode::GetUserData) return false;
+		const auto reg = RegIndex(inst->Arg(0).ScalarRegister());
+		if (reg < program.user_data_base) return false;
+		index = reg - program.user_data_base;
+		return true;
+	};
+	for (const auto& read: program.srt_reads) {
+		const auto value = read.value.Resolve();
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr || inst->GetOpcode() != ValueOpcode::LoadAddressU32) {
+			return RejectDirect(program, "not-load", value);
+		}
+		if (!IsRawRead(program, *inst)) return RejectDirect(program, "not-raw", value);
+		if (read.flat_offset >= program.srt_reads.size()) return RejectDirect(program, "flat", value);
+		const auto* handle = inst->Arg(0).Resolve().TryInstruction();
+		if (handle == nullptr || handle->GetOpcode() != ValueOpcode::GetAddressResource ||
+		    handle->NumArgs() < 2) {
+			return RejectDirect(program, "handle", value);
+		}
+		ResourcePlan::DirectSrtRead entry;
+		if (!user_data_index(handle->Arg(0), entry.low_register) ||
+		    !user_data_index(handle->Arg(1), entry.high_register)) {
+			return RejectDirect(program, "base", value);
+		}
+		const auto offset = inst->Arg(1).Resolve();
+		if (!offset.IsImmediate() || offset.GetType() != Type::U32) {
+			return RejectDirect(program, "offset", value);
+		}
+		const auto& mem       = program.memory_info[inst->Flags<MemoryFlags>().index];
+		const auto  immediate = static_cast<int64_t>(static_cast<int32_t>(mem.offset));
+		entry.relative = (immediate & ~int64_t {3}) + static_cast<int64_t>(offset.U32() & ~3u);
+		entry.evaluation_index = inst->EvaluationIndex(program.evaluation_value_count);
+		entry.clean = read.flat_offset < clean_flat_slots.size() && clean_flat_slots[read.flat_offset] != 0u;
+		direct.push_back(entry);
+	}
+	auto& offsets = program.direct_descriptor_offsets;
+	offsets.assign(program.descriptor_sources.size() * 8u, -1);
+	for (size_t source = 0; source < program.descriptor_sources.size(); ++source) {
+		const auto& descriptor = program.descriptor_sources[source];
+		for (uint32_t i = 0; i < descriptor.dword_count && i < 8u; ++i) {
+			const auto* inst = descriptor.dwords[i].Resolve().TryInstruction();
+			if (inst == nullptr || inst->GetOpcode() != ValueOpcode::ReadConst) continue;
+			const auto slot = inst->Arg(1).Resolve();
+			if (!slot.IsImmediate() || slot.GetType() != Type::U32 ||
+			    slot.U32() >= program.srt_reads.size())
+				continue;
+			offsets[source * 8u + i] = static_cast<int32_t>(program.srt_reads[slot.U32()].flat_offset);
+		}
+	}
+	// Group contiguous dwords read through the same pointer into runs (one reader call each).
+	for (size_t head = 0; head < direct.size();) {
+		size_t next = head + 1;
+		while (next < direct.size() && next - head < 256 &&
+		       direct[next].clean == direct[head].clean &&
+		       direct[next].low_register == direct[head].low_register &&
+		       direct[next].high_register == direct[head].high_register &&
+		       direct[next].relative == direct[next - 1].relative + 4 &&
+		       program.srt_reads[next].flat_offset == program.srt_reads[next - 1].flat_offset + 1) {
+			direct[next].run = 0;
+			++next;
+		}
+		direct[head].run = static_cast<uint32_t>(next - head);
+		head = next;
+	}
+	return true;
+}
+
+} // namespace
+
+void SetDirectSrtReadsOverride(int value) {
+	g_direct_srt_override.store(value, std::memory_order_relaxed);
+}
+
+bool SrtWalker::DirectReadRun(uint32_t slot, uint32_t count, std::vector<uint32_t>& flat) {
+	const auto& direct = m_program.direct_srt_reads;
+	if (count == 0 || slot >= direct.size() || count > direct.size() - slot) return false;
+	const auto& head = direct[slot];
+	if (head.clean && (m_clean_evaluator == nullptr || m_runtime.read_specialization_memory == nullptr))
+		return false;
+	auto&       evaluator = head.clean ? *m_clean_evaluator : *this;
+	const auto& user_data = evaluator.m_runtime.user_data;
+	if (head.low_register >= user_data.size() || head.high_register >= user_data.size()) return false;
+	const auto base = ((static_cast<uint64_t>(user_data[head.high_register]) << 32u) |
+	                   user_data[head.low_register]) &
+	                  AddressMask;
+	uint64_t   address = 0;
+	const auto bytes   = static_cast<uint64_t>(count) * 4u;
+	if (!AddSignedAddress(base & ~uint64_t {3}, head.relative, address) || address > AddressMask ||
+	    bytes - 1 > AddressMask - address) {
+		return false;
+	}
+	const auto first = m_program.srt_reads[slot].flat_offset;
+	if (first > flat.size() || count > flat.size() - first) return false;
+	const auto words = std::span(flat).subspan(first, count);
+	if (evaluator.m_runtime.read_memory != nullptr) {
+		if (!evaluator.m_runtime.read_memory(evaluator.m_runtime.userdata, address, words)) return false;
+	} else {
+		std::memcpy(words.data(), reinterpret_cast<const void*>(address), words.size_bytes());
+	}
+	// Descriptor and condition expressions refer back to these reads through the memo.
+	auto& values = evaluator.m_context.values;
+	if (values.size() < m_program.evaluation_value_count) values.resize(m_program.evaluation_value_count);
+	for (uint32_t i = 0; i < count; ++i) {
+		values[direct[slot + i].evaluation_index] = {words[i], evaluator.m_context.generation};
+	}
+	return true;
+}
+
+void SrtWalker::ShareDirectFlat(const std::vector<uint32_t>& flat, const std::vector<uint8_t>* filled) {
+	// Experiment CleanFromDirect: branch conditions, uniform fills and written descriptors are
+	// evaluated strictly; their resource-table words need not be read a second time.
+	if (m_clean_evaluator == nullptr || !Common::Experiments::Enabled(Common::Experiments::CleanFromDirect)) {
+		return;
+	}
+	m_clean_evaluator->m_direct_flat   = &flat;
+	m_clean_evaluator->m_direct_filled = filled;
+}
+
+bool SrtWalker::RefreshDirectFlat(std::vector<uint32_t>& flat) {
+	const auto& direct = m_program.direct_srt_reads;
+	flat.resize(m_program.srt_reads.size());
+	for (size_t slot = 0; slot < direct.size();) {
+		// Without batching every slot is its own read, as in the scalar walk.
+		const uint32_t count = m_runtime.batch_reads ? direct[slot].run : 1u;
+		if (!DirectReadRun(static_cast<uint32_t>(slot), count, flat)) return false;
+		slot += count;
+	}
+	m_direct_flat   = &flat;
+	m_direct_filled = nullptr;
+	ShareDirectFlat(flat, nullptr);
+	return true;
+}
+
+// Direct plans with control flow: the blocks reached from the entry read their slots directly;
+// branch conditions are evaluated as before (strictly, through the clean evaluator).
+bool SrtWalker::RefreshDirectControlFlow(std::vector<uint32_t>& flat) {
+	auto& active = m_program.active_sources;
+	flat.assign(m_program.srt_reads.size(), 0u);
+	{
+		m_program.direct_filled.assign(m_program.srt_reads.size(), 0u);
+		// Conditions below see the words of the blocks visited so far.
+		ShareDirectFlat(flat, &m_program.direct_filled);
+	}
+	active.assign(m_program.descriptor_sources.size(), 1u);
+	for (const auto& block: m_program.control_flow) {
+		for (const auto source: block.sources) active.at(source) = 0u;
+	}
+	auto& visited = m_program.visited_blocks;
+	auto& pending = m_program.pending_blocks;
+	visited.assign(m_program.control_flow.size(), 0u);
+	pending.clear();
+	pending.push_back(0u);
+	while (!pending.empty()) {
+		const auto index = pending.back();
+		pending.pop_back();
+		if (visited.at(index)) continue;
+		visited[index] = 1u;
+		const auto& block = m_program.control_flow[index];
+		for (const auto source: block.sources) active[source] = 1u;
+		for (size_t position = 0; position < block.srt_reads.size();) {
+			// Direct reads: extend the run while this block's next slot continues it.
+			const auto  slot  = block.srt_reads[position];
+			const auto& reads = m_program.direct_srt_reads;
+			if (slot >= reads.size()) return false;
+			uint32_t count = 1;
+			while (m_runtime.batch_reads && position + count < block.srt_reads.size() &&
+			       block.srt_reads[position + count] == slot + count && slot + count < reads.size() &&
+			       reads[slot + count].run == 0u && reads[slot + count].clean == reads[slot].clean) {
+				++count;
+			}
+			if (!DirectReadRun(slot, count, flat)) return false;
+			for (uint32_t i = 0; i < count; ++i) {
+				const auto offset = m_program.srt_reads[slot + i].flat_offset;
+				if (offset < m_program.direct_filled.size()) m_program.direct_filled[offset] = 1u;
+			}
+			position += count;
+		}
+		uint32_t condition = 0;
+		auto& predicate = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
+		if (!block.condition.IsEmpty() && m_runtime.read_specialization_memory != nullptr &&
+		    predicate.Evaluate(block.condition, condition)) {
+			pending.push_back(block.successors[condition != 0u ? 0u : 1u]);
+		} else {
+			pending.insert(pending.end(), block.successors.begin(), block.successors.end());
+		}
+	}
+	{
+		m_direct_flat   = &flat;
+		m_direct_filled = &m_program.direct_filled;
+	}
+	return true;
+}
+
 bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	SRT_PROF_SCOPE(SrtProf::Refresh);
 	// KYTY_PERF_STATS: one clock pair per call, split by how the refresh was served.
@@ -1958,6 +2270,22 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		m_clean_evaluator->m_served_cfg  = nullptr;
 	}
 	if (!m_program.srt_plan_complete) return false;
+	// Experiment DirectSrtReads: plans whose every SRT read is a dword load through a user-data
+	// pointer pair read their words directly (claude/nhl27-perf).
+	if (DirectSrtReadsEnabled() && m_active_mask.IsEmpty()) {
+		if (m_program.direct_srt_state == ResourcePlan::DirectSrtState::Unknown) {
+			m_program.direct_srt_state = BuildDirectSrtReads(m_program, m_clean_flat_slots)
+			                                 ? ResourcePlan::DirectSrtState::Direct
+			                                 : ResourcePlan::DirectSrtState::Unsupported;
+		}
+		const bool direct = m_program.direct_srt_state == ResourcePlan::DirectSrtState::Direct;
+		if (DirectSrtDebug()) {
+			CountDirectRefresh(m_program, !direct ? 2 : m_program.control_flow.empty() ? 0 : 1);
+		}
+		if (direct) {
+			return m_program.control_flow.empty() ? RefreshDirectFlat(flat) : RefreshDirectControlFlow(flat);
+		}
+	}
 	using TraceKind = ResourcePlan::CfgTrace::Kind;
 	struct TraceReset {
 		bool& recording;

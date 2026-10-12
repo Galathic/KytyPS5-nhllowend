@@ -12,8 +12,13 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -73,6 +78,62 @@ struct Binding {
 
 constexpr int              MOUSE_POLL_INTERVAL_MS = 33;
 constexpr uint64_t         CURSOR_IDLE_HIDE_MS    = 2000;
+
+// Opt-in test input, processed on the SDL thread alongside physical input.
+struct ScriptedInput {
+	struct Command { SDL_Keycode key; uint32_t duration; };
+	std::string path;
+	std::vector<Command> commands;
+	size_t next = 0;
+	SDL_Keycode pressed = SDLK_UNKNOWN;
+	uint64_t deadline = 0;
+	uint64_t poll_at = 0;
+} g_scripted_input;
+
+void PollScriptedInput() {
+	auto& input = g_scripted_input;
+	if (input.path.empty()) return;
+	const auto now = SDL_GetTicks();
+	if (now < input.deadline) return;
+	if (input.pressed != SDLK_UNKNOWN) {
+		HostInputKey(static_cast<int>(input.pressed), false);
+		input.pressed = SDLK_UNKNOWN;
+		input.deadline = now + 150;
+		return;
+	}
+	if (input.next == input.commands.size()) {
+		if (now < input.poll_at) return;
+		input.poll_at = now + 100;
+		std::ifstream file(input.path);
+		if (!file) return;
+		input.commands.clear();
+		input.next = 0;
+		std::string line;
+		while (input.commands.size() < 128 && std::getline(file, line)) {
+			std::istringstream fields(line);
+			std::string name;
+			int duration = 150;
+			if (!(fields >> name)) continue;
+			fields >> duration;
+			const auto key = name == "sleep" ? SDLK_UNKNOWN : SDL_GetKeyFromName(name.c_str());
+			if (name != "sleep" && key == SDLK_UNKNOWN) continue;
+			input.commands.push_back({key, static_cast<uint32_t>(std::clamp(duration, 1, 60000))});
+		}
+		file.close();
+		std::error_code error;
+		std::filesystem::remove(input.path, error);
+	}
+	if (input.next < input.commands.size()) {
+		const auto command = input.commands[input.next++];
+		input.deadline = now + command.duration;
+		if (command.key != SDLK_UNKNOWN) {
+			input.pressed = command.key;
+			std::printf("InputFile: press %s (%u ms)\n", SDL_GetKeyName(command.key), command.duration);
+			std::fflush(stdout);
+			HostInputKey(static_cast<int>(command.key), true);
+		}
+	}
+}
 constexpr std::string_view MOUSE_SENSITIVITY      = "MouseSensitivity=";
 
 struct MouseJoystickState {
@@ -403,6 +464,9 @@ bool IsCursorActivity(const SDL_Event& event) {
 
 void HostInputInit(SDL_Window* window) {
 	GetInputMap();
+	if (const auto* path = std::getenv("KYTY_INPUT_FILE"); path != nullptr) {
+		g_scripted_input.path = path;
+	}
 	g_mouse_window = window;
 	if (Config::HideCursorEnabled()) {
 		g_cursor_hide_at = SDL_GetTicks() + CURSOR_IDLE_HIDE_MS;
@@ -410,6 +474,10 @@ void HostInputInit(SDL_Window* window) {
 }
 
 void HostInputShutdown() {
+	if (g_scripted_input.pressed != SDLK_UNKNOWN) {
+		HostInputKey(static_cast<int>(g_scripted_input.pressed), false);
+	}
+	g_scripted_input = {};
 	if (g_mouse.enabled) {
 		SetRelativeMouseMode(false);
 		CenterMouseStick();
@@ -455,6 +523,10 @@ void HostInputToggleMouseToJoystick() {
 }
 
 bool HostInputWaitEvent(SDL_Event* event, int max_wait_ms) {
+	PollScriptedInput();
+	if (!g_scripted_input.path.empty()) {
+		max_wait_ms = std::min(max_wait_ms, 10);
+	}
 	int timeout = -1;
 	if (!g_mouse.enabled || SDL_GetKeyboardFocus() != g_mouse_window) {
 		g_mouse.next_poll = 0;

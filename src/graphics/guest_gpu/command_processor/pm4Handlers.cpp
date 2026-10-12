@@ -1316,10 +1316,10 @@ KYTY_CP_OP_PARSER(CpOpAcquireMem) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0055800 && cmd_id != 0xc0061050);
-	FrameBreakdown::Add(FrameBreakdown::g_counters.port_acquire_mem);
-	if (Common::RuntimeFlags::Current().guest_sync) {
-		// Without the automatic per-dispatch barriers, the guest's cache acquire is the point where
-		// earlier shader writes must become visible.
+	BufferCache::PerfCount(BufferCache::PerfEvent::AcquireMem);
+	if (BufferCache::GuestSyncOnly()) {
+		// Without the automatic per-dispatch barriers, the guest's cache acquire is the point
+		// where earlier shader writes must become visible.
 		cp.EmitGlobalBarrier();
 	}
 	return (cmd_id == 0xc0061050 ? 7 : 6);
@@ -1995,7 +1995,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	}
 	// Read the requested register bytes, rather than faulting on a GPU-owned page.
 	// The helper downloads actual overlapping GPU writes before exposing backing memory.
-	std::vector<uint32_t> backing_registers(indirect_num_dw * 2u);
+	// Reused per packet (GPU thread only): one allocation instead of one per packet.
+	static thread_local std::vector<uint32_t> backing_registers;
+	backing_registers.resize(indirect_num_dw * 2u);
 	if (LibKernel::Memory::TryReadBufferBacking(reinterpret_cast<uint64_t>(indirect_buffer),
 	                                          backing_registers.data(),
 	                                          backing_registers.size() * sizeof(uint32_t))) {
@@ -2080,7 +2082,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 
 	// Read the requested register bytes, rather than faulting on a GPU-owned page.
 	// The helper downloads actual overlapping GPU writes before exposing backing memory.
-	std::vector<uint32_t> backing_registers(indirect_num_dw * 2u);
+	// Reused per packet (GPU thread only): one allocation instead of one per packet.
+	static thread_local std::vector<uint32_t> backing_registers;
+	backing_registers.resize(indirect_num_dw * 2u);
 	if (LibKernel::Memory::TryReadBufferBacking(reinterpret_cast<uint64_t>(indirect_buffer),
 	                                          backing_registers.data(),
 	                                          backing_registers.size() * sizeof(uint32_t))) {
@@ -2154,7 +2158,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	}
 	// Read the requested register bytes, rather than faulting on a GPU-owned page.
 	// The helper downloads actual overlapping GPU writes before exposing backing memory.
-	std::vector<uint32_t> backing_registers(indirect_num_dw * 2u);
+	// Reused per packet (GPU thread only): one allocation instead of one per packet.
+	static thread_local std::vector<uint32_t> backing_registers;
+	backing_registers.resize(indirect_num_dw * 2u);
 	if (LibKernel::Memory::TryReadBufferBacking(reinterpret_cast<uint64_t>(indirect_buffer),
 	                                          backing_registers.data(),
 	                                          backing_registers.size() * sizeof(uint32_t))) {

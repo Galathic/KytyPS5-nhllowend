@@ -3,6 +3,7 @@
 #include "common/alignment.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/regionDefinitions.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "kernel/memory.h"
 
@@ -28,6 +29,35 @@
 #endif
 
 namespace Libs::Graphics {
+namespace {
+std::atomic<uint64_t> g_protect_calls {0};
+std::atomic<uint64_t> g_protect_bytes {0};
+std::atomic<uint64_t> g_protect_gpu_calls {0};
+std::atomic<uint64_t> g_read_faults {0};
+std::atomic<uint64_t> g_write_faults {0};
+} // namespace
+
+void ProtectStats::Count(uint64_t bytes) noexcept {
+	g_protect_calls.fetch_add(1, std::memory_order_relaxed);
+	g_protect_bytes.fetch_add(bytes, std::memory_order_relaxed);
+	if (GuestGpu::IsGpuThread()) {
+		g_protect_gpu_calls.fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
+void ProtectStats::CountFault(bool write) noexcept {
+	(write ? g_write_faults : g_read_faults).fetch_add(1, std::memory_order_relaxed);
+}
+
+void ProtectStats::Read(uint64_t& calls, uint64_t& bytes, uint64_t& gpu_calls,
+                        uint64_t& read_faults, uint64_t& write_faults) noexcept {
+	calls        = g_protect_calls.load(std::memory_order_relaxed);
+	bytes        = g_protect_bytes.load(std::memory_order_relaxed);
+	gpu_calls    = g_protect_gpu_calls.load(std::memory_order_relaxed);
+	read_faults  = g_read_faults.load(std::memory_order_relaxed);
+	write_faults = g_write_faults.load(std::memory_order_relaxed);
+}
+
 namespace {
 
 constexpr uint64_t PAGE_SIZE    = TRACKER_PAGE_SIZE;
@@ -82,9 +112,11 @@ void ValidateRange(uint64_t vaddr, uint64_t size) {
 } // namespace
 
 struct PageManager::Impl {
+	// Many small images can share one page (NHL 27's jersey selection registers more than 127
+	// on a page), so write watchers use 15 bits.
 	struct PageState {
-		uint8_t write_watchers  : 7 = 0;
-		uint8_t access_watchers : 1 = 0;
+		uint16_t write_watchers  : 15 = 0;
+		uint16_t access_watchers : 1  = 0;
 
 		[[nodiscard]] Common::VirtualMemory::Mode Perms() const noexcept {
 			if (access_watchers != 0) {
@@ -115,7 +147,7 @@ struct PageManager::Impl {
 				}
 			} else {
 				if constexpr (delta == 1) {
-					if (write_watchers == 0x7f) {
+					if (write_watchers == 0x7fff) {
 						Fatal("write-watcher overflow at 0x%016" PRIx64, address);
 					}
 					return ++write_watchers;
@@ -130,7 +162,7 @@ struct PageManager::Impl {
 			}
 		}
 	};
-	static_assert(sizeof(PageState) == 1);
+	static_assert(sizeof(PageState) == 2);
 
 	struct Region {
 		std::atomic_flag                    lock = ATOMIC_FLAG_INIT;
@@ -192,6 +224,7 @@ struct PageManager::Impl {
 	}
 
 	void Protect(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode) noexcept {
+		ProtectStats::Count(size);
 		FrameBreakdown::Add(FrameBreakdown::g_counters.protect_calls);
 		FrameBreakdown::Timer protect_timer(FrameBreakdown::g_counters.protect_ns);
 		FrameBreakdown::FaultTimer fault_protect_timer(FrameBreakdown::g_fault_cost.protect_ns);

@@ -777,7 +777,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 			     MakeIrDump(cfg_dump, ir).c_str());
 		}
 	}
-	IR::TrackResources(ir, decoded, native_cfg);
+	IR::TrackResources(ir, decoded, native_cfg, options.gpu_scalar_data);
 	TranslateResult result;
 	result.program = std::move(ir);
 	if (options.dump_ir) {

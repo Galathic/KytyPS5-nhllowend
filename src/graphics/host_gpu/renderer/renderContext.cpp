@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include "common/assert.h"
+#include "common/experiments.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
 #include "common/runtimeFlags.h"
@@ -68,6 +69,8 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		return false;
 	}
+	ProtectStats::CountFault(access == PageFaultAccess::Write);
+	Common::Timeline::Mark(access == PageFaultAccess::Write ? "fault-write" : "fault-read", fault_vaddr);
 	// KYTY_PERF_STATS: fault time includes any synchronous readback it triggers (overlaps readback).
 	FrameBreakdown::Timer fault_timer(FrameBreakdown::g_counters.fault_ns);
 	FrameBreakdown::GpuBusyScope busy_scope(FrameBreakdown::GB_FAULT);
@@ -167,12 +170,14 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 }
 
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
+	Common::Timeline::Mark("map", size);
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
 	++m_mapping_generation;
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
+	Common::Timeline::Mark("unmap", size);
 	if (CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported memory unmap from an asynchronous GPU completion, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",

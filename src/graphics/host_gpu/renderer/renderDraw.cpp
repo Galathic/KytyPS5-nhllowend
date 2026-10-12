@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/renderDraw.h"
+#include "graphics/host_gpu/renderer/bindEpoch.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -855,7 +856,15 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			}
 		}
 		if (feedback_aspects && !m_context.GetGraphics().attachment_feedback_loop_enabled) {
-			EXIT("depth attachment feedback loop is not supported by the host\n");
+			// Without VK_EXT_attachment_feedback_loop_dynamic_state (the RX 9070 XT driver lacks it)
+			// the draw samples the depth it writes in the GENERAL layout below: formally a race, in
+			// practice the previous contents. Some NHL 27 scenes do this; do not terminate.
+			static std::atomic_flag reported = ATOMIC_FLAG_INIT;
+			if (!reported.test_and_set(std::memory_order_relaxed)) {
+				std::printf("NHL27DEPTHFEEDBACK: a draw samples the depth attachment it writes; the "
+				            "host lacks attachment feedback loops, using the general layout\n");
+				std::fflush(stdout);
+			}
 		}
 		auto layout = depth_attachment_layout(depth);
 		if (sampled_aspects & ~DepthReadableAspects(layout)) {
@@ -1230,9 +1239,11 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	                  (color_output_mask != 0 ||
 	                   PixelShaderHasDepthOrCoverageSideEffects(shader_regs));
 	{
+		BufferCache::PerfTimerScope phase_timer(BufferCache::PerfTimer::DrawPrograms);
 		FrameBreakdown::Timer materialize_timer(FrameBreakdown::g_counters.dp_materialize_ns);
 		RefreshShaders(buffer, draw, color_output_mask, state);
 	}
+	BufferCache::PerfTimerScope phase_timer(BufferCache::PerfTimer::DrawTargets);
 	if (!state.programs.vertex[0]) {
 		// NHL debugging: a shader failed to build (KYTY_DBG_SKIP_BAD_SHADERS=1); skip the draw.
 		return false;
@@ -1411,6 +1422,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
                                          const DrawIndexBufferSource& index_source,
 	                                     bool primitive_restart_enable) {
+	BufferCache::PerfTimerScope phase_timer(BufferCache::PerfTimer::DrawExecute);
 	auto& ucfg = buffer.GetUserConfig();
 	const auto vertex_stages =
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
@@ -1454,6 +1466,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                              index_source.guest_element_size);
 	}
 	LogDrawPhase(draw.Name(), "PrepareBindings");
+	BufferCache::PerfTimerScope section(BufferCache::PerfTimer::DrawBindPrepare);
 	auto&                            bindings = m_graphics_bindings;
 	std::array<PreparedBindings*, 4> descriptor_stages {};
 	uint32_t                         stage_count = 0;
@@ -1483,7 +1496,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		(void)cache.FindBuffer(source.args_addr, source.ArgsSize());
 		if (source.count_addr != 0) (void)cache.FindBuffer(source.count_addr, sizeof(uint32_t));
 	}
+	section.Stop();
+	BufferCache::PerfTimerScope resolve_section(BufferCache::PerfTimer::DrawBindResolve);
 	PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
+	resolve_section.Stop();
+	BufferCache::PerfTimerScope vertex_section(BufferCache::PerfTimer::DrawVertex);
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
 	if (!mesh_active) {
@@ -1535,6 +1552,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                        vk::PipelineStageFlagBits::eDrawIndirect | vk::PipelineStageFlagBits::eHost | vk::PipelineStageFlagBits::eVertexShader,
 		                        {}, 1, &copied, 0, nullptr, 0, nullptr);
 	}
+	vertex_section.Stop();
+	BufferCache::PerfTimerScope pipeline_section(BufferCache::PerfTimer::DrawPipeline);
 	// Pipeline bucket: paused around CommitBindings (its own bucket) and stopped after the draw.
 	std::optional<FrameBreakdown::Timer> pipeline_timer;
 	pipeline_timer.emplace(FrameBreakdown::g_counters.dp_pipeline_ns);
@@ -1542,11 +1561,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
 	    state.programs);
+	pipeline_section.Stop();
+	BufferCache::PerfTimerScope attachments_section(BufferCache::PerfTimer::DrawAttachments);
 	vk::ImageAspectFlags feedback_aspects;
 	FrameBreakdown::Timer targets_timer(FrameBreakdown::g_pl.targets_ns, FrameBreakdown::Verbose());
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
 	                         feedback_aspects, stages);
+	attachments_section.Stop();
+	BufferCache::PerfTimerScope commit_section(BufferCache::PerfTimer::DrawCommit);
 	targets_timer.Stop();
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
@@ -1578,6 +1601,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		    static_cast<uint32_t>(index_source.address),
 		    static_cast<uint32_t>(index_source.address >> 32u)};
 		static_assert(std::size(draw_data) == ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
+		InvalidateRedundantBinds();
 		vk_buffer.pushConstants(pipeline.pipeline_layout,
 		                        vk::ShaderStageFlagBits::eMeshEXT |
 		                            vk::ShaderStageFlagBits::eFragment,
@@ -1621,6 +1645,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 	}
 
+	commit_section.Stop();
+	BufferCache::PerfTimerScope record_section(BufferCache::PerfTimer::DrawRecord);
 	LogDrawPhase(draw.Name(), "BeginRendering");
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
@@ -1792,10 +1818,13 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 		FrameDump::OnDraw(m_context, log);
 	}
+	m_context.GetTextureCache().FlushStorageShadows();
 
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x600u);
 	}
+	BufferCache::PerfCount(BufferCache::PerfEvent::Draw);
+	NoteShaderWork();
 	vk::PipelineStageFlags shader_write_stages = {};
 	for (const auto& stage: vertex_stages) {
 		if (HasShaderBufferWrites(stage.stage)) {

@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -53,6 +54,9 @@ struct BreadcrumbState {
 	VkBuffer                                buffer      = VK_NULL_HANDLE;
 	VmaAllocation                           allocation  = nullptr;
 	volatile uint32_t*                      mapped      = nullptr;
+	VkBuffer                                args_buffer = VK_NULL_HANDLE;
+	VmaAllocation                           args_allocation = nullptr;
+	volatile uint32_t*                      args_mapped = nullptr;
 	uint32_t                                next_id     = 1;
 	std::array<BreadcrumbEntry, 1u << 16u>  entries {};
 };
@@ -92,6 +96,21 @@ bool BreadcrumbInit(GraphicContext& graphics) {
 	g_breadcrumbs.mapped    = static_cast<volatile uint32_t*>(result_info.pMappedData);
 	g_breadcrumbs.mapped[0] = 0;
 	g_breadcrumbs.mapped[1] = 0;
+	// One 16-byte slot per breadcrumb entry for captured indirect arguments.
+	buffer_info.size  = g_breadcrumbs.entries.size() * 16u;
+	buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+	VmaAllocationInfo args_info {};
+	if (vmaCreateBuffer(graphics.allocator, &buffer_info, &allocation_info,
+	                    &g_breadcrumbs.args_buffer, &g_breadcrumbs.args_allocation, &args_info) ==
+	        VK_SUCCESS &&
+	    args_info.pMappedData != nullptr) {
+		g_breadcrumbs.args_mapped = static_cast<volatile uint32_t*>(args_info.pMappedData);
+		for (size_t i = 0; i < g_breadcrumbs.entries.size() * 4u; ++i) {
+			g_breadcrumbs.args_mapped[i] = 0xdeadbeefu;
+		}
+	} else {
+		g_breadcrumbs.args_buffer = VK_NULL_HANDLE;
+	}
 	g_breadcrumbs.available = true;
 	return true;
 }
@@ -115,6 +134,12 @@ void DumpBreadcrumbs() {
 		            e.kind != nullptr ? e.kind : "?", static_cast<unsigned long long>(e.hash_a),
 		            static_cast<unsigned long long>(e.hash_b),
 		            static_cast<unsigned long long>(e.info));
+		if (g_breadcrumbs.args_mapped != nullptr && e.kind != nullptr &&
+		    std::strstr(e.kind, "indirect") != nullptr) {
+			const auto* args = g_breadcrumbs.args_mapped + (id & (g_breadcrumbs.entries.size() - 1u)) * 4u;
+			std::printf("NHL26CRUMB:     args = %u %u %u (0x%08x 0x%08x 0x%08x)\n", args[0], args[1],
+			            args[2], args[0], args[1], args[2]);
+		}
 	}
 	std::fflush(stdout);
 }
@@ -351,7 +376,15 @@ uint32_t GpuTimingBegin(GraphicContext& graphics, vk::CommandBuffer cmd, const c
 	VULKAN_HPP_DEFAULT_DISPATCHER.vkResetQueryPool(static_cast<VkDevice>(g_timing.device),
 	                                               static_cast<VkQueryPool>(g_timing.pool), slot * 2u,
 	                                               2u);
-	cmd.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, g_timing.pool, slot * 2u);
+	// KYTY_PERF_GPU_TIMING=2 starts each interval when all earlier work completed, so intervals
+	// do not overlap and add up to GPU busy time (incremental cost per operation).
+	static const bool incremental = [] {
+		const char* value = std::getenv("KYTY_PERF_GPU_TIMING");
+		return value != nullptr && value[0] == '2';
+	}();
+	cmd.writeTimestamp(incremental ? vk::PipelineStageFlagBits::eBottomOfPipe
+	                               : vk::PipelineStageFlagBits::eTopOfPipe,
+	                   g_timing.pool, slot * 2u);
 	return slot + 1u;
 }
 
@@ -392,6 +425,22 @@ uint64_t BreadcrumbBegin(GraphicContext& graphics, vk::CommandBuffer cmd, const 
 
 void ReportDeviceLost(GraphicContext& graphics) {
 	DumpDeviceFault(graphics.device);
+}
+
+void BreadcrumbCaptureArgs(vk::CommandBuffer cmd, uint64_t id, vk::Buffer source, uint64_t offset,
+                           uint32_t bytes) {
+	const auto crumb = static_cast<uint32_t>(id);
+	if (crumb == 0 || !g_breadcrumbs.available || g_breadcrumbs.args_buffer == VK_NULL_HANDLE ||
+	    bytes == 0 || bytes > 16u) {
+		return;
+	}
+	vk::MemoryBarrier written {};
+	written.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
+	written.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+	cmd.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer,
+	                    {}, 1, &written, 0, nullptr, 0, nullptr);
+	const vk::BufferCopy copy {offset, (crumb & (g_breadcrumbs.entries.size() - 1u)) * 16u, bytes};
+	cmd.copyBuffer(source, vk::Buffer(g_breadcrumbs.args_buffer), 1, &copy);
 }
 
 void BreadcrumbEnd(GraphicContext& graphics, vk::CommandBuffer cmd, uint64_t id) {
@@ -1199,7 +1248,15 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
 	FrameBreakdown::GpuBusyScope busy_scope(FrameBreakdown::GB_BEGIN_CMD);
 	m_command.m_buffer = m_command_pool.Commit();
-	m_command.Begin();
+	if (BufferCache::PerfTimersEnabled()) {
+		const auto start = std::chrono::steady_clock::now();
+		m_command.Begin();
+		BufferCache::PerfAddTime(BufferCache::PerfTimer::CommandBegin,
+		                         static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                             std::chrono::steady_clock::now() - start).count()));
+	} else {
+		m_command.Begin();
+	}
 	m_trace_slot = GpuTraceBegin(m_graphics, m_command.m_buffer);
 	return m_command;
 }
@@ -1213,6 +1270,9 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 
+	const bool timed       = BufferCache::PerfTimersEnabled();
+	const auto submit_start = timed ? std::chrono::steady_clock::now()
+	                                : std::chrono::steady_clock::time_point {};
 	if (m_trace_slot != 0) {
 		m_command.EndRendering(); // Idempotent; keeps the end timestamp after the last pass.
 		GpuTraceEnd(m_command.m_buffer, m_trace_slot);
@@ -1254,6 +1314,11 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 
 		FrameBreakdown::GpuBusyScope queue_scope(FrameBreakdown::GB_QUEUE_SUBMIT);
 		result = graphics.queue.submit(1, &submit_info, nullptr);
+	}
+	if (timed) {
+		BufferCache::PerfAddTime(BufferCache::PerfTimer::Submit,
+		                         static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                             std::chrono::steady_clock::now() - submit_start).count()));
 	}
 
 	if (result == vk::Result::eErrorDeviceLost) {

@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "common/experiments.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -46,12 +47,18 @@ constexpr size_t PerfBuckets = 4; // color clear, fault, invalidate (CPU write),
 struct PerfStats {
 	std::atomic<uint64_t> waits[PerfBuckets] {};
 	std::atomic<uint64_t> wait_ns[PerfBuckets] {};
-	std::atomic<uint64_t> events[2] {};
+	std::atomic<uint64_t> events[static_cast<size_t>(BufferCache::PerfEvent::Count)] {};
 	std::atomic<uint32_t> pm4_op {0};
+	std::atomic<uint64_t> created_bytes {0};
+	std::atomic<uint64_t> memory_used {0};
+	std::atomic<uint64_t> texture_trigger {0};
+	std::atomic<uint64_t> buffer_trigger {0};
+	std::atomic<uint64_t> timer_count[static_cast<size_t>(BufferCache::PerfTimer::Count)] {};
+	std::atomic<uint64_t> timer_ns[static_cast<size_t>(BufferCache::PerfTimer::Count)] {};
 	// Only touched from the GPU thread.
 	uint64_t                              last_waits[PerfBuckets] {};
 	uint64_t                              last_wait_ns[PerfBuckets] {};
-	uint64_t                              last_events[2] {};
+	uint64_t last_events[static_cast<size_t>(BufferCache::PerfEvent::Count)] {};
 	std::chrono::steady_clock::time_point last_print {};
 };
 PerfStats g_perf;
@@ -67,6 +74,7 @@ struct FaultPageStat {
 	uint64_t    writer_hash = 0;
 	double      ms          = 0;
 	uint32_t    pm4_op      = 0; // PM4 opcode being processed when the GPU thread itself faulted
+	const char* via         = "fault";
 };
 std::unordered_map<uint64_t, FaultPageStat> g_fault_pages;
 
@@ -77,6 +85,10 @@ bool PerfStatsEnabled() {
 
 } // namespace
 
+bool BufferCache::GuestSyncOnly() {
+	return Common::RuntimeFlags::Current().guest_sync;
+}
+
 bool BufferCache::PerfNoSyncReadback() {
 	static const bool enabled = EnvFlag("KYTY_PERF_NO_SYNC_READBACK");
 	return enabled;
@@ -86,6 +98,27 @@ void BufferCache::PerfSetPm4Op(uint32_t opcode) {
 	if (PerfStatsEnabled()) {
 		g_perf.pm4_op.store(opcode, std::memory_order_relaxed);
 	}
+}
+
+bool BufferCache::PerfTimersEnabled() {
+	return PerfStatsEnabled();
+}
+
+void BufferCache::PerfAddTime(PerfTimer timer, uint64_t ns) {
+	const auto index = static_cast<size_t>(timer);
+	g_perf.timer_count[index].fetch_add(1, std::memory_order_relaxed);
+	g_perf.timer_ns[index].fetch_add(ns, std::memory_order_relaxed);
+}
+
+void BufferCache::PerfSetMemoryUsage(uint64_t used, uint64_t texture_trigger, uint64_t buffer_trigger) {
+	if (!PerfStatsEnabled()) return;
+	g_perf.memory_used.store(used, std::memory_order_relaxed);
+	if (texture_trigger != 0) g_perf.texture_trigger.store(texture_trigger, std::memory_order_relaxed);
+	if (buffer_trigger != 0) g_perf.buffer_trigger.store(buffer_trigger, std::memory_order_relaxed);
+}
+
+uint64_t BufferCache::PerfFlipCount() {
+	return g_perf.events[static_cast<size_t>(PerfEvent::Flip)].load(std::memory_order_relaxed);
 }
 
 void BufferCache::PerfCount(PerfEvent event) {
@@ -122,8 +155,9 @@ void BufferCache::PerfMaybePrint() {
 		total_waits += waits[i];
 		total_ms += ms[i];
 	}
-	uint64_t events[2] {};
-	for (size_t i = 0; i < 2; ++i) {
+	constexpr size_t EventCount = static_cast<size_t>(PerfEvent::Count);
+	uint64_t         events[EventCount] {};
+	for (size_t i = 0; i < EventCount; ++i) {
 		const auto now_count = g_perf.events[i].load(std::memory_order_relaxed);
 		events[i]            = now_count - g_perf.last_events[i];
 		g_perf.last_events[i] = now_count;
@@ -138,20 +172,125 @@ void BufferCache::PerfMaybePrint() {
 	            static_cast<unsigned long long>(waits[3]), ms[3],
 	            static_cast<unsigned long long>(events[0]),
 	            static_cast<unsigned long long>(events[1]), PerfNoSyncReadback() ? 1 : 0);
+	std::printf("NHL27PERF: work dispatches=%llu draws=%llu auto_dispatch_barriers=%llu "
+	            "guest_barriers=%llu (skipped %llu) acquire_mem=%llu render_passes=%llu experiments=%d\n",
+	            static_cast<unsigned long long>(events[2]),
+	            static_cast<unsigned long long>(events[3]),
+	            static_cast<unsigned long long>(events[4]),
+	            static_cast<unsigned long long>(events[5]),
+	            static_cast<unsigned long long>(
+	                events[static_cast<size_t>(PerfEvent::BarrierSkipped)]),
+	            static_cast<unsigned long long>(events[6]),
+	            static_cast<unsigned long long>(events[7]), static_cast<int>(Common::Experiments::Mask()));
+	{
+		constexpr size_t TimerCount = static_cast<size_t>(PerfTimer::Count);
+		static uint64_t  last_count[TimerCount] {};
+		static uint64_t  last_ns[TimerCount] {};
+		uint64_t         count[TimerCount] {};
+		double           timer_ms[TimerCount] {};
+		for (size_t i = 0; i < TimerCount; ++i) {
+			const auto c  = g_perf.timer_count[i].load(std::memory_order_relaxed);
+			const auto ns = g_perf.timer_ns[i].load(std::memory_order_relaxed);
+			count[i]      = c - last_count[i];
+			timer_ms[i]   = static_cast<double>(ns - last_ns[i]) / 1e6;
+			last_count[i] = c;
+			last_ns[i]    = ns;
+		}
+		std::printf("NHL27PERF: cmd begins=%llu (%.1f ms) submits=%llu (%.1f ms) "
+		            "gpu_waits=%llu (%.1f ms) false_share_reads=%llu pm4_shadow=%llu\n",
+		            static_cast<unsigned long long>(count[0]), timer_ms[0],
+		            static_cast<unsigned long long>(count[1]), timer_ms[1],
+		            static_cast<unsigned long long>(count[2]), timer_ms[2],
+		            static_cast<unsigned long long>(events[static_cast<size_t>(PerfEvent::FalseShareRead)]),
+		            static_cast<unsigned long long>(events[static_cast<size_t>(PerfEvent::Pm4ShadowPacket)]));
+		const auto flips = events[static_cast<size_t>(PerfEvent::Flip)];
+		static uint64_t last_created_bytes = 0;
+		const uint64_t  created_now        = g_perf.created_bytes.load(std::memory_order_relaxed);
+		const uint64_t  created_bytes      = created_now - last_created_bytes;
+		last_created_bytes                 = created_now;
+		const auto per_frame = [&](PerfTimer timer) {
+			return flips != 0 ? timer_ms[static_cast<size_t>(timer)] / static_cast<double>(flips) : 0.0;
+		};
+		std::printf("NHL27PHASE: ms/frame pm4=%.1f draw_programs=%.1f draw_targets=%.1f "
+		            "draw_execute=%.1f (draws %llu) dispatch=%.1f dispatch_program=%.1f "
+		            "(dispatches %llu) gpu_waits=%.1f submits=%.1f\n",
+		            per_frame(PerfTimer::Pm4), per_frame(PerfTimer::DrawPrograms),
+		            per_frame(PerfTimer::DrawTargets), per_frame(PerfTimer::DrawExecute),
+		            static_cast<unsigned long long>(count[static_cast<size_t>(PerfTimer::DrawExecute)]),
+		            per_frame(PerfTimer::Dispatch), per_frame(PerfTimer::DispatchProgram),
+		            static_cast<unsigned long long>(count[static_cast<size_t>(PerfTimer::Dispatch)]),
+		            per_frame(PerfTimer::GpuWait), per_frame(PerfTimer::Submit));
+		std::printf("NHL27DRAW: ms/frame bind_prepare=%.1f bind_resolve=%.1f vertex=%.1f "
+		            "pipeline=%.1f attachments=%.1f commit=%.1f record=%.1f | per frame: "
+		            "buffer_creates=%.1f (%.1f MiB) buffer_deletes=%.1f (gc %.1f) buffer_uploads=%.1f "
+		            "image_inserts=%.1f image_gc_frees=%.1f image_uploads=%.1f | memory %.0f MiB, gc triggers "
+		            "texture %.0f buffer %.0f MiB\n",
+		            per_frame(PerfTimer::DrawBindPrepare), per_frame(PerfTimer::DrawBindResolve),
+		            per_frame(PerfTimer::DrawVertex), per_frame(PerfTimer::DrawPipeline),
+		            per_frame(PerfTimer::DrawAttachments), per_frame(PerfTimer::DrawCommit),
+		            per_frame(PerfTimer::DrawRecord),
+		            flips != 0 ? static_cast<double>(events[static_cast<size_t>(PerfEvent::BufferCreate)]) / flips : 0.0,
+		            flips != 0 ? static_cast<double>(created_bytes) / (1024.0 * 1024.0) / flips : 0.0,
+		            flips != 0 ? static_cast<double>(events[static_cast<size_t>(PerfEvent::BufferDelete)]) / flips : 0.0,
+		            flips != 0 ? static_cast<double>(events[static_cast<size_t>(PerfEvent::BufferGcDelete)]) / flips : 0.0,
+		            flips != 0 ? static_cast<double>(events[static_cast<size_t>(PerfEvent::BufferUpload)]) / flips : 0.0,
+		            flips != 0 ? static_cast<double>(events[static_cast<size_t>(PerfEvent::ImageInsert)]) / flips : 0.0,
+		            flips != 0 ? static_cast<double>(events[static_cast<size_t>(PerfEvent::ImageGcFree)]) / flips : 0.0,
+		            flips != 0 ? static_cast<double>(events[static_cast<size_t>(PerfEvent::ImageUpload)]) / flips : 0.0,
+		            static_cast<double>(g_perf.memory_used.load(std::memory_order_relaxed)) / (1024.0 * 1024.0),
+		            static_cast<double>(g_perf.texture_trigger.load(std::memory_order_relaxed)) / (1024.0 * 1024.0),
+		            static_cast<double>(g_perf.buffer_trigger.load(std::memory_order_relaxed)) / (1024.0 * 1024.0));
+	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	{
+		// GPU-thread CPU time per presented frame: the frame cost of emulation work without the
+		// time spent blocked on the GPU or on guest submissions.
+		static uint64_t last_cpu_100ns = 0;
+		FILETIME        created {}, exited {}, kernel {}, user {};
+		if (GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user) != 0) {
+			const auto as_u64 = [](const FILETIME& t) {
+				return (static_cast<uint64_t>(t.dwHighDateTime) << 32u) | t.dwLowDateTime;
+			};
+			const uint64_t cpu   = as_u64(kernel) + as_u64(user);
+			const double   cpu_ms = static_cast<double>(cpu - last_cpu_100ns) / 1e4;
+			last_cpu_100ns        = cpu;
+			const auto flips      = events[static_cast<size_t>(PerfEvent::Flip)];
+			std::printf("NHL27PERF: frame flips=%llu wall_ms/frame=%.1f gpu_thread_cpu_ms/frame=%.1f "
+			            "(busy %.0f%%)\n",
+			            static_cast<unsigned long long>(flips),
+			            flips != 0 ? seconds * 1000.0 / static_cast<double>(flips) : 0.0,
+			            flips != 0 ? cpu_ms / static_cast<double>(flips) : 0.0,
+			            100.0 * cpu_ms / (seconds * 1000.0));
+		}
+	}
+#endif
+	{
+		static uint64_t last[5] {};
+		uint64_t        now[5] {};
+		ProtectStats::Read(now[0], now[1], now[2], now[3], now[4]);
+		std::printf("NHL27PERF: protect calls=%llu (gpu-thread %llu) MiB=%.1f | tracking faults "
+		            "read=%llu write=%llu\n",
+		            static_cast<unsigned long long>(now[0] - last[0]),
+		            static_cast<unsigned long long>(now[2] - last[2]),
+		            static_cast<double>(now[1] - last[1]) / (1024.0 * 1024.0),
+		            static_cast<unsigned long long>(now[3] - last[3]),
+		            static_cast<unsigned long long>(now[4] - last[4]));
+		std::copy(std::begin(now), std::end(now), std::begin(last));
+	}
 	std::vector<std::pair<uint64_t, FaultPageStat>> pages(g_fault_pages.begin(), g_fault_pages.end());
 	std::sort(pages.begin(), pages.end(),
 	          [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
 	for (size_t i = 0; i < pages.size() && i < 8; ++i) {
 		const auto& [page, stat] = pages[i];
 		std::printf("NHL27PERF: fault page=0x%llx count=%llu bytes=%llu exact=%llu ms=%.1f "
-		            "thread=%s tid=%llu pm4_op=0x%x writer=%s hash=%016llx\n",
+		            "thread=%s tid=%llu pm4_op=0x%x writer=%s hash=%016llx via=%s\n",
 		            static_cast<unsigned long long>(page),
 		            static_cast<unsigned long long>(stat.count),
 		            static_cast<unsigned long long>(stat.bytes),
 		            static_cast<unsigned long long>(stat.exact), stat.ms,
 		            stat.gpu_thread ? "gpu-cp" : "guest-cpu",
 		            static_cast<unsigned long long>(stat.tid), stat.pm4_op, stat.writer,
-		            static_cast<unsigned long long>(stat.writer_hash));
+		            static_cast<unsigned long long>(stat.writer_hash), stat.via);
 	}
 	if (!pages.empty()) {
 		uint64_t gpu_count = 0, cpu_count = 0, unique_pages = pages.size();
@@ -225,6 +364,21 @@ void BufferCache::DiscardGpuModified(uint64_t vaddr, uint64_t size) {
 	DropGpuFills(vaddr, size);
 	m_gpu_modified_ranges.Subtract(vaddr, size);
 	m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+}
+
+void BufferCache::ForgetGpuWrite(uint64_t vaddr, uint64_t size) {
+	if (size == 0 || !GuestRange {vaddr, size}.Valid()) {
+		return;
+	}
+	DropGpuFills(vaddr, size);
+	m_gpu_modified_ranges.Subtract(vaddr, size);
+	const auto first = vaddr & ~(TRACKER_PAGE_SIZE - 1);
+	const auto last  = (vaddr + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
+	for (auto page = first; page < last; page += TRACKER_PAGE_SIZE) {
+		if (!m_gpu_modified_ranges.Intersects(page, TRACKER_PAGE_SIZE)) {
+			m_memory_tracker.UnmarkRegionAsGpuModified(page, TRACKER_PAGE_SIZE);
+		}
+	}
 }
 
 void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source,
@@ -302,6 +456,7 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	if (IsBufferInvalid(id)) {
 		return;
 	}
+	PerfCount(PerfEvent::BufferDelete);
 	Unregister(id);
 	if (m_scheduler.Active()) {
 		m_scheduler.DeferOperation([this, id] { m_slot_buffers.erase(id); });
@@ -348,7 +503,6 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	for (auto& copy: copies) {
 		copy.dstOffset += offset;
 	}
-
 	auto publish = [this, mapped, offset, total_size, buffer_address,
 	                copies = copies, owner = std::move(temporary)]() mutable {
 		(owner ? *owner : m_download_buffer).Invalidate(offset, total_size);
@@ -480,8 +634,10 @@ bool BufferCache::ReadbackOnSecondQueue(const Buffer& source, const Buffer& dest
 	if (result != vk::Result::eSuccess) {
 		EXIT("BufferCache: readback queue submission failed\n");
 	}
+	Common::Timeline::Mark("readback-queue", wait_tick);
 	EXIT_NOT_IMPLEMENTED(graphics.device.waitForFences(1, &m_readback_fence, VK_TRUE, UINT64_MAX) !=
 	                     vk::Result::eSuccess);
+	Common::Timeline::Mark("readback-done", wait_tick);
 	(void)graphics.device.resetFences(1, &m_readback_fence);
 	(void)m_readback_buffer.reset({});
 	return true;
@@ -584,9 +740,12 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadC
 		    timed && caller == ReadCaller::Fault && !is_write && HasGpuDirtyBytes(vaddr, 1);
 		const bool downloaded = DownloadBufferMemory<false>(buffer, vaddr, size);
 		if (timed) {
-			if (downloaded && caller == ReadCaller::Fault && !is_write) {
+			if (downloaded && !is_write) {
 				const auto page = vaddr & ~(TRACKER_PAGE_SIZE - 1);
 				auto&      stat = g_fault_pages[page];
+				stat.via        = caller == ReadCaller::Fault        ? "fault"
+				                  : caller == ReadCaller::ColorClear ? "clear"
+				                                                     : "other";
 				stat.count++;
 				stat.bytes += m_last_download_bytes;
 				stat.exact += exact_dirty ? 1 : 0;
@@ -719,6 +878,10 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	vaddr = Common::AlignDown(vaddr, CACHING_PAGESIZE);
 	size               = end - vaddr;
 	const auto overlap = ResolveOverlaps(vaddr, size);
+	PerfCount(PerfEvent::BufferCreate);
+	if (PerfStatsEnabled()) {
+		g_perf.created_bytes.fetch_add(overlap.end - overlap.begin, std::memory_order_relaxed);
+	}
 	FrameBreakdown::Add(FrameBreakdown::g_counters.port_buffer_creates);
 
 	const auto id = m_slot_buffers.insert(
@@ -762,6 +925,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	    });
 	walk_timer.Stop();
 	if (source) {
+		PerfCount(PerfEvent::BufferUpload);
 		FrameBreakdown::Add(FrameBreakdown::g_counters.sync_uploads);
 		FrameBreakdown::Add(FrameBreakdown::g_counters.sync_bytes, total_size);
 		if (bon) {
@@ -898,6 +1062,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 			FrameDump::TraceWrite("buffer-write", vaddr, vaddr + size, m_writer_kind, m_writer_hash);
 		}
 		m_gpu_modified_ranges.Add(vaddr, size);
+		++m_gpu_dirty_generation;
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }
@@ -1057,6 +1222,7 @@ void BufferCache::RunGarbageCollector() {
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
+	PerfSetMemoryUsage(m_total_used_memory, 0, m_trigger_gc_memory);
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
@@ -1092,6 +1258,7 @@ void BufferCache::RunGarbageCollector() {
 			dirty_buffers.push_back(id);
 		} else {
 			m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
+			PerfCount(PerfEvent::BufferGcDelete);
 			FrameBreakdown::Add(FrameBreakdown::g_counters.port_buffer_gc_deletes);
 			DeleteBuffer(id);
 		}

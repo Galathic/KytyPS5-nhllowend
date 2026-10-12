@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "common/eventTrace.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
+#include "graphics/host_gpu/renderer/bindEpoch.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -203,6 +204,7 @@ void FaultManager::ProcessFaultBuffer() {
 
 	if (!gate) {
 		Libs::Graphics::g_compute_pipeline_epoch.fetch_add(1, std::memory_order_relaxed);
+		InvalidateRedundantBinds();
 		command.bindPipeline(vk::PipelineBindPoint::eCompute, m_fault_process_pipeline);
 		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute,
 		                             m_fault_process_pipeline_layout, 0, writes);
@@ -228,6 +230,7 @@ void FaultManager::ProcessFaultBuffer() {
 		m_gate_primed = true;
 
 		Libs::Graphics::g_compute_pipeline_epoch.fetch_add(1, std::memory_order_relaxed);
+		InvalidateRedundantBinds();
 		command.bindPipeline(vk::PipelineBindPoint::eCompute, m_fault_gate_pipeline);
 		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_fault_gate_pipeline_layout,
 		                             0, gate_writes);
@@ -255,6 +258,7 @@ void FaultManager::ProcessFaultBuffer() {
 		command.pipelineBarrier2(dependency);
 
 		Libs::Graphics::g_compute_pipeline_epoch.fetch_add(1, std::memory_order_relaxed);
+		InvalidateRedundantBinds();
 		command.bindPipeline(vk::PipelineBindPoint::eCompute, m_fault_process_pipeline);
 		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute,
 		                             m_fault_process_pipeline_layout, 0, writes);

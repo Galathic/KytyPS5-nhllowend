@@ -3,6 +3,7 @@
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
@@ -70,6 +71,7 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	        state.num_color_attachments > RENDER_COLOR_ATTACHMENTS_MAX);
 	FrameBreakdown::GpuBusyScope busy_scope(FrameBreakdown::GB_RENDER_PASS);
 	EndRendering();
+	BufferCache::PerfCount(BufferCache::PerfEvent::RenderPassBegin);
 
 	std::array<vk::RenderingAttachmentInfo, RENDER_COLOR_ATTACHMENTS_MAX> colors {};
 	for (uint32_t i = 0; i < state.num_color_attachments; i++) {
