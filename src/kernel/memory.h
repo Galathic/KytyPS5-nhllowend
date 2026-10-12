@@ -122,6 +122,11 @@ bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t
 bool                   TryReadCleanBacking(uint64_t vaddr, void* data, uint64_t size);
 // Optional GPU-thread clean peek: refusal never downloads, faults or changes output.
 bool                   TryReadCleanBufferBacking(uint64_t vaddr, void* data, uint64_t size);
+// The last 16 pages on which this thread took a GPU-tracking read fault (they are protected because
+// the GPU wrote some of their bytes). Readers of guest memory can read such pages through the
+// backing when their bytes are clean instead of faulting again.
+void                   NoteReadFaultPage(uint64_t vaddr) noexcept;
+[[nodiscard]] bool     IsReadFaultPage(uint64_t vaddr, uint64_t size) noexcept;
 // GPU-thread clean validation (DRAWPREP prefetch): Equal = the backing bytes are not GPU-dirty and equal `expected`;
 // Different = clean but unequal; Dirty = GPU-dirty bytes (never downloaded); Unavailable = preconditions or mapping failed.
 // Never copies, downloads, faults or changes any state.

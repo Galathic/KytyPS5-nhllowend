@@ -50,6 +50,7 @@ uint32_t EnvironmentMask() {
 	set("KYTY_ASYNC_SUBMIT", AsyncSubmit, false);
 	set("KYTY_LAZY_SHARED_WRITES", LazySharedWrites, false);
 	set("KYTY_NATIVE_FP16", NativeFp16, false);
+	set("KYTY_FAULT_PAGE_READS", FaultPageReads, false);
 	return mask;
 }
 

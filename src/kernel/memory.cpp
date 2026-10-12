@@ -978,6 +978,29 @@ bool TryReadCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
+namespace {
+thread_local std::array<uint64_t, 16> t_read_fault_pages {};
+thread_local uint32_t                 t_read_fault_next = 0;
+} // namespace
+
+void NoteReadFaultPage(uint64_t vaddr) noexcept {
+	const auto page = vaddr & ~uint64_t {0xfff};
+	for (const auto known: t_read_fault_pages) {
+		if (known == page) return;
+	}
+	t_read_fault_pages[t_read_fault_next++ % t_read_fault_pages.size()] = page;
+}
+
+bool IsReadFaultPage(uint64_t vaddr, uint64_t size) noexcept {
+	if (size == 0) return false;
+	const auto first = vaddr & ~uint64_t {0xfff};
+	const auto last  = (vaddr + size - 1) & ~uint64_t {0xfff};
+	for (const auto known: t_read_fault_pages) {
+		if (known != 0 && (known == first || known == last)) return true;
+	}
+	return false;
+}
+
 bool TryReadCleanBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	if (g_gpu_resources == nullptr || !Graphics::GuestGpu::IsGpuThread() || data == nullptr ||
 	    !Graphics::GuestRange {vaddr, size}.Valid()) {

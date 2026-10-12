@@ -10,6 +10,12 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
+// Ordinary (non-strict) resource-table reads dereference guest memory. When set, this reader is
+// tried first; it returns false to keep the plain read (experiment FaultPageReads).
+using FaultPageReader = bool (*)(uint64_t address, void* data, uint64_t size);
+void SetFaultPageReader(FaultPageReader reader);
+
+
 // Canonical module-affecting resource state. Runtime addresses and descriptor payloads remain in
 // ResourceSnapshot and therefore do not create shader permutations.
 struct ResourceSpecialization {
