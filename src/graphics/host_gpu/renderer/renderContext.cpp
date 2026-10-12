@@ -67,6 +67,7 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		return false;
 	}
 	ProtectStats::CountFault(access == PageFaultAccess::Write);
+	Common::Timeline::Mark(access == PageFaultAccess::Write ? "fault-write" : "fault-read", fault_vaddr);
 	if (access == PageFaultAccess::Write) {
 		if (Common::Experiments::Enabled(Common::Experiments::FaultCoalesce)) {
 			// Games stream per-frame data through CPU-written rings: one fault per page and one
@@ -108,12 +109,14 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 }
 
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
+	Common::Timeline::Mark("map", size);
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
 	++m_mapping_generation;
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
+	Common::Timeline::Mark("unmap", size);
 	if (CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported memory unmap from an asynchronous GPU completion, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",

@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/experiments.h"
 #include "common/logging/log.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -233,6 +234,15 @@ void TriggerEopEventAtEndOfPipe(CommandBuffer& buffer, int event_id, uint32_t co
 	auto& renderer  = buffer.GetContext();
 	auto& scheduler = renderer.GetCommandScheduler();
 	EXIT_IF(!scheduler.Active() || &buffer != &scheduler.Current());
+	// Experiment DirectEopInterrupts: end-of-pipe labels are already written when the CP reaches
+	// them, and recorded work holds its own copies of guest memory. NHL 27 submits a frame only
+	// after the previous frame's EOP interrupt, so deferring it to host completion leaves the GPU
+	// thread idle while the host GPU drains. Deliver it with the label instead; CPU reads of
+	// GPU-written memory still wait for the host GPU through the page tracking.
+	if (Common::Experiments::Enabled(Common::Experiments::DirectEopInterrupts)) {
+		renderer.TriggerInterrupt(event_id, context_id);
+		return;
+	}
 	scheduler.DeferPriorityOperation(
 	    [&renderer, event_id, context_id] { renderer.TriggerInterrupt(event_id, context_id); });
 }

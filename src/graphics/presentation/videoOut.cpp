@@ -1455,6 +1455,10 @@ KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer
 	     buffer_index_start, buffer_num, set_index, attribute->pixel_format, attribute->tiling_mode,
 	     attribute->aspect_ratio, attribute->width, attribute->height, attribute->pitch_in_pixel,
 	     attribute->option, category);
+	std::printf("NHL27VIDEO: register buffers set=%d count=%d %ux%u format=0x%llx\n", set_index,
+	            buffer_num, attribute->width, attribute->height,
+	            static_cast<unsigned long long>(attribute->pixel_format));
+	std::fflush(stdout);
 
 	if (option != nullptr) {
 		return VIDEO_OUT_ERROR_INVALID_OPTION;

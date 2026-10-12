@@ -249,6 +249,12 @@ private:
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;
+	// Experiment ReadbackQueue: copies downloads on GraphicContext::readback_queue.
+	vk::CommandPool                                   m_readback_pool   = nullptr;
+	vk::CommandBuffer                                 m_readback_buffer = nullptr;
+	vk::Fence                                         m_readback_fence  = nullptr;
+	bool ReadbackOnSecondQueue(const Buffer& source, const Buffer& destination,
+	                           std::span<const vk::BufferCopy> copies, uint64_t wait_tick);
 	StreamBuffer                                      m_device_buffer;
 	TextureCache&                                     m_texture_cache;
 	struct GpuFill {

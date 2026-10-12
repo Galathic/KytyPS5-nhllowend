@@ -24,8 +24,18 @@ On top of the fork's usual flags (`KYTY_PROGRAM_RESOURCE_CACHE=1`, `KYTY_PERF_NO
 | `KYTY_FAULT_COALESCE=1` | 65536 | A CPU write fault on a tracked buffer page releases its whole clean 64 KiB window (`KYTY_FAULT_COALESCE_PAGES`, default 16) | +2.0% paused match, write faults -85% |
 | `KYTY_SPARSE_BUFFER_GC=1` | 131072 | Scans for idle cache buffers every 16th guest submission instead of after each one | +1.0% paused match |
 | `KYTY_CLEAN_FROM_DIRECT=1` | 262144 | The strict resource-table evaluator (branch conditions, uniform fills, written descriptors) takes words the direct reads already fetched | +3.1% paused match |
+| `KYTY_READBACK_QUEUE=1` | 1048576 | GPU-to-CPU downloads of a buffer last written by an already submitted command buffer run on a second queue and wait only for that submission (about 45 us instead of draining everything queued) | +1.4% paused match |
+| `KYTY_DIRECT_EOP_INTERRUPTS=1` | 524288 | End-of-pipe interrupts are delivered when the CP reaches them, like the labels (`KYTY_EOP_DIRECT_LABELS`) | +0.7% paused match (+0.8% with the readback queue) |
 
-Mask for all of the above: `523267`, plus `KYTY_SRT_BATCH_READS=1` in the environment.
+Mask for all of the above: `2096131`, plus `KYTY_SRT_BATCH_READS=1` in the environment.
+
+### Why a frame waits
+
+NHL 27 submits a whole frame only after the previous frame's end-of-pipe interrupt, then rewrites
+command-buffer memory that shares pages with bytes a compute shader wrote into the previous
+frame's command buffers. That write faults, and the fault used to download the page after
+everything queued on the GPU (11-15 ms per frame). With both switches above the download waits
+only for the writer's submission. Recorded with `KYTY_DBG_TIMELINE` (below).
 
 ## Always on
 
@@ -43,6 +53,15 @@ finishes it and the device is lost. Zeroed dispatches are reported as `NHL27GUAR
 * `KYTY_DBG_IMAGE_CHURN=1`: logs image inserts and frees.
 * `KYTY_DBG_DIRECT_SRT=1`: counts direct and interpreted resource-table refreshes and why plans fall back (`NHL27SRT`).
 * `KYTY_PERF_FAULT_RIPS=gpu`: host instruction addresses of the GPU thread's page faults.
+* `KYTY_DBG_TIMELINE=<seconds or trigger file>`: records submissions, GPU-thread idle/wake, host
+  GPU waits, event-queue waits and triggers, faults and synchronous GPU commands from all threads
+  for 1.5 s, then prints them in time order (`NHL27TL`). A non-numeric value names a file whose
+  appearance starts the recording.
+* `KYTY_PERF_GPU_TIMING=1|2`: per draw/dispatch GPU time by shader (`NHL27GPU`, every 5 s).
+  `2` measures each operation from the completion of the previous one, so the times add up to
+  GPU busy time; `1` measures from top of pipe (overlapping).
+* `tools/profiling/sampler.exe <pid> <seconds> <out> [interval_ms] [tid|rN]`: out-of-process
+  stack sampler (about 400 samples/s, dbghelp); `tools/profiling/foldprof.py` summarizes its output.
 * Replay benchmarks on a copy of a `_PipelineCache/*.shaders` record (no Vulkan):
   `shader_recompiler_compute_tests --resource-replay-phases <file> [iterations] [direct]`
   (validates the direct path against the interpreter), `--resource-replay-shapes <file>`,

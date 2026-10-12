@@ -1,6 +1,7 @@
 #include "kernel/eventQueue.h"
 
 #include "common/assert.h"
+#include "common/experiments.h"
 #include "common/common.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
@@ -361,6 +362,9 @@ int KYTY_SYSV_ABI KernelTriggerEvent(KernelEqueue eq, uintptr_t ident, int16_t f
 		return KERNEL_ERROR_EBADF;
 	}
 
+	Common::Timeline::Mark("eq-trigger", (static_cast<uint64_t>(eq) << 16u) |
+	                                         (static_cast<uint64_t>(static_cast<uint16_t>(filter)) << 8u) |
+	                                         (ident & 0xffu));
 	return owner->TriggerEvent(ident, filter, trigger_data);
 }
 
@@ -421,7 +425,9 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
 	     Common::Thread::GetThreadIdUnique());
 
 	if (timo == nullptr) {
+		Common::Timeline::Mark("eq-wait", static_cast<uint64_t>(eq));
 		*out = owner->WaitForEvents(ev, num, 0);
+		Common::Timeline::Mark("eq-done", static_cast<uint64_t>(eq));
 	}
 
 	if (timo != nullptr) {

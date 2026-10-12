@@ -2095,6 +2095,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	if (!selected) {
 		return false;
 	}
+	buffer.last_write_tick = m_scheduler.CurrentTick();
 
 	std::scoped_lock lock {m_texture_cache.m_lock};
 	auto& image = m_texture_cache.m_slot_images[selected];

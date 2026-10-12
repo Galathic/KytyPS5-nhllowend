@@ -500,6 +500,28 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	for (auto& copy: copies) {
 		copy.dstOffset += offset;
 	}
+	auto publish = [this, mapped, offset, total_size, buffer_address,
+	                copies = copies, owner = std::move(temporary)]() mutable {
+		(owner ? *owner : m_download_buffer).Invalidate(offset, total_size);
+		for (const auto& copy: copies) {
+			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
+			                                      mapped + (copy.dstOffset - offset), copy.size);
+		}
+	};
+	if constexpr (!async) {
+		// Experiment ReadbackQueue: a buffer last written by an already submitted command buffer
+		// can be copied on the second queue once that submission finishes, rather than after
+		// everything queued since (the whole remaining frame, when the game rewrites command
+		// memory next to GPU-written bytes right after an end-of-pipe event).
+		if (buffer.last_write_tick < m_scheduler.CurrentTick() &&
+		    Common::Experiments::Enabled(Common::Experiments::ReadbackQueue) &&
+		    ReadbackOnSecondQueue(buffer, download, copies, buffer.last_write_tick)) {
+			// Older asynchronous downloads of these bytes publish first, as on the normal path.
+			m_scheduler.WaitPriorityOperations(buffer.last_write_tick);
+			publish();
+			return true;
+		}
+	}
 
 	auto& command = m_scheduler.Current();
 	command.EndRendering();
@@ -528,14 +550,6 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	                       vk::PipelineStageFlagBits::eAllCommands |
 	                           vk::PipelineStageFlagBits::eHost,
 	                       {}, 0, nullptr, 1, &after, 0, nullptr);
-	auto publish = [this, mapped, offset, total_size, buffer_address,
-	                copies = std::move(copies), owner = std::move(temporary)] {
-		(owner ? *owner : m_download_buffer).Invalidate(offset, total_size);
-		for (const auto& copy: copies) {
-			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
-			                                      mapped + (copy.dstOffset - offset), copy.size);
-		}
-	};
 	if constexpr (async) {
 		m_scheduler.DeferPriorityOperation(std::move(publish));
 	} else {
@@ -544,6 +558,72 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		m_scheduler.WaitPriorityOperations(tick);
 		publish();
 	}
+	return true;
+}
+
+bool BufferCache::ReadbackOnSecondQueue(const Buffer& source, const Buffer& destination,
+                                        std::span<const vk::BufferCopy> copies,
+                                        uint64_t                        wait_tick) {
+	auto& graphics = m_graphics;
+	if (graphics.readback_queue == nullptr || copies.empty()) {
+		return false;
+	}
+	if (m_readback_buffer == nullptr) {
+		vk::CommandPoolCreateInfo pool_info {};
+		pool_info.flags            = vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
+		pool_info.queueFamilyIndex = graphics.queue_family;
+		if (graphics.device.createCommandPool(&pool_info, nullptr, &m_readback_pool) !=
+		    vk::Result::eSuccess) {
+			return false;
+		}
+		vk::CommandBufferAllocateInfo alloc {};
+		alloc.commandPool        = m_readback_pool;
+		alloc.level              = vk::CommandBufferLevel::ePrimary;
+		alloc.commandBufferCount = 1;
+		vk::FenceCreateInfo fence_info {};
+		if (graphics.device.allocateCommandBuffers(&alloc, &m_readback_buffer) != vk::Result::eSuccess ||
+		    graphics.device.createFence(&fence_info, nullptr, &m_readback_fence) != vk::Result::eSuccess) {
+			m_readback_buffer = nullptr;
+			return false;
+		}
+	}
+	vk::CommandBufferBeginInfo begin {};
+	begin.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+	if (m_readback_buffer.begin(&begin) != vk::Result::eSuccess) {
+		return false;
+	}
+	m_readback_buffer.copyBuffer(source.Handle(), destination.Handle(),
+	                             static_cast<uint32_t>(copies.size()), copies.data());
+	vk::MemoryBarrier host {};
+	host.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	host.dstAccessMask = vk::AccessFlagBits::eHostRead;
+	m_readback_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                                  vk::PipelineStageFlagBits::eHost, {}, 1, &host, 0, nullptr, 0,
+	                                  nullptr);
+	if (m_readback_buffer.end() != vk::Result::eSuccess) {
+		return false;
+	}
+	const auto                      semaphore = m_scheduler.GetMasterSemaphore().Handle();
+	const vk::PipelineStageFlags    stage     = vk::PipelineStageFlagBits::eTransfer;
+	vk::TimelineSemaphoreSubmitInfo timeline {};
+	timeline.waitSemaphoreValueCount = 1;
+	timeline.pWaitSemaphoreValues    = &wait_tick;
+	vk::SubmitInfo submit {};
+	submit.pNext              = &timeline;
+	submit.waitSemaphoreCount = 1;
+	submit.pWaitSemaphores    = &semaphore;
+	submit.pWaitDstStageMask  = &stage;
+	submit.commandBufferCount = 1;
+	submit.pCommandBuffers    = &m_readback_buffer;
+	if (graphics.readback_queue.submit(1, &submit, m_readback_fence) != vk::Result::eSuccess) {
+		EXIT("BufferCache: readback queue submission failed\n");
+	}
+	Common::Timeline::Mark("readback-queue", wait_tick);
+	EXIT_NOT_IMPLEMENTED(graphics.device.waitForFences(1, &m_readback_fence, VK_TRUE, UINT64_MAX) !=
+	                     vk::Result::eSuccess);
+	Common::Timeline::Mark("readback-done", wait_tick);
+	(void)graphics.device.resetFences(1, &m_readback_fence);
+	(void)m_readback_buffer.reset({});
 	return true;
 }
 
@@ -913,6 +993,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		DropGpuFills(vaddr, size);
 	}
 	if (is_written) {
+		buffer.last_write_tick = m_scheduler.CurrentTick();
 		if (PerfStatsEnabled()) {
 			LogGpuWrite(vaddr, size);
 		}

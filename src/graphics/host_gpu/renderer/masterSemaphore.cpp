@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 
 #include "common/assert.h"
+#include "common/experiments.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
@@ -56,7 +57,9 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	const bool timed  = BufferCache::PerfTimersEnabled() && GuestGpu::IsGpuThread();
 	const auto start  = timed ? std::chrono::steady_clock::now()
 	                          : std::chrono::steady_clock::time_point {};
+	Common::Timeline::Mark("host-wait", tick);
 	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
+	Common::Timeline::Mark("host-done", tick);
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	if (timed) {
 		BufferCache::PerfAddTime(BufferCache::PerfTimer::GpuWait,

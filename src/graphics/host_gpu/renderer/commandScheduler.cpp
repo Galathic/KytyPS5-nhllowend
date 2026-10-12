@@ -362,7 +362,15 @@ uint32_t GpuTimingBegin(GraphicContext& graphics, vk::CommandBuffer cmd, const c
 	VULKAN_HPP_DEFAULT_DISPATCHER.vkResetQueryPool(static_cast<VkDevice>(g_timing.device),
 	                                               static_cast<VkQueryPool>(g_timing.pool), slot * 2u,
 	                                               2u);
-	cmd.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, g_timing.pool, slot * 2u);
+	// KYTY_PERF_GPU_TIMING=2 starts each interval when all earlier work completed, so intervals
+	// do not overlap and add up to GPU busy time (incremental cost per operation).
+	static const bool incremental = [] {
+		const char* value = std::getenv("KYTY_PERF_GPU_TIMING");
+		return value != nullptr && value[0] == '2';
+	}();
+	cmd.writeTimestamp(incremental ? vk::PipelineStageFlagBits::eBottomOfPipe
+	                               : vk::PipelineStageFlagBits::eTopOfPipe,
+	                   g_timing.pool, slot * 2u);
 	return slot + 1u;
 }
 

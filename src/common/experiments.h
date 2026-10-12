@@ -28,6 +28,8 @@ enum Bit : uint32_t {
 	FaultCoalesce        = 1u << 16u, // KYTY_FAULT_COALESCE (a write fault releases its clean 64 KiB window)
 	SparseBufferGc       = 1u << 17u, // KYTY_SPARSE_BUFFER_GC (scan for idle buffers every 16th submission)
 	CleanFromDirect      = 1u << 18u, // KYTY_CLEAN_FROM_DIRECT (strict evaluator reuses direct SRT words)
+	DirectEopInterrupts  = 1u << 19u, // KYTY_DIRECT_EOP_INTERRUPTS (EOP interrupts at CP time, like labels)
+	ReadbackQueue        = 1u << 20u, // KYTY_READBACK_QUEUE (downloads wait only for the buffer's last writer)
 	// A/B only (no environment variable): selects the code a pending change replaces.
 	AbLegacy = 1u << 31u,
 };
@@ -36,5 +38,14 @@ enum Bit : uint32_t {
 [[nodiscard]] uint32_t Mask() noexcept;
 
 } // namespace Common::Experiments
+
+namespace Common::Timeline {
+
+// Debugging: KYTY_DBG_TIMELINE=<seconds> records marks from every thread for 1.5 s after that
+// delay, then prints them once in time order (NHL27TL lines): who waits on whom in a frame.
+[[nodiscard]] bool Enabled() noexcept;
+void Mark(const char* what, uint64_t value = 0) noexcept;
+
+} // namespace Common::Timeline
 
 #endif // EMULATOR_SRC_COMMON_EXPERIMENTS_H_

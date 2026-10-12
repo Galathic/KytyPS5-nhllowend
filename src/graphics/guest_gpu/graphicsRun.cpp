@@ -132,11 +132,14 @@ void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 		return;
 	}
 	std::binary_semaphore done {0};
+	Common::Timeline::Mark("sync-cmd", reinterpret_cast<uint64_t>(__builtin_return_address(0)));
 	SendCommand([operation = std::move(command), &done]() mutable {
+		Common::Timeline::Mark("sync-cmd-run");
 		operation();
 		done.release();
 	});
 	done.acquire();
+	Common::Timeline::Mark("sync-cmd-done");
 }
 
 void GuestGpu::Submit(std::span<const uint32_t> draw_commands,
@@ -149,6 +152,7 @@ void GuestGpu::Submit(std::span<const uint32_t> draw_commands,
 	submission.queue_id          = 0;
 	submission.commands          = draw_commands;
 	submission.constant_commands = constant_commands;
+	Common::Timeline::Mark("submit-gfx", draw_commands.size());
 	Enqueue(std::move(submission));
 }
 
@@ -162,6 +166,7 @@ void GuestGpu::SubmitCompute(uint32_t queue, std::span<const uint32_t> commands)
 	submission.type     = SubmissionType::Compute;
 	submission.queue_id = 1 + compute_queue;
 	submission.commands = commands;
+	Common::Timeline::Mark("submit-cs", commands.size());
 	Enqueue(std::move(submission));
 }
 
@@ -170,6 +175,7 @@ void GuestGpu::SubmitFlipPreparation(uint64_t request_id) {
 	submission.type            = SubmissionType::FlipPreparation;
 	submission.queue_id        = 0;
 	submission.flip_request_id = request_id;
+	Common::Timeline::Mark("submit-flip", request_id);
 	Enqueue(std::move(submission));
 }
 
@@ -177,7 +183,9 @@ void GuestGpu::SuspendPoint() {
 	EXIT_IF(IsGpuThread() || CommandScheduler::InDeferredOperation());
 	// Do not hold a queue lock while waiting: asynchronous work may be needed to
 	// finish the preceding graphics frame. The first point returns immediately.
+	Common::Timeline::Mark("suspend-wait");
 	m_suspend_point_ready->acquire();
+	Common::Timeline::Mark("suspend-go");
 	Submission submission;
 	submission.type = SubmissionType::SuspendPoint;
 	Enqueue(std::move(submission));
@@ -523,7 +531,9 @@ void GuestGpu::ThreadRun(void* data) {
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
+				Common::Timeline::Mark("gpu-idle");
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
+				Common::Timeline::Mark("gpu-wake");
 			}
 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
 				gpu->m_processing = false;
@@ -545,7 +555,9 @@ void GuestGpu::ThreadRun(void* data) {
 				}
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
+					Common::Timeline::Mark("gpu-blocked");
 					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					Common::Timeline::Mark("gpu-unblocked");
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {
 							queue.front().blocked = false;
@@ -582,7 +594,9 @@ void GuestGpu::ThreadRun(void* data) {
 		}
 
 		EXIT_IF(!has_submission);
+		Common::Timeline::Mark("slice-begin", submission.queue_id * 10u + static_cast<uint32_t>(submission.type));
 		const bool complete = gpu->Process(submission);
+		Common::Timeline::Mark(complete ? "slice-done" : "slice-blocked", submission.queue_id);
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
 		if (!complete) {
@@ -1655,6 +1669,7 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 }
 
 void CommandProcessor::Flip() {
+	Common::Timeline::Mark("cp-flip");
 	if (GraphicsRunDebugDumpEnabled()) {
 		LOGF("CommandProcessor::Flip()\n");
 	}
