@@ -3,6 +3,7 @@
 
 #include "common/abi.h"
 #include "common/common.h"
+#include "common/experiments.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/shader/recompiler/ir/ResourceSnapshot.h"
 #include "graphics/shader/shaderBindings.h"
@@ -17,15 +18,17 @@
 namespace Libs::Graphics {
 
 // Codegen option: native f16 (Float16 capability) for V_PK_{ADD,MUL,FMA,FMAC}_F16 with plain
-// operands. Set once at device creation (KYTY_NATIVE_FP16=1 and shaderFloat16 supported). The mode
-// bits describe which float-controls f16 execution modes the device allows the emitter to declare.
+// operands, when the device supports shaderFloat16 and experiment NativeFp16 (KYTY_NATIVE_FP16=1) is
+// on. The option is part of every stage key, so switching it at runtime compiles new variants. The
+// mode bits describe which float-controls f16 execution modes the device allows the emitter to declare.
 inline constexpr uint32_t kNativeFp16DenormPreserve = 1u << 0u;
 inline constexpr uint32_t kNativeFp16SignedZeroInfNan = 1u << 1u;
 inline constexpr uint32_t kNativeFp16RoundTiesEven = 1u << 2u;
 inline std::atomic<bool>     g_shader_native_fp16 {false};
 inline std::atomic<uint32_t> g_shader_native_fp16_modes {0};
 [[nodiscard]] inline bool ShaderNativeFp16() {
-	return g_shader_native_fp16.load(std::memory_order_relaxed);
+	return g_shader_native_fp16.load(std::memory_order_relaxed) &&
+	       Common::Experiments::Enabled(Common::Experiments::NativeFp16);
 }
 [[nodiscard]] inline uint32_t ShaderNativeFp16Modes() {
 	return g_shader_native_fp16_modes.load(std::memory_order_relaxed);

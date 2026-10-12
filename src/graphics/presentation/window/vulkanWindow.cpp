@@ -1,6 +1,7 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 
+#include "common/experiments.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -705,10 +706,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	    graphics.compute_subgroup_size_control_enabled ? VK_TRUE : VK_FALSE;
 
 	{
-		// KYTY_NATIVE_FP16=1: native f16 arithmetic for plain V_PK_{ADD,MUL,FMA,FMAC}_F16.
-		const char* fp16_env   = std::getenv("KYTY_NATIVE_FP16");
-		const bool  fp16_gate  = fp16_env != nullptr && fp16_env[0] == '1';
-		const bool  fp16_ok    = fp16_gate && supported_features12.shaderFloat16 == VK_TRUE;
+		// Native f16 arithmetic for plain V_PK_{ADD,MUL,FMA,FMAC}_F16: the feature is enabled whenever
+		// the device has it; experiment NativeFp16 (KYTY_NATIVE_FP16=1) selects the codegen.
+		const bool  fp16_gate  = Common::Experiments::Enabled(Common::Experiments::NativeFp16);
+		const bool  fp16_ok    = supported_features12.shaderFloat16 == VK_TRUE;
 		uint32_t    fp16_modes = 0;
 		if (fp16_ok) {
 			features12.shaderFloat16 = VK_TRUE;
@@ -736,7 +737,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		     float_controls.shaderDenormPreserveFloat16 == VK_TRUE,
 		     float_controls.shaderSignedZeroInfNanPreserveFloat16 == VK_TRUE,
 		     float_controls.shaderRoundingModeRTEFloat16 == VK_TRUE);
-		std::printf("NHL27CODEGEN native_fp16=%d\n",
+		std::printf("NHL27CODEGEN native_fp16=%d (device %d)\n", fp16_ok && fp16_gate ? 1 : 0,
 		            fp16_ok ? 1 : 0);
 		std::fflush(stdout);
 	}
@@ -762,6 +763,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		image_atomic_int64.pNext = const_cast<void*>(create_info.pNext);
 		image_atomic_int64.sparseImageInt64Atomics = VK_FALSE;
 		create_info.pNext = &image_atomic_int64;
+	}
+	vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR pipeline_executable {};
+	if (graphics.pipeline_stats_enabled) {
+		pipeline_executable.pNext                  = const_cast<void*>(create_info.pNext);
+		pipeline_executable.pipelineExecutableInfo = VK_TRUE;
+		create_info.pNext                          = &pipeline_executable;
 	}
 	// VK_EXT_device_fault: lets a device loss report the faulting GPU address.
 	vk::PhysicalDeviceFaultFeaturesEXT device_fault {};
@@ -1197,6 +1204,12 @@ void WindowContext::CreateVulkan() {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}
+		}
+		// KYTY_DBG_PIPELINE_STATS=<hex hash>[,...]: driver statistics and ISA of those shaders' pipelines.
+		if (std::getenv("KYTY_DBG_PIPELINE_STATS") != nullptr &&
+		    HasExtension(available_extensions, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+			graphic_ctx.pipeline_stats_enabled = true;
 		}
 		// Used only by the KYTY_IDLE_TRACE GPU timeline (GPU -> CPU clock conversion).
 		if (HasExtension(available_extensions, VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) {
