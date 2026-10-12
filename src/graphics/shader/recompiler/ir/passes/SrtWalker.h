@@ -68,6 +68,7 @@ private:
 	bool RawReadAddress(const Inst& inst, uint64_t& address, uint64_t bytes, bool& zero);
 	bool RefreshReadBatch(uint32_t slot, uint32_t count, std::vector<uint32_t>& flat);
 	bool RefreshDirectFlat(std::vector<uint32_t>& flat);
+	bool DirectReadRun(uint32_t slot, uint32_t count, std::vector<uint32_t>& flat);
 	bool EvaluateInst(const Inst& inst, uint64_t& result);
 
 	const ResourcePlan&              m_program;
@@ -77,6 +78,8 @@ private:
 	Value                           m_active_mask;
 	// Set once a direct refresh filled the flat buffer; descriptor words copy it directly.
 	const std::vector<uint32_t>*    m_direct_flat = nullptr;
+	// When set, only these flat slots were filled by the direct refresh.
+	const std::vector<uint8_t>*     m_direct_filled = nullptr;
 	uint64_t                        m_cycle_count = 0;
 	ResourcePlan::EvaluationContext& m_context;
 };

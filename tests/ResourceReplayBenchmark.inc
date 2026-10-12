@@ -210,7 +210,21 @@ int ResourceReplayPhases(const char* path, unsigned iterations, int direct) {
     };
     ResourceSnapshot snapshot;
     ResourceSpecialization specialization;
-    // The direct SRT path must reproduce the interpreter exactly.
+    // The direct SRT path must reproduce the interpreter exactly (captured specialization reads
+    // as merged address ranges: the direct path may split or repeat reads of the same bytes).
+    const auto merged = [](const ResourceSnapshot& snapshot) {
+      auto result = snapshot.specialization_reads;
+      for (auto& [address, bytes] : result) bytes += address;
+      std::ranges::sort(result);
+      size_t count = 0;
+      for (const auto range : result) {
+        if (count != 0 && range.first <= result[count - 1].second)
+          result[count - 1].second = std::max(result[count - 1].second, range.second);
+        else result[count++] = range;
+      }
+      result.resize(count);
+      return result;
+    };
     SetDirectSrtReadsOverride(0);
     ResourceSnapshot reference;
     ResourceSpecialization reference_spec;
@@ -223,11 +237,18 @@ int ResourceReplayPhases(const char* path, unsigned iterations, int direct) {
                           reference.flattened_srt != snapshot.flattened_srt ||
                           reference.user_data != snapshot.user_data ||
                           reference.uniform_fill != snapshot.uniform_fill ||
-                          reference.specialization_reads != snapshot.specialization_reads ||
+                          merged(reference) != merged(snapshot) ||
                           reference_spec != specialization))) {
-      std::fprintf(stderr, "ResourcePhases: direct SRT mismatch hash=%016llx stage=%u ok=%d/%d\n",
-                   static_cast<unsigned long long>(record.hash), static_cast<unsigned>(record.stage),
-                   reference_ok ? 1 : 0, direct_ok ? 1 : 0);
+      if (mismatches < 8)
+        std::fprintf(stderr, "ResourcePhases: direct SRT mismatch hash=%016llx stage=%u ok=%d/%d buffers=%d images=%d samplers=%d flat=%d user=%d fill=%d reads=%d(%zu/%zu) spec=%d\n",
+                     static_cast<unsigned long long>(record.hash), static_cast<unsigned>(record.stage),
+                     reference_ok ? 1 : 0, direct_ok ? 1 : 0, reference.buffers != snapshot.buffers,
+                     reference.images != snapshot.images, reference.samplers != snapshot.samplers,
+                     reference.flattened_srt != snapshot.flattened_srt, reference.user_data != snapshot.user_data,
+                     reference.uniform_fill != snapshot.uniform_fill,
+                     merged(reference) != merged(snapshot),
+                     reference.specialization_reads.size(), snapshot.specialization_reads.size(),
+                     reference_spec != specialization);
       ++mismatches;
     }
     direct_plans += plan.direct_srt_state == ResourcePlan::DirectSrtState::Direct;
@@ -325,4 +346,49 @@ int ResourceReplayShapes(const char* path) {
   print("SrtShapes", srt_shapes);
   print("DescriptorShapes", descriptor_shapes);
   return 0;
+}
+
+// Prints the translated IR and uniform-fill/copy analysis of one recorded shader:
+// --resource-replay-dump <copied .shaders file> <hex hash>
+int ResourceReplayDump(const char* path, uint64_t hash) {
+  using namespace ShaderRecompiler;
+  using namespace ShaderRecompiler::IR;
+  PipelineRecord::Records records;
+  PipelineRecord::RecordFile file;
+  if (!file.Open(std::filesystem::path(path), records) || records.programs.empty()) return 2;
+  for (auto& record : records.programs) {
+    if (record.hash != hash) continue;
+    CompileOptions options;
+    options.stage = record.stage;
+    options.shader_hash = record.hash;
+    options.user_data = record.user_data;
+    options.back_code = record.back_code;
+    options.dump_ir = false;
+    switch (record.stage) {
+      case ShaderType::Vertex:
+        options.wave_size = record.vertex.wave_size;
+        options.user_data_base = 8;
+        options.input_info.vertex = &record.vertex;
+        break;
+      case ShaderType::Pixel:
+        options.wave_size = record.pixel.wave_size;
+        options.input_info.pixel = &record.pixel;
+        break;
+      case ShaderType::Compute:
+        options.wave_size = record.compute.wave_size;
+        options.input_info.compute = &record.compute;
+        break;
+      default: continue;
+    }
+    auto translated = TranslateProgram(record.code, options);
+    if (translated.build_failed) { std::printf("build failed\n"); return 1; }
+    std::printf("%s\n", ProgramToString(translated.program).c_str());
+    const auto plan = ExtractResourcePlan(translated.program);
+    std::printf("uniform_fill kind=%u words=%u uniform_copy valid=%d buffers=%zu images=%zu\n",
+                static_cast<unsigned>(plan.uniform_fill.fill.kind), plan.uniform_fill.fill.words,
+                plan.uniform_copy.valid ? 1 : 0, plan.info.buffers.size(), plan.info.images.size());
+    return 0;
+  }
+  std::printf("hash not found\n");
+  return 1;
 }

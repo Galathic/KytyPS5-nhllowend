@@ -41635,6 +41635,10 @@ int main(int argc, char **argv) {
     EnsureConfigInitialized(false, false);
     return ResourceReplayBenchmark(argv[2]);
   }
+  if (argc == 4 && std::strcmp(argv[1], "--resource-replay-dump") == 0) {
+    EnsureConfigInitialized(false, false);
+    return ResourceReplayDump(argv[2], std::strtoull(argv[3], nullptr, 16));
+  }
   if (argc == 3 && std::strcmp(argv[1], "--resource-replay-shapes") == 0) {
     EnsureConfigInitialized(false, false);
     return ResourceReplayShapes(argv[2]);

@@ -619,6 +619,8 @@ struct ResourcePlan {
 	// Per descriptor source, 8 entries: the flat offset a dword copies (ReadConst of one slot),
 	// or -1 when the dword needs the IR walk. Built with direct_srt_reads.
 	mutable std::vector<int32_t>       direct_descriptor_offsets;
+	// Flat slots a direct refresh filled (plans with control flow skip unreached blocks).
+	mutable std::vector<uint8_t>       direct_filled;
 };
 
 struct Program: ResourcePlan {
