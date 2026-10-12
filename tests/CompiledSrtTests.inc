@@ -741,7 +741,7 @@ inline void TestDescriptorReuseAndDeadMemo() {
               BufferDword(b, 2) == 0x4cu + add2,
           "cfg reuse plan: recovery after a failed call");
   }
-  Common::RuntimeFlags::g_published.store(saved_flags & ~(uint64_t{1} << 22), std::memory_order_relaxed);
+  Common::RuntimeFlags::g_published.store(saved_flags & ~(uint64_t{1} << Common::RuntimeFlags::kBitSrtCompiled), std::memory_order_relaxed);
   Check(tally.mismatches == 0, "no descriptor reuse / dead memo differential mismatch");
 }
 

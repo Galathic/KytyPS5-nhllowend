@@ -2674,10 +2674,12 @@ void TestCfgDescriptorGatherMemoShortcut() {
   };
   struct Outcome { DescriptorValue descriptor; SrtEvaluationCounts counts; std::vector<uint64_t> addresses; bool ok; };
   const auto run = [&](bool enabled, bool invalidate_after_refresh = false) {
-    Common::RuntimeFlags::FlagSet flags {.srt_cfg_gather = enabled};
+    // Only the gather bit: FlagSet defaults now turn other materialization paths on.
+    const uint64_t gather_bit = Common::RuntimeFlags::Bits(Common::RuntimeFlags::FlagSet {.srt_cfg_gather = true}) ^
+                                Common::RuntimeFlags::Bits(Common::RuntimeFlags::FlagSet {.srt_cfg_gather = false});
     const auto old = Common::RuntimeFlags::g_published.load(std::memory_order_relaxed);
     Common::RuntimeFlags::g_published.store((old & ~Common::RuntimeFlags::kFlagMask) |
-      Common::RuntimeFlags::Bits(flags), std::memory_order_relaxed);
+      (enabled ? gather_bit : 0u), std::memory_order_relaxed);
     reads.addresses.clear();
     Outcome result;
     SrtRuntime runtime {.read_memory = reader, .userdata = &reads, .evaluation_counts = &result.counts};
