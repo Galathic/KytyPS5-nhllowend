@@ -247,6 +247,14 @@ struct BufDeltaStats {
 	std::atomic<uint64_t> up_verify {0}, up_verify_mismatch {0};        // sampled: staged bytes at the reused offset compared
 };
 inline BufDeltaStats g_bufdelta;
+
+// NHL27DIRTYWALK (KYTY_DIRTY_WALK_FAST): MemoryTracker::ForEachUploadRange fast walk.
+struct DirtyWalkStats {
+	std::atomic<uint64_t> calls {0}, managers_visited {0}, managers_skipped {0}, pages_scanned {0}, runs {0};
+	std::atomic<uint64_t> walk_ns {0};
+	std::atomic<uint64_t> verify_checks {0}, verify_mismatch {0};
+};
+inline DirtyWalkStats g_dirtywalk;
 inline bool BufOn() noexcept {
 	return g_buf_scope > 0 && Enabled();
 }
@@ -1255,6 +1263,17 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 				            "up_verify=%.2f up_verify_mismatch=%.2f\n",
 				            per(d_sl), per(d_h), per(d_m), per(d_vc), per(d_vm), per(u_c), per(u_r),
 				            per(u_by) / 1024.0, per(u_rd), per(u_re), per(u_vc), per(u_vm));
+			}
+		}
+		{
+			auto& dw = g_dirtywalk;
+			const uint64_t w_c = Take(dw.calls), w_v = Take(dw.managers_visited), w_s = Take(dw.managers_skipped);
+			const uint64_t w_p = Take(dw.pages_scanned), w_r = Take(dw.runs), w_n = Take(dw.walk_ns);
+			const uint64_t w_vc = Take(dw.verify_checks), w_vm = Take(dw.verify_mismatch);
+			if (Common::RuntimeFlags::Current().dirty_walk_fast) {
+				std::printf("NHL27DIRTYWALK calls=%.1f managers_visited=%.1f managers_skipped=%.1f pages_scanned=%.1f "
+				            "runs=%.1f walk_ms=%.3f verify_checks=%.2f verify_mismatch=%.2f\n",
+				            per(w_c), per(w_v), per(w_s), per(w_p), per(w_r), ms(w_n), per(w_vc), per(w_vm));
 			}
 		}
 		std::printf("NHL27PROTECT calls=%.2f ms=%.3f\n", per(protect_calls), ms(protect_ns));

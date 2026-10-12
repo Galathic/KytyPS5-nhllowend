@@ -7,7 +7,11 @@
 #include "graphics/host_gpu/regionManager.h"
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
 
+#include "common/runtimeFlags.h"
+
 #include <algorithm>
+#include <bit>
+#include <cstdlib>
 #include <atomic>
 #include <memory>
 #include <mutex>
@@ -154,6 +158,65 @@ public:
 		CheckNotInUploadCallback();
 		Iterate<true>(vaddr, size, [](RegionManager*, uint64_t, uint64_t) {});
 		const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
+		if (Common::RuntimeFlags::Current().dirty_walk_fast) {
+			// Same observable behaviour as the walk below; managers whose summary shows no CPU-dirty
+			// page in the span are not scanned (and, for read-only syncs, not even locked).
+			const bool verify = VerifyEnabled() && (s_verify_seq.fetch_add(1, std::memory_order_relaxed) % 64 == 0);
+			uint64_t   visited = 0, skipped = 0, pages = 0, runs = 0, v_checks = 0, v_bad = 0;
+			FrameBreakdown::Timer walk_timer(FrameBreakdown::g_dirtywalk.walk_ns);
+			Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+				const uint32_t mask = RegionManager::SpanWordMask(offset, bytes);
+				if (!is_written && !verify &&
+				    (manager->cpu_summary.load(std::memory_order_acquire) & mask) == 0) {
+					++skipped;
+					return;
+				}
+				manager->lock.lock();
+				const uint32_t live = manager->cpu_summary.load(std::memory_order_relaxed) & mask;
+				uint64_t       found = 0;
+				if (live != 0 || verify) {
+					++visited;
+					pages += static_cast<uint64_t>(std::popcount(live)) * 64;
+					manager->ForEachModifiedRange<DirtySource::Cpu, true>(
+					    manager->GetCpuAddr() + offset, bytes, [&](uint64_t a, uint64_t b) noexcept {
+						    ++found;
+						    range_func(a, b);
+					    });
+					runs += found;
+				} else {
+					++skipped;
+				}
+				if (verify) {
+					++v_checks;
+					if (live == 0 && found != 0) ++v_bad;
+				}
+				if (!is_written) {
+					manager->lock.unlock();
+				}
+			});
+			walk_timer.Stop();
+			upload_func();
+			if (is_written) {
+				Iterate<false>(vaddr, size,
+				               [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+					               manager->template ChangeState<DirtySource::Gpu, true>(
+					                   manager->GetCpuAddr() + offset, bytes);
+					               manager->lock.unlock();
+				               });
+			}
+			s_upload_owner = previous_upload_owner;
+			if (FrameBreakdown::Enabled()) {
+				auto& ds = FrameBreakdown::g_dirtywalk;
+				ds.calls.fetch_add(1, std::memory_order_relaxed);
+				ds.managers_visited.fetch_add(visited, std::memory_order_relaxed);
+				ds.managers_skipped.fetch_add(skipped, std::memory_order_relaxed);
+				ds.pages_scanned.fetch_add(pages, std::memory_order_relaxed);
+				ds.runs.fetch_add(runs, std::memory_order_relaxed);
+				ds.verify_checks.fetch_add(v_checks, std::memory_order_relaxed);
+				ds.verify_mismatch.fetch_add(v_bad, std::memory_order_relaxed);
+			}
+			return;
+		}
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			manager->lock.lock();
 			manager->ForEachModifiedRange<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset,
@@ -177,6 +240,15 @@ public:
 private:
 	static constexpr size_t REGION_COUNT = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
 	inline static thread_local const MemoryTracker* s_upload_owner = nullptr;
+	inline static std::atomic<uint64_t> s_verify_seq {0};
+	// KYTY_DRAWPREP_VERIFY=1 (read once): sampled fast walks also run the full scan and compare.
+	static bool VerifyEnabled() {
+		static const bool enabled = [] {
+			const char* value = std::getenv("KYTY_DRAWPREP_VERIFY");
+			return value != nullptr && value[0] == '1';
+		}();
+		return enabled;
+	}
 
 	void CheckNotInUploadCallback() const noexcept {
 		if (s_upload_owner == this) {

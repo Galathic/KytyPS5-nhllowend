@@ -70,7 +70,12 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 
 bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
-	return Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+	const bool fast = Common::RuntimeFlags::Current().dirty_walk_fast;
+	return Iterate<true>(vaddr, size, [fast](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		// Zero summary over the span: no CPU-dirty page there (see RegionManager::cpu_summary).
+		if (fast && (manager->cpu_summary.load(std::memory_order_acquire) & RegionManager::SpanWordMask(offset, bytes)) == 0) {
+			return false;
+		}
 		std::scoped_lock lock(manager->lock);
 		return manager->IsModified<DirtySource::Cpu>(offset, bytes);
 	});
