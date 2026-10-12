@@ -265,6 +265,46 @@ inline bool BufOn() noexcept {
 }
 // ---- END pipeline/buffer sub-bucket probes ----
 
+// NHL27BDABATCH (KYTY_PERF_STATS=1): safety counters for KYTY_BDA_BATCH. GPU command thread only (no atomics).
+// A batch is the span between two RenderContext::BdaBatchBoundary calls. "Stale-window" events are PrepareBda
+// scans after the first scan of a batch that still uploaded CPU-dirty data; with KYTY_BDA_BATCH on those
+// uploads would be deferred to the next batch.
+struct BdaBatchStats {
+	struct Late {
+		uint64_t begin, end;
+		uint32_t event;
+	};
+	// current batch
+	bool     active     = false;  // PrepareBda was called
+	bool     scanned    = false;  // a real (non generation-skipped) scan already ran in this batch
+	bool     collecting = false;  // inside a scan: SynchronizeBuffer reports uploaded runs
+	uint32_t b_calls = 0, b_scans = 0, b_events = 0;
+	std::vector<std::pair<uint64_t, uint64_t>> used;         // ranges requested through ObtainBuffer
+	std::vector<std::pair<uint64_t, uint64_t>> scan_ranges;  // runs uploaded by the scan in progress
+	std::vector<Late>                          late;         // runs uploaded by stale-window scans
+	// interval totals (reset at each print)
+	uint64_t batches = 0, calls = 0, scans = 0, extra_scans = 0, events = 0, ev_used = 0, ev_unused = 0;
+	uint64_t stale_bytes = 0, trunc = 0, flag_skips = 0, flips = 0, max_calls = 0, idle_batches = 0;
+	uint64_t kind[16] {};
+	Clock::time_point last_print {};
+};
+inline BdaBatchStats g_bda_batch;
+
+inline void BdaBatchNoteUsed(uint64_t vaddr, uint64_t size) noexcept {
+	if (!Enabled()) return;
+	auto& b = g_bda_batch;
+	if (b.used.size() < 16384 && (b.used.empty() || b.used.back() != std::pair<uint64_t, uint64_t> {vaddr, vaddr + size})) {
+		b.used.emplace_back(vaddr, vaddr + size);
+	}
+}
+
+inline void BdaBatchNoteUpload(uint64_t vaddr, uint64_t size) noexcept {
+	auto& b = g_bda_batch;
+	if (b.collecting && b.scan_ranges.size() < 8192) {
+		b.scan_ranges.emplace_back(vaddr, vaddr + size);
+	}
+}
+
 // NHL27SPECULATE (Stage 0 of parallel draw prep): how much materialization could have run ahead of time.
 // Seq counts materializations (draws + dispatches). Page tables are direct-mapped by hashed 4K page;
 // aliasing only over-blocks. Everything is gated on Enabled() at the call sites.

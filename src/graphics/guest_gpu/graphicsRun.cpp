@@ -161,6 +161,7 @@ void GuestGpu::ProcessCommands() {
 			EXIT_IF(m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
 		}
 		FrameBreakdown::GpuBusyScope busy_scope(FrameBreakdown::GB_GPU_CMDS);
+		m_renderer.BdaBatchBoundary(RenderContext::BdaBoundary::Other);
 		command();
 	}
 }
@@ -844,7 +845,38 @@ static void SubmitSplitMaybePrint() {
 	last_count = count;
 }
 
+// KYTY_BDA_BATCH: PM4 packets after which guest memory may be ordered for the GPU or CPU. WRITE_DATA, COPY_DATA
+// and draws/dispatches are deliberately not boundaries: they do not order CPU-written memory for the GPU.
+static bool BdaBoundaryKind(uint32_t opcode, uint32_t header, RenderContext::BdaBoundary& kind) {
+	using B = RenderContext::BdaBoundary;
+	switch (opcode) {
+		case Pm4::IT_WAIT_REG_MEM:
+		case Pm4::IT_WAIT_REG_MEM_64:
+		case Pm4::IT_WAIT_ON_CE_COUNTER:
+		case Pm4::IT_WAIT_ON_DE_COUNTER_DIFF: kind = B::Wait; return true;
+		case Pm4::IT_EVENT_WRITE:
+		case Pm4::IT_EVENT_WRITE_EOP:
+		case Pm4::IT_EVENT_WRITE_EOS: kind = B::Event; return true;
+		case Pm4::IT_ACQUIRE_MEM: kind = B::Acquire; return true;
+		case Pm4::IT_DMA_DATA: kind = B::Dma; return true;
+		case Pm4::IT_PFP_SYNC_ME: kind = B::Sync; return true;
+		case Pm4::IT_INDIRECT_BUFFER: kind = B::Ib; return true;
+		case Pm4::IT_NOP:
+			switch (KYTY_PM4_R(header)) {
+				case Pm4::R_WAIT_FLIP_DONE: kind = B::Wait; return true;
+				case Pm4::R_ACQUIRE_MEM: kind = B::Acquire; return true;
+				case Pm4::R_RELEASE_MEM: kind = B::Event; return true;
+				case Pm4::R_FLIP: kind = B::Flip; return true;
+				default: return false;
+			}
+		default: return false;
+	}
+}
+
 bool GuestGpu::Process(Submission& submission) {
+	// Start of each PM4 submission slice (graphics, compute queue, flip preparation, suspend point).
+	m_renderer.BdaBatchBoundary(submission.type == SubmissionType::FlipPreparation ? RenderContext::BdaBoundary::Flip
+	                                                                                : RenderContext::BdaBoundary::Submit);
 	const bool first_slice = !submission.started;
 	auto&      cp          = GetProcessor(submission.queue_id);
 
@@ -943,6 +975,7 @@ bool GuestGpu::Process(Submission& submission) {
 
 	g_submit_split.enabled = false;
 	SubmitSplitMaybePrint();
+	m_renderer.BdaBatchBoundary(RenderContext::BdaBoundary::Submit);
 	return complete;
 }
 
@@ -1009,6 +1042,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		auto& cursor = execution.m_buffer_stack.back();
 		EXIT_IF(cursor.offset_dw > cursor.commands.size());
 		if (cursor.offset_dw == cursor.commands.size()) {
+			if (execution.m_buffer_stack.size() > 1) {
+				m_renderer.BdaBatchBoundary(RenderContext::BdaBoundary::Ib);  // return edge of an indirect buffer call
+			}
 			execution.m_buffer_stack.pop_back();
 			continue;
 		}
@@ -1095,6 +1131,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			packet_dw = handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 		}
 		EXIT_IF(packet_dw > remaining_dw);
+		if (RenderContext::BdaBoundary bda_kind; BdaBoundaryKind(opcode, packet_header, bda_kind)) {
+			m_renderer.BdaBatchBoundary(bda_kind);  // after the handler, also when the packet suspended on a wait
+		}
 		if (execution.m_suspended) {
 			return;
 		}

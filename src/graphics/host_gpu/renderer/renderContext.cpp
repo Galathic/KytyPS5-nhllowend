@@ -213,6 +213,21 @@ void RenderContext::PrepareBda() {
 		FrameBreakdown::Timer lock_timer(FrameBreakdown::g_counters.bda_lock_ns);
 		lock = std::shared_lock(m_mapped_ranges_mutex);
 	}
+	auto& batch = FrameBreakdown::g_bda_batch;
+	if (stats_enabled) {
+		batch.active = true;
+		++batch.b_calls;
+	}
+	// KYTY_BDA_BATCH: only the first call of a batch synchronizes. A mapping change (unmap/map from the
+	// GPU command lane or a guest thread) always forces a sync. Writes that land after the batch's sync
+	// become visible at the next batch boundary (see NHL27BDABATCH for how often that window matters).
+	if (m_bda_batch_synced && Common::RuntimeFlags::g_published.load(std::memory_order_relaxed) >> Common::RuntimeFlags::kBitBdaBatch & 1u &&
+	    m_mapping_generation == m_bda_mapping_generation) {
+		if (stats_enabled) {
+			++batch.flag_skips;
+		}
+		return;
+	}
 	const auto cpu = m_buffer_cache.CpuModificationGeneration();
 	const auto registrations = m_buffer_cache.RegistrationGeneration();
 	const bool unchanged = cache_enabled && cpu == m_bda_cpu_generation &&
@@ -223,6 +238,11 @@ void RenderContext::PrepareBda() {
 		FrameBreakdown::Add(FrameBreakdown::g_counters.bda_skips);
 	} else {
 		++m_bda_stats.scans;
+		const bool extra_scan = batch.scanned;
+		if (stats_enabled) {
+			batch.collecting = true;
+			batch.scan_ranges.clear();
+		}
 		if (cache_enabled && dirty_regions) {
 			const bool full = m_mapping_generation != m_bda_mapping_generation;
 			m_bda_stats.full_scans += full;
@@ -253,7 +273,24 @@ void RenderContext::PrepareBda() {
 		m_bda_cpu_generation = cpu;
 		m_bda_registration_generation = registrations;
 		m_bda_mapping_generation = m_mapping_generation;
+		if (stats_enabled) {
+			batch.collecting = false;
+			++batch.b_scans;
+			batch.scanned = true;
+			if (extra_scan && !batch.scan_ranges.empty()) {
+				const uint32_t event = batch.b_events++;
+				for (const auto& r: batch.scan_ranges) {
+					batch.stale_bytes += r.second - r.first;
+					if (batch.late.size() < 8192) {
+						batch.late.push_back({r.first, r.second, event});
+					} else {
+						++batch.trunc;
+					}
+				}
+			}
+		}
 	}
+	m_bda_batch_synced = true;
 	total_timer.Stop();
 	// Lazy BDA faults still need processing even when uploads were unchanged.
 	m_fault_process_pending = true;
@@ -268,6 +305,87 @@ void RenderContext::PrepareBda() {
 			            static_cast<unsigned long long>(m_bda_stats.dirty_regions));
 			last = now;
 		}
+	}
+}
+
+static const char* const kBdaBoundaryNames[] = {"submit", "wait", "event", "acquire", "dma", "sync", "ib", "flip", "other"};
+
+void RenderContext::BdaBatchBoundary(BdaBoundary kind) {
+	m_bda_batch_synced = false;
+	if (!FrameBreakdown::Enabled()) {
+		return;
+	}
+	auto& b = FrameBreakdown::g_bda_batch;
+	++b.kind[static_cast<size_t>(kind)];
+	if (kind == BdaBoundary::Flip) {
+		++b.flips;
+	}
+	if (!b.active) {
+		b.used.clear();
+		b.late.clear();
+		b.b_events = 0;
+		return;
+	}
+	// Close the batch: classify stale-window events against the buffers requested during the batch.
+	++b.batches;
+	b.calls += b.b_calls;
+	b.scans += b.b_scans;
+	b.extra_scans += b.b_scans > 0 ? b.b_scans - 1 : 0;
+	b.max_calls = std::max<uint64_t>(b.max_calls, b.b_calls);
+	if (b.b_events != 0) {
+		std::sort(b.used.begin(), b.used.end());
+		std::vector<std::pair<uint64_t, uint64_t>> merged;
+		for (const auto& r: b.used) {
+			if (!merged.empty() && r.first <= merged.back().second) {
+				merged.back().second = std::max(merged.back().second, r.second);
+			} else {
+				merged.push_back(r);
+			}
+		}
+		std::vector<char> hit(b.b_events, 0);
+		for (const auto& l: b.late) {
+			auto it = std::upper_bound(merged.begin(), merged.end(), l.begin,
+			                           [](uint64_t v, const std::pair<uint64_t, uint64_t>& m) { return v < m.second; });
+			if (it != merged.end() && it->first < l.end) {
+				hit[l.event] = 1;
+			}
+		}
+		for (const char h: hit) {
+			++b.events;
+			(h ? b.ev_used : b.ev_unused) += 1;
+		}
+	}
+	b.active  = false;
+	b.scanned = false;
+	b.b_calls = b.b_scans = b.b_events = 0;
+	b.used.clear();
+	b.late.clear();
+	const auto now = std::chrono::steady_clock::now();
+	if (b.last_print == std::chrono::steady_clock::time_point {}) {
+		b.last_print = now;
+	}
+	if (now - b.last_print >= std::chrono::seconds(5)) {
+		const double flips   = static_cast<double>(std::max<uint64_t>(b.flips, 1));
+		const double batches = static_cast<double>(std::max<uint64_t>(b.batches, 1));
+		std::printf("NHL27BDABATCH flag=%d flips=%llu batches/flip=%.1f calls/batch=%.2f scans/batch=%.2f max_calls=%llu "
+		            "avoidable_syncs/flip=%.1f flag_skips/flip=%.1f stale_events/flip=%.2f (a_overlaps_used=%llu "
+		            "b_unused=%llu) stale_kb/flip=%.1f trunc=%llu bnd/flip[",
+		            static_cast<int>(Common::RuntimeFlags::g_published.load(std::memory_order_relaxed) >> Common::RuntimeFlags::kBitBdaBatch & 1u),
+		            static_cast<unsigned long long>(b.flips), static_cast<double>(b.batches) / flips,
+		            static_cast<double>(b.calls) / batches, static_cast<double>(b.scans) / batches,
+		            static_cast<unsigned long long>(b.max_calls), static_cast<double>(b.extra_scans) / flips,
+		            static_cast<double>(b.flag_skips) / flips, static_cast<double>(b.events) / flips,
+		            static_cast<unsigned long long>(b.ev_used), static_cast<unsigned long long>(b.ev_unused),
+		            static_cast<double>(b.stale_bytes) / 1024.0 / flips, static_cast<unsigned long long>(b.trunc));
+		for (size_t i = 0; i < static_cast<size_t>(BdaBoundary::Count); ++i) {
+			std::printf("%s%s=%.1f", i == 0 ? "" : " ", kBdaBoundaryNames[i], static_cast<double>(b.kind[i]) / flips);
+		}
+		std::printf("]\n");
+		std::fflush(stdout);
+		b.batches = b.calls = b.scans = b.extra_scans = b.events = b.ev_used = b.ev_unused = 0;
+		b.stale_bytes = b.trunc = b.flag_skips = b.flips = b.max_calls = 0;
+		std::fill(std::begin(b.kind), std::end(b.kind), 0);
+		b.last_print = now;
 	}
 }
 

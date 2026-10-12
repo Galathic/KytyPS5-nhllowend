@@ -662,6 +662,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	    [&](uint64_t address, uint64_t bytes) noexcept {
 		    copies.emplace_back(total_size, buffer.Offset(address), bytes);
 		    total_size += bytes;
+		    FrameBreakdown::BdaBatchNoteUpload(address, bytes);
 	    },
 	    [&]() noexcept {
 		    FrameBreakdown::Timer stage_timer(bs.sb_stage_ns[bi], bon);
@@ -749,6 +750,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
 	}
 
+	FrameBreakdown::BdaBatchNoteUsed(vaddr, size);
 	// NHL27BUFFERS2: counted only inside the RebindBuffers lookup scope.
 	const bool bon = FrameBreakdown::BufOn() && FrameBreakdown::g_buf_scope == 1;
 	auto&      bs  = FrameBreakdown::g_buf;
@@ -821,6 +823,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferCached(uint64_t vaddr, uin
 		// Registration unchanged: the buffer set, page table and offsets are the same. The range was
 		// CPU-clean when stored and is still CPU-clean, so SynchronizeBuffer would upload nothing.
 		entry.cpu_generation = cpu;
+		FrameBreakdown::BdaBatchNoteUsed(vaddr, size);
 		auto& buffer         = m_slot_buffers[entry.id];
 		TouchBuffer(buffer);
 		FrameBreakdown::VAdd(FrameBreakdown::g_counters.obtain_cache_hits);
