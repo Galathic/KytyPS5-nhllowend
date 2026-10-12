@@ -245,6 +245,16 @@ struct DeltaStats {
 	std::atomic<uint64_t> verify_mismatch {0};     // ... whose image id / view info differed (must be 0)
 	std::atomic<uint64_t> smp_slots_seen {0};      // sampler slots looked up by PrepareBindings (delta on)
 	std::atomic<uint64_t> smp_reuse {0};           // ... that reused the stored vk sampler
+	// Same counters split for compute dispatches (the plain ones above cover all stages; draw = total - cs).
+	std::atomic<uint64_t> cs_hits {0}, cs_eligible {0}, cs_rej_gen {0}, cs_rej_state {0}, cs_unmemoable {0}, cs_slots {0};
+	std::atomic<uint64_t> dr_slots {0};
+	// Unmemoable reasons (all stages).
+	std::atomic<uint64_t> um_dcc {0}, um_depth {0}, um_other {0};
+	// TextureCache::BumpGeneration call sites (a FreeImage counts in free + delete + unregister).
+	std::atomic<uint64_t> gen_insert {0}, gen_free {0}, gen_unregister {0}, gen_delete {0}, gen_rebind {0};
+	std::atomic<uint64_t> gen_dirty_skipped {0}, gen_untrack_skipped {0};  // no longer bump; counted for reference
+	// Generation log: rejected_gen = overlap + overrun; scans = memo hits with a stale generation checked against the log.
+	std::atomic<uint64_t> rej_gen_overlap {0}, rej_gen_overrun {0}, gen_log_scans {0};
 };
 inline DeltaStats g_delta;
 struct DeltaProg {
@@ -1030,6 +1040,24 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 				            "unmemoable=%.1f verify_checks=%.1f verify_mismatch=%.1f smp_slots=%.1f smp_reuse=%.1f\n",
 				            per(r_hit), per(r_el), per(r_gen), per(r_st), per(r_um), per(r_vc), per(r_vm), per(r_ss),
 				            per(r_sr));
+					const uint64_t c_hit = Take(dl.cs_hits), c_el = Take(dl.cs_eligible), c_gen = Take(dl.cs_rej_gen);
+					const uint64_t c_st = Take(dl.cs_rej_state), c_um = Take(dl.cs_unmemoable), c_sl = Take(dl.cs_slots);
+					const uint64_t d_sl = Take(dl.dr_slots), u_dcc = Take(dl.um_dcc), u_dep = Take(dl.um_depth);
+					const uint64_t u_oth = Take(dl.um_other);
+					std::printf("NHL27DELTAREUSE_SPLIT draw: slots=%.1f eligible=%.1f hits=%.1f rejected_gen=%.1f "
+					            "rejected_state=%.1f unmemoable=%.1f | dispatch: slots=%.1f eligible=%.1f hits=%.1f "
+					            "rejected_gen=%.1f rejected_state=%.1f unmemoable=%.1f | unmemoable_by: dcc_cmask=%.1f "
+					            "depth=%.1f other=%.1f\n",
+					            per(d_sl), per(r_el - c_el), per(r_hit - c_hit), per(r_gen - c_gen), per(r_st - c_st),
+					            per(r_um - c_um), per(c_sl), per(c_el), per(c_hit), per(c_gen), per(c_st), per(c_um),
+					            per(u_dcc), per(u_dep), per(u_oth));
+					std::printf("NHL27DELTAGEN gen_insert=%.1f gen_free=%.1f gen_unregister=%.1f gen_delete=%.1f "
+					            "gen_rebind=%.1f gen_dirty_skipped=%.1f gen_untrack_skipped=%.1f "
+						            "rejected_gen_overlap=%.1f rejected_gen_overrun=%.1f gen_log_scans=%.1f\n",
+					            per(Take(dl.gen_insert)), per(Take(dl.gen_free)), per(Take(dl.gen_unregister)),
+					            per(Take(dl.gen_delete)), per(Take(dl.gen_rebind)), per(Take(dl.gen_dirty_skipped)),
+					            per(Take(dl.gen_untrack_skipped)), per(Take(dl.rej_gen_overlap)),
+						            per(Take(dl.rej_gen_overrun)), per(Take(dl.gen_log_scans)));
 			}
 		}
 		std::printf("NHL27BUFFERS vertex_index=%.2fms indirect=%.2fms find=%.2fms bda=%.2fms "

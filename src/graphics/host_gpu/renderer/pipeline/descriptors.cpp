@@ -957,6 +957,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	// its inputs and the texture cache are provably unchanged (see TextureCache::Generation()).
 	const bool delta_on    = Common::RuntimeFlags::Current().drawprep_delta;
 	const bool delta_stats = delta_on && FrameBreakdown::Enabled();
+	const bool is_cs       = program.stage == ShaderType::Compute;
 	StageBindingMemo* memo_stage = nullptr;
 	if (delta_on) {
 		memo_stage = &m_binding_memos[&snapshot];
@@ -970,24 +971,56 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		for (uint32_t i = 0; i < program.info.images.size(); i++) {
 			TextureBinding binding;
 			ImageSlotMemo* memo      = memo_stage != nullptr ? &memo_stage->images[i] : nullptr;
+				if (delta_stats) {
+					(is_cs ? FrameBreakdown::g_delta.cs_slots : FrameBreakdown::g_delta.dr_slots)
+					    .fetch_add(1, std::memory_order_relaxed);
+				}
 			uint64_t       memo_key  = 0;
 			bool           reused    = false;
 			if (memo != nullptr) {
 				memo_key = ImageResourceKey(program.info.images[i]);
 				if (memo->valid && memo->resource_key == memo_key && memo->words == snapshot.images[i]) {
-					if (delta_stats) FrameBreakdown::g_delta.reuse_eligible.fetch_add(1, std::memory_order_relaxed);
-					if (memo->generation != texture_cache.Generation()) {
-						if (delta_stats) FrameBreakdown::g_delta.reuse_rej_gen.fetch_add(1, std::memory_order_relaxed);
+					if (delta_stats) {
+						FrameBreakdown::g_delta.reuse_eligible.fetch_add(1, std::memory_order_relaxed);
+						if (is_cs) FrameBreakdown::g_delta.cs_eligible.fetch_add(1, std::memory_order_relaxed);
+					}
+					bool gen_ok = memo->generation == texture_cache.Generation();
+					if (!gen_ok) {
+						// Targeted test: only a log entry overlapping this slot's guest range can change the answer.
+						uint64_t current = 0;
+						const auto check = texture_cache.CheckGenerationLog(memo->generation, memo->range_begin,
+						                                                    memo->range_end, current);
+						if (delta_stats) FrameBreakdown::g_delta.gen_log_scans.fetch_add(1, std::memory_order_relaxed);
+						if (check == TextureCache::GenCheck::Clean) {
+							memo->generation = current;
+							gen_ok           = true;
+						} else if (delta_stats) {
+							(check == TextureCache::GenCheck::Overlap ? FrameBreakdown::g_delta.rej_gen_overlap
+							                                          : FrameBreakdown::g_delta.rej_gen_overrun)
+							    .fetch_add(1, std::memory_order_relaxed);
+						}
+					}
+					if (!gen_ok) {
+						if (delta_stats) {
+							FrameBreakdown::g_delta.reuse_rej_gen.fetch_add(1, std::memory_order_relaxed);
+							if (is_cs) FrameBreakdown::g_delta.cs_rej_gen.fetch_add(1, std::memory_order_relaxed);
+						}
 					} else if (const auto* cached = texture_cache.m_slot_images.try_get(memo->image_id);
 					           cached == nullptr || !cached->registered || cached->binding.needs_rebind) {
-						if (delta_stats) FrameBreakdown::g_delta.reuse_rej_state.fetch_add(1, std::memory_order_relaxed);
+						if (delta_stats) {
+							FrameBreakdown::g_delta.reuse_rej_state.fetch_add(1, std::memory_order_relaxed);
+							if (is_cs) FrameBreakdown::g_delta.cs_rej_state.fetch_add(1, std::memory_order_relaxed);
+						}
 					} else {
 						// FindImage's remaining per-call side effects on a hit: last-access tick + LRU touch.
 						texture_cache.NoteImageUse(memo->image_id);
 						binding.image_id = memo->image_id;
 						binding.desc     = memo->desc;
 						reused           = true;
-						if (delta_stats) FrameBreakdown::g_delta.reuse_hits.fetch_add(1, std::memory_order_relaxed);
+						if (delta_stats) {
+								FrameBreakdown::g_delta.reuse_hits.fetch_add(1, std::memory_order_relaxed);
+								if (is_cs) FrameBreakdown::g_delta.cs_hits.fetch_add(1, std::memory_order_relaxed);
+							}
 						static uint32_t verify_tick = 0;
 						if (DrawPrepDeltaVerifyEnabled() && (++verify_tick & 63u) == 0) {
 							// Full path on 1 of 64 hits; it is a normal ResolveTexture call. Keep its result.
@@ -1023,20 +1056,37 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 				}
 				if (memo != nullptr) {
 					const auto* resolved = texture_cache.m_slot_images.try_get(binding.image_id);
+					// Depth-only images are memoable: their FindImage path has no per-call side effect beyond the last-access
+					// tick + LRU touch (replicated by NoteImageUse). Depth with stencil stays excluded: ResolveTexture redirects a
+					// stencil association record to its depth image, and AssociateStencil can re-point that without a generation bump.
+					// DCC/Cmask colour images stay unmemoable: FindImage runs MaterializeColorClear on every call, which re-reads
+					// guest metadata bytes (written by GPU/CPU with no generation signal) and may clear the image, so a pending
+					// fast clear cannot be ruled out cheaply.
+					const bool is_dcc = binding.desc.info.metadata.kind == ImageMetadataKind::Dcc ||
+					                    binding.desc.info.metadata.kind == ImageMetadataKind::Cmask;
+					const bool stencil_bad = resolved != nullptr && (resolved->depth_id || resolved->info.HasStencil());
 					const bool  memoable = resolved != nullptr && resolved->registered &&
 					                      !resolved->info.data.Empty() && !resolved->binding.needs_rebind &&
-					                      !resolved->depth_id && !resolved->info.IsDepth() &&
-					                      binding.desc.info.metadata.kind != ImageMetadataKind::Dcc &&
-					                      binding.desc.info.metadata.kind != ImageMetadataKind::Cmask;
+					                      !stencil_bad && !is_dcc;
 					memo->valid = memoable;
 					if (memoable) {
 						memo->words        = snapshot.images[i];
 						memo->resource_key = memo_key;
 						memo->generation   = texture_cache.Generation();
+						// Conservative guest range: T# range union the resolved image's range.
+						const auto& req = binding.desc.info.data;
+						const auto& got = resolved->info.data;
+						memo->range_begin = std::min(req.address, got.address);
+						memo->range_end   = std::max(req.address + req.size, got.address + got.size);
 						memo->image_id     = binding.image_id;
 						memo->desc         = binding.desc;
 					} else if (delta_stats) {
 						FrameBreakdown::g_delta.reuse_unmemoable.fetch_add(1, std::memory_order_relaxed);
+						if (is_cs) FrameBreakdown::g_delta.cs_unmemoable.fetch_add(1, std::memory_order_relaxed);
+						(is_dcc ? FrameBreakdown::g_delta.um_dcc
+						        : (resolved != nullptr && resolved->info.IsDepth()) ? FrameBreakdown::g_delta.um_depth
+						                                                            : FrameBreakdown::g_delta.um_other)
+						    .fetch_add(1, std::memory_order_relaxed);
 					}
 				}
 			}

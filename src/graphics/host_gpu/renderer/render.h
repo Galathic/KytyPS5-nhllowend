@@ -324,6 +324,9 @@ private:
 		ShaderRecompiler::IR::DescriptorValue        words;
 		uint64_t                                     resource_key = 0;
 		uint64_t                                     generation   = 0;
+		// Guest range [range_begin, range_end): union of the T# range and the resolved image's range.
+		uint64_t                                     range_begin  = 0;
+		uint64_t                                     range_end    = 0;
 		ImageId                                      image_id;
 		TextureCache::ImageDesc                      desc;
 	};
