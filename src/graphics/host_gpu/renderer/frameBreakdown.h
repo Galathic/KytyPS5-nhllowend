@@ -187,6 +187,15 @@ struct Counters {
 	std::atomic<uint64_t> port_rt_memo_misses {0};     // decodes computed and inserted
 	std::atomic<uint64_t> port_buffer_gc_deletes {0};  // buffers deleted by the buffer collector
 	std::atomic<uint64_t> port_buffer_creates {0};     // buffers created (churn indicator)
+	// KYTY_READBACK_QUEUE / KYTY_DIRECT_EOP_INTERRUPTS / KYTY_FAULT_COALESCE / KYTY_SPARSE_BUFFER_GC
+	std::atomic<uint64_t> port_rbq_used {0};           // downloads served by the second queue
+	std::atomic<uint64_t> port_rbq_fallback {0};       // eligible downloads that fell back (queue unavailable/failed)
+	std::atomic<uint64_t> port_rbq_wait_ns {0};        // host time blocked on the readback fence
+	std::atomic<uint64_t> port_eop_direct {0};         // EOP interrupts delivered at CP time
+	std::atomic<uint64_t> port_fault_windows {0};      // write faults that released a coalescing window
+	std::atomic<uint64_t> port_fault_pages {0};        // extra tracker pages released by those windows
+	std::atomic<uint64_t> port_gc_scans {0};           // buffer GC scans run
+	std::atomic<uint64_t> port_gc_sparse_skips {0};    // buffer GC scans skipped by KYTY_SPARSE_BUFFER_GC
 };
 inline Counters g_counters;
 
@@ -937,6 +946,14 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 	const uint64_t port_rt_miss      = Take(c.port_rt_memo_misses);
 	const uint64_t port_gc_del       = Take(c.port_buffer_gc_deletes);
 	const uint64_t port_buf_new      = Take(c.port_buffer_creates);
+	const uint64_t port_rbq_used     = Take(c.port_rbq_used);
+	const uint64_t port_rbq_fb       = Take(c.port_rbq_fallback);
+	const uint64_t port_rbq_wait     = Take(c.port_rbq_wait_ns);
+	const uint64_t port_eop          = Take(c.port_eop_direct);
+	const uint64_t port_fwin         = Take(c.port_fault_windows);
+	const uint64_t port_fpages       = Take(c.port_fault_pages);
+	const uint64_t port_gcs          = Take(c.port_gc_scans);
+	const uint64_t port_gcskip       = Take(c.port_gc_sparse_skips);
 	uint64_t gb[GB_COUNT];
 	for (size_t i = 0; i < GB_COUNT; ++i) {
 		gb[i] = Take(g_gpu_busy_ns[i]);
@@ -998,6 +1015,10 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 	            per(port_auto), per(port_auto_skip), per(port_gbar), per(port_gbar_skip), per(port_acq),
 	            per(port_guard), per(port_hit), per(port_miss), per(port_rt_hit), per(port_rt_miss),
 	            per(port_buf_new), per(port_gc_del));
+	std::printf("NHL27PORT2 per_frame: readback_queue_used=%.2f(fallbacks %.2f wait=%.3fms) eop_direct=%.2f "
+	            "fault_coalesce_windows=%.2f(pages %.2f) sparse_gc_scans=%.2f(skipped %.2f)\n",
+	            per(port_rbq_used), per(port_rbq_fb), ms(port_rbq_wait),
+	            per(port_eop), per(port_fwin), per(port_fpages), per(port_gcs), per(port_gcskip));
 	std::fflush(stdout);
 	if (DetailEnabled()) {
 		std::printf("NHL27PREP frames=%" PRIu64

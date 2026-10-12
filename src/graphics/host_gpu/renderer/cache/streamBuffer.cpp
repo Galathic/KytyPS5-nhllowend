@@ -167,6 +167,7 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
 	    destination_offset < source_offset + size) {
 		EXIT("Buffer: overlapping self-copy\n");
 	}
+	last_write_tick = Scheduler().CurrentTick();
 	command.EndRendering();
 	const vk::BufferMemoryBarrier before[] = {
 	    source.Barrier(source_offset, size, source_before, vk::AccessFlagBits::eTransferRead),
@@ -199,6 +200,7 @@ void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
 		EXIT("Buffer: fill range must be dword aligned\n");
 	}
 	auto& command = Scheduler().Current();
+	last_write_tick = Scheduler().CurrentTick();
 	command.EndRendering();
 	const auto before =
 	    Barrier(offset, size, vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,

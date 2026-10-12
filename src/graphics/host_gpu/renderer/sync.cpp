@@ -4,6 +4,8 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/logging/log.h"
+#include "common/runtimeFlags.h"
+#include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
@@ -235,6 +237,17 @@ void TriggerEopEventAtEndOfPipe(CommandBuffer& buffer, int event_id, uint32_t co
 	auto& renderer  = buffer.GetContext();
 	auto& scheduler = renderer.GetCommandScheduler();
 	EXIT_IF(!scheduler.Active() || &buffer != &scheduler.Current());
+	// KYTY_DIRECT_EOP_INTERRUPTS: end-of-pipe labels are already written when the CP reaches them
+	// and recorded work holds its own copies of guest memory, so deliver the interrupt with the
+	// label instead of after host completion. CPU reads of GPU-written memory still wait for the
+	// host GPU through the page tracking.
+	if (Common::RuntimeFlags::Current().direct_eop_interrupts) {
+		FrameBreakdown::Add(FrameBreakdown::g_counters.port_eop_direct);
+		Common::EventTrace::Record(Common::EventTrace::EOP_TRIGGER, static_cast<uint64_t>(event_id),
+		                           scheduler.CurrentTick());
+		renderer.TriggerInterrupt(event_id, context_id);
+		return;
+	}
 	scheduler.DeferPriorityOperation(
 	    [&renderer, event_id, context_id, tick = scheduler.CurrentTick()] {
 		    Common::EventTrace::Record(Common::EventTrace::EOP_TRIGGER, static_cast<uint64_t>(event_id), tick);

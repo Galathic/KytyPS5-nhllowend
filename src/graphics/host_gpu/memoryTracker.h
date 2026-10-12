@@ -76,8 +76,10 @@ public:
 	// GPU-modified pages are skipped. Used to unprotect pages a sequential CPU writer
 	// is about to reach, so one write fault covers several pages. Marking a page
 	// CPU-modified is always conservative (it is re-uploaded before GPU use).
-	void MarkCpuDirtyAhead(uint64_t vaddr, uint64_t size) noexcept {
+	// Returns the number of tracker pages newly marked.
+	uint64_t MarkCpuDirtyAhead(uint64_t vaddr, uint64_t size) noexcept {
 		CheckNotInUploadCallback();
+		uint64_t marked_pages = 0;
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			std::scoped_lock lock(manager->lock);
 			uint64_t run_begin = 0;
@@ -86,6 +88,7 @@ public:
 			const auto flush_run = [&] {
 				if (run_bytes == 0) return;
 				manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + run_begin, run_bytes);
+				marked_pages += run_bytes / TRACKER_PAGE_SIZE;
 				run_bytes = 0;
 				changed   = true;
 			};
@@ -105,6 +108,7 @@ public:
 				m_cpu_generation.fetch_add(1, std::memory_order_release);
 			}
 		});
+		return marked_pages;
 	}
 
 	// Single GPU-thread consumer. Read the next link before releasing this node to

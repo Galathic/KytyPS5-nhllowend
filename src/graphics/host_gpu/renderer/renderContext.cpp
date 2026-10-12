@@ -10,6 +10,7 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cstdlib>
 #include <cstdio>
@@ -111,6 +112,25 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		{
 			FrameBreakdown::FaultTimer t(FrameBreakdown::g_fault_cost.tex_inv_ns);
 			m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
+		}
+		// KYTY_FAULT_COALESCE: release the clean neighbors of the faulting page's aligned window
+		// (KYTY_FAULT_COALESCE_PAGES tracker pages, default 16) in one protection change. Pages that
+		// are GPU-modified or already CPU-dirty are skipped; marking an unwritten page CPU-dirty
+		// only costs an upload.
+		if (Common::RuntimeFlags::Current().fault_coalesce) {
+			static const uint64_t window = [] {
+				const char* value = std::getenv("KYTY_FAULT_COALESCE_PAGES");
+				const auto  pages = value != nullptr ? std::strtoull(value, nullptr, 10) : 16ull;
+				return std::bit_ceil(std::clamp<uint64_t>(pages, 1, 256)) * TRACKER_PAGE_SIZE;
+			}();
+			const uint64_t begin = fault_vaddr & ~(window - 1);
+			if (window > TRACKER_PAGE_SIZE && IsMapped(begin, window)) {
+				const uint64_t marked = m_buffer_cache.MarkCpuDirtyAhead(begin, window);
+				if (marked != 0) {
+					FrameBreakdown::Add(FrameBreakdown::g_counters.port_fault_windows);
+					FrameBreakdown::Add(FrameBreakdown::g_counters.port_fault_pages, marked);
+				}
+			}
 		}
 		// KYTY_FAULT_AHEAD: streaming writers (ring buffers) fault on every page they touch
 		// each frame, and each page is re-protected after its upload. Unprotect the next

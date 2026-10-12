@@ -14,10 +14,10 @@
 
 namespace Common::RuntimeFlags {
 inline constexpr int64_t kIntervalMs = 250;
-inline constexpr unsigned kRevisionShift = 29;
+inline constexpr unsigned kRevisionShift = 33;
 inline constexpr uint64_t kFlagMask = (uint64_t{1} << kRevisionShift) - 1;
-inline constexpr uint32_t kUnpinnedBits = uint32_t{1} << kRevisionShift;
-static_assert(kRevisionShift < 32, "evaluation bits and unpinned sentinel must fit uint32_t");
+inline constexpr uint64_t kUnpinnedBits = uint64_t{1} << kRevisionShift;
+static_assert(kRevisionShift <= 48, "flag bits and the unpinned sentinel must fit uint64_t and leave revision bits");
 // A flag's bit is its index in kSwitchableFlags. Defaults live in the FlagSet initializers: a missing
 // environment variable / flags.ctl line means the default, an explicit =0 / =1 overrides it.
 struct FlagSet {
@@ -50,6 +50,10 @@ struct FlagSet {
  bool long_buffer_gc_age = false;
  bool rt_decode_memo = false;
  bool bda_batch = false;
+ bool readback_queue = false;
+ bool direct_eop_interrupts = false;
+ bool fault_coalesce = false;
+ bool sparse_buffer_gc = false;
 };
 inline constexpr const char* kSwitchableFlags[] = {
  "KYTY_RESOURCE_DYNAMIC_DEPS",
@@ -80,7 +84,11 @@ inline constexpr const char* kSwitchableFlags[] = {
  "KYTY_DISPATCH_ARGS_GUARD",
  "KYTY_LONG_BUFFER_GC_AGE",
  "KYTY_RT_DECODE_MEMO",
- "KYTY_BDA_BATCH"
+ "KYTY_BDA_BATCH",
+ "KYTY_READBACK_QUEUE",
+ "KYTY_DIRECT_EOP_INTERRUPTS",
+ "KYTY_FAULT_COALESCE",
+ "KYTY_SPARSE_BUFFER_GC"
 };
 static_assert(sizeof(kSwitchableFlags) / sizeof(kSwitchableFlags[0]) == kRevisionShift, "one bit per switchable flag");
 inline constexpr uint64_t Bits(const FlagSet& f) {
@@ -112,7 +120,11 @@ inline constexpr uint64_t Bits(const FlagSet& f) {
   (uint64_t(f.dispatch_args_guard)<<25) |
   (uint64_t(f.long_buffer_gc_age)<<26) |
   (uint64_t(f.rt_decode_memo)<<27) |
-  (uint64_t(f.bda_batch)<<28);
+  (uint64_t(f.bda_batch)<<28) |
+  (uint64_t(f.readback_queue)<<29) |
+  (uint64_t(f.direct_eop_interrupts)<<30) |
+  (uint64_t(f.fault_coalesce)<<31) |
+  (uint64_t(f.sparse_buffer_gc)<<32);
 }
 // Bit positions for the few call sites that test g_published directly without decoding a FlagSet.
 inline constexpr unsigned kBitIdleTrace = 15;
@@ -120,11 +132,19 @@ inline constexpr unsigned kBitSrtSourceReuse = 17;
 inline constexpr unsigned kBitSrtCompiled = 21;
 inline constexpr unsigned kBitLongBufferGcAge = 26;
 inline constexpr unsigned kBitBdaBatch = 28;
+inline constexpr unsigned kBitReadbackQueue = 29;
+inline constexpr unsigned kBitDirectEopInterrupts = 30;
+inline constexpr unsigned kBitFaultCoalesce = 31;
+inline constexpr unsigned kBitSparseBufferGc = 32;
 static_assert(Bits(FlagSet{.idle_trace=true}) >> kBitIdleTrace & 1, "kBitIdleTrace");
 static_assert(Bits(FlagSet{.srt_source_reuse=true}) >> kBitSrtSourceReuse & 1, "kBitSrtSourceReuse");
 static_assert(Bits(FlagSet{.srt_compiled=true}) >> kBitSrtCompiled & 1, "kBitSrtCompiled");
 static_assert(Bits(FlagSet{.long_buffer_gc_age=true}) >> kBitLongBufferGcAge & 1, "kBitLongBufferGcAge");
 static_assert(Bits(FlagSet{.bda_batch=true}) >> kBitBdaBatch & 1, "kBitBdaBatch");
+static_assert(Bits(FlagSet{.readback_queue=true}) >> kBitReadbackQueue & 1, "kBitReadbackQueue");
+static_assert(Bits(FlagSet{.direct_eop_interrupts=true}) >> kBitDirectEopInterrupts & 1, "kBitDirectEopInterrupts");
+static_assert(Bits(FlagSet{.fault_coalesce=true}) >> kBitFaultCoalesce & 1, "kBitFaultCoalesce");
+static_assert(Bits(FlagSet{.sparse_buffer_gc=true}) >> kBitSparseBufferGc & 1, "kBitSparseBufferGc");
 // Low kRevisionShift bits flags; remaining bits revision. One atomic publication.
 // Starts at the defaults (revision 0) so a reader that runs before the first Refresh sees them.
 inline std::atomic<uint64_t> g_published{Bits(FlagSet{})};
@@ -134,12 +154,12 @@ inline std::string g_control_path;
 inline bool g_path_set = false;
 // Shader memory synchronization can submit while materialization is in progress.
 // Pin the complete flag set for that evaluation, even if a safe-point poll publishes.
-inline thread_local uint32_t g_evaluation_bits = kUnpinnedBits;
+inline thread_local uint64_t g_evaluation_bits = kUnpinnedBits;
 class EvaluationScope {
- uint32_t previous;
+ uint64_t previous;
 public:
  EvaluationScope():previous(g_evaluation_bits) {
-  if (previous==kUnpinnedBits) g_evaluation_bits=static_cast<uint32_t>(g_published.load(std::memory_order_relaxed)&kFlagMask);
+  if (previous==kUnpinnedBits) g_evaluation_bits=g_published.load(std::memory_order_relaxed)&kFlagMask;
  }
  ~EvaluationScope() { g_evaluation_bits=previous; }
  EvaluationScope(const EvaluationScope&)=delete;
@@ -177,6 +197,10 @@ inline FlagSet Current() {
  f.long_buffer_gc_age=(bits>>26&1u)!=0;
  f.rt_decode_memo=(bits>>27&1u)!=0;
  f.bda_batch=(bits>>28&1u)!=0;
+ f.readback_queue=(bits>>29&1u)!=0;
+ f.direct_eop_interrupts=(bits>>30&1u)!=0;
+ f.fault_coalesce=(bits>>31&1u)!=0;
+ f.sparse_buffer_gc=(bits>>32&1u)!=0;
  return f;
 }
 inline uint64_t Revision() { return g_published.load(std::memory_order_relaxed)>>kRevisionShift; }
@@ -221,6 +245,10 @@ inline bool* FieldFor(FlagSet& f,const char* name) {
  if (!std::strcmp(name,kSwitchableFlags[26])) return &f.long_buffer_gc_age;
  if (!std::strcmp(name,kSwitchableFlags[27])) return &f.rt_decode_memo;
  if (!std::strcmp(name,kSwitchableFlags[28])) return &f.bda_batch;
+ if (!std::strcmp(name,kSwitchableFlags[29])) return &f.readback_queue;
+ if (!std::strcmp(name,kSwitchableFlags[30])) return &f.direct_eop_interrupts;
+ if (!std::strcmp(name,kSwitchableFlags[31])) return &f.fault_coalesce;
+ if (!std::strcmp(name,kSwitchableFlags[32])) return &f.sparse_buffer_gc;
  return nullptr;
 }
 inline void Trim(std::string& s) {

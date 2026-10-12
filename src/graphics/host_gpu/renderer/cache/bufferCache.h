@@ -55,8 +55,8 @@ public:
 	bool                   TryWriteLabel(uint64_t vaddr, const void* data, uint64_t size);
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 	// See MemoryTracker::MarkCpuDirtyAhead.
-	void MarkCpuDirtyAhead(uint64_t vaddr, uint64_t size) noexcept {
-		m_memory_tracker.MarkCpuDirtyAhead(vaddr, size);
+	uint64_t MarkCpuDirtyAhead(uint64_t vaddr, uint64_t size) noexcept {
+		return m_memory_tracker.MarkCpuDirtyAhead(vaddr, size);
 	}
 	// Only used to attribute synchronous readbacks in the KYTY_PERF_STATS output.
 	enum class ReadCaller : uint8_t { Other, ColorClear, Fault };
@@ -176,6 +176,12 @@ private:
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;
+	// KYTY_READBACK_QUEUE: copies downloads on GraphicContext::readback_queue.
+	vk::CommandPool                                   m_readback_pool   = nullptr;
+	vk::CommandBuffer                                 m_readback_buffer = nullptr;
+	vk::Fence                                         m_readback_fence  = nullptr;
+	bool ReadbackOnSecondQueue(const Buffer& source, const Buffer& destination,
+	                           std::span<const vk::BufferCopy> copies, uint64_t wait_tick);
 	StreamBuffer                                      m_device_buffer;
 	TextureCache&                                     m_texture_cache;
 	struct GpuFill {
