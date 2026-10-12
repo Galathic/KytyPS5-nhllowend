@@ -30,6 +30,7 @@ enum Bit : uint32_t {
 	CleanFromDirect      = 1u << 18u, // KYTY_CLEAN_FROM_DIRECT (strict evaluator reuses direct SRT words)
 	DirectEopInterrupts  = 1u << 19u, // KYTY_DIRECT_EOP_INTERRUPTS (EOP interrupts at CP time, like labels)
 	ReadbackQueue        = 1u << 20u, // KYTY_READBACK_QUEUE (downloads wait only for the buffer's last writer)
+	AsyncSubmit          = 1u << 21u, // KYTY_ASYNC_SUBMIT (vkQueueSubmit on a worker thread, in tick order)
 	// A/B only (no environment variable): selects the code a pending change replaces.
 	AbLegacy = 1u << 31u,
 };

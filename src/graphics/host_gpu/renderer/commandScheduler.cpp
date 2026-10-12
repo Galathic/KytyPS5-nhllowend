@@ -1,4 +1,5 @@
 #include "common/eventTrace.h"
+#include "common/experiments.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
 #include "common/assert.h"
@@ -1035,6 +1036,7 @@ void CommandScheduler::Shutdown() {
 		Submit();
 	}
 	m_master.Wait(CurrentTick() - 1);
+	StopSubmitThread();
 	PopPendingOperations();
 	DrainPriorityOperations();
 	m_priority_thread.request_stop();
@@ -1285,44 +1287,86 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	Common::RuntimeFlags::Refresh();
 	Common::EventTrace::Poll();
 
-	const auto buffer   = m_command.m_buffer;
-	auto&      graphics = m_graphics;
-	EXIT_IF(graphics.queue == nullptr);
+	const auto buffer = m_command.m_buffer;
+	EXIT_IF(m_graphics.queue == nullptr);
+	const SubmitDebug debug {m_command.m_debug_op,
+	                         m_command.m_debug_submit_id,
+	                         {m_command.m_debug_arg0, m_command.m_debug_arg1, m_command.m_debug_arg2,
+	                          m_command.m_debug_arg3},
+	                         m_command.m_debug_arg4};
 
-	vk::Result result;
-	uint64_t   tick;
-	{
-		Common::LockGuard lock(graphics.queue_mutex);
-		tick = m_master.NextTick();
-		submit.AddSignal(m_master.Handle(), tick);
-
-		vk::TimelineSemaphoreSubmitInfo timeline_info {};
-		timeline_info.waitSemaphoreValueCount   = submit.num_wait_semaphores;
-		timeline_info.pWaitSemaphoreValues      = submit.wait_ticks.data();
-		timeline_info.signalSemaphoreValueCount = submit.num_signal_semaphores;
-		timeline_info.pSignalSemaphoreValues    = submit.signal_ticks.data();
-
-		vk::SubmitInfo submit_info {};
-		submit_info.pNext                = &timeline_info;
-		submit_info.waitSemaphoreCount   = submit.num_wait_semaphores;
-		submit_info.pWaitSemaphores      = submit.wait_semaphores.data();
-		submit_info.pWaitDstStageMask    = submit.wait_stages.data();
-		submit_info.commandBufferCount   = 1;
-		submit_info.pCommandBuffers      = &buffer;
-		submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
-		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
-
-		FrameBreakdown::GpuBusyScope queue_scope(FrameBreakdown::GB_QUEUE_SUBMIT);
-		result = graphics.queue.submit(1, &submit_info, nullptr);
+	// Experiment AsyncSubmit: each vkQueueSubmit costs this thread about 65 us. Submissions without
+	// external semaphores go to a worker in tick order; waits on their ticks work unchanged because
+	// timeline semaphores may be waited on before the signalling submission is made.
+	uint64_t tick;
+	if (m_async_allowed && submit.num_wait_semaphores == 0 && submit.num_signal_semaphores == 0 &&
+	    Common::Experiments::Enabled(Common::Experiments::AsyncSubmit)) {
+		if (!m_submit_thread.joinable()) {
+			m_submit_thread = std::jthread([this](std::stop_token stop) { SubmitThread(stop); });
+		}
+		{
+			std::lock_guard lock(m_submit_mutex);
+			tick = m_master.NextTick();
+			submit.AddSignal(m_master.Handle(), tick);
+			m_submits.push_back({buffer, submit, tick, debug});
+		}
+		m_submit_available.notify_one();
+		if (timed) {
+			BufferCache::PerfAddTime(BufferCache::PerfTimer::Submit,
+			                         static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+			                             std::chrono::steady_clock::now() - submit_start).count()));
+		}
+	} else {
+		// Keeps the queue order of ticks (and of any binary semaphores) with earlier async submits.
+		DrainSubmits();
+		vk::Result result;
+		{
+			Common::LockGuard lock(m_graphics.queue_mutex);
+			tick = m_master.NextTick();
+			submit.AddSignal(m_master.Handle(), tick);
+			FrameBreakdown::GpuBusyScope queue_scope(FrameBreakdown::GB_QUEUE_SUBMIT);
+			result = QueueSubmit(buffer, submit);
+		}
+		if (timed) {
+			BufferCache::PerfAddTime(BufferCache::PerfTimer::Submit,
+			                         static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+			                             std::chrono::steady_clock::now() - submit_start).count()));
+		}
+		CheckSubmitResult(result, tick, debug);
 	}
-	if (timed) {
-		BufferCache::PerfAddTime(BufferCache::PerfTimer::Submit,
-		                         static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-		                             std::chrono::steady_clock::now() - submit_start).count()));
-	}
 
+	m_command.m_buffer = nullptr;
+	Common::EventTrace::Record(Common::EventTrace::NATIVE_SUBMIT, tick);
+	GpuTraceSubmitted(m_trace_slot, tick);
+	m_trace_slot = 0;
+	GpuTracePoll();
+	GpuTimingPoll();
+	return tick;
+}
+
+// Caller holds m_graphics.queue_mutex. The signal of the scheduler's tick is already in `submit`.
+vk::Result CommandScheduler::QueueSubmit(vk::CommandBuffer buffer, const SubmitInfo& submit) {
+	vk::TimelineSemaphoreSubmitInfo timeline_info {};
+	timeline_info.waitSemaphoreValueCount   = submit.num_wait_semaphores;
+	timeline_info.pWaitSemaphoreValues      = submit.wait_ticks.data();
+	timeline_info.signalSemaphoreValueCount = submit.num_signal_semaphores;
+	timeline_info.pSignalSemaphoreValues    = submit.signal_ticks.data();
+
+	vk::SubmitInfo submit_info {};
+	submit_info.pNext                = &timeline_info;
+	submit_info.waitSemaphoreCount   = submit.num_wait_semaphores;
+	submit_info.pWaitSemaphores      = submit.wait_semaphores.data();
+	submit_info.pWaitDstStageMask    = submit.wait_stages.data();
+	submit_info.commandBufferCount   = 1;
+	submit_info.pCommandBuffers      = &buffer;
+	submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
+	submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
+	return m_graphics.queue.submit(1, &submit_info, nullptr);
+}
+
+void CommandScheduler::CheckSubmitResult(vk::Result result, uint64_t tick, const SubmitDebug& debug) {
 	if (result == vk::Result::eErrorDeviceLost) {
-		DumpDeviceFault(graphics.device);
+		DumpDeviceFault(m_graphics.device);
 		// NHL26 debugging: GDS is host-visible; print its nonzero dwords as of the hang.
 		const auto gds = m_context.GetBufferCache().GetGdsBuffer()->Mapped();
 		if (!gds.empty()) {
@@ -1339,20 +1383,59 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		}
 	}
 	if (result != vk::Result::eSuccess) {
-		ReportVulkanFatal("vkQueueSubmit", result, tick, m_command.m_debug_op,
-		                  m_command.m_debug_submit_id, m_command.m_debug_arg0,
-		                  m_command.m_debug_arg1, m_command.m_debug_arg2, m_command.m_debug_arg3,
-		                  m_command.m_debug_arg4);
+		ReportVulkanFatal("vkQueueSubmit", result, tick, debug.op, debug.submit_id, debug.args[0],
+		                  debug.args[1], debug.args[2], debug.args[3], debug.arg4);
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+}
 
-	m_command.m_buffer = nullptr;
-	Common::EventTrace::Record(Common::EventTrace::NATIVE_SUBMIT, tick);
-	GpuTraceSubmitted(m_trace_slot, tick);
-	m_trace_slot = 0;
-	GpuTracePoll();
-	GpuTimingPoll();
-	return tick;
+void CommandScheduler::SubmitThread(std::stop_token stop) {
+#if defined(_WIN32)
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+#endif
+	for (;;) {
+		QueuedSubmit item;
+		{
+			std::unique_lock lock(m_submit_mutex);
+			if (!m_submit_available.wait(lock, stop, [this] { return !m_submits.empty(); })) {
+				return;
+			}
+			item = m_submits.front();
+			m_submits.pop_front();
+			m_submit_busy = true;
+		}
+		vk::Result result;
+		{
+			Common::LockGuard lock(m_graphics.queue_mutex);
+			result = QueueSubmit(item.buffer, item.info);
+		}
+		CheckSubmitResult(result, item.tick, item.debug);
+		{
+			std::lock_guard lock(m_submit_mutex);
+			m_submit_busy = false;
+			if (!m_submits.empty()) {
+				continue;
+			}
+		}
+		m_submit_idle.notify_all();
+	}
+}
+
+void CommandScheduler::DrainSubmits() {
+	if (!m_submit_thread.joinable()) {
+		return;
+	}
+	std::unique_lock lock(m_submit_mutex);
+	m_submit_idle.wait(lock, [this] { return m_submits.empty() && !m_submit_busy; });
+}
+
+void CommandScheduler::StopSubmitThread() {
+	if (!m_submit_thread.joinable()) {
+		return;
+	}
+	DrainSubmits();
+	m_submit_thread.request_stop();
+	m_submit_thread.join();
 }
 
 void CommandScheduler::BeginNext() {
