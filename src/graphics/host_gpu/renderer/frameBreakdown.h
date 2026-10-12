@@ -592,8 +592,7 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 			            per(mat_flat_trace_hits), per(mat_flat_trace_other));
 			std::printf("NHL27TRACE nocfg=%.1f flag_off=%.1f inelig_mode=%.1f empty=%.1f disabled=%.1f tape_nr=%.1f "
 			            "strict=%.1f m_memo=%.1f m_exec=%.1f m_memoslot=%.1f m_cond=%.1f m_eval=%.1f m_condeval=%.1f "
-			            "rec_abort=%.1f merge_refused=%.1f merge_new=%.1f
-",
+			            "rec_abort=%.1f merge_refused=%.1f merge_new=%.1f\n",
 			            per(mat_tr_why[0]), per(mat_tr_why[1]), per(mat_tr_why[2]), per(mat_tr_why[3]),
 			            per(mat_tr_why[4]), per(mat_tr_why[5]), per(mat_tr_why[6]), per(mat_tr_why[7]),
 			            per(mat_tr_why[8]), per(mat_tr_why[9]), per(mat_tr_why[10]), per(mat_tr_why[11]),
