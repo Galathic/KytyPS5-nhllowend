@@ -24,7 +24,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -718,6 +720,44 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
 }
 
+static thread_local uint64_t g_fault_rip = 0;
+
+void BufferCache::NoteFaultRip(uint64_t rip) {
+	g_fault_rip = rip;
+}
+
+// NHL27WRITEBACK: CPU-write readbacks (a guest write to a GPU-written page) by faulting guest
+// instruction, cumulative, the top entries by wait time every 5 s.
+struct WriteBackStat {
+	uint64_t count = 0;
+	uint64_t ns    = 0;
+	uint64_t vaddr = 0;
+};
+static std::mutex                                g_writeback_mutex;
+static std::unordered_map<uint64_t, WriteBackStat> g_writeback;
+
+static void WriteBackRecord(uint64_t rip, uint64_t vaddr, uint64_t ns) {
+	std::scoped_lock lock {g_writeback_mutex};
+	auto&            stat = g_writeback[rip];
+	stat.count++;
+	stat.ns += ns;
+	stat.vaddr = vaddr;
+	static auto last = std::chrono::steady_clock::now();
+	const auto  now  = std::chrono::steady_clock::now();
+	if (now - last < std::chrono::seconds(5)) {
+		return;
+	}
+	last = now;
+	std::vector<std::pair<uint64_t, WriteBackStat>> top(g_writeback.begin(), g_writeback.end());
+	std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
+	for (size_t i = 0; i < top.size() && i < 12; i++) {
+		std::printf("NHL27WRITEBACK: rip=0x%016" PRIx64 " count=%" PRIu64 " ms=%.1f last_vaddr=0x%016" PRIx64 "\n",
+		            top[i].first, top[i].second.count, static_cast<double>(top[i].second.ns) / 1e6,
+		            top[i].second.vaddr);
+	}
+	std::fflush(stdout);
+}
+
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadCaller caller) {
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
@@ -727,7 +767,8 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadC
 	FrameBreakdown::FaultTimer fault_readmem_timer(FrameBreakdown::g_fault_cost.readmem_ns);
 	const bool     on_gpu = GuestGpu::IsGpuThread();
 	const uint64_t tid   = static_cast<uint64_t>(std::hash<std::thread::id> {}(std::this_thread::get_id()));
-	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write, caller, on_gpu, tid] {
+	const uint64_t fault_rip = on_gpu ? 0 : g_fault_rip;
+	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write, caller, on_gpu, tid, fault_rip] {
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
 		}
@@ -776,6 +817,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadC
 				                    std::chrono::steady_clock::now() - start)
 				                    .count();
 				FrameBreakdown::AddReadback(static_cast<uint64_t>(ns));
+				if (is_write) {
+					WriteBackRecord(fault_rip, vaddr, static_cast<uint64_t>(ns));
+				}
 				g_perf.waits[bucket].fetch_add(1, std::memory_order_relaxed);
 				g_perf.wait_ns[bucket].fetch_add(static_cast<uint64_t>(ns),
 				                                 std::memory_order_relaxed);

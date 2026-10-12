@@ -797,6 +797,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			Libs::Graphics::BufferCache::PerfCount(Libs::Graphics::BufferCache::PerfEvent::FalseShareRead);
 			return true;
 		}
+		Libs::Graphics::BufferCache::NoteFaultRip(info->exception_address);
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			return true;
 		}

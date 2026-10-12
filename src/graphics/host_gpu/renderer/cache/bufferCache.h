@@ -89,6 +89,9 @@ public:
 	// KYTY_PERF_NO_SYNC_READBACK=1 enables the readback-avoidance paths (default: off).
 	[[nodiscard]] static bool PerfNoSyncReadback();
 	static void               PerfCount(PerfEvent event);
+	// KYTY_PERF_STATS=1: the faulting guest instruction of the calling thread, so CPU-write
+	// readbacks can be attributed to the code that caused them (NHL27WRITEBACK).
+	static void               NoteFaultRip(uint64_t rip);
 	[[nodiscard]] static uint64_t PerfFlipCount();
 	// KYTY_PERF_STATS: device memory use the texture/buffer collectors last saw.
 	static void PerfSetMemoryUsage(uint64_t used, uint64_t texture_trigger, uint64_t buffer_trigger);
