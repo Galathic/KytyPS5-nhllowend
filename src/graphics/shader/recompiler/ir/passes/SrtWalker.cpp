@@ -1730,6 +1730,10 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	                            !m_skip_tape && !m_cfg_schedule_enabled &&
 	                            !m_scalar_batch_enabled && m_active_mask.IsEmpty() &&
 	                            (m_clean_evaluator == nullptr || m_clean_evaluator->m_active_mask.IsEmpty());
+	if (FrameBreakdown::Enabled() && !trace_eligible) {
+		const int why = m_program.control_flow.empty() ? 0 : (!m_cfg_trace_enabled || !m_cfg_tape_enabled) ? 1 : 2;
+		FrameBreakdown::g_counters.mat_tr_why[why].fetch_add(1, std::memory_order_relaxed);
+	}
 	if (trace_eligible && ReplayCfgTrace(flat) > 0) {
 		if (FrameBreakdown::Enabled()) FrameBreakdown::g_counters.mat_flat_trace_hits.fetch_add(1, std::memory_order_relaxed);
 		return true;
@@ -2143,7 +2147,13 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	}
 	if (m_cfg_trace_recording) {
 		record({.kind = TraceKind::End});
+		const uint32_t paths_before = m_program.cfg_traces[m_clean_evaluator != nullptr ? 1 : 0].paths;
 		MergeCfgTrace();
+		if (FrameBreakdown::Enabled())
+			FrameBreakdown::g_counters.mat_tr_why[m_program.cfg_traces[m_clean_evaluator != nullptr ? 1 : 0].paths != paths_before ? 15 : 14]
+			    .fetch_add(1, std::memory_order_relaxed);
+	} else if (trace_eligible && FrameBreakdown::Enabled()) {
+		FrameBreakdown::g_counters.mat_tr_why[13].fetch_add(1, std::memory_order_relaxed);
 	}
 	m_context.refreshed_flat = &flat;
 	if (m_clean_evaluator != nullptr) m_clean_evaluator->m_context.refreshed_flat = &flat;
@@ -2871,8 +2881,14 @@ int SrtWalker::ReplayCfgTrace(std::vector<uint32_t>& flat) {
 	auto& trace = m_program.cfg_traces[variant];
 	const auto& tape = m_program.cfg_srt_tapes[variant];
 	if (trace.disabled || trace.steps.empty() || tape.state != ResourcePlan::SrtTape::State::Ready ||
-	    trace.strict != (m_runtime.read_specialization_memory != nullptr))
+	    trace.strict != (m_runtime.read_specialization_memory != nullptr)) {
+		if (FrameBreakdown::Enabled()) {
+			const int why = trace.disabled ? 4 : trace.steps.empty() ? 3 : tape.state != ResourcePlan::SrtTape::State::Ready ? 5 : 6;
+			FrameBreakdown::g_counters.mat_tr_why[why].fetch_add(1, std::memory_order_relaxed);
+		}
 		return -1;
+	}
+	int miss_why = 0;
 	auto& values = m_context.tape_values;
 	if (values.size() < tape.ops.size()) values.resize(tape.ops.size());
 	{
@@ -2891,6 +2907,7 @@ int SrtWalker::ReplayCfgTrace(std::vector<uint32_t>& flat) {
 	auto& published = m_context.tape_pending;
 	published.clear();
 	const auto miss = [&] {
+		if (FrameBreakdown::Enabled()) FrameBreakdown::g_counters.mat_tr_why[miss_why].fetch_add(1, std::memory_order_relaxed);
 		for (const auto& [index, unused]: published) {
 			const auto& op = tape.ops[index];
 			context_for(op).values[op.memo_index].generation = 0;
@@ -2902,7 +2919,7 @@ int SrtWalker::ReplayCfgTrace(std::vector<uint32_t>& flat) {
 				std::fill(m_clean_evaluator->m_cfg_gather_ready_sources.begin(),
 				          m_clean_evaluator->m_cfg_gather_ready_sources.end(), 0u);
 		}
-		if (++trace.misses > 256 && trace.misses > trace.hits) trace.disabled = true;
+		if (++trace.misses > (m_source_reuse_enabled ? 8192u : 256u) && trace.misses > trace.hits) trace.disabled = true;
 		g_tape_stats.cfg_trace_misses.fetch_add(1, std::memory_order_relaxed);
 		return -1;
 	};
@@ -2915,10 +2932,12 @@ int SrtWalker::ReplayCfgTrace(std::vector<uint32_t>& flat) {
 				if (op.memo_index != UINT32_MAX) {
 					const auto& context = context_for(op);
 					if (op.memo_index < context.values.size() &&
-					    (context.values[op.memo_index].generation | 3u) == (context.generation | 3u))
+					    (context.values[op.memo_index].generation | 3u) == (context.generation | 3u)) {
+						miss_why = 7;
 						return miss();
+					}
 				}
-				if (!ExecuteTapeOp(op, values, step.a)) return miss();
+				if (!ExecuteTapeOp(op, values, step.a)) { miss_why = 8; return miss(); }
 				if (op.memo_index != UINT32_MAX) published.emplace_back(step.a, 0u);
 				++pc;
 				break;
@@ -2927,8 +2946,10 @@ int SrtWalker::ReplayCfgTrace(std::vector<uint32_t>& flat) {
 				const auto& op = tape.ops[step.a];
 				const auto& context = op.clean && m_clean_evaluator != nullptr ? m_clean_evaluator->m_context : m_context;
 				if (op.memo_index >= context.values.size() ||
-				    context.values[op.memo_index].generation != context.generation)
+				    context.values[op.memo_index].generation != context.generation) {
+					miss_why = 9;
 					return miss();
+				}
 				values[step.a] = context.values[op.memo_index].value;
 				++pc;
 				break;
@@ -2943,14 +2964,14 @@ int SrtWalker::ReplayCfgTrace(std::vector<uint32_t>& flat) {
 				break;
 			case TraceKind::Cond: {
 				const auto next = step.next[static_cast<uint32_t>(values[step.a]) != 0u ? 1 : 0];
-				if (next == UINT32_MAX) return miss();
+				if (next == UINT32_MAX) { miss_why = 10; return miss(); }
 				pc = next;
 				break;
 			}
 			case TraceKind::CondTri: {
 				const auto value = static_cast<uint32_t>(values[step.a]);
 				const auto next = step.next[value == 2u ? 2 : value != 0u ? 1 : 0];
-				if (next == UINT32_MAX) return miss();
+				if (next == UINT32_MAX) { miss_why = 10; return miss(); }
 				pc = next;
 				break;
 			}
@@ -2959,9 +2980,9 @@ int SrtWalker::ReplayCfgTrace(std::vector<uint32_t>& flat) {
 				const bool clean = read.flat_offset < m_clean_flat_slots.size() &&
 				                   m_clean_flat_slots[read.flat_offset] != 0u;
 				if (clean && (m_clean_evaluator == nullptr || m_runtime.read_specialization_memory == nullptr))
-					return miss();
+				{ miss_why = 11; return miss(); }
 				auto& evaluator = clean ? *m_clean_evaluator : *this;
-				if (!evaluator.Evaluate(read.value, flat[step.b])) return miss();
+				if (!evaluator.Evaluate(read.value, flat[step.b])) { miss_why = 11; return miss(); }
 				++pc;
 				break;
 			}
@@ -2978,7 +2999,7 @@ int SrtWalker::ReplayCfgTrace(std::vector<uint32_t>& flat) {
 				uint32_t condition = 0;
 				const bool ok = predicate.Evaluate(m_program.control_flow[step.a].condition, condition);
 				const auto next = step.next[!ok ? 2 : condition != 0u ? 1 : 0];
-				if (next == UINT32_MAX) return miss();
+				if (next == UINT32_MAX) { miss_why = 12; return miss(); }
 				pc = next;
 				break;
 			}
@@ -2994,8 +3015,10 @@ int SrtWalker::ReplayCfgTrace(std::vector<uint32_t>& flat) {
 
 void SrtWalker::MergeCfgTrace() {
 	using TraceKind = ResourcePlan::CfgTrace::Kind;
-	constexpr size_t   kMaxSteps = size_t {1} << 16;
-	constexpr uint32_t kMaxPaths = 32;
+	// KYTY_SRT_SOURCE_REUSE: allow many more observed control-flow paths per trie (the 32-path cap
+	// left programs with varying branch outcomes permanently missing).
+	const size_t   kMaxSteps = m_source_reuse_enabled ? size_t {1} << 19 : size_t {1} << 16;
+	const uint32_t kMaxPaths = m_source_reuse_enabled ? 512u : 32u;
 	auto& trace = m_program.cfg_traces[m_clean_evaluator != nullptr ? 1 : 0];
 	const auto& recorded = m_program.cfg_trace_scratch;
 	if (trace.disabled || recorded.empty() || recorded.back().kind != TraceKind::End) return;

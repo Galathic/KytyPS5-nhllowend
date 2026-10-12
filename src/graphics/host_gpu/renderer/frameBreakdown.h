@@ -111,6 +111,7 @@ struct Counters {
 	std::atomic<uint64_t> mat_flat_alloc_ns {0};  // flat.assign + trace setup (KYTY_PERF_DRAW_DETAIL=1 only)
 	std::atomic<uint64_t> mat_flat_trace_hits {0};   // refreshes served by ReplayCfgTrace
 	std::atomic<uint64_t> mat_flat_trace_other {0};  // refreshes that were not (miss/ineligible/non-CFG)
+	std::atomic<uint64_t> mat_tr_why[16] {};  // ReplayCfgTrace outcome reasons (see NHL27TRACE print)
 	std::atomic<uint64_t> mat_reuse_hits {0};   // KYTY_SRT_SOURCE_REUSE: gather output equals the previous one
 	std::atomic<uint64_t> mat_reuse_misses {0}; // gather output differs / first time
 	std::atomic<uint64_t> mat_reuse_fallback {0}; // sources not on the gather fast path
@@ -460,6 +461,8 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 	const uint64_t mat_flat_alloc_ns = Take(c.mat_flat_alloc_ns);
 	const uint64_t mat_flat_trace_hits  = Take(c.mat_flat_trace_hits);
 	const uint64_t mat_flat_trace_other = Take(c.mat_flat_trace_other);
+	uint64_t mat_tr_why[16];
+	for (int i = 0; i < 16; ++i) mat_tr_why[i] = Take(c.mat_tr_why[i]);
 	const uint64_t mat_reuse_hits    = Take(c.mat_reuse_hits);
 	const uint64_t mat_reuse_misses  = Take(c.mat_reuse_misses);
 	const uint64_t mat_reuse_fallback = Take(c.mat_reuse_fallback);
@@ -587,6 +590,14 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 			            "trace_hit=%.1f trace_other=%.1f\n",
 			            per(mat_flat_reads), ms(mat_flat_read_ns), per(mat_flat_ops), ms(mat_flat_alloc_ns),
 			            per(mat_flat_trace_hits), per(mat_flat_trace_other));
+			std::printf("NHL27TRACE nocfg=%.1f flag_off=%.1f inelig_mode=%.1f empty=%.1f disabled=%.1f tape_nr=%.1f "
+			            "strict=%.1f m_memo=%.1f m_exec=%.1f m_memoslot=%.1f m_cond=%.1f m_eval=%.1f m_condeval=%.1f "
+			            "rec_abort=%.1f merge_refused=%.1f merge_new=%.1f
+",
+			            per(mat_tr_why[0]), per(mat_tr_why[1]), per(mat_tr_why[2]), per(mat_tr_why[3]),
+			            per(mat_tr_why[4]), per(mat_tr_why[5]), per(mat_tr_why[6]), per(mat_tr_why[7]),
+			            per(mat_tr_why[8]), per(mat_tr_why[9]), per(mat_tr_why[10]), per(mat_tr_why[11]),
+			            per(mat_tr_why[12]), per(mat_tr_why[13]), per(mat_tr_why[14]), per(mat_tr_why[15]));
 			const double dc_named = ms(dc_materialize_ns) + ms(dc_textures_ns) + ms(dc_buffers_ns) +
 			                        ms(dc_descriptors_ns) + ms(dc_pipeline_ns) + ms(dc_barrier_ns) +
 			                        ms(dc_record_ns);
