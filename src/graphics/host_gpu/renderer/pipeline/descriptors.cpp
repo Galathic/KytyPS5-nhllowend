@@ -568,6 +568,8 @@ struct ComputedTextureDesc {
 	vk::Format              pixel_format      = vk::Format::eUndefined;
 	vk::Format              view_format       = vk::Format::eUndefined;
 	uint64_t                size              = 0;
+	// Experiment ImageLookupHint: the image this description last resolved to exactly.
+	ImageId                 last_image {};
 };
 
 // Every ImageResource field the computation reads, plus the (r128-masked) descriptor.
@@ -775,7 +777,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		return {id, nullptr, std::move(desc)};
 	}
 	ComputedTextureDesc computed_storage;
-	const ComputedTextureDesc* computed = nullptr;
+	ComputedTextureDesc* computed = nullptr;
 	static std::unordered_map<TextureDescKey, ComputedTextureDesc, TextureDescKeyHash> memo;
 	if (Common::Experiments::Enabled(Common::Experiments::TextureDescCache)) {
 		const TextureDescKey key(resource, descriptor.fields);
@@ -797,7 +799,15 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		uint64_t size;
 	} size {computed->size};
 
-	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
+	ImageId id {};
+	if (computed != &computed_storage &&
+	    Common::Experiments::Enabled(Common::Experiments::ImageLookupHint)) {
+		bool exact = false;
+		id = texture_cache.FindImageHinted(desc, shader_conversion, computed->last_image, exact);
+		computed->last_image = exact ? id : ImageId {};
+	} else {
+		id = texture_cache.FindImage(desc, shader_conversion);
+	}
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
 	if (stencil_association) {

@@ -47,6 +47,7 @@ struct PerfStats {
 	std::atomic<uint64_t> wait_ns[PerfBuckets] {};
 	std::atomic<uint64_t> events[static_cast<size_t>(BufferCache::PerfEvent::Count)] {};
 	std::atomic<uint32_t> pm4_op {0};
+	std::atomic<uint64_t> created_bytes {0};
 	std::atomic<uint64_t> timer_count[static_cast<size_t>(BufferCache::PerfTimer::Count)] {};
 	std::atomic<uint64_t> timer_ns[static_cast<size_t>(BufferCache::PerfTimer::Count)] {};
 	// Only touched from the GPU thread.
@@ -191,6 +192,10 @@ void BufferCache::PerfMaybePrint() {
 		            static_cast<unsigned long long>(events[static_cast<size_t>(PerfEvent::FalseShareRead)]),
 		            static_cast<unsigned long long>(events[static_cast<size_t>(PerfEvent::Pm4ShadowPacket)]));
 		const auto flips = events[static_cast<size_t>(PerfEvent::Flip)];
+		static uint64_t last_created_bytes = 0;
+		const uint64_t  created_now        = g_perf.created_bytes.load(std::memory_order_relaxed);
+		const uint64_t  created_bytes      = created_now - last_created_bytes;
+		last_created_bytes                 = created_now;
 		const auto per_frame = [&](PerfTimer timer) {
 			return flips != 0 ? timer_ms[static_cast<size_t>(timer)] / static_cast<double>(flips) : 0.0;
 		};
@@ -205,12 +210,15 @@ void BufferCache::PerfMaybePrint() {
 		            per_frame(PerfTimer::GpuWait), per_frame(PerfTimer::Submit));
 		std::printf("NHL27DRAW: ms/frame bind_prepare=%.1f bind_resolve=%.1f vertex=%.1f "
 		            "pipeline=%.1f attachments=%.1f commit=%.1f record=%.1f | per frame: "
-		            "buffer_creates=%.1f buffer_uploads=%.1f\n",
+		            "buffer_creates=%.1f (%.1f MiB) buffer_deletes=%.1f (gc %.1f) buffer_uploads=%.1f\n",
 		            per_frame(PerfTimer::DrawBindPrepare), per_frame(PerfTimer::DrawBindResolve),
 		            per_frame(PerfTimer::DrawVertex), per_frame(PerfTimer::DrawPipeline),
 		            per_frame(PerfTimer::DrawAttachments), per_frame(PerfTimer::DrawCommit),
 		            per_frame(PerfTimer::DrawRecord),
 		            flips != 0 ? static_cast<double>(events[static_cast<size_t>(PerfEvent::BufferCreate)]) / flips : 0.0,
+		            flips != 0 ? static_cast<double>(created_bytes) / (1024.0 * 1024.0) / flips : 0.0,
+		            flips != 0 ? static_cast<double>(events[static_cast<size_t>(PerfEvent::BufferDelete)]) / flips : 0.0,
+		            flips != 0 ? static_cast<double>(events[static_cast<size_t>(PerfEvent::BufferGcDelete)]) / flips : 0.0,
 		            flips != 0 ? static_cast<double>(events[static_cast<size_t>(PerfEvent::BufferUpload)]) / flips : 0.0);
 	}
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -427,6 +435,7 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	if (IsBufferInvalid(id)) {
 		return;
 	}
+	PerfCount(PerfEvent::BufferDelete);
 	Unregister(id);
 	if (m_scheduler.Active()) {
 		m_scheduler.DeferOperation([this, id] { m_slot_buffers.erase(id); });
@@ -754,6 +763,9 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	size               = end - vaddr;
 	const auto overlap = ResolveOverlaps(vaddr, size);
 	PerfCount(PerfEvent::BufferCreate);
+	if (PerfStatsEnabled()) {
+		g_perf.created_bytes.fetch_add(overlap.end - overlap.begin, std::memory_order_relaxed);
+	}
 
 	const auto id = m_slot_buffers.insert(
 	    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, overlap.begin,
@@ -1033,6 +1045,7 @@ void BufferCache::RunGarbageCollector() {
 			dirty_buffers.push_back(id);
 		} else {
 			m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
+			PerfCount(PerfEvent::BufferGcDelete);
 			DeleteBuffer(id);
 		}
 		return ++retire_count == limit;

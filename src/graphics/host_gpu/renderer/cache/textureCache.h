@@ -45,6 +45,12 @@ public:
 	KYTY_CLASS_NO_COPY(TextureCache);
 
 	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false);
+	// FindImage that first tries `hint`, an image an earlier lookup of the same description
+	// resolved to as an exact backing match: when it is still registered and still the exact
+	// match, the region scan over every page of the image is skipped. `exact` reports whether
+	// the result is such a match (a valid hint for the next lookup).
+	[[nodiscard]] ImageId FindImageHinted(ImageDesc& desc, bool exact_format, ImageId hint,
+	                                      bool& exact);
 	void                        UpdateImage(ImageId id);
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);

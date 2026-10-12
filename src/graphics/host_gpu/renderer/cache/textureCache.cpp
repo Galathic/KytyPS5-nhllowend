@@ -1571,6 +1571,45 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	return result;
 }
 
+ImageId TextureCache::FindImageHinted(ImageDesc& desc, bool exact_format, ImageId hint,
+                                      bool& exact) {
+	exact = false;
+	const auto metadata_base_layer = desc.view_info.base_layer;
+	const auto matches             = [&](const Image& image) {
+		return image.registered && !(desc.type == BindingType::RenderTarget && image.depth_id) &&
+		       SameBacking(image.info, desc.info, exact_format) &&
+		       !(image.info.resources < desc.info.resources) &&
+		       (!exact_format || image.info.pixel_format == desc.info.pixel_format);
+	};
+	if (hint && desc.type != BindingType::VideoOut && !desc.info.data.Empty() &&
+	    !m_scheduler.Current().IsInvalid()) {
+		bool hit = false;
+		{
+			std::scoped_lock lock {m_lock};
+			if (auto* image = m_slot_images.try_get(hint); image != nullptr && matches(*image)) {
+				image->tick_accessed_last = m_scheduler.CurrentTick();
+				TouchImage(*image);
+				hit = true;
+			}
+		}
+		if (hit) {
+			MaterializeColorClear(hint, desc, metadata_base_layer);
+			exact = true;
+			return hint;
+		}
+	}
+	const auto base_level = desc.view_info.base_level;
+	const auto id         = FindImage(desc, exact_format);
+	{
+		std::scoped_lock lock {m_lock};
+		const auto* image = m_slot_images.try_get(id);
+		exact = image != nullptr && desc.type != BindingType::VideoOut && !desc.info.data.Empty() &&
+		        desc.view_info.base_level == base_level &&
+		        desc.view_info.base_layer == metadata_base_layer && matches(*image);
+	}
+	return id;
+}
+
 void TextureCache::UpdateImage(ImageId id) {
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];

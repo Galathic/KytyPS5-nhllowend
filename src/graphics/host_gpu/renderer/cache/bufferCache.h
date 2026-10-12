@@ -71,6 +71,8 @@ public:
 		Pm4ShadowPacket,
 		BufferCreate,
 		BufferUpload,
+		BufferDelete,
+		BufferGcDelete,
 		Count
 	};
 	// KYTY_GUEST_SYNC=1 (experiment): compute dispatches rely on the guest's own partial-flush,
