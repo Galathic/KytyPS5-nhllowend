@@ -556,6 +556,20 @@ struct UniformFillPlan {
 // Resource analysis retained by the shader cache. It owns immutable descriptor/SRT,
 // condition and fill values without translated blocks, plus reusable evaluation scratch.
 struct ResourcePlan {
+	// Compiled descriptor gathers avoid interpreting literal/user-data leaves on
+	// every refresh. Register numbers stay absolute so rebasing remains valid.
+	struct DescriptorGather {
+		struct Word {
+			enum class Kind { Literal, UserData, Flat };
+			uint32_t value = 0;
+			Kind kind = Kind::Literal;
+			// Derived at plan compilation/load; deliberately excluded from the fixture archive.
+			uint32_t read_slot = UINT32_MAX;
+		};
+		std::array<Word, 8> words {};
+		bool valid = false;
+		bool needs_flat = false;
+	};
 	struct EvaluationContext {
 		struct Entry {
 			uint64_t value      = 0;
@@ -564,6 +578,15 @@ struct ResourcePlan {
 
 		std::vector<Entry> values;
 		uint64_t           generation = 0;
+		uint64_t           cfg_gather_epoch = 0;
+		std::vector<uint64_t> cfg_gather_slot_epochs;
+		// Keep the vector identity, not its data pointer: indirect materialization
+		// can append mappings and reallocate its storage after a successful refresh.
+		const std::vector<uint32_t>* refreshed_flat = nullptr;
+		// Reused demand-tape scratch; scoped to an evaluator session, never a draw cache.
+		std::vector<uint64_t> tape_values;
+		std::vector<uint8_t> tape_marks;
+		std::vector<std::pair<uint32_t, uint8_t>> tape_pending;
 	};
 
 	ResourcePlan() = default;
@@ -581,6 +604,7 @@ struct ResourcePlan {
 	std::list<Inst>                     value_storage;
 	std::vector<MemoryInfo>             memory_info;
 	std::vector<DescriptorSource>       descriptor_sources;
+	std::vector<DescriptorGather>       descriptor_gathers;
 	std::vector<ResourceBlock>          control_flow;
 	std::vector<SrtRead>                srt_reads;
 	// Contiguous scalar reads eligible for one backing read, indexed by first slot.
@@ -621,6 +645,130 @@ struct ResourcePlan {
 	mutable std::vector<int32_t>       direct_descriptor_offsets;
 	// Flat slots a direct refresh filled (plans with control flow skip unreached blocks).
 	mutable std::vector<uint8_t>       direct_filled;
+	// Linearized SRT read expressions (KYTY_SRT_TAPE=1). Built lazily on the GPU thread,
+	// one per variant: [0] = no clean evaluator, [1] = with clean evaluator. Ops are in the
+	// exact order the recursive walker would evaluate them, so captured reads and failure
+	// points match. Plans with conditional/lazy operators stay on the walker.
+	struct SrtTape {
+		enum class State : uint8_t { Unbuilt, Ready, Unsupported };
+		enum class Kind : uint8_t { Immediate, UserData, ShaderBase, Inst, RawRead };
+		struct Op {
+			ValueOpcode             opcode {};
+			const Inst*             source = nullptr;
+			Kind                    kind       = Kind::Immediate;
+			uint8_t                 clean      = 0;
+			uint32_t                aux        = 0;
+			uint32_t                memo_index = UINT32_MAX;
+			uint8_t                 dependency_count = 0;
+			std::array<uint32_t, 5> args {};
+			uint64_t                imm = 0;
+		};
+		std::vector<Op>       ops;
+		std::vector<uint32_t> slot_ops;
+		std::vector<uint32_t> condition_ops;
+		// Per condition: its op yields 0/1, or 2 where the walker's predicate fails.
+		std::vector<uint8_t> condition_tri;
+		// Cached per-demand-root DFS programs. Enter skips the whole subtree on
+		// a memo hit; exit executes the op after its ordered dependencies.
+		struct DemandStep { uint32_t op = 0; uint32_t next = UINT32_MAX; };
+		struct DemandSchedule {
+			std::vector<DemandStep> steps;
+			State state = State::Unbuilt;
+		};
+		std::vector<DemandSchedule> demand_schedules;
+		bool                  clean_root = false;
+		State                 state      = State::Unbuilt;
+	};
+	mutable std::array<SrtTape, 2> srt_tapes;
+	mutable std::array<SrtTape, 2> cfg_srt_tapes;
+	mutable std::vector<uint64_t>  srt_tape_values;
+	// Recorded CFG tape refreshes (KYTY_SRT_CFG_TRACE=1), one per cfg_srt_tapes variant.
+	// A trace replays the exact op/memo/flat/activity sequence of a complete tape-only
+	// refresh. Cond steps check the recorded predicate outcome and branch to other
+	// observed paths, so the steps form a trie; an unseen outcome falls back to the DFS.
+	struct CfgTrace {
+		// Eval/CondEval re-run the recursive walker for roots the tape does not cover.
+		// Gather marks a descriptor source CFG-gather ready (EvaluateDescriptor still verifies it).
+		// CondTri: a tri-state condition op (0, 1, or 2 = predicate failed).
+		enum class Kind : uint8_t { Exec, Memo, Flat, Activate, Cond, Eval, CondEval, Gather, End, CondTri };
+		struct Step {
+			Kind     kind = Kind::End;
+			uint32_t a    = 0; // op (Exec/Memo/Flat/Cond), slot (Eval), block (Activate/CondEval), source (Gather)
+			uint32_t b    = 0; // Flat/Eval: flat offset; Cond/CondEval (recording): outcome
+			// Cond/CondEval: next step per outcome (0 = zero, 1 = non-zero, 2 = evaluation failed).
+			std::array<uint32_t, 3> next {UINT32_MAX, UINT32_MAX, UINT32_MAX};
+		};
+		std::vector<Step>    steps;
+		std::vector<uint8_t> base_active;
+		uint32_t             paths    = 0;
+		uint32_t             hits     = 0;
+		uint32_t             misses   = 0;
+		bool                 disabled = false;
+		bool                 strict   = false; // recorded with a strict reader (conditions evaluated)
+	};
+	mutable std::array<CfgTrace, 2> cfg_traces;
+	mutable std::vector<CfgTrace::Step> cfg_trace_scratch;
+	// KYTY_SRT_COMPILED: a flat step program compiled from the straight-line tape (non-CFG plans) or from
+	// the recorded CFG trace trie. It re-executes every operation, user-data read and guest read on every
+	// call; nothing observed in a previous call is trusted. Same indexing as the tape: `out`/`args` address
+	// the evaluator value array, immediates are folded into `consts`.
+	struct CompiledSrt {
+		enum class State : uint8_t { Unbuilt, Ready, Unsupported };
+		enum class Code : uint8_t { UserData, ShaderBase, Alu, Read, Flat, Activate, Cond, CondTri, Memo, Gather, End };
+		struct Step {
+			Code                    code   = Code::End;
+			uint8_t                 clean  = 0;
+			// Dead-memo elimination: 0 = nothing can read this step's memo slot after it ran, so the
+			// value/generation store and the rollback bookkeeping are skipped (see ClassifyMemoPublication).
+			uint8_t                 publish = 1;
+			// Read: number of adjacent same-pointer scalar loads starting here that may be fetched in
+			// one reader call when their addresses are contiguous (1 = single read).
+			uint8_t                 group  = 1;
+			ValueOpcode             opcode {};
+			uint32_t                out    = 0;           // value index written (Exec), read (Flat/Cond/Memo)
+			uint32_t                memo   = UINT32_MAX;  // evaluator memo slot (UINT32_MAX = none)
+			uint32_t                aux    = 0;           // UserData: register; Read: memory_info; Flat: flat offset;
+			                                              // Activate: block; Gather: descriptor source
+			std::array<uint32_t, 5> args {};
+			uint64_t                imm    = 0;
+			std::array<uint32_t, 3> next {UINT32_MAX, UINT32_MAX, UINT32_MAX};
+		};
+		std::vector<Step>                         steps;
+		std::vector<std::pair<uint32_t, uint64_t>> consts;
+		State    state        = State::Unbuilt;
+		uint8_t  reason       = 0;   // why Unsupported (see SrtCompiledReasonName)
+		uint32_t value_count  = 0;
+		uint32_t source_steps = 0;  // CFG: trace size this program was compiled from
+		uint32_t source_paths = 0;
+		uint32_t read_steps   = 0;  // statistics: Read steps / merged groups
+		uint32_t group_steps  = 0;
+		uint32_t dead_memo_steps = 0; // steps whose memo publication was eliminated
+		// CFG: per evaluator role (0 = ordinary, 1 = clean), the Gather step id whose memo/flat agreement
+		// EvaluateDescriptor already verified per source. A trie step has one fixed predecessor path, so
+		// the agreement is a property of the step, not of the values. Cleared whenever the program is rebuilt.
+		std::array<std::vector<uint32_t>, 2> verified_gather;
+	};
+	mutable std::array<CompiledSrt, 2> compiled_nocfg;
+	mutable std::array<CompiledSrt, 2> compiled_cfg;
+	// KYTY_SRT_COMPILED input-keyed descriptor reuse: for one (evaluator mode, descriptor source) the memo
+	// leaves its recursive evaluation can reach. Built lazily from a purity walk of the source's dwords.
+	struct SourceReusePlan {
+		enum class State : uint8_t { Unbuilt, Eligible, Ineligible };
+		struct Leaf {
+			const Inst* inst = nullptr;
+			uint8_t     role = 0;     // 0 = the evaluating walker's own context, 1 = its clean partner's
+			uint32_t    memo_index = 0;
+		};
+		State             state = State::Unbuilt;
+		uint64_t          serial = 0;       // changes whenever the plan is rebuilt
+		const void*       tape  = nullptr;  // tape the stop set was derived from
+		size_t            tape_ops = 0;
+		std::vector<Leaf> leaves;
+	};
+	mutable std::array<std::vector<SourceReusePlan>, 3> source_reuse_plans;
+	// KYTY_SRT_SOURCE_REUSE: previous gather-path output per descriptor source (GPU thread only).
+	mutable std::vector<DescriptorValue> source_reuse_last;
+	mutable std::vector<uint8_t>         source_reuse_valid;
 };
 
 struct Program: ResourcePlan {

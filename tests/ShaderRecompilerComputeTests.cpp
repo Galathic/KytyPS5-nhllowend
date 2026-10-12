@@ -2,6 +2,7 @@
 #include "common/emulatorConfig.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
+#include "common/runtimeFlags.h"
 #include "common/subsystems.h"
 #include "common/threads.h"
 #include "gpu_test_shaders/gpu_test_ms_depth_spv.h"
@@ -120,6 +121,9 @@ struct CommandProcessorTestAccess {
   static uint32_t Instances(CommandProcessor& cp) { return cp.ResolveNumInstances(); }
   static void PendingShader(CommandProcessor& cp, NativeIndirectDraw source) {
     cp.m_pending_shader_offsets.push_back(std::move(source));
+  }
+  static size_t PendingShaderCount(const CommandProcessor& cp) {
+    return cp.m_pending_shader_offsets.size();
   }
 };
 
@@ -4000,6 +4004,7 @@ public:
   }
 
   void CheckInlineLabelWrites() {
+    Common::RuntimeFlags::Refresh(true);
     constexpr const char *name = "InlineLabelWrites";
     constexpr uintptr_t base = 0x0000000200900000ull;
     constexpr uint64_t size = 0x10000;
@@ -4094,6 +4099,175 @@ public:
           processor.Process(changed_uc_execution, uc_packet) == Pm4ProcessResult::Complete &&
           processor.GetUcfg().GetObjectId() == 0,
           "UC backing read ignored overlapping GPU writes");
+
+      // UC packet metadata can be clean while unrelated GPU-owned data protects
+      // the same guest page. Only exact-clean metadata may bypass that page fault.
+      constexpr uint64_t clean_nop_address = base + 0x300;
+      constexpr uint64_t clean_agc_address = base + 0x320;
+      constexpr uint64_t dirty_agc_address = base + 0x340;
+      constexpr uint64_t protected_neighbor = base + 0x500;
+      const std::array<uint32_t, 3> clean_nop_packet{
+          KYTY_PM4(3, Pm4::IT_SET_UCONFIG_REG, Pm4::R_ZERO), Pm4::UC_NOP, 0u};
+      const std::array<uint32_t, 4> clean_agc_packet{
+          KYTY_PM4(4, Pm4::IT_SET_UCONFIG_REG, 1u), 0x342u, 0xc8010000u, 0u};
+      const std::array<uint32_t, 4> dirty_agc_packet{
+          KYTY_PM4(4, Pm4::IT_SET_UCONFIG_REG, 1u), 0x342u, 0u, 0u};
+      const auto initialize_metadata_packet = [&](uint64_t address,
+                                                   std::span<const uint32_t> words) {
+        for (size_t i = 0; i < words.size(); ++i) {
+          if (!cache.TryWriteLabel(address + i * sizeof(uint32_t), &words[i], sizeof(uint32_t)))
+            return false;
+        }
+        return true;
+      };
+      Require(name, "metadata packet initialization",
+              initialize_metadata_packet(clean_nop_address, clean_nop_packet) &&
+                  initialize_metadata_packet(clean_agc_address, clean_agc_packet) &&
+                  initialize_metadata_packet(dirty_agc_address, dirty_agc_packet),
+              "could not initialize UC metadata packets");
+      auto protected_word = cache.ObtainBuffer(protected_neighbor, sizeof(uint32_t), true, false);
+      protected_word.first->Fill(protected_word.second, sizeof(uint32_t), pattern);
+      const char *metadata_setting = std::getenv("KYTY_PM4_CLEAN_METADATA");
+      const char *header_setting = std::getenv("KYTY_PM4_CLEAN_BACKING");
+      uint32_t probe = 0;
+      const bool clean_peeks_requested =
+          metadata_setting != nullptr && metadata_setting[0] == '1' &&
+          header_setting != nullptr && header_setting[0] == '1';
+      if (clean_peeks_requested) {
+        Require(name, "clean metadata probe",
+                processor.TryPeekGuest(reinterpret_cast<const void *>(clean_nop_address + sizeof(uint32_t)),
+                                       &probe, sizeof(probe)),
+                "requested metadata regression cannot use exact-clean reads");
+        const auto run_clean_metadata_packet = [&](uint64_t address, uint32_t words,
+                                                   const char *stage) {
+          const auto tick_before = scheduler.CurrentTick();
+          Pm4Execution metadata_execution;
+          const auto packet = std::span<const uint32_t>(
+              reinterpret_cast<const uint32_t *>(address), words);
+          Require(name, stage,
+                  processor.Process(metadata_execution, packet) == Pm4ProcessResult::Complete &&
+                      scheduler.CurrentTick() == tick_before &&
+                      cache.HasGpuDirtyBytes(protected_neighbor, sizeof(uint32_t)),
+                  "clean UC metadata waited for or downloaded unrelated GPU-owned page data");
+        };
+        run_clean_metadata_packet(clean_nop_address, clean_nop_packet.size(),
+                                  "clean UC NOP metadata");
+        run_clean_metadata_packet(clean_agc_address, clean_agc_packet.size(),
+                                  "clean AGC tag metadata");
+
+        constexpr uint64_t wait_target32 = base + 0x700;
+        constexpr uint64_t wait_target64 = base + 0x708;
+        constexpr uint32_t wait_value32 = 0x13579bdfu;
+        constexpr uint64_t wait_value64 = 0x0123456789abcdefull;
+        Require(name, "wait target initialization",
+                cache.TryWriteLabel(wait_target32, &wait_value32, sizeof(wait_value32)) &&
+                    cache.TryWriteLabel(wait_target64, &wait_value64, sizeof(wait_value64)),
+                "could not initialize WAIT_REG_MEM targets");
+        const auto make_wait32 = [&](uint32_t poll) {
+          return std::array<uint32_t, 7>{
+              KYTY_PM4(7, Pm4::IT_WAIT_REG_MEM, Pm4::R_ZERO), 0x13u,
+              static_cast<uint32_t>(wait_target32),
+              static_cast<uint32_t>(wait_target32 >> 32u), wait_value32,
+              UINT32_MAX, poll};
+        };
+        const auto make_wait64 = [&](uint32_t poll) {
+          return std::array<uint32_t, 9>{
+              KYTY_PM4(9, Pm4::IT_WAIT_REG_MEM_64, Pm4::R_ZERO), 0x13u,
+              static_cast<uint32_t>(wait_target64),
+              static_cast<uint32_t>(wait_target64 >> 32u),
+              static_cast<uint32_t>(wait_value64),
+              static_cast<uint32_t>(wait_value64 >> 32u), UINT32_MAX,
+              UINT32_MAX, poll};
+        };
+        const auto run_wait_metadata = [&](uint64_t packet_address,
+                                           const auto &packet_words,
+                                           uint64_t dirty_word_address,
+                                           const char *stage) {
+          Require(name, stage, initialize_metadata_packet(
+                      packet_address,
+                      std::span<const uint32_t>(packet_words.data(), packet_words.size())),
+                  "could not initialize exact-clean WAIT_REG_MEM packet");
+          auto wait_neighbor = cache.ObtainBuffer(protected_neighbor, sizeof(uint32_t), true, false);
+          wait_neighbor.first->Fill(wait_neighbor.second, sizeof(uint32_t), pattern);
+          Require(name, "wait metadata dirty neighbor setup",
+                  cache.HasGpuDirtyBytes(protected_neighbor, sizeof(uint32_t)),
+                  "wait metadata fixture did not establish GPU-dirty neighboring bytes");
+          const auto tick_before = scheduler.CurrentTick();
+          Pm4Execution wait_execution;
+          const auto guest_packet = std::span<const uint32_t>(
+              reinterpret_cast<const uint32_t *>(packet_address), packet_words.size());
+          std::array<uint32_t, 8> payload_before{};
+          const bool payload_peek_before = processor.TryPeekGuest(
+              reinterpret_cast<const void *>(packet_address + sizeof(uint32_t)),
+              payload_before.data(), (packet_words.size() - 1) * sizeof(uint32_t));
+          uint64_t target_before = 0;
+          const uint64_t target_address = packet_words.size() == 7 ? wait_target32 : wait_target64;
+          const bool target_read_before = Libs::LibKernel::Memory::TryReadBacking(
+              target_address, &target_before, packet_words.size() == 7 ? sizeof(uint32_t)
+                                                                       : sizeof(uint64_t));
+          const auto wait_result = processor.Process(wait_execution, guest_packet);
+          const auto tick_after = scheduler.CurrentTick();
+          const bool neighbor_dirty_after =
+              cache.HasGpuDirtyBytes(protected_neighbor, sizeof(uint32_t));
+          if (wait_result != Pm4ProcessResult::Complete || tick_after != tick_before ||
+              !neighbor_dirty_after) {
+            std::printf("[host] WAIT diagnostic %s: result=%u tick=%llu->%llu neighbor_dirty=%u payload_peek=%u payload=[",
+                        stage, static_cast<unsigned>(wait_result),
+                        static_cast<unsigned long long>(tick_before),
+                        static_cast<unsigned long long>(tick_after),
+                        neighbor_dirty_after ? 1u : 0u, payload_peek_before ? 1u : 0u);
+            for (size_t i = 0; i + 1 < packet_words.size(); ++i) {
+              std::printf("%s%08x", i == 0 ? "" : ",", payload_before[i]);
+            }
+            std::printf("] target_read=%u target=%llx dirty_payload=%u\n",
+                        target_read_before ? 1u : 0u,
+                        static_cast<unsigned long long>(target_before),
+                        cache.HasGpuDirtyBytes(packet_address + sizeof(uint32_t),
+                                               (packet_words.size() - 1) * sizeof(uint32_t))
+                            ? 1u
+                            : 0u);
+          }
+          Require(name, stage,
+                  wait_result == Pm4ProcessResult::Complete && tick_after == tick_before &&
+                      neighbor_dirty_after,
+                  "clean WAIT_REG_MEM payload waited for unrelated GPU-owned bytes");
+
+          auto gpu_payload = cache.ObtainBuffer(dirty_word_address, sizeof(uint32_t), true, false);
+          const uint32_t updated_poll = packet_words.back() + 1u;
+          gpu_payload.first->Fill(gpu_payload.second, sizeof(updated_poll), updated_poll);
+          const auto fallback_tick = scheduler.CurrentTick();
+          Pm4Execution fallback_execution;
+          Require(name, "dirty WAIT_REG_MEM fallback",
+                  processor.Process(fallback_execution, guest_packet) == Pm4ProcessResult::Complete &&
+                      scheduler.CurrentTick() > fallback_tick &&
+                      !cache.HasGpuDirtyBytes(dirty_word_address, sizeof(uint32_t)),
+                  "dirty WAIT_REG_MEM payload did not use the synchronized packet path");
+        };
+        const auto wait32 = make_wait32(25u);
+        run_wait_metadata(base + 0x400, wait32, base + 0x400 + 6 * sizeof(uint32_t),
+                          "clean 32-bit WAIT_REG_MEM");
+        const auto wait64 = make_wait64(25u);
+        run_wait_metadata(base + 0x440, wait64, base + 0x440 + 8 * sizeof(uint32_t),
+                          "clean 64-bit WAIT_REG_MEM");
+
+        auto dirty_tag = cache.ObtainBuffer(dirty_agc_address + 2 * sizeof(uint32_t),
+                                            sizeof(uint32_t), true, false);
+        dirty_tag.first->Fill(dirty_tag.second, sizeof(uint32_t), 0xc8010000u);
+        const auto tick_before_fallback = scheduler.CurrentTick();
+        Pm4Execution dirty_tag_execution;
+        const auto packet = std::span<const uint32_t>(
+            reinterpret_cast<const uint32_t *>(dirty_agc_address), dirty_agc_packet.size());
+        Require(name, "dirty AGC tag fallback",
+                processor.Process(dirty_tag_execution, packet) == Pm4ProcessResult::Complete &&
+                    scheduler.CurrentTick() > tick_before_fallback &&
+                    !cache.HasGpuDirtyBytes(dirty_agc_address + 2 * sizeof(uint32_t),
+                                            sizeof(uint32_t)),
+                "dirty AGC tag did not use the synchronized volatile fallback");
+        std::printf("[host]    %-32s ok\n", "Pm4CleanUconfigMetadata");
+      } else {
+        std::printf("[host]    %-32s skipped (clean backing disabled)\n",
+                    "Pm4CleanUconfigMetadata");
+      }
       // Updating the register pair on the GPU must still synchronize before decoding.
       auto changed = cache.ObtainBuffer(address + 4, 4, true, false);
       changed.first->Fill(changed.second, 4, 0);
@@ -4103,6 +4277,9 @@ public:
           !processor.GetCtx().GetDepthControl().stencil_enable &&
           !processor.GetCtx().GetDepthControl().z_write_enable,
           "direct register backing read ignored overlapping GPU writes");
+#include "Pm4WriteDataFastTests.inc"
+#include "ShaderCleanReadTests.inc"
+#include "ScalarBatchBackingTests.inc"
     });
     scheduler.Finish();
     context.UnmapMemory(base, size);
@@ -40962,6 +41139,28 @@ void CheckNativeIndexedPreparation(RenderContext& renderer) {
   source.shader_regs = {Pm4::SPI_SHADER_USER_DATA_GS_0 + 5, Pm4::SPI_SHADER_USER_DATA_GS_0 + 6, Pm4::SPI_SHADER_USER_DATA_GS_0 + 7};
   scheduler.Current().Handle().updateBuffer(source.snapshot->Handle(), 0, sizeof(data), data.data());
   CommandProcessorTestAccess::PendingShader(processor, source);
+  const auto unrelated_tick = scheduler.CurrentTick();
+  g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_DATA_PS_0 + 3](
+      processor, Pm4::SPI_SHADER_USER_DATA_PS_0 + 3, 321);
+  g_hw_sh_indirect_func[Pm4::COMPUTE_USER_DATA_0](
+      processor, Pm4::COMPUTE_USER_DATA_0, 654);
+  g_hw_sh_indirect_func[Pm4::SPI_SHADER_PGM_LO_GS](
+      processor, Pm4::SPI_SHADER_PGM_LO_GS, 0x1234);
+  const auto& updated = processor.GetShCtxForStateUpdate();
+  Require("NativeIndexedPrep", "unrelated state updates preserve pending offsets without a drain",
+      CommandProcessorTestAccess::PendingShaderCount(processor) == 1 &&
+      scheduler.CurrentTick() == unrelated_tick &&
+      updated.GetPs().ps_user_sgpr.value[3] == 321 &&
+      updated.GetCs().cs_user_sgpr.value[0] == 654 &&
+      updated.GetVs().gs_regs.data_addr == 0x123400,
+      "unrelated shader state consumed pending offsets or forced a GPU drain");
+  processor.GetShCtxForWrite(Pm4::SPI_SHADER_USER_DATA_GS_0 + 5).SetGsUserSgpr(
+      5, 501, HW::UserSgprType::Unknown);
+  const auto& partial = processor.GetShCtx().GetVs().gs_user_sgpr;
+  Require("NativeIndexedPrep", "partial overwrite preserves unconsumed GPU offsets",
+      partial.value[5] == 501 && partial.value[6] == 88 && partial.value[7] == 7,
+      "resolving pending offsets overwrote an explicit field or lost a retained field");
+  CommandProcessorTestAccess::PendingShader(processor, source);
   const auto tick = scheduler.CurrentTick();
   for (uint32_t slot = 5; slot <= 7; ++slot) {
     processor.GetShCtxForWrite(Pm4::SPI_SHADER_USER_DATA_GS_0 + slot).SetGsUserSgpr(slot, 100 + slot, HW::UserSgprType::Unknown);
@@ -41626,8 +41825,13 @@ int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
 #ifdef _WIN32
   _putenv_s("KYTY_DPP_PRESERVE_INACTIVE", "1");
+  // EVENT_WRITE payload peeking shares TryPeekGuest's own KYTY_PERF_NO_SYNC_READBACK
+  // requirement. Set it so the PM4 event-clean coverage runs by default rather than
+  // depending on the caller's environment.
+  _putenv_s("KYTY_PERF_NO_SYNC_READBACK", "1");
 #else
   setenv("KYTY_DPP_PRESERVE_INACTIVE", "1", 1);
+  setenv("KYTY_PERF_NO_SYNC_READBACK", "1", 1);
 #endif
   const bool renderdoc_smoke =
       argc == 2 && std::strcmp(argv[1], "--renderdoc-only") == 0;

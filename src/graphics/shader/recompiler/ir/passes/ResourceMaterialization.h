@@ -3,6 +3,11 @@
 
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
+#include <atomic>
+#include <cstdint>
+#include <functional>
+#include <mutex>
+
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
 // Canonical module-affecting resource state. Runtime addresses and descriptor payloads remain in
@@ -37,6 +42,79 @@ struct ResourceSpecialization {
 	std::vector<Image>  images;
 
 	bool operator==(const ResourceSpecialization&) const = default;
+};
+
+// Retains direct descriptor decoding independently of changing addresses/payloads.
+// The owner must reset this cache if its immutable plan is replaced or modified.
+struct ResourceSpecializationCache {
+	struct BufferEntry {
+		std::array<uint32_t, 2> key {};
+		ResourceSpecialization::Buffer value;
+		bool valid = false;
+	};
+	struct ImageEntry {
+		std::array<uint32_t, 7> key {};
+		ResourceSpecialization::Image value;
+		bool null = false;
+		bool valid = false;
+	};
+	const ResourcePlan* owner = nullptr;
+	bool active = false; // A nested materialization falls back instead of sharing mutable entries.
+	std::vector<BufferEntry> buffers;
+	std::vector<ImageEntry> images;
+	void Reset() { owner = nullptr; active = false; buffers.clear(); images.clear(); }
+};
+
+struct ResourceSpecializationCacheStats {
+	uint64_t calls = 0;
+	uint64_t buffer_hits = 0, buffer_misses = 0;
+	uint64_t image_hits = 0, image_misses = 0;
+	uint64_t indirect_uncached = 0;
+};
+// Per-thread counters: diagnostics do not introduce contended atomics in draw prep.
+ResourceSpecializationCacheStats GetResourceSpecializationCacheStats();
+
+// KYTY_SRT_COMPILED (part A): the previous outputs of one program (owned by its plan entry) and the
+// per-part change mask of the most recent call against them. Keyed on the program's own last use,
+// not on the previous draw. Compare-then-copy keeps the stored copy current without extra passes.
+struct ResourceChangeMask {
+	bool valid             = false; // a previous successful call existed to compare against
+	bool images            = false;
+	bool samplers          = false;
+	bool buffer_fmt        = false; // stride/format/swizzle words (everything but address and num_records)
+	bool buffer_addr       = false; // dword0 plus dword1[15:0]
+	bool buffer_size       = false; // num_records
+	bool flat_changed      = false;
+	bool user_data_changed = false;
+};
+
+struct ResourceDelta {
+	std::vector<DescriptorValue> images, samplers, buffers;
+	std::vector<uint32_t>        flat, user_data;
+	bool                         have = false;
+	ResourceChangeMask           mask;
+	// Specialization built from the image words below; reused while those words are unchanged.
+	const ResourcePlan*                         owner = nullptr;
+	std::vector<DescriptorValue>                spec_images_in;
+	std::vector<ResourceSpecialization::Image> spec_images_out;
+	bool                                        spec_valid = false;
+	uint64_t                                    verify_ticker = 0;
+	// Input-keyed descriptor reuse (SrtWalker::EvaluateDescriptor): per descriptor source, the exact memo
+	// values the last successful recursive evaluation consumed and the descriptor it produced.
+	struct SourceReuse {
+		bool                  valid = false;
+		uint8_t               mode  = 0;
+		uint64_t              plan_serial = 0;
+		std::vector<uint64_t> inputs;
+		DescriptorValue       output;
+	};
+	std::vector<SourceReuse>                    sources;
+	void Reset() {
+		have = spec_valid = false;
+		mask = {};
+		owner = nullptr;
+		for (auto& entry: sources) entry.valid = false;
+	}
 };
 
 // Extracts the descriptor/SRT value graph before resource specialization. The returned plan owns

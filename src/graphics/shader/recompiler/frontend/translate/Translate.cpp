@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstdio>
+#include <fmt/format.h>
 #include <unordered_map>
 #include <utility>
 
@@ -1338,9 +1340,13 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 	}
 	const bool flush_f32_inputs = options.stage == ShaderType::Compute &&
 	                             (options.input_info.compute->float_mode & 0x10u) == 0;
+	Fp16Coverage  fp16_coverage;
+	Fp16Coverage* fp16_coverage_ptr = ShaderNativeFp16() ? &fp16_coverage : nullptr;
+	fp16_coverage.hash              = options.shader_hash;
 	for (const auto& cfg_block: cfg.blocks) {
 		const auto typed_index = block_indices.at(cfg_block.id);
-		Translator translator(result, result.blocks[typed_index], vector_limit, flush_f32_inputs);
+		Translator translator(result, result.blocks[typed_index], vector_limit, flush_f32_inputs,
+		                      fp16_coverage_ptr);
 		for (uint32_t index = cfg_block.inst_begin; index < cfg_block.inst_end; index++) {
 			const auto& instruction = decoded.instructions[index];
 			if (IsCodeTableLoad(cfg, instruction.pc)) {
@@ -1364,6 +1370,26 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			translator.TranslateInstruction(instruction);
 		}
 		translator.AddBranchCondition(cfg, cfg_block, result.block_info[typed_index]);
+	}
+	if (fp16_coverage_ptr != nullptr && !fp16_coverage.ops.empty()) {
+		uint32_t native = 0, fallback = 0;
+		std::string per_op;
+		for (const auto& [opcode, entry]: fp16_coverage.ops) {
+			native += entry.native;
+			fallback += entry.fallback;
+			per_op += fmt::format(" | {} n={} f={}", magic_enum::enum_name(opcode), entry.native,
+			                      entry.fallback);
+		}
+		static constexpr const char* kReasonNames[] = {"op", "op_sel", "neg", "neg_hi", "abs", "clamp", "omod",
+		                                               "const", "sdwa", "dpp", "fmac_dst", "sel_hi", "other"};
+		std::string reasons;
+		for (size_t i = 0; i < fp16_coverage.reasons.size(); i++) {
+			reasons += fmt::format(" {}={}", kReasonNames[i], fp16_coverage.reasons[i]);
+		}
+		const auto line = fmt::format("NHL27FP16 hash=0x{:016x} native={} fallback={}{} | reasons:{}\n",
+		                              fp16_coverage.hash, native, fallback, per_op, reasons);
+		std::fwrite(line.data(), 1, line.size(), stdout);
+		std::fflush(stdout);
 	}
 	IR::ValidateProgram(result, false);
 	return result;

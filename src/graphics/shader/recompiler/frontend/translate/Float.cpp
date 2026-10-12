@@ -1,12 +1,123 @@
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
+#include "graphics/shader/shader.h"
+
 #include <array>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
+bool Translator::NativeF16Eligible(const Decoder::Operand& op) const {
+	return op.sdwa_sel == 6u && !op.dpp && !op.dpp8;
+}
+
+// Both f16 lanes of a source as one u32 (lo = lane read for the low result, hi = for the high one).
+IR::U32 Translator::NativePackedF16Source(const Decoder::Operand& op) {
+	const bool plain_reg = (op.kind == Decoder::OperandKind::Vgpr || op.kind == Decoder::OperandKind::Sgpr) &&
+	                       !op.absolute;
+	if (!plain_reg) {
+		return PackU16Lanes(Read16LaneBits(op, false), Read16LaneBits(op, true));
+	}
+	const auto raw = ReadRawU32(op);
+	const auto c16 = IR::U32(IR::Value(16u));
+	IR::U32    v   = raw;
+	if (!op.op_sel && op.op_sel_hi) {
+		v = raw;
+	} else if (op.op_sel && !op.op_sel_hi) {
+		v = ir.BitwiseOr(ir.ShiftLeftLogical(raw, c16), ir.ShiftRightLogical(raw, c16));
+	} else if (!op.op_sel && !op.op_sel_hi) {
+		v = ir.BitwiseOr(ir.BitwiseAnd(raw, IR::U32(IR::Value(0xffffu))), ir.ShiftLeftLogical(raw, c16));
+	} else {
+		v = ir.BitwiseOr(ir.ShiftRightLogical(raw, c16), ir.BitwiseAnd(raw, IR::U32(IR::Value(0xffff0000u))));
+	}
+	const uint32_t flip = (op.negate ? 0x8000u : 0u) | (op.negate_hi ? 0x80000000u : 0u);
+	if (flip != 0u) {
+		v = ir.BitwiseXor(v, IR::U32(IR::Value(flip)));
+	}
+	return v;
+}
+
+// Scalar f16 op through the packed native opcodes: the operand lane goes in the low half (the high
+// half is zero and discarded).
+bool Translator::NativeScalarF16(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool reverse,
+                                 bool accumulator) {
+	if (!ShaderNativeFp16() || inst.dst.omod != 0u) {
+		return false;
+	}
+	IR::ValueOpcode native = IR::ValueOpcode::Void;
+	bool            negate_b = false;
+	switch (opcode) {
+		case IR::ValueOpcode::FPAdd32: native = IR::ValueOpcode::FPAdd16x2; break;
+		case IR::ValueOpcode::FPSub32: native = IR::ValueOpcode::FPAdd16x2; negate_b = true; break;
+		case IR::ValueOpcode::FPMul32: native = IR::ValueOpcode::FPMul16x2; break;
+		case IR::ValueOpcode::FPFma32: native = IR::ValueOpcode::FPFma16x2; break;
+		default: return false;
+	}
+	const bool three = native == IR::ValueOpcode::FPFma16x2;
+	if (three ? (!accumulator && inst.src_count != 3u) : inst.src_count != 2u) {
+		return false;
+	}
+	const Decoder::Operand* srcs[3] = {&inst.src0, &inst.src1, nullptr};
+	if (three) srcs[2] = accumulator ? &inst.dst : &inst.src2;
+	if (reverse) std::swap(srcs[0], srcs[1]);
+	for (const auto* s: srcs) {
+		if (s != nullptr && !NativeF16Eligible(*s)) return false;
+	}
+	const auto lane = [&](const Decoder::Operand& op) { return Read16LaneBits(op, false); };
+	const auto a    = lane(*srcs[0]);
+	auto       b    = lane(*srcs[1]);
+	if (negate_b) b = ir.BitwiseXor(b, IR::U32(IR::Value(0x8000u)));
+	IR::U32 result;
+	if (three) {
+		result = IR::U32(ir.Emit(native, {a, b, lane(*srcs[2])}));
+	} else {
+		result = IR::U32(ir.Emit(native, {a, b}));
+	}
+	if (inst.dst.clamp) {
+		result = IR::U32(ir.Emit(IR::ValueOpcode::FPClamp16x2, {result}));
+	}
+	Write16Bits(DestinationOperand(inst), result);
+	fp16_native = true;
+	return true;
+}
+
 void Translator::PackedFloat16(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                                bool accumulator, bool quiet_snan) {
+	if (ShaderNativeFp16() && !quiet_snan) {
+		// Native packed f16. Sources are packed into one u32 holding both halves exactly as the
+		// fallback reads them (op_sel/op_sel_hi, neg/neg_hi, abs, inline constants); omod falls back.
+		IR::ValueOpcode native = IR::ValueOpcode::Void;
+		switch (opcode) {
+			case IR::ValueOpcode::FPAdd32: native = IR::ValueOpcode::FPAdd16x2; break;
+			case IR::ValueOpcode::FPMul32: native = IR::ValueOpcode::FPMul16x2; break;
+			case IR::ValueOpcode::FPFma32: native = IR::ValueOpcode::FPFma16x2; break;
+			default: break;
+		}
+		const bool three = native == IR::ValueOpcode::FPFma16x2;
+		const bool shape_ok = three ? (accumulator || inst.src_count == 3u) : (inst.src_count == 2u);
+		if (native != IR::ValueOpcode::Void && shape_ok && inst.dst.omod == 0u &&
+		    NativeF16Eligible(inst.src0) && NativeF16Eligible(inst.src1) &&
+		    (!three || NativeF16Eligible(accumulator ? inst.dst : inst.src2))) {
+			const auto a = NativePackedF16Source(inst.src0);
+			const auto b = NativePackedF16Source(inst.src1);
+			IR::U32    result;
+			if (three) {
+				const auto c = NativePackedF16Source(accumulator ? inst.dst : inst.src2);
+				result       = IR::U32(ir.Emit(native, {a, b, c}));
+			} else {
+				result = IR::U32(ir.Emit(native, {a, b}));
+			}
+			if (inst.dst.clamp) {
+				result = IR::U32(ir.Emit(IR::ValueOpcode::FPClamp16x2, {result}));
+			}
+			auto raw  = DestinationOperand(inst);
+			raw.omod  = 0u;
+			raw.clamp = false;
+			WriteOperand(raw, result);
+			fp16_native = true;
+			return;
+		}
+	}
 	const auto translate_lane = [&](bool high) {
 		const auto lhs = ReadF16LaneAsF32(inst.src0, high);
 		const auto rhs = ReadF16LaneAsF32(inst.src1, high);
@@ -98,6 +209,9 @@ void Translator::Float16Trig(const Decoder::Instruction& inst, IR::ValueOpcode o
 
 void Translator::Float16Binary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                                bool reverse) {
+	if (NativeScalarF16(inst, opcode, reverse, false)) {
+		return;
+	}
 	const auto lhs = ReadF16AsF32(reverse ? inst.src1 : inst.src0);
 	const auto rhs = ReadF16AsF32(reverse ? inst.src0 : inst.src1);
 	WriteF16(DestinationOperand(inst), IR::F32(ir.Emit(opcode, {lhs, rhs})));
@@ -105,6 +219,10 @@ void Translator::Float16Binary(const Decoder::Instruction& inst, IR::ValueOpcode
 
 void Translator::Float16Ternary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                                 bool accumulator, bool mix) {
+	if (!mix && inst.opcode != Decoder::Opcode::V_FMAMK_F16 && inst.opcode != Decoder::Opcode::V_FMAAK_F16 &&
+	    NativeScalarF16(inst, opcode, false, accumulator)) {
+		return;
+	}
 	std::array<IR::Value, 3> args;
 	for (uint32_t index = 0; index < args.size(); index++) {
 		const auto& operand = accumulator && index == 2u ? inst.dst : SourceAt(inst, index);

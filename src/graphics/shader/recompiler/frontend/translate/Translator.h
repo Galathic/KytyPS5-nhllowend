@@ -4,15 +4,28 @@
 #include "graphics/shader/recompiler/ir/IREmitter.h"
 
 #include <array>
+#include <cstdint>
+#include <map>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
+
+// KYTY_NATIVE_FP16 coverage diagnostic: per-translation counters, printed once per shader.
+struct Fp16Coverage {
+	struct Entry {
+		uint32_t native   = 0;
+		uint32_t fallback = 0;
+	};
+	std::map<Decoder::Opcode, Entry> ops;
+	std::array<uint32_t, 13>         reasons {};
+	uint64_t                         hash = 0;
+};
 
 class Translator {
 public:
 	Translator(IR::Program& program, IR::Block* block, uint32_t vector_limit,
-	           bool flush_f32_inputs)
+	           bool flush_f32_inputs, Fp16Coverage* fp16_coverage = nullptr)
 	    : program(program), ir(block), current_vector_limit(vector_limit),
-	      flush_f32_inputs(flush_f32_inputs) {}
+	      flush_f32_inputs(flush_f32_inputs), fp16_coverage(fp16_coverage) {}
 
 	void TranslateInstruction(const Decoder::Instruction& inst);
 	void TranslateEmbeddedFetch(const Decoder::Instruction& inst, uint32_t attribute,
@@ -147,6 +160,10 @@ private:
 	void V_PACK_B32_F16(const Decoder::Instruction& inst);
 	void PackedFloat16(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool accumulator,
 	                   bool quiet_snan);
+	bool NativeF16Eligible(const Decoder::Operand& op) const;
+	IR::U32 NativePackedF16Source(const Decoder::Operand& op);
+	bool NativeScalarF16(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool reverse,
+	                     bool accumulator);
 	void Float16Unary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
 	                  bool invalid_negative);
 	void Float16Trig(const Decoder::Instruction& inst, IR::ValueOpcode opcode);
@@ -255,6 +272,8 @@ private:
 	void EmitInterpolation(const Decoder::Instruction& inst);
 	void EmitMemory(const Decoder::Instruction& inst);
 	static void FailMissingTranslation(const Decoder::Instruction& inst);
+	void TranslateInstructionImpl(const Decoder::Instruction& inst);
+	void RecordFp16Coverage(const Decoder::Instruction& inst);
 
 	IR::Program&    program;
 	IR::IREmitter   ir;
@@ -263,6 +282,8 @@ private:
 	uint32_t        current_pc           = 0;
 	uint32_t        current_vector_limit = 1;
 	bool            flush_f32_inputs;
+	Fp16Coverage*   fp16_coverage = nullptr;
+	bool            fp16_native   = false;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend

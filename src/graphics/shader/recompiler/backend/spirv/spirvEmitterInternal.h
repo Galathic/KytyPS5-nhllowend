@@ -79,6 +79,7 @@ struct SpirvRequirements {
 	// s_barrier; the barrier must also order/publish buffer (and image) memory.
 	bool workgroup_buffer_sync        = false;
 	bool float64                     = false;
+	bool float16                     = false;
 };
 
 SpirvRequirements AnalyzeProgramRequirements(const IR::Program& program);

@@ -1,3 +1,4 @@
+#include "common/eventTrace.h"
 #include "kernel/eventQueue.h"
 
 #include "common/assert.h"
@@ -423,6 +424,22 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
 	     static_cast<uint64_t>(eq), reinterpret_cast<uint64_t>(ev), num,
 	     (timo == nullptr ? "inf" : fmt::format("{}", *timo).c_str()),
 	     Common::Thread::GetThreadIdUnique());
+
+	Common::EventTrace::Record(Common::EventTrace::GUEST_EQ_WAIT_BEGIN,
+	                           static_cast<uint64_t>(Common::Thread::GetThreadIdUnique()),
+	                           static_cast<uint64_t>(eq));
+	struct EqWaitEndTrace {
+		int*         out;
+		KernelEvent* ev;
+		~EqWaitEndTrace() {
+			const bool got = *out > 0;
+			Common::EventTrace::Record(Common::EventTrace::GUEST_EQ_WAIT_END,
+			                           static_cast<uint64_t>(Common::Thread::GetThreadIdUnique()),
+			                           got ? ((static_cast<uint64_t>(static_cast<uint16_t>(ev[0].filter)) << 32) |
+			                                  static_cast<uint32_t>(ev[0].ident))
+			                               : 0);
+		}
+	} eq_wait_end_trace {out, ev};
 
 	if (timo == nullptr) {
 		Common::Timeline::Mark("eq-wait", static_cast<uint64_t>(eq));

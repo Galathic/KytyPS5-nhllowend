@@ -1,6 +1,7 @@
 #ifndef GRAPHICS_HOST_GPU_RENDERER_NATIVEINDIRECT_H
 #define GRAPHICS_HOST_GPU_RENDERER_NATIVEINDIRECT_H
 #include "graphics/host_gpu/vulkanCommon.h"
+#include <cstdint>
 #include <memory>
 #include <utility>
 namespace Libs::Graphics {

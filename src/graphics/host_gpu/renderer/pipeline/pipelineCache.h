@@ -183,6 +183,11 @@ private:
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
+	// KYTY_PIPELINE_MEMO / NHL27PIPELINE: key and result of the previous GetGraphicsPipeline call. Pipelines are
+	// never erased before destruction, so the pointer stays valid.
+	GraphicsPipelineKey m_last_key {};
+	Pipeline*           m_last_pipeline = nullptr;
+	uint64_t            m_last_compute_id = 0;
 
 	void InitializeDriverCache();
 	std::unique_ptr<PipelineRecord::RecordFile> m_record;

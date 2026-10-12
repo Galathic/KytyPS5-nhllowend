@@ -120,6 +120,52 @@ uint32_t EmitF32ToU32(EmitterState& state, uint32_t src, bool signed_value) {
 
 } // namespace
 
+namespace {
+uint32_t TypeF16Vector2(EmitterState& state) {
+	return state.builder.Type(spv::OpTypeVector, state.builder.Type(spv::OpTypeFloat, 16u), 2u);
+}
+
+uint32_t BitcastToF16x2(EmitterState& state, uint32_t bits) {
+	return Unary(state, spv::OpBitcast, TypeF16Vector2(state), bits);
+}
+
+uint32_t BitcastF16x2ToU32(EmitterState& state, uint32_t value) {
+	return Unary(state, spv::OpBitcast, TypeU32(state), value);
+}
+} // namespace
+
+// Native packed f16 (KYTY_NATIVE_FP16): u32 -> f16vec2, vector op, f16vec2 -> u32. The FMA is a
+// single-rounded GLSL Fma, matching v_pk_fma_f16 (the f32 path double-rounds).
+uint32_t EmitFPAdd16x2(EmitterState& state, uint32_t a, uint32_t b) {
+	return BitcastF16x2ToU32(
+	    state, Binary(state, spv::OpFAdd, TypeF16Vector2(state), BitcastToF16x2(state, a),
+	                  BitcastToF16x2(state, b)));
+}
+
+uint32_t EmitFPMul16x2(EmitterState& state, uint32_t a, uint32_t b) {
+	return BitcastF16x2ToU32(
+	    state, Binary(state, spv::OpFMul, TypeF16Vector2(state), BitcastToF16x2(state, a),
+	                  BitcastToF16x2(state, b)));
+}
+
+uint32_t EmitFPFma16x2(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
+	return BitcastF16x2ToU32(
+	    state, EmitExt(state, TypeF16Vector2(state), GLSLstd450Fma,
+	                   {BitcastToF16x2(state, a), BitcastToF16x2(state, b),
+	                    BitcastToF16x2(state, c)}));
+}
+
+uint32_t EmitFPClamp16x2(EmitterState& state, uint32_t a) {
+	const auto half = state.builder.Type(spv::OpTypeFloat, 16u);
+	const auto zero = state.builder.Constant(spv::OpConstant, half, 0x0000u);
+	const auto one  = state.builder.Constant(spv::OpConstant, half, 0x3c00u);
+	const auto vec  = TypeF16Vector2(state);
+	const auto zero2 = state.builder.Constant(spv::OpConstantComposite, vec, zero, zero);
+	const auto one2  = state.builder.Constant(spv::OpConstantComposite, vec, one, one);
+	return BitcastF16x2ToU32(
+	    state, EmitExt(state, vec, GLSLstd450FClamp, {BitcastToF16x2(state, a), zero2, one2}));
+}
+
 uint32_t EmitFPFma32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 	const auto result = EmitGlsl<GLSLstd450Fma, IR::Type::F32>(state, a, b, c);
 	state.builder.AddAnnotation(spv::OpDecorate, result, spv::DecorationNoContraction);

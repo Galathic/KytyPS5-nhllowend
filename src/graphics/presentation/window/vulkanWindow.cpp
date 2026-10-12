@@ -19,6 +19,7 @@
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "graphics/shader/shader.h"
 #include "kernel/memory.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
@@ -703,6 +704,42 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	features13.subgroupSizeControl =
 	    graphics.compute_subgroup_size_control_enabled ? VK_TRUE : VK_FALSE;
 
+	{
+		// KYTY_NATIVE_FP16=1: native f16 arithmetic for plain V_PK_{ADD,MUL,FMA,FMAC}_F16.
+		const char* fp16_env   = std::getenv("KYTY_NATIVE_FP16");
+		const bool  fp16_gate  = fp16_env != nullptr && fp16_env[0] == '1';
+		const bool  fp16_ok    = fp16_gate && supported_features12.shaderFloat16 == VK_TRUE;
+		uint32_t    fp16_modes = 0;
+		if (fp16_ok) {
+			features12.shaderFloat16 = VK_TRUE;
+			if (float_controls.shaderDenormPreserveFloat16) {
+				fp16_modes |= kNativeFp16DenormPreserve;
+			}
+			if (float_controls.shaderSignedZeroInfNanPreserveFloat16) {
+				fp16_modes |= kNativeFp16SignedZeroInfNan;
+			}
+			if (float_controls.shaderRoundingModeRTEFloat16) {
+				fp16_modes |= kNativeFp16RoundTiesEven;
+			}
+			// Guest needs RNE + denorm preserve; log (but still allow) when not guaranteed.
+			if ((fp16_modes & (kNativeFp16DenormPreserve | kNativeFp16RoundTiesEven)) !=
+			    (kNativeFp16DenormPreserve | kNativeFp16RoundTiesEven)) {
+				LOGF("WARNING: native FP16 without full float-controls support (modes=0x%x): "
+				     "f16 denorm/rounding may not match the guest\n",
+				     fp16_modes);
+			}
+		}
+		g_shader_native_fp16_modes.store(fp16_modes, std::memory_order_relaxed);
+		g_shader_native_fp16.store(fp16_ok, std::memory_order_relaxed);
+		LOGF("Vulkan shaderFloat16=%d gate=%d native_fp16=%d denormPreserve16=%d szinp16=%d rte16=%d\n",
+		     supported_features12.shaderFloat16 == VK_TRUE, fp16_gate, fp16_ok,
+		     float_controls.shaderDenormPreserveFloat16 == VK_TRUE,
+		     float_controls.shaderSignedZeroInfNanPreserveFloat16 == VK_TRUE,
+		     float_controls.shaderRoundingModeRTEFloat16 == VK_TRUE);
+		std::printf("NHL27CODEGEN native_fp16=%d\n",
+		            fp16_ok ? 1 : 0);
+		std::fflush(stdout);
+	}
 	LOGF("Vulkan robustness: robustImageAccess=%s robustImageAccess2=%s\n",
 	     features13.robustImageAccess == VK_TRUE ? "true" : "false",
 	     robustness2_ext_enabled && robustness2.robustImageAccess2 == VK_TRUE ? "true" : "false");
@@ -1160,6 +1197,11 @@ void WindowContext::CreateVulkan() {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}
+		}
+		// Used only by the KYTY_IDLE_TRACE GPU timeline (GPU -> CPU clock conversion).
+		if (HasExtension(available_extensions, VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+			graphic_ctx.calibrated_timestamps_enabled = true;
 		}
 		if (HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
 		    HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME)) {

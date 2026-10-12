@@ -6,10 +6,13 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/runtimeFlags.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
@@ -112,8 +115,54 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
 	// Scalar and unformatted buffer dependencies use the same backing as native raw loads.
 	// Image synchronization belongs to formatted buffer bindings, not these reads.
+	if (FrameBreakdown::g_spec_collect != nullptr) FrameBreakdown::SpecCollectRead(address, values.size_bytes());
 	return !values.empty() &&
 	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
+}
+
+bool ReadShaderOrdinaryBacking(void*, uint64_t address, std::span<uint32_t> values) {
+	// Ordinary scalar loads previously dereferenced the protected guest mapping.
+	// Read only the requested bytes through its alias, synchronizing actual GPU
+	// writes rather than unrelated bytes sharing the protection page. Non-backed
+	// pointers retain the original memcpy/fault behavior; strict reads still fail.
+	if (FrameBreakdown::g_spec_collect != nullptr) FrameBreakdown::SpecCollectRead(address, values.size_bytes());
+	if (!values.empty() && Libs::LibKernel::Memory::TryReadBufferBacking(
+	        address, values.data(), values.size_bytes())) {
+		return true;
+	}
+	std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
+	return true;
+}
+
+bool PeekShaderCleanSpan(void*, uint64_t address, std::span<uint32_t> values) {
+	// This capability declines dirty or unavailable ranges without synchronizing
+	// them. The walker then performs its original ordered scalar reads.
+	if (FrameBreakdown::g_spec_collect != nullptr) FrameBreakdown::SpecCollectRead(address, values.size_bytes());
+	return !values.empty() && Libs::LibKernel::Memory::TryReadCleanBufferBacking(
+	    address, values.data(), values.size_bytes());
+}
+
+bool ReadShaderNativeSpan(void*, uint64_t address, std::span<uint32_t> values) {
+	if (!GuestGpu::IsGpuThread() || values.empty() ||
+	    !GuestRange{address, values.size_bytes()}.Valid()) return false;
+	// This completes the original ordinary native reads; it does not certify the
+	// range clean. Protected GPU-owned bytes follow existing fault/readback handling.
+	if (FrameBreakdown::g_spec_collect != nullptr) FrameBreakdown::SpecCollectRead(address, values.size_bytes());
+	// After access begins, failures keep native fault behavior rather than returning false.
+	std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
+	return true;
+}
+
+template <bool strict, bool native = false>
+bool CaptureShaderSpan(void* data, uint64_t address, std::span<uint32_t> values) {
+	const auto reader = native ? ReadShaderNativeSpan : PeekShaderCleanSpan;
+	if (!reader(nullptr, address, values)) return false;
+	auto& record = *static_cast<PipelineRecord::Program*>(data);
+	auto& reads = strict ? record.reads : record.raw_reads;
+	for (size_t index = 0; index < values.size(); ++index) {
+		reads.push_back({address + index * sizeof(uint32_t), values[index], 1u});
+	}
+	return true;
 }
 
 
@@ -127,10 +176,14 @@ bool ReplayRawWords(void* data, uint64_t address, std::span<uint32_t> values) {
 bool ReplayCleanWords(void* data, uint64_t address, std::span<uint32_t> values) {
     return ReplayRecordedWords(data, address, values, true);
 }
-bool CaptureRecordedWords(void* data, uint64_t address, std::span<uint32_t> values, bool strict) {
+bool CaptureRecordedWords(void* data, uint64_t address, std::span<uint32_t> values, bool strict,
+                          bool ordinary_backing = false) {
     auto& record = *static_cast<PipelineRecord::Program*>(data);
     const bool valid = strict ? ReadShaderGuestMemory(nullptr, address, values) : true;
-    if (!strict) std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
+    if (!strict) {
+        if (ordinary_backing) ReadShaderOrdinaryBacking(nullptr, address, values);
+        else std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
+    }
     auto& reads = strict ? record.reads : record.raw_reads;
     for (size_t index = 0; index < values.size(); ++index)
         reads.push_back({address + index * 4, valid ? values[index] : 0u, valid ? 1u : 0u});
@@ -138,6 +191,9 @@ bool CaptureRecordedWords(void* data, uint64_t address, std::span<uint32_t> valu
 }
 bool CaptureRawWords(void* data, uint64_t address, std::span<uint32_t> values) {
     return CaptureRecordedWords(data, address, values, false);
+}
+bool CaptureOrdinaryBackingWords(void* data, uint64_t address, std::span<uint32_t> values) {
+    return CaptureRecordedWords(data, address, values, false, true);
 }
 bool CaptureCleanWords(void* data, uint64_t address, std::span<uint32_t> values) {
     return CaptureRecordedWords(data, address, values, true);
@@ -284,6 +340,8 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		std::vector<Permutation>                    permutations;
 		ResourceMemo                               resource_memo;
+		ShaderRecompiler::IR::ResourceSpecializationCache specialization_cache;
+		ShaderRecompiler::IR::ResourceDelta               delta; // KYTY_SRT_COMPILED: this program's previous outputs
 		size_t                                     last_permutation = std::numeric_limits<size_t>::max();
 		bool                                       native_plan_checked = false;
 		bool                                       native_plan_allowed = false;
@@ -315,6 +373,9 @@ struct PipelineCache::ProgramCache {
 	                               ShaderRecompiler::TranslateResult            translated,
 	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
 	                               uint32_t push_data_start_dword) {
+		// KYTY_PERF_STATS: shader permutation compile time (SPIR-V generation and module creation).
+		FrameBreakdown::Timer compile_timer(FrameBreakdown::g_counters.compile_ns);
+		FrameBreakdown::Add(FrameBreakdown::g_counters.compile_count);
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
 		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv)) {
@@ -383,10 +444,18 @@ struct PipelineCache::ProgramCache {
 			entry = &found->second;
 			last = {&found->first, entry};
 		}
+		const auto runtime_flags = Common::RuntimeFlags::Current();
 		ShaderRecompiler::IR::SrtRuntime             runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
+		    .read_memory = runtime_flags.shader_clean_reads
+		                       ? ReadShaderOrdinaryBacking : nullptr,
 		    .read_specialization_memory = ReadShaderGuestMemory,
+		    .try_read_memory_span = runtime_flags.srt_scalar_batch
+		                                ? (runtime_flags.shader_clean_reads
+		                                       ? PeekShaderCleanSpan : ReadShaderNativeSpan) : nullptr,
+		    .try_read_specialization_span = runtime_flags.srt_scalar_batch
+		                                        ? PeekShaderCleanSpan : nullptr,
 		};
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			runtime.workgroup_counts = input_info.workgroup_counts;
@@ -395,15 +464,23 @@ struct PipelineCache::ProgramCache {
             runtime.read_memory = ReplayRawWords;
             runtime.read_specialization_memory = ReplayCleanWords;
             runtime.userdata = const_cast<PipelineRecord::Program*>(replaying);
+            // Frozen PipelineRecords replay through their domain readers. Never
+            // retain a live-memory capability after replacing its userdata.
+            runtime.try_read_memory_span = nullptr;
+            runtime.try_read_specialization_span = nullptr;
         }
-        const bool memo_enabled = reuse_enabled && replaying == nullptr;
+        const bool memo_enabled = reuse_enabled && replaying == nullptr && !runtime_flags.resource_memo_bypass;
 		runtime.batch_reads = batch_reads;
         const auto refresh = [&](SourceEntry& source, bool& reused) {
-            // Newly encountered shaders must use the current diagnostic policy too.
-            if (cache_control_capacity != 0) source.resource_memo.SetCapacity(cache_control_capacity);
             const auto begin = resource_timing ? std::chrono::steady_clock::now()
                                                : std::chrono::steady_clock::time_point {};
-            const bool ok = source.resource_memo.Refresh(source.resource_plan, runtime,
+            auto observed_runtime = runtime;
+            observed_runtime.specialization_cache = runtime_flags.resource_spec_cache
+                ? &source.specialization_cache : nullptr;
+            // Frozen pipeline-record readers see single-dword requests only; never merge there.
+            observed_runtime.allow_compiled = replaying == nullptr;
+            observed_runtime.delta = runtime_flags.srt_compiled && replaying == nullptr ? &source.delta : nullptr;
+            const bool ok = source.resource_memo.Refresh(source.resource_plan, observed_runtime,
                 source.resources, source.specialization, memo_enabled, reused);
             if (resource_timing) {
                 source.refresh_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -442,7 +519,7 @@ struct PipelineCache::ProgramCache {
 			if (!refresh(*entry, reused)) return {};
 			resource_hits += reused;
 			materializations += !reused;
-			if (reuse_enabled && !reused) ++resource_misses[static_cast<size_t>(entry->resource_memo.LastMiss())];
+			if (memo_enabled && !reused) ++resource_misses[static_cast<size_t>(entry->resource_memo.LastMiss())];
 			if (reuse_enabled && entry->last_permutation < entry->permutations.size()) {
 				const auto& candidate = entry->permutations[entry->last_permutation];
 				const auto& layout = candidate.program.bindings;
@@ -551,8 +628,14 @@ struct PipelineCache::ProgramCache {
             else recorded.compute = input_info;
             auto capture_runtime = runtime;
             capture_runtime.userdata = &recorded;
-            capture_runtime.read_memory = CaptureRawWords;
+            capture_runtime.read_memory = runtime.read_memory == ReadShaderOrdinaryBacking
+                ? CaptureOrdinaryBackingWords : CaptureRawWords;
             capture_runtime.read_specialization_memory = CaptureCleanWords;
+            capture_runtime.try_read_memory_span = runtime.try_read_memory_span != nullptr
+                ? (runtime.try_read_memory_span == ReadShaderNativeSpan
+                       ? CaptureShaderSpan<false, true> : CaptureShaderSpan<false>) : nullptr;
+            capture_runtime.try_read_specialization_span = runtime.try_read_specialization_span != nullptr
+                ? CaptureShaderSpan<true> : nullptr;
             ShaderRecompiler::IR::ResourceSnapshot captured;
             ShaderRecompiler::IR::ResourceSpecialization captured_specialization;
             recording = ShaderRecompiler::IR::MaterializeResources(entry->resource_plan, capture_runtime,
@@ -594,6 +677,15 @@ struct PipelineCache::ProgramCache {
 		    enabled, static_cast<unsigned long long>(lookups), static_cast<unsigned long long>(source_hits),
 		    static_cast<unsigned long long>(resource_hits), static_cast<unsigned long long>(materializations),
 		    static_cast<unsigned long long>(permutation_hits));
+		if (stats) {
+			const auto spec = ShaderRecompiler::IR::GetResourceSpecializationCacheStats();
+			std::printf("NHL27SPECCACHE: enabled=%d calls=%llu buffers=%llu/%llu images=%llu/%llu indirect_uncached=%llu\n",
+			    Common::RuntimeFlags::Current().resource_spec_cache,
+			    static_cast<unsigned long long>(spec.calls),
+			    static_cast<unsigned long long>(spec.buffer_hits), static_cast<unsigned long long>(spec.buffer_misses),
+			    static_cast<unsigned long long>(spec.image_hits), static_cast<unsigned long long>(spec.image_misses),
+			    static_cast<unsigned long long>(spec.indirect_uncached));
+		}
 		if (stats && enabled) {
 			std::printf("NHL27PROGRAMMISS: cold=%llu base=%llu regs=%llu groups=%llu read_failed=%llu memory_changed=%llu\n",
 			    static_cast<unsigned long long>(resource_misses[static_cast<size_t>(ResourceMemo::Miss::Cold)]),
@@ -602,6 +694,54 @@ struct PipelineCache::ProgramCache {
 			    static_cast<unsigned long long>(resource_misses[static_cast<size_t>(ResourceMemo::Miss::Workgroups)]),
 			    static_cast<unsigned long long>(resource_misses[static_cast<size_t>(ResourceMemo::Miss::ReadFailed)]),
 			    static_cast<unsigned long long>(resource_misses[static_cast<size_t>(ResourceMemo::Miss::MemoryChanged)]));
+			if (ResourceMissDiag::Enabled()) {
+				auto& d = ResourceMissDiag::Get();
+				const auto get = [](const std::atomic<uint64_t>& v) {
+					return static_cast<unsigned long long>(v.load(std::memory_order_relaxed));
+				};
+				std::printf("NHL27MISSDIAG: misses=%llu changed=1:%llu,2:%llu,3-4:%llu,5+:%llu same: images=%llu samplers=%llu "
+				            "buffers=%llu buffers_ignoring_base=%llu flat_srt=%llu spec=%llu fill=%llu "
+				            "all_but_buffer_base=%llu identical=%llu first_reg:",
+				    get(d.misses), get(d.changed[0]), get(d.changed[1]), get(d.changed[2]), get(d.changed[3]),
+				    get(d.same_images), get(d.same_samplers), get(d.same_buffers), get(d.same_buffers_masked),
+				    get(d.same_flat), get(d.same_spec), get(d.same_fill), get(d.all_but_buffer_base), get(d.identical));
+				for (size_t i = 0; i < d.first_index.size(); ++i) {
+					if (get(d.first_index[i]) != 0) std::printf(" %zu=%llu", i, get(d.first_index[i]));
+				}
+				std::printf("\n");
+			}
+			const auto reuse_trace = GetResourceReuseTraceStats();
+			if (reuse_trace.checked != 0 || reuse_trace.evictions != 0) {
+				std::printf("NHL27REUSETRACE: evictions=%llu checked=%llu register_recur=%llu distance16=%llu distance32=%llu distance64=%llu distance128=%llu\n",
+				    static_cast<unsigned long long>(reuse_trace.evictions), static_cast<unsigned long long>(reuse_trace.checked),
+				    static_cast<unsigned long long>(reuse_trace.matched), static_cast<unsigned long long>(reuse_trace.distance16),
+				    static_cast<unsigned long long>(reuse_trace.distance32), static_cast<unsigned long long>(reuse_trace.distance64),
+				    static_cast<unsigned long long>(reuse_trace.distance128));
+			}
+			const auto tape = ShaderRecompiler::IR::GetSrtTapeStats();
+			const auto filter = GetResourceHashFilterStats();
+			if (filter.eligible != 0) {
+				std::printf("NHL27RESOURCEFILTER: eligible=%llu rejected=%llu hash_match=%llu\n",
+				    static_cast<unsigned long long>(filter.eligible),
+				    static_cast<unsigned long long>(filter.rejected),
+				    static_cast<unsigned long long>(filter.matched));
+			}
+			std::printf("NHL27SRTTAPE: runs=%llu failed=%llu walker=%llu built=%llu unsupported=%llu ops=%llu cfg_roots=%llu cfg_fallback=%llu cfg_checked=%llu cfg_matched=%llu cfg_mismatch=%llu cfg_inconclusive=%llu trace_hits=%llu trace_misses=%llu trace_recorded=%llu\n",
+			    static_cast<unsigned long long>(tape.runs),
+			    static_cast<unsigned long long>(tape.failed),
+			    static_cast<unsigned long long>(tape.walker),
+			    static_cast<unsigned long long>(tape.built),
+			    static_cast<unsigned long long>(tape.unsupported),
+			    static_cast<unsigned long long>(tape.ops),
+			    static_cast<unsigned long long>(tape.cfg_runs),
+			    static_cast<unsigned long long>(tape.cfg_fallback),
+			    static_cast<unsigned long long>(tape.cfg_checked),
+			    static_cast<unsigned long long>(tape.cfg_matched),
+			    static_cast<unsigned long long>(tape.cfg_mismatch),
+			    static_cast<unsigned long long>(tape.cfg_inconclusive),
+			    static_cast<unsigned long long>(tape.cfg_trace_hits),
+			    static_cast<unsigned long long>(tape.cfg_trace_misses),
+			    static_cast<unsigned long long>(tape.cfg_trace_recorded));
 		}
 		if (resource_timing) {
 			std::vector<std::pair<const ProgramKey*, SourceEntry*>> measured;
@@ -637,7 +777,7 @@ struct PipelineCache::ProgramCache {
 				if (control >> capacity && (capacity == 1 || capacity == 16)) {
 					if (capacity != cache_control_capacity) {
 						size_t changed = 0;
-						for (auto& [key, source]: programs) changed += source.resource_memo.SetCapacity(capacity);
+						// The merged resource memo keeps one state per shader; capacity is informational.
 						cache_control_capacity = capacity;
 						std::printf("NHL27RESOURCE: cache_capacity=%u changed=%zu\n", capacity, changed);
 					}
@@ -670,7 +810,6 @@ struct PipelineCache::ProgramCache {
 		if ((changed & Common::Experiments::ResourceMultiCache) != 0) {
 			const unsigned capacity =
 			    (mask & Common::Experiments::ResourceMultiCache) != 0 ? 16u : 1u;
-			for (auto& [key, source]: programs) (void)source.resource_memo.SetCapacity(capacity);
 			cache_control_capacity = capacity;
 		}
 		std::printf("NHL27RESOURCE: experiments batch_reads=%d capacity=%u\n", batch_reads ? 1 : 0,
@@ -939,6 +1078,7 @@ void PipelineCache::WarmUp(PipelineRecord::Records& records) {
     const auto start = std::chrono::steady_clock::now();
     // Shared ProgramCache/compiler state is serialized; do not race translation or insertion.
     std::vector<ShaderProgram> handles(records.programs.size());
+    std::vector<ShaderRecompiler::IR::ResourceSnapshot> snapshots(records.programs.size());
     for (size_t index = 0; index < records.programs.size(); ++index) {
         auto& source = records.programs[index];
         if (source.user_data.size() > ShaderParams{}.user_data.size()) continue;
@@ -968,6 +1108,17 @@ void PipelineCache::WarmUp(PipelineRecord::Records& records) {
             default: break;
         }
         m_program_cache->replaying = nullptr;
+        if (handles[index]) {
+            const ShaderStageRuntime* runtime = nullptr;
+            switch (source.stage) {
+                case ShaderType::Vertex: runtime = &source.vertex.stage; break;
+                case ShaderType::Pixel: runtime = &source.pixel.stage; break;
+                case ShaderType::Compute: runtime = &source.compute.stage; break;
+                default: break;
+            }
+            if (runtime != nullptr && runtime->resources != nullptr)
+                snapshots[index] = *runtime->resources;
+        }
         if (handles[index]) m_program_cache->ordinals[handles[index].id] = static_cast<uint32_t>(index);
     }
     // Replay records omit runtime pointers. Rebind both parts of the stage after
@@ -1044,6 +1195,8 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
     std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info, const NativeDrawShaderInfo& native_draw) {
+	FrameBreakdown::Timer prep_timer(FrameBreakdown::g_counters.prep_graphics_programs_ns,
+	                                 FrameBreakdown::DetailEnabled());
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
 	std::array<ShaderParams, 3> vertex_params;
 	if (tess_active) {
@@ -1147,6 +1300,8 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                const HW::ShaderRegisters&   sh,
                                                ShaderComputeInputInfo&      input_info) {
+	FrameBreakdown::Timer prep_timer(FrameBreakdown::g_counters.prep_compute_program_ns,
+	                                 FrameBreakdown::DetailEnabled());
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	const auto        params      = PrepareProgram(regs, sh, input_info);
 	input_info.lds_storage = input_info.lds_size_dwords * 4u >
@@ -1157,6 +1312,14 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 
 bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other) const noexcept {
 	return std::memcmp(this, &other, sizeof(*this)) == 0;
+}
+
+static bool PipelineMemoVerifyEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DRAWPREP_VERIFY");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
 }
 
 PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
@@ -1182,6 +1345,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	const auto vs_id = vertex_program.id;
 	const auto ps_id = ps_active ? pixel_program.id : 0;
 
+	FrameBreakdown::Timer key_timer(FrameBreakdown::g_pl.key_ns, FrameBreakdown::Verbose());
 	GraphicsPipelineKey key {};
 	for (uint32_t i = 0; i < programs.vertex.size(); i++) {
 		key.vertex_shader_ids[i] = programs.vertex[i].id;
@@ -1328,8 +1492,40 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		}
 	}
 
-	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
-		return *iter->second;
+	key_timer.Stop();
+	{
+		FrameBreakdown::Timer lookup_timer(FrameBreakdown::g_pl.lookup_ns, FrameBreakdown::Verbose());
+		FrameBreakdown::VAdd(FrameBreakdown::g_pl.lookups);
+		// A key equal to the previous call's key maps to the previous call's pipeline (the map never changes an
+		// existing entry), so the hash + lookup can be skipped. The compare also feeds the key_repeat counter.
+		const bool memo_on = Common::RuntimeFlags::Current().pipeline_memo;
+		if (m_last_pipeline != nullptr && (memo_on || FrameBreakdown::Verbose()) && key == m_last_key) {
+			FrameBreakdown::VAdd(FrameBreakdown::g_pl.key_repeats);
+			if (memo_on) {
+				static uint32_t verify_tick = 0;
+				if (PipelineMemoVerifyEnabled() && (++verify_tick & 63u) == 0) {
+					const auto full = m_graphics_pipelines.find(key);
+					FrameBreakdown::VAdd(FrameBreakdown::g_pl.memo_verify);
+					if (full == m_graphics_pipelines.end() || full->second.get() != m_last_pipeline) {
+						FrameBreakdown::VAdd(FrameBreakdown::g_pl.memo_mismatch);
+						std::fprintf(stderr, "NHL27PIPELINE memo mismatch: graphics key (vs=%" PRIu64 " ps=%" PRIu64 ")\n",
+						             vs_id, ps_id);
+						std::fflush(stderr);
+						if (full != m_graphics_pipelines.end()) {
+							m_last_pipeline = full->second.get();
+						}
+					}
+				}
+				return *m_last_pipeline;
+			}
+		}
+		if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
+			if (memo_on || FrameBreakdown::Verbose()) {
+				m_last_key      = key;
+				m_last_pipeline = iter->second.get();
+			}
+			return *iter->second;
+		}
 	}
 
 	if (graphics_debug_dump_enabled()) {
@@ -1366,6 +1562,11 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	EXIT_IF(!compute_program);
 
+	FrameBreakdown::VAdd(FrameBreakdown::g_pl.cs_lookups);
+	if (m_last_compute_id == compute_program.id) {
+		FrameBreakdown::VAdd(FrameBreakdown::g_pl.cs_repeats);
+	}
+	m_last_compute_id = compute_program.id;
 	if (auto iter = m_compute_pipelines.find(compute_program.id);
 	    iter != m_compute_pipelines.end()) {
 		return *iter->second;

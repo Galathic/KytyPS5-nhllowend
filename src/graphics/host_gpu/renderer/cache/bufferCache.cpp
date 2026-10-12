@@ -5,10 +5,12 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/runtimeFlags.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/host_gpu/renderer/frameDump.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -307,6 +309,7 @@ void BufferCache::PerfMaybePrint() {
 }
 
 void BufferCache::LogGpuWrite(uint64_t vaddr, uint64_t size) {
+	FrameBreakdown::SpecNoteGpuWrite(vaddr, size);
 	constexpr size_t MaxRecords = 512;
 	const WriterRecord record {vaddr, vaddr + size, m_writer_hash, m_writer_kind};
 	if (m_writer_log.size() < MaxRecords) {
@@ -715,8 +718,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadC
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
+	FrameBreakdown::FaultTimer fault_readmem_timer(FrameBreakdown::g_fault_cost.readmem_ns);
 	const bool     on_gpu = GuestGpu::IsGpuThread();
-	const uint64_t tid    = static_cast<uint64_t>(std::hash<std::thread::id> {}(std::this_thread::get_id()));
+	const uint64_t tid   = static_cast<uint64_t>(std::hash<std::thread::id> {}(std::this_thread::get_id()));
 	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write, caller, on_gpu, tid] {
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
@@ -765,6 +769,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadC
 				const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
 				                    std::chrono::steady_clock::now() - start)
 				                    .count();
+				FrameBreakdown::AddReadback(static_cast<uint64_t>(ns));
 				g_perf.waits[bucket].fetch_add(1, std::memory_order_relaxed);
 				g_perf.wait_ns[bucket].fetch_add(static_cast<uint64_t>(ns),
 				                                 std::memory_order_relaxed);
@@ -871,6 +876,7 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	if (PerfStatsEnabled()) {
 		g_perf.created_bytes.fetch_add(overlap.end - overlap.begin, std::memory_order_relaxed);
 	}
+	FrameBreakdown::Add(FrameBreakdown::g_counters.port_buffer_creates);
 
 	const auto id = m_slot_buffers.insert(
 	    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, overlap.begin,
@@ -892,17 +898,40 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
+	// NHL27BUFFERS2 (KYTY_PERF_STATS): [0] = rebind lookup scope, [1] = PrepareBda scope.
+	const bool bon = FrameBreakdown::BufOn();
+	const int  bi  = bon ? FrameBreakdown::g_buf_scope - 1 : 0;
+	auto&      bs  = FrameBreakdown::g_buf;
+	if (bon) {
+		bs.sb_calls[bi].fetch_add(1, std::memory_order_relaxed);
+	}
+	FrameBreakdown::Timer walk_timer(bs.sb_walk_ns[bi], bon);
 	m_memory_tracker.ForEachUploadRange(
 	    vaddr, size, is_written,
 	    [&](uint64_t address, uint64_t bytes) noexcept {
 		    copies.emplace_back(total_size, buffer.Offset(address), bytes);
 		    total_size += bytes;
+		    FrameBreakdown::BdaBatchNoteUpload(address, bytes);
 	    },
-	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
+	    [&]() noexcept {
+		    FrameBreakdown::Timer stage_timer(bs.sb_stage_ns[bi], bon);
+		    source = UploadCopies(buffer, copies, total_size);
+	    });
+	walk_timer.Stop();
 	if (source) {
 		PerfCount(PerfEvent::BufferUpload);
+		FrameBreakdown::Add(FrameBreakdown::g_counters.sync_uploads);
+		FrameBreakdown::Add(FrameBreakdown::g_counters.sync_bytes, total_size);
+		if (bon) {
+			bs.sb_uploads[bi].fetch_add(1, std::memory_order_relaxed);
+			bs.sb_bytes[bi].fetch_add(total_size, std::memory_order_relaxed);
+		}
 		auto& command = m_scheduler.Current();
-		command.EndRendering();
+		{
+			FrameBreakdown::Timer end_timer(bs.sb_end_ns[bi], bon);
+			command.EndRendering();
+		}
+		FrameBreakdown::Timer rec_timer(bs.sb_rec_ns[bi], bon);
 		const auto native = command.Handle();
 		vk::BufferMemoryBarrier before {};
 		before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
@@ -927,6 +956,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
 	}
 	if (is_texel_buffer && !is_written) {
+		FrameBreakdown::Timer image_timer(bs.sb_image_ns[bi], bon);
 		return SynchronizeBufferFromImage(buffer, vaddr, size);
 	}
 	return false;
@@ -970,25 +1000,50 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
 	}
 
-	if (!is_written && size <= CACHING_PAGESIZE &&
-	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
-	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
+	FrameBreakdown::BdaBatchNoteUsed(vaddr, size);
+	// NHL27BUFFERS2: counted only inside the RebindBuffers lookup scope.
+	const bool bon = FrameBreakdown::BufOn() && FrameBreakdown::g_buf_scope == 1;
+	auto&      bs  = FrameBreakdown::g_buf;
+	if (bon) {
+		bs.ob_calls.fetch_add(1, std::memory_order_relaxed);
+		if (is_written) bs.ob_written.fetch_add(1, std::memory_order_relaxed);
+	}
+	bool stream_candidate = false;
+	{
+		FrameBreakdown::Timer check_timer(bs.ob_stream_check_ns, bon);
+		stream_candidate = !is_written && size <= CACHING_PAGESIZE &&
+		                   !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
+		                   m_memory_tracker.IsRegionCpuModified(vaddr, size);
+	}
+	if (stream_candidate) {
+		FrameBreakdown::Timer copy_timer(bs.ob_stream_copy_ns, bon);
 		const auto alignment = std::max<uint64_t>(
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
 		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
 		if (mapped != nullptr) {
 			std::memcpy(mapped, reinterpret_cast<const void*>(vaddr), size);
 			m_stream_buffer.Commit();
+			if (bon) bs.ob_stream.fetch_add(1, std::memory_order_relaxed);
 			return {&m_stream_buffer, offset};
 		}
 	}
 
 	if (IsBufferInvalid(id) || !m_slot_buffers[id].IsInBounds(vaddr, size)) {
+		FrameBreakdown::Timer find_timer(bs.ob_find_ns, bon);
+		if (bon) bs.ob_find_calls.fetch_add(1, std::memory_order_relaxed);
 		id = FindBuffer(vaddr, size);
 	}
 	auto& buffer = m_slot_buffers[id];
-	TouchBuffer(buffer);
-	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
+	{
+		FrameBreakdown::Timer touch_timer(bs.ob_touch_ns, bon);
+		TouchBuffer(buffer);
+	}
+	{
+		FrameBreakdown::Timer sync_timer(bs.ob_sync_ns, bon);
+		if (bon) bs.ob_syncs.fetch_add(1, std::memory_order_relaxed);
+		(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
+	}
+	FrameBreakdown::Timer book_timer(bs.ob_book_ns, bon);
 	if (is_written || is_texel_buffer) {
 		DropGpuFills(vaddr, size);
 	}
@@ -1004,6 +1059,40 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		++m_gpu_dirty_generation;
 	}
 	return {&buffer, buffer.Offset(vaddr)};
+}
+
+std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferCached(uint64_t vaddr, uint64_t size,
+                                                             bool is_written, bool is_texel_buffer,
+                                                             BufferId id) {
+	if (is_written || is_texel_buffer || !Common::RuntimeFlags::Current().buffer_fast) {
+		return ObtainBuffer(vaddr, size, is_written, is_texel_buffer, id);
+	}
+	auto&      entry = m_obtain_cache[((vaddr >> 4) * 0x9E3779B97F4A7C15ull ^ size) % kObtainCacheSize];
+	const auto cpu   = m_memory_tracker.CpuModificationGeneration();
+	if (entry.vaddr == vaddr && entry.size == size && entry.registration == m_registration_generation &&
+	    !IsBufferInvalid(entry.id) && m_slot_buffers[entry.id].IsInBounds(vaddr, size) &&
+	    (entry.cpu_generation == cpu || !m_memory_tracker.IsRegionCpuModified(vaddr, size))) {
+		// Registration unchanged: the buffer set, page table and offsets are the same. The range was
+		// CPU-clean when stored and is still CPU-clean, so SynchronizeBuffer would upload nothing.
+		entry.cpu_generation = cpu;
+		FrameBreakdown::BdaBatchNoteUsed(vaddr, size);
+		auto& buffer         = m_slot_buffers[entry.id];
+		TouchBuffer(buffer);
+		FrameBreakdown::VAdd(FrameBreakdown::g_counters.obtain_cache_hits);
+		return {&buffer, entry.offset};
+	}
+	FrameBreakdown::VAdd(FrameBreakdown::g_counters.obtain_cache_misses);
+	// Stamp before the lookup so a CPU write racing with it forces a recheck on the next hit.
+	const auto registration = m_registration_generation;
+	const auto result       = ObtainBuffer(vaddr, size, false, false, id);
+	if (result.first != &m_stream_buffer && registration == m_registration_generation &&
+	    !m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
+		const auto found = FindBuffer(vaddr, size);
+		if (!IsBufferInvalid(found) && &m_slot_buffers[found] == result.first) {
+			entry = {vaddr, size, registration, cpu, found, result.second};
+		}
+	}
+	return result;
 }
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
@@ -1165,6 +1254,7 @@ void BufferCache::RunGarbageCollector() {
 		} else {
 			m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
 			PerfCount(PerfEvent::BufferGcDelete);
+			FrameBreakdown::Add(FrameBreakdown::g_counters.port_buffer_gc_deletes);
 			DeleteBuffer(id);
 		}
 		return ++retire_count == limit;

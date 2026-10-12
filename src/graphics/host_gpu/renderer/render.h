@@ -18,7 +18,7 @@
 #include <optional>
 #include <memory>
 #include <span>
-#include <tuple>
+#include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -306,6 +306,47 @@ private:
 	std::shared_ptr<DispatchArgsGuard>   m_dispatch_guard;
 	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;
+	// ResolveTexture: memoized pure descriptor -> ImageDesc decode (direct-mapped).
+	struct TextureDescMemo {
+		bool                                valid = false;
+		uint32_t                            fields[8] {};
+		ShaderRecompiler::IR::ImageResource resource;
+		TextureCache::ImageDesc             desc;
+		bool                                shader_conversion = false;
+		vk::Format                          pixel_format      = vk::Format::eUndefined;
+		vk::Format                          view_format       = vk::Format::eUndefined;
+		uint64_t                            size              = 0;
+		ImageId                             last_image {}; // ImageLookupHint: exact image of the last lookup
+	};
+	std::vector<TextureDescMemo> m_texture_desc_memo = std::vector<TextureDescMemo>(1024);
+	// KYTY_DRAWPREP_DELTA: per-program (keyed by the stage's ResourceSnapshot address) memo of the last
+	// PrepareBindings outputs per image / sampler slot. Every entry is revalidated against the slot's
+	// descriptor words, the slot's resource and TextureCache::Generation() before it is reused.
+	struct ImageSlotMemo {
+		bool                                         valid = false;
+		ShaderRecompiler::IR::DescriptorValue        words;
+		uint64_t                                     resource_key = 0;
+		uint64_t                                     generation   = 0;
+		// Guest range [range_begin, range_end): union of the T# range and the resolved image's range.
+		uint64_t                                     range_begin  = 0;
+		uint64_t                                     range_end    = 0;
+		ImageId                                      image_id;
+		TextureCache::ImageDesc                      desc;
+	};
+	struct SamplerSlotMemo {
+		bool                                         valid = false;
+		ShaderRecompiler::IR::DescriptorValue        words;
+		uint32_t                                     key = 0;
+		vk::Sampler                                  sampler = nullptr;
+	};
+	struct StageBindingMemo {
+		std::vector<ImageSlotMemo>   images;
+		std::vector<SamplerSlotMemo> samplers;
+	};
+	std::unordered_map<const void*, StageBindingMemo> m_binding_memos;
+	// CommitBindings scratch: ranges written by bound images / shader buffers.
+	std::vector<std::pair<uint64_t, uint64_t>> m_written_image_ranges;
+	std::vector<std::pair<uint64_t, uint64_t>> m_written_buffer_ranges;
 	std::vector<vk::DescriptorBufferInfo> m_descriptor_buffers;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
@@ -324,8 +365,6 @@ private:
 	};
 	RedundantBindState    m_redundant[2];
 	std::vector<uint64_t> m_descriptor_key;
-	// Ranges this draw writes (image or attachment = true), checked against scalar resource reads.
-	std::vector<std::tuple<uint64_t, uint64_t, bool>> m_written_ranges;
 	std::vector<uint32_t>                 m_image_occurrences;
 
 	friend class CommandProcessor;

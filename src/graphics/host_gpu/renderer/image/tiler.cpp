@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/bindEpoch.h"
 
@@ -330,6 +331,7 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset,
 		InvalidateRedundantBinds();
 		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0,
 		                             static_cast<uint32_t>(writes.size()), writes.data());
+		Libs::Graphics::g_compute_pipeline_epoch.fetch_add(1, std::memory_order_relaxed);
 		command.bindPipeline(vk::PipelineBindPoint::eCompute, GetPipeline(dispatch.pipeline_slot));
 		command.dispatch((dispatch.push.width + 7u) / 8u, (dispatch.push.height + 7u) / 8u,
 		                 dispatch.push.depth);
@@ -518,6 +520,7 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 	command.pipelineBarrier(
 	    vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
 	    vk::PipelineStageFlagBits::eComputeShader, {}, 0, nullptr, 2, barriers, 0, nullptr);
+	Libs::Graphics::g_compute_pipeline_epoch.fetch_add(1, std::memory_order_relaxed);
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
 	const auto& limits              = m_graphics.GetPhysicalDeviceProperties().limits;
 	const auto descriptor_alignment = std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
@@ -645,6 +648,7 @@ void TileManager::TransformColor(Result input, Result output, ColorTransform tra
 	command.pipelineBarrier(
 	    vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
 	    vk::PipelineStageFlagBits::eComputeShader, {}, 0, nullptr, 2, barriers, 0, nullptr);
+	Libs::Graphics::g_compute_pipeline_epoch.fetch_add(1, std::memory_order_relaxed);
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_color_transform);
 	InvalidateRedundantBinds();
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0,

@@ -1,0 +1,30 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#version 450
+
+// Single-invocation gate for fault_buffer_process.comp. Consumes the dirty word that
+// fault-recording shaders set (see RecordBdaFault), clears it, and writes the indirect dispatch
+// arguments for the parser: full parse when dirty (or forced), zero groups otherwise.
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer input_buf {
+    uint fault_buffer[];
+};
+
+layout(std430, binding = 1) buffer indirect_buf {
+    uint indirect_args[];
+};
+
+layout(push_constant) uniform gate_params {
+    uint parser_groups;
+    uint dirty_index;
+    uint force_parse;
+};
+
+void main() {
+    const uint dirty = fault_buffer[dirty_index];
+    fault_buffer[dirty_index] = 0u;
+    indirect_args[0] = (force_parse != 0u || dirty != 0u) ? parser_groups : 0u;
+    indirect_args[1] = 1u;
+    indirect_args[2] = 1u;
+}

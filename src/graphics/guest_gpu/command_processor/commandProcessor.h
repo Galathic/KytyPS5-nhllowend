@@ -72,6 +72,8 @@ public:
 	HW::Context&    GetCtx() { return m_ctx; }
 	HW::UserConfig& GetUcfg() { return m_ucfg; }
 	HW::Shader&     GetShCtx() { ResolveNativeShaderRegisters(); return m_sh_ctx; }
+	// PM4 setters for disjoint state do not consume pending GS draw-offset registers.
+	HW::Shader& GetShCtxForStateUpdate() { return m_sh_ctx; }
 	HW::Shader& GetShCtxForWrite(uint32_t location) { CancelNativeShaderRegister(location); return m_sh_ctx; }
 
 	void SetIndexType(uint32_t index_type_and_size);
@@ -127,6 +129,13 @@ public:
 	void WriteConstRam(uint32_t offset, const uint32_t* src, uint32_t dw_num);
 	void DumpConstRam(uint32_t* dst, uint32_t offset, uint32_t dw_num);
 
+	// Reads current bytes without a GPU->CPU download when the exact range is not
+	// GPU-dirty. Safe for CPU-written command-stream bytes; refuses any range the GPU
+	// has written, so the fault path still supplies the authoritative value. Unlike
+	// TryPeekGuest this is not gated on KYTY_PERF_NO_SYNC_READBACK and does not
+	// increment that experiment's counter: it serves the correctness-preserving
+	// false-sharing fix for EVENT_WRITE payload reads.
+	[[nodiscard]] bool TryPeekCleanBackingBytes(const volatile void* addr, void* out, uint64_t size);
 	// KYTY_PERF_NO_SYNC_READBACK: reads guest memory the CP polls or branches on without faulting
 	// into a page download when the exact bytes are not GPU-dirty (they are current in the backing).
 	[[nodiscard]] bool TryPeekGuest(const volatile void* addr, void* out, uint64_t size);

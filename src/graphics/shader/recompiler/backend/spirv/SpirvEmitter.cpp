@@ -200,6 +200,10 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			requirements.float64 |= inst.GetType() == IR::Type::F64;
+			requirements.float16 |= inst.GetOpcode() == IR::ValueOpcode::FPAdd16x2 ||
+			                        inst.GetOpcode() == IR::ValueOpcode::FPMul16x2 ||
+			                        inst.GetOpcode() == IR::ValueOpcode::FPFma16x2 ||
+			                        inst.GetOpcode() == IR::ValueOpcode::FPClamp16x2;
 			has_barrier |= inst.GetOpcode() == IR::ValueOpcode::Barrier;
 			{
 				const auto access = IR::BufferAccessOf(inst.GetOpcode());

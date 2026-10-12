@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
+#include <array>
 #include <chrono>
 #include <map>
 #include <span>
@@ -56,6 +57,10 @@ public:
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 	// Releases a whole clean window around a CPU write fault (experiment FaultCoalesce).
 	void                   InvalidateCleanWindow(uint64_t vaddr, uint64_t size);
+	// See MemoryTracker::MarkCpuDirtyAhead.
+	void MarkCpuDirtyAhead(uint64_t vaddr, uint64_t size) noexcept {
+		m_memory_tracker.MarkCpuDirtyAhead(vaddr, size);
+	}
 	// Only used to attribute synchronous readbacks in the KYTY_PERF_STATS output.
 	enum class ReadCaller : uint8_t { Other, ColorClear, Fault };
 	enum class PerfEvent : uint8_t {
@@ -173,6 +178,12 @@ public:
 	[[nodiscard]] const Buffer* GetGdsBuffer() const noexcept { return &m_gds_buffer; }
 	[[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
+	// KYTY_BUFFER_FAST: ObtainBuffer for plain reads, reusing the previous (buffer, offset) while the
+	// registration generation is unchanged and the range is not CPU-modified. Other requests
+	// (written or texel buffers) always go through ObtainBuffer.
+	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferCached(uint64_t vaddr, uint64_t size,
+	                                                              bool is_written, bool is_texel_buffer,
+	                                                              BufferId id = {});
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
@@ -279,6 +290,17 @@ private:
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
 	uint64_t m_registration_generation = 1;
+
+	struct ObtainCacheEntry {
+		uint64_t   vaddr          = 0;
+		uint64_t   size           = 0;
+		uint64_t   registration   = 0;
+		uint64_t   cpu_generation = 0;
+		BufferId   id {};
+		uint64_t   offset         = 0;
+	};
+	static constexpr size_t kObtainCacheSize = 512;
+	std::array<ObtainCacheEntry, kObtainCacheSize> m_obtain_cache {};
 };
 
 } // namespace Libs::Graphics

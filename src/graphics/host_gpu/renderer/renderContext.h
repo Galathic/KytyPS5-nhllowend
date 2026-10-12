@@ -54,6 +54,10 @@ public:
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               PrepareBda();
+	// KYTY_BDA_BATCH: a point where guest memory can become ordered for the GPU or CPU. The next PrepareBda
+	// syncs again. GPU command thread only.
+	enum class BdaBoundary : uint8_t { Submit, Wait, Event, Acquire, Dma, Sync, Ib, Flip, Other, Count };
+	void               BdaBatchBoundary(BdaBoundary kind);
 	struct BdaPreparationStats {
 		uint64_t scans = 0; uint64_t reused = 0;
 		uint64_t full_scans = 0; uint64_t dirty_regions = 0;
@@ -92,6 +96,7 @@ private:
 	uint64_t                  m_bda_cpu_generation = 0;
 	uint64_t                  m_bda_registration_generation = 0;
 	uint64_t                  m_bda_mapping_generation = 0;
+	bool                      m_bda_batch_synced = false;  // KYTY_BDA_BATCH: this batch already synchronized
 	BdaPreparationStats       m_bda_stats;
 
 	Common::Mutex                        m_interrupt_mutex;

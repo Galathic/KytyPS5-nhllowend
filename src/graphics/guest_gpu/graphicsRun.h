@@ -21,6 +21,9 @@ namespace Libs::Graphics {
 
 class RenderContext;
 
+// Bounded performance diagnostics only; does not resolve or change fault handling.
+void NotePm4MemoryFault(uint64_t fault_vaddr, uint32_t access) noexcept;
+
 class GuestGpu final {
 public:
 	explicit GuestGpu(RenderContext& renderer);

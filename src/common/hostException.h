@@ -39,6 +39,10 @@ using Handler = bool (*)(const ExceptionInfo&);
 
 bool InstallHandler(Handler handler);
 
+// steady_clock nanoseconds taken at the start of the current thread's last host exception filter
+// (Windows only; 0 elsewhere). For KYTY_PERF_STATS fault-cost accounting.
+uint64_t LastEntryTimeNs() noexcept;
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 bool InitializeThreadSignalStack();
 #endif

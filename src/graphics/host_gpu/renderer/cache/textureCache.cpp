@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
+#include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "kernel/memory.h"
 
@@ -230,6 +231,38 @@ TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 	return image.usage.storage ? BindingType::Storage : BindingType::Texture;
 }
 
+namespace {
+inline void GenCount(std::atomic<uint64_t>& counter) noexcept {
+	if (FrameBreakdown::Verbose()) counter.fetch_add(1, std::memory_order_relaxed);
+}
+} // namespace
+
+void TextureCache::BumpGeneration(uint64_t begin, uint64_t end) noexcept {
+	std::lock_guard lock {m_gen_log_mutex};
+	const uint64_t generation = m_generation.load(std::memory_order_relaxed) + 1;
+	m_gen_log[generation % GEN_LOG_SIZE] = {generation, begin, end};
+	m_generation.store(generation, std::memory_order_release);
+}
+
+TextureCache::GenCheck TextureCache::CheckGenerationLog(uint64_t memo_gen, uint64_t begin, uint64_t end,
+                                                        uint64_t& current) const {
+	std::lock_guard lock {m_gen_log_mutex};
+	current = m_generation.load(std::memory_order_relaxed);
+	if (current < memo_gen || current - memo_gen > GEN_LOG_SIZE) {
+		return GenCheck::Overrun;
+	}
+	for (uint64_t generation = memo_gen + 1; generation <= current; generation++) {
+		const auto& entry = m_gen_log[generation % GEN_LOG_SIZE];
+		if (entry.generation != generation) {
+			return GenCheck::Overrun;
+		}
+		if (entry.begin < end && begin < entry.end) {
+			return GenCheck::Overlap;
+		}
+	}
+	return GenCheck::Clean;
+}
+
 // Diagnostic: KYTY_DBG_IMAGE_CHURN=1 prints image inserts and frees (first 4000).
 static bool ImageChurnLogLine() {
 	static const bool enabled = [] {
@@ -252,9 +285,14 @@ ImageId TextureCache::InsertImage(const ImageInfo& info) {
 		            static_cast<uint32_t>(info.tile_mode), info.samples,
 		            static_cast<unsigned long long>(BufferCache::PerfFlipCount()));
 	}
+	// A new image can become the answer for any T# overlapping its guest range (FindImagesInRegion /
+	// ResolveOverlap candidates are exactly the registered images overlapping the T# range). Images without
+	// guest data are never registered, so no T# lookup can find them.
+	GenCount(FrameBreakdown::g_delta.gen_insert);
 	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
 	if (!info.data.Empty()) {
 		RegisterImage(id);
+		BumpGeneration(info.data.address, info.data.address + info.data.size);
 	}
 	return id;
 }
@@ -271,16 +309,22 @@ void TextureCache::RegisterImage(ImageId id) {
 	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
 		m_image_page_table[page].push_back(id);
 	});
+	m_images_by_address[image.info.data.address].push_back(id);
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
 	m_total_used_memory += image.AccountedSize();
 }
 
 void TextureCache::UnregisterImage(ImageId id) {
+	GenCount(FrameBreakdown::g_delta.gen_unregister);
 	auto& image = m_slot_images[id];
 	if (!image.registered) {
 		return;
 	}
+	// The unregistered image itself is caught by the memo hit-path checks (slot id generation / registered).
+	// It is also logged by range: removing a candidate can change which overlap candidate wins for another
+	// T# overlapping it (FindImage picks the last matching candidate / last ResolveOverlap result).
+	BumpGeneration(image.info.data.address, image.info.data.address + image.info.data.size);
 	UntrackImage(id);
 	ImagePageTable::PageRange pages {};
 	if (!ImagePageTable::TryGetPageRange(image.info.data.address, image.info.data.size, pages)) {
@@ -292,6 +336,19 @@ void TextureCache::UnregisterImage(ImageId id) {
 			EXIT("TextureCache: image missing from page owner index\n");
 		}
 	});
+	{
+		const auto by_address = m_images_by_address.find(image.info.data.address);
+		if (by_address == m_images_by_address.end()) {
+			EXIT("TextureCache: image missing from address index\n");
+		}
+		auto& ids = by_address->second;
+		const auto found = std::find(ids.begin(), ids.end(), id);
+		if (found == ids.end()) {
+			EXIT("TextureCache: image missing from address index\n");
+		}
+		ids.erase(found);
+		if (ids.empty()) m_images_by_address.erase(by_address);
+	}
 	m_lru_cache.Free(image.lru_id);
 	const auto accounted = image.AccountedSize();
 	if (accounted > m_total_used_memory) {
@@ -302,6 +359,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 }
 
 void TextureCache::DeleteImage(ImageId id) {
+	GenCount(FrameBreakdown::g_delta.gen_delete);  // UnregisterImage below logs the range
 	auto* image = m_slot_images.try_get(id);
 	if (image == nullptr || !image->registered) {
 		return;
@@ -411,6 +469,7 @@ bool TextureCache::WriteBackAliasedImage(ImageId id) {
 }
 
 void TextureCache::FreeImage(ImageId id) {
+	GenCount(FrameBreakdown::g_delta.gen_free);  // DeleteImage -> UnregisterImage logs the range
 	auto& image = m_slot_images[id];
 	if (ImageChurnLogLine()) {
 		std::printf("NHL27IMAGE: free addr=0x%llx size=0x%llx fmt=%s %ux%u gpu_modified=%d frame=%llu\n",
@@ -448,6 +507,11 @@ void TextureCache::TouchImage(Image& image) {
 }
 
 void TextureCache::MarkAsMaybeDirty(ImageId id, Image& image) {
+	// Generation is intentionally NOT bumped here (KYTY_DRAWPREP_DELTA): this only changes CPU-dirty and page-watch
+	// state (flags, maybe-cpu hash, watcher ranges). FindImage selects images from info/registration only
+	// (SameBacking, ResolveOverlap) and never reads those; dirtiness is acted on later by RefreshImage.
+	// Registration/free changes still bump via Unregister/Delete/Free.
+	GenCount(FrameBreakdown::g_delta.gen_dirty_skipped);
 	image.MarkMaybeCpuDirty();
 	if (image.NeedsMaybeCpuHash()) {
 		image.SetMaybeCpuHash(image.HashGuestEdges());
@@ -519,6 +583,8 @@ void TextureCache::UntrackImage(ImageId id) {
 	if (!image.IsTracked()) {
 		return;
 	}
+	// No generation bump: watcher-range change only (see MarkAsMaybeDirty). Unregister bumps on removal.
+	GenCount(FrameBreakdown::g_delta.gen_untrack_skipped);
 	const auto address   = image.track_addr;
 	const auto size      = image.track_addr_end - image.track_addr;
 	image.track_addr     = 0;
@@ -534,6 +600,8 @@ void TextureCache::UntrackImageHead(ImageId id) {
 	if (!image.IsTracked() || begin < image.track_addr) {
 		return;
 	}
+	// No generation bump: watcher-range change only (see MarkAsMaybeDirty).
+	GenCount(FrameBreakdown::g_delta.gen_untrack_skipped);
 	const auto address = Common::AlignDown(begin + TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE);
 	const auto size    = address - begin;
 	image.track_addr   = address;
@@ -551,6 +619,8 @@ void TextureCache::UntrackImageTail(ImageId id) {
 	if (!image.IsTracked() || image.track_addr_end < end) {
 		return;
 	}
+	// No generation bump: watcher-range change only (see MarkAsMaybeDirty).
+	GenCount(FrameBreakdown::g_delta.gen_untrack_skipped);
 	const auto address   = Common::AlignDown(end, TRACKER_PAGE_SIZE);
 	const auto size      = end - address;
 	image.track_addr_end = address;
@@ -899,6 +969,8 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	replacement.usage         = cached.usage;
 	if (cached.binding.is_bound || cached.binding.is_target) {
 		cached.binding.needs_rebind = true;
+		BumpGeneration(cached.info.data.address, cached.info.data.address + cached.info.data.size);
+		GenCount(FrameBreakdown::g_delta.gen_rebind);
 	}
 	const char* copy_path = "none";
 	if (cached.backing.samples == replacement.backing.samples) {
@@ -1063,6 +1135,8 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			return {ExpandImage(requested, cached_id)};
 		}
 		cached.binding.needs_rebind |= cached.binding.is_bound || cached.binding.is_target;
+		BumpGeneration(cached.info.data.address, cached.info.data.address + cached.info.data.size);
+		GenCount(FrameBreakdown::g_delta.gen_rebind);
 		m_slot_images[merged_id].binding.is_target |= cached.binding.is_target;
 		CopyImageMip(merged_id, cached_id, static_cast<uint32_t>(mip),
 		             static_cast<uint32_t>(layer));
@@ -1096,6 +1170,8 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	auto&      source      = m_slot_images[source_id];
 	if (source.binding.is_bound || source.binding.is_target) {
 		source.binding.needs_rebind = true;
+		BumpGeneration(source.info.data.address, source.info.data.address + source.info.data.size);
+		GenCount(FrameBreakdown::g_delta.gen_rebind);
 	}
 	InitializeImage(expanded_id);
 	const int32_t mip = source.info.MipOf(info);
@@ -1433,6 +1509,8 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 }
 
 void TextureCache::RefreshImage(ImageId id) {
+	FrameBreakdown::Timer tex_timer(FrameBreakdown::g_tex.refresh_ns, FrameBreakdown::TexOn());
+	FrameBreakdown::TexAdd(FrameBreakdown::g_tex.refresh_calls);
 	auto& image = m_slot_images[id];
 	if (image.depth_id &&
 	    (m_slot_images[image.depth_id].info.metadata.stencil_compressed ||
@@ -1458,6 +1536,7 @@ void TextureCache::RefreshImage(ImageId id) {
 	if (!cpu_dirty) {
 		return;
 	}
+	FrameBreakdown::TexAdd(FrameBreakdown::g_tex.uploads);
 	InitializeImage(id);
 }
 
@@ -1506,8 +1585,6 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	ImageId result {};
 	{
 		std::scoped_lock lock {m_lock};
-		const auto       candidates =
-		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
 
 		// A color render target can alias a depth buffer's stencil plane (games write stencil via an
 		// R8 color target). Stencil association records have no native image, so never hand one
@@ -1515,10 +1592,31 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		const auto skip_candidate = [&](ImageId id) {
 			return desc.type == BindingType::RenderTarget && m_slot_images[id].depth_id;
 		};
-		for (const auto id: candidates) {
-			const auto& image = m_slot_images[id];
-			if (!skip_candidate(id) && SameBacking(image.info, desc.info, exact_format)) {
-				result = id;
+		// Fast path: SameBacking requires an identical start address, so every image the region
+		// scan below could select is in the address index. With exactly one match the scan
+		// would pick that same image; skip walking every owner on the covered 1 MiB pages.
+		if (const auto by_address = m_images_by_address.find(desc.info.data.address);
+		    by_address != m_images_by_address.end()) {
+			uint32_t matches = 0;
+			ImageId  match {};
+			for (const auto id: by_address->second) {
+				if (!skip_candidate(id) && SameBacking(m_slot_images[id].info, desc.info, exact_format)) {
+					match = id;
+					++matches;
+				}
+			}
+			if (matches == 1) result = match;
+		}
+		FrameBreakdown::Add(result ? FrameBreakdown::g_counters.port_hint_hits
+		                           : FrameBreakdown::g_counters.port_hint_misses);
+		ImageIds candidates;
+		if (!result) {
+			candidates = FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
+			for (const auto id: candidates) {
+				const auto& image = m_slot_images[id];
+				if (!skip_candidate(id) && SameBacking(image.info, desc.info, exact_format)) {
+					result = id;
+				}
 			}
 		}
 
@@ -1638,6 +1736,13 @@ ImageId TextureCache::FindImageHinted(ImageDesc& desc, bool exact_format, ImageI
 		        desc.view_info.base_layer == metadata_base_layer && matches(*image);
 	}
 	return id;
+}
+
+void TextureCache::NoteImageUse(ImageId id) {
+	std::scoped_lock lock {m_lock};
+	auto&            image = m_slot_images[id];
+	image.tick_accessed_last = m_scheduler.CurrentTick();
+	TouchImage(image);
 }
 
 void TextureCache::UpdateImage(ImageId id) {
@@ -1995,7 +2100,11 @@ void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid memory-invalidation range\n");
 	}
-	std::scoped_lock lock {m_lock};
+	std::unique_lock lock {m_lock, std::defer_lock};
+	{
+		FrameBreakdown::FaultTimer lock_timer(FrameBreakdown::g_fault_cost.lock_ns);
+		lock.lock();
+	}
 	InvalidateCpuAliases(address, size);
 }
 

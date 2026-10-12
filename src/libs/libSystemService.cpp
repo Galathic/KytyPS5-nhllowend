@@ -2,6 +2,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
+#include "common/lightingTrace.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "libs/dialog.h"
@@ -191,12 +192,16 @@ SystemServiceGetHdrToneMapLuminance(SystemServiceHdrToneMapLuminance* luminance)
 	PRINT_NAME();
 
 	if (luminance == nullptr) {
+		Common::LightingApiTrace("GetHdrToneMapLuminance null result=0x%x", SYSTEM_SERVICE_ERROR_PARAMETER);
 		return SYSTEM_SERVICE_ERROR_PARAMETER;
 	}
 
 	luminance->max_full_frame_tone_map_luminance = 80.0f;
 	luminance->max_tone_map_luminance            = 1000.0f;
 	luminance->min_tone_map_luminance            = 0.0f;
+	Common::LightingApiTrace("GetHdrToneMapLuminance full=%g max=%g min=%g result=0",
+	    luminance->max_full_frame_tone_map_luminance, luminance->max_tone_map_luminance,
+	    luminance->min_tone_map_luminance);
 
 	return OK;
 }

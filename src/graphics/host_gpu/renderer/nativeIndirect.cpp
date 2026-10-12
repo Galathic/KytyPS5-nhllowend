@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/nativeIndirect.h"
 #include "graphics/host_gpu/renderer/bindEpoch.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -89,6 +90,8 @@ std::pair<vk::Buffer, uint64_t> DispatchArgsGuard::Record(CommandBuffer& buffer,
                       m_trips->BufferDeviceAddress(), guest_address,
                       limits.maxComputeWorkGroupCount[0], limits.maxComputeWorkGroupCount[1],
                       limits.maxComputeWorkGroupCount[2], 0};
+ // Binding another compute pipeline invalidates the elided-bind caches of the dispatch path.
+ Libs::Graphics::g_compute_pipeline_epoch.fetch_add(1, std::memory_order_relaxed);
  command.bindPipeline(vk::PipelineBindPoint::eCompute, m_pipeline);
  InvalidateRedundantBinds();
  command.pushConstants(m_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(params), &params);
@@ -111,6 +114,7 @@ void NativeIndirectPrep::Record(CommandBuffer& buffer, const NativeIndirectDraw&
  static_assert(sizeof(Params) == 24);
  const Params params {source.snapshot->BufferDeviceAddress(), source.stride / 4,
                       source.max_count, source.index_count_limit, 0};
+ Libs::Graphics::g_compute_pipeline_epoch.fetch_add(1, std::memory_order_relaxed);
  command.bindPipeline(vk::PipelineBindPoint::eCompute, m_pipeline);
  InvalidateRedundantBinds();
  command.pushConstants(m_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(params), &params);

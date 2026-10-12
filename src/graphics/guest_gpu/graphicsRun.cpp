@@ -1,3 +1,4 @@
+#include "common/eventTrace.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/bindEpoch.h"
 
@@ -6,12 +7,15 @@
 #include "common/experiments.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/runtimeFlags.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/renderer/frameBreakdown.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -26,6 +30,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -42,6 +47,42 @@ static thread_local CommandProcessor* g_current_processor = nullptr;
 static thread_local Pm4Execution*     g_current_execution = nullptr;
 static thread_local bool              g_gpu_thread        = false;
 static thread_local GuestGpu*         g_gpu_state         = nullptr;
+
+struct Pm4FaultScope {
+	uint64_t packet_addr = 0;
+	uint32_t packet_dw   = 0;
+	uint32_t header      = 0;
+	bool     executing   = false;
+};
+static thread_local Pm4FaultScope g_pm4_fault_scope;
+
+void NotePm4MemoryFault(uint64_t fault_vaddr, uint32_t access) noexcept {
+	static const bool enabled = [] {
+		const char* setting = std::getenv("KYTY_PERF_STATS");
+		return setting != nullptr && setting[0] == '1';
+	}();
+	if (!enabled || !GuestGpu::IsGpuThread() || g_pm4_fault_scope.packet_addr == 0) return;
+	// Limit log traffic without exhausting the diagnostic during startup before training.
+	static thread_local auto interval = std::chrono::steady_clock::now();
+	static thread_local uint32_t lines = 0;
+	const auto now = std::chrono::steady_clock::now();
+	if (now - interval >= std::chrono::seconds(5)) {
+		interval = now;
+		lines = 0;
+	}
+	if (lines++ >= 8) return;
+	const auto& scope = g_pm4_fault_scope;
+	const uint64_t bytes = static_cast<uint64_t>(scope.packet_dw) * sizeof(uint32_t);
+	const bool in_packet = fault_vaddr >= scope.packet_addr &&
+	                       fault_vaddr - scope.packet_addr < bytes;
+	std::printf("NHL27PM4FAULT: fault=0x%llx access=%u packet=0x%llx packet_dw=%u "
+	            "header=0x%08x op=0x%x custom=0x%x phase=%s in_packet=%u\n",
+	            static_cast<unsigned long long>(fault_vaddr), access,
+	            static_cast<unsigned long long>(scope.packet_addr), scope.packet_dw,
+	            scope.header, scope.executing ? ((scope.header >> 8u) & 0xffu) : UINT32_MAX,
+	            scope.executing ? KYTY_PM4_R(scope.header) : UINT32_MAX,
+	            scope.executing ? "handler" : "fetch", static_cast<unsigned>(in_packet));
+}
 
 struct DrawIndirectArgs {
 	uint32_t vertex_count_per_instance;
@@ -121,6 +162,8 @@ void GuestGpu::ProcessCommands() {
 			m_commands.pop_front();
 			EXIT_IF(m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
 		}
+		FrameBreakdown::GpuBusyScope busy_scope(FrameBreakdown::GB_GPU_CMDS);
+		m_renderer.BdaBatchBoundary(RenderContext::BdaBoundary::Other);
 		command();
 	}
 }
@@ -148,6 +191,7 @@ void GuestGpu::Submit(std::span<const uint32_t> draw_commands,
 		return;
 	}
 	Submission submission;
+	Common::EventTrace::Record(Common::EventTrace::GUEST_SUBMIT, 0, draw_commands.size());
 	submission.type              = SubmissionType::Graphics;
 	submission.queue_id          = 0;
 	submission.commands          = draw_commands;
@@ -162,6 +206,7 @@ void GuestGpu::SubmitCompute(uint32_t queue, std::span<const uint32_t> commands)
 	EXIT_NOT_IMPLEMENTED(queue < ComputeQueueBase || queue >= ComputeQueueBase + ComputeQueueCount);
 
 	const auto compute_queue = queue - ComputeQueueBase;
+	Common::EventTrace::Record(Common::EventTrace::GUEST_SUBMIT, 1 + compute_queue, commands.size());
 	Submission submission;
 	submission.type     = SubmissionType::Compute;
 	submission.queue_id = 1 + compute_queue;
@@ -184,7 +229,9 @@ void GuestGpu::SuspendPoint() {
 	// Do not hold a queue lock while waiting: asynchronous work may be needed to
 	// finish the preceding graphics frame. The first point returns immediately.
 	Common::Timeline::Mark("suspend-wait");
+	Common::EventTrace::Record(Common::EventTrace::SUSPEND_ACQ_BEGIN);
 	m_suspend_point_ready->acquire();
+	Common::EventTrace::Record(Common::EventTrace::SUSPEND_ACQ_END);
 	Common::Timeline::Mark("suspend-go");
 	Submission submission;
 	submission.type = SubmissionType::SuspendPoint;
@@ -303,6 +350,7 @@ void CommandProcessor::WriteConstRam(uint32_t offset, const uint32_t* src, uint3
 }
 
 void CommandProcessor::DumpConstRam(uint32_t* dst, uint32_t offset, uint32_t dw_num) {
+	if (FrameBreakdown::Enabled()) FrameBreakdown::SpecNotePktWrite(reinterpret_cast<uint64_t>(dst), static_cast<uint64_t>(dw_num) * 4);
 	memcpy(dst, m_const_ram + offset / 4, static_cast<size_t>(dw_num) * 4);
 }
 
@@ -321,13 +369,27 @@ bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t f
 	return false;
 }
 
+bool CommandProcessor::TryPeekCleanBackingBytes(const volatile void* addr, void* out, uint64_t size) {
+	// Read current bytes without a GPU->CPU download when they are not GPU-dirty. The
+	// backing copy is authoritative for CPU-written bytes: a guest computation writes
+	// its command stream, submits it, and only then does the CP consume it, so the CP
+	// cannot be reading bytes a concurrent GPU write is still producing. Any exact-range
+	// GPU write still refuses the peek, so the fault path keeps the final say. This is
+	// the property that makes a false-sharing read cheap: a dirty neighbour on the same
+	// 4 KiB page must not drag a whole-page download and queue drain behind it.
+	const auto vaddr = reinterpret_cast<uint64_t>(addr);
+	if (!GuestRange {vaddr, size}.Valid() || m_renderer.GetBufferCache().HasGpuDirtyBytes(vaddr, size) ||
+	    !LibKernel::Memory::TryReadBacking(vaddr, out, size)) {
+		return false;
+	}
+	return true;
+}
+
 bool CommandProcessor::TryPeekGuest(const volatile void* addr, void* out, uint64_t size) {
 	if (!BufferCache::PerfNoSyncReadback() || !GuestGpu::IsGpuThread()) {
 		return false;
 	}
-	const auto vaddr = reinterpret_cast<uint64_t>(addr);
-	if (!GuestRange {vaddr, size}.Valid() || m_renderer.GetBufferCache().HasGpuDirtyBytes(vaddr, size) ||
-	    !LibKernel::Memory::TryReadBacking(vaddr, out, size)) {
+	if (!TryPeekCleanBackingBytes(addr, out, size)) {
 		return false;
 	}
 	BufferCache::PerfCount(BufferCache::PerfEvent::WaitRegMemBackingRead);
@@ -379,6 +441,36 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	if (dw_num == 0) {
 		return;
 	}
+	if (FrameBreakdown::Enabled()) {
+		FrameBreakdown::SpecNotePktWrite(reinterpret_cast<uint64_t>(dst),
+		                                 write_one_address ? sizeof(uint32_t)
+		                                                   : static_cast<uint64_t>(dw_num) * sizeof(uint32_t));
+	}
+
+	// Labels commonly share a protected page with GPU-written data. Update both
+	// copies through the existing exact-range label path, without downloading or
+	// unprotecting unrelated bytes. Read each source before its corresponding
+	// repeated-address write: source and destination may alias.
+	if (Common::RuntimeFlags::Current().pm4_write_data_fast && GuestGpu::IsGpuThread()) {
+		auto& cache = m_renderer.GetBufferCache();
+		if (write_one_address) {
+			for (uint32_t i = 0; i < dw_num; i++) {
+				const uint32_t value = src[i];
+				if (!cache.TryWriteLabel(reinterpret_cast<uint64_t>(dst), &value, sizeof(value))) {
+					dst[0] = value;
+				}
+			}
+			return;
+		}
+		if (dw_num <= 2) {
+			std::array<uint32_t, 2> values{};
+			std::memcpy(values.data(), src, static_cast<size_t>(dw_num) * sizeof(uint32_t));
+			if (cache.TryWriteLabel(reinterpret_cast<uint64_t>(dst), values.data(),
+			                        static_cast<uint64_t>(dw_num) * sizeof(uint32_t))) {
+				return;
+			}
+		}
+	}
 
 	if (write_one_address) {
 		for (uint32_t i = 0; i < dw_num; i++) {
@@ -395,6 +487,7 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 		EXIT("invalid reference-clock copy, dst=0x%016" PRIx64 " size=%u\n", dst_address,
 		     num_bytes);
 	}
+	if (FrameBreakdown::Enabled()) FrameBreakdown::SpecNotePktWrite(dst_address, num_bytes);
 	const auto value = Sync::ReadReferenceClock();
 	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
 	static std::atomic<uint32_t> clock_log_count {0};
@@ -441,6 +534,9 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 	bool dst_gds = false;
 	if (!decode_gds(dst_sel, dst_gds)) {
 		EXIT("unsupported dmaData destination selector 0x%02" PRIx8 "\n", dst_sel);
+	}
+	if (!dst_gds && FrameBreakdown::Enabled()) {
+		FrameBreakdown::SpecNotePktWrite(dst_address_or_offset, num_bytes);
 	}
 	auto& buffer_cache = m_renderer.GetBufferCache();
 	{
@@ -532,7 +628,14 @@ void GuestGpu::ThreadRun(void* data) {
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
 				Common::Timeline::Mark("gpu-idle");
+				const auto idle_start = std::chrono::steady_clock::now();
+				Common::EventTrace::Record(Common::EventTrace::GPU_WAIT_BEGIN);
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
+				Common::EventTrace::Record(Common::EventTrace::GPU_WAIT_END,
+				                           gpu->m_commands.size() + gpu->m_submission_count);
+				FrameBreakdown::AddIdleGap(static_cast<uint64_t>(
+				    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - idle_start)
+				        .count()));
 				Common::Timeline::Mark("gpu-wake");
 			}
 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
@@ -583,7 +686,9 @@ void GuestGpu::ThreadRun(void* data) {
 
 		if (command) {
 			EXIT_IF(g_current_processor != nullptr);
+			Common::EventTrace::Record(Common::EventTrace::GPU_CMD_BEGIN, 1, 0);
 			command();
+			Common::EventTrace::Record(Common::EventTrace::GPU_CMD_END, 1, 0);
 
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			gpu->m_processing = false;
@@ -595,8 +700,24 @@ void GuestGpu::ThreadRun(void* data) {
 
 		EXIT_IF(!has_submission);
 		Common::Timeline::Mark("slice-begin", submission.queue_id * 10u + static_cast<uint32_t>(submission.type));
-		const bool complete = gpu->Process(submission);
+		bool complete = false;
+		{
+			// KYTY_PERF_STATS: GPU thread busy = Process wall time minus its master-semaphore waits.
+			FrameBreakdown::Timer process_timer(FrameBreakdown::g_counters.gpu_process_ns);
+			// NHL27GPUBUSY: exclusive bucket attribution over the same window.
+			struct GpuBusyWindow {
+				GpuBusyWindow() { FrameBreakdown::GpuBusyBegin(); }
+				~GpuBusyWindow() { FrameBreakdown::GpuBusyEnd(); }
+			} gpu_busy_window;
+			// kind: 2 + SubmissionType (graphics/compute/flip prep/suspend point), +0x100 when sliced/blocked
+			const uint64_t kind = 2 + static_cast<uint64_t>(submission.type);
+			Common::EventTrace::Record(Common::EventTrace::GPU_CMD_BEGIN, kind, gpu->m_submit_id);
+			complete = gpu->Process(submission);
+			Common::EventTrace::Record(Common::EventTrace::GPU_CMD_END, kind | (complete ? 0u : 0x100u),
+			                           gpu->m_submit_id);
+		}
 		Common::Timeline::Mark(complete ? "slice-done" : "slice-blocked", submission.queue_id);
+		FrameBreakdown::MaybePrint();
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
 		if (!complete) {
@@ -617,7 +738,166 @@ void GuestGpu::ThreadRun(void* data) {
 	}
 }
 
+// KYTY_SUBMIT_SPLIT: while recording one large guest command buffer, submit the native command
+// buffer after enough draws/dispatches or recording time so the host GPU can start earlier.
+// GPU-thread only. Policy (kept simple): split at packet boundaries right after a draw/dispatch
+// packet completes, regardless of render-pass state. Submit() ends dynamic rendering and the next
+// draw re-begins it, exactly like the existing Flip()/WaitFlipDone()/slice-end flushes.
+struct SubmitSplitState {
+	bool                                  enabled = false;
+	uint32_t                              work    = 0;
+	std::chrono::steady_clock::time_point since {};
+};
+static thread_local SubmitSplitState g_submit_split;
+static std::atomic<uint64_t>         g_submit_split_count {0};
+
+// Split thresholds: env KYTY_SUBMIT_SPLIT_DRAWS / KYTY_SUBMIT_SPLIT_US set the defaults; a
+// "split.ctl" file in the working directory (lines "draws=N", "us=T") overrides them and is
+// re-read every 500 ms so the thresholds can be tuned while the game runs.
+static std::atomic<uint32_t> g_split_draws {0};
+static std::atomic<int64_t>  g_split_us {0};
+
+static void SubmitSplitRefresh() {
+	static const uint32_t env_draws = [] {
+		const char* s = std::getenv("KYTY_SUBMIT_SPLIT_DRAWS");
+		const long  n = s != nullptr ? std::atol(s) : 0;
+		return n > 0 ? static_cast<uint32_t>(n) : 48u;
+	}();
+	static const int64_t env_us = [] {
+		const char* s = std::getenv("KYTY_SUBMIT_SPLIT_US");
+		const long  n = s != nullptr ? std::atol(s) : 0;
+		return n > 0 ? static_cast<int64_t>(n) : int64_t {750};
+	}();
+	static auto last = std::chrono::steady_clock::time_point {};
+	const auto  now  = std::chrono::steady_clock::now();
+	if (last != std::chrono::steady_clock::time_point {} && now - last < std::chrono::milliseconds(500)) {
+		return;
+	}
+	last           = now;
+	uint32_t draws = env_draws;
+	int64_t  us    = env_us;
+	if (FILE* file = std::fopen("split.ctl", "r"); file != nullptr) {
+		char line[64];
+		while (std::fgets(line, sizeof(line), file) != nullptr) {
+			long value = 0;
+			if (std::sscanf(line, "draws=%ld", &value) == 1 && value > 0) {
+				draws = static_cast<uint32_t>(value);
+			} else if (std::sscanf(line, "us=%ld", &value) == 1 && value > 0) {
+				us = value;
+			}
+		}
+		std::fclose(file);
+	}
+	g_split_draws.store(draws, std::memory_order_relaxed);
+	g_split_us.store(us, std::memory_order_relaxed);
+}
+
+static uint32_t SubmitSplitDraws() {
+	return g_split_draws.load(std::memory_order_relaxed);
+}
+
+static int64_t SubmitSplitUs() {
+	return g_split_us.load(std::memory_order_relaxed);
+}
+
+static bool SubmitSplitIsWorkOpcode(uint32_t op) {
+	switch (op) {
+		case Pm4::IT_DISPATCH_DIRECT:
+		case Pm4::IT_DISPATCH_INDIRECT:
+		case Pm4::IT_DRAW_INDIRECT:
+		case Pm4::IT_DRAW_INDEX_INDIRECT:
+		case Pm4::IT_DRAW_INDEX_2:
+		case Pm4::IT_DRAW_INDIRECT_MULTI:
+		case Pm4::IT_DRAW_INDEX_AUTO:
+		case Pm4::IT_DRAW_INDEX_OFFSET_2:
+		case Pm4::IT_DRAW_INDEX_INDIRECT_MULTI: return true;
+		default: return false;
+	}
+}
+
+// NHL27GPUBUSY: which exclusive bucket a PM4 packet handler is charged to.
+static FrameBreakdown::GpuBucket PacketBusyBucket(uint32_t op) {
+	switch (op) {
+		case Pm4::IT_DRAW_INDIRECT:
+		case Pm4::IT_DRAW_INDEX_INDIRECT:
+		case Pm4::IT_DRAW_INDEX_2:
+		case Pm4::IT_DRAW_INDIRECT_MULTI:
+		case Pm4::IT_DRAW_INDEX_AUTO:
+		case Pm4::IT_DRAW_INDEX_OFFSET_2:
+		case Pm4::IT_DRAW_INDEX_INDIRECT_MULTI:
+		case Pm4::IT_DISPATCH_DRAW: return FrameBreakdown::GB_DRAW_HANDLER;
+		case Pm4::IT_DISPATCH_DIRECT:
+		case Pm4::IT_DISPATCH_INDIRECT: return FrameBreakdown::GB_DISPATCH_HANDLER;
+		case Pm4::IT_EVENT_WRITE:
+		case Pm4::IT_EVENT_WRITE_EOP:
+		case Pm4::IT_EVENT_WRITE_EOS:
+		case Pm4::IT_RELEASE_MEM:
+		case Pm4::IT_WRITE_DATA:
+		case Pm4::IT_WAIT_REG_MEM:
+		case Pm4::IT_WAIT_REG_MEM_64:
+		case Pm4::IT_MEM_SEMAPHORE:
+		case Pm4::IT_PFP_SYNC_ME:
+		case Pm4::IT_SURFACE_SYNC:
+		case Pm4::IT_ACQUIRE_MEM: return FrameBreakdown::GB_SYNC_PKT;
+		case Pm4::IT_DMA_DATA:
+		case Pm4::IT_CP_DMA:
+		case Pm4::IT_COPY_DATA: return FrameBreakdown::GB_DMA_PKT;
+		default: return FrameBreakdown::GB_HANDLER;
+	}
+}
+
+static void SubmitSplitMaybePrint() {
+	static const bool stats = [] {
+		const char* s = std::getenv("KYTY_PERF_STATS");
+		return s != nullptr && s[0] == '1';
+	}();
+	if (!stats) return;
+	static auto     last = std::chrono::steady_clock::now();
+	static uint64_t last_count = 0;
+	const auto      now = std::chrono::steady_clock::now();
+	if (now - last < std::chrono::seconds(5)) return;
+	const auto count = g_submit_split_count.load(std::memory_order_relaxed);
+	std::printf("NHL27SPLIT: splits=%llu delta=%llu draws_thr=%u us_thr=%lld\n",
+	            static_cast<unsigned long long>(count),
+	            static_cast<unsigned long long>(count - last_count), SubmitSplitDraws(),
+	            static_cast<long long>(SubmitSplitUs()));
+	std::fflush(stdout);
+	last = now;
+	last_count = count;
+}
+
+// KYTY_BDA_BATCH: PM4 packets after which guest memory may be ordered for the GPU or CPU. WRITE_DATA, COPY_DATA
+// and draws/dispatches are deliberately not boundaries: they do not order CPU-written memory for the GPU.
+static bool BdaBoundaryKind(uint32_t opcode, uint32_t header, RenderContext::BdaBoundary& kind) {
+	using B = RenderContext::BdaBoundary;
+	switch (opcode) {
+		case Pm4::IT_WAIT_REG_MEM:
+		case Pm4::IT_WAIT_REG_MEM_64:
+		case Pm4::IT_WAIT_ON_CE_COUNTER:
+		case Pm4::IT_WAIT_ON_DE_COUNTER_DIFF: kind = B::Wait; return true;
+		case Pm4::IT_EVENT_WRITE:
+		case Pm4::IT_EVENT_WRITE_EOP:
+		case Pm4::IT_EVENT_WRITE_EOS: kind = B::Event; return true;
+		case Pm4::IT_ACQUIRE_MEM: kind = B::Acquire; return true;
+		case Pm4::IT_DMA_DATA: kind = B::Dma; return true;
+		case Pm4::IT_PFP_SYNC_ME: kind = B::Sync; return true;
+		case Pm4::IT_INDIRECT_BUFFER: kind = B::Ib; return true;
+		case Pm4::IT_NOP:
+			switch (KYTY_PM4_R(header)) {
+				case Pm4::R_WAIT_FLIP_DONE: kind = B::Wait; return true;
+				case Pm4::R_ACQUIRE_MEM: kind = B::Acquire; return true;
+				case Pm4::R_RELEASE_MEM: kind = B::Event; return true;
+				case Pm4::R_FLIP: kind = B::Flip; return true;
+				default: return false;
+			}
+		default: return false;
+	}
+}
+
 bool GuestGpu::Process(Submission& submission) {
+	// Start of each PM4 submission slice (graphics, compute queue, flip preparation, suspend point).
+	m_renderer.BdaBatchBoundary(submission.type == SubmissionType::FlipPreparation ? RenderContext::BdaBoundary::Flip
+	                                                                                : RenderContext::BdaBoundary::Submit);
 	const bool first_slice = !submission.started;
 	auto&      cp          = GetProcessor(submission.queue_id);
 
@@ -629,6 +909,12 @@ bool GuestGpu::Process(Submission& submission) {
 	}
 
 	cp.BufferInit();
+	g_submit_split.enabled = Common::RuntimeFlags::Current().submit_split;
+	if (g_submit_split.enabled) {
+		SubmitSplitRefresh();
+	}
+	g_submit_split.work    = 0;
+	g_submit_split.since   = {};
 	bool complete = true;
 
 	switch (submission.type) {
@@ -699,12 +985,18 @@ bool GuestGpu::Process(Submission& submission) {
 		case SubmissionType::SuspendPoint:
 			cp.EmitGlobalBarrier();
 			m_renderer.GetCommandScheduler().DeferPriorityOperation(
-			    [ready = m_suspend_point_ready] { ready->release(); });
+			    [ready = m_suspend_point_ready] {
+				    Common::EventTrace::Record(Common::EventTrace::SUSPEND_RELEASE);
+				    ready->release();
+			    });
 			cp.BufferFlush();
 			cp.Reset();
 			break;
 	}
 
+	g_submit_split.enabled = false;
+	SubmitSplitMaybePrint();
+	m_renderer.BdaBatchBoundary(RenderContext::BdaBoundary::Submit);
 	return complete;
 }
 
@@ -750,6 +1042,7 @@ void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands,
 
 void CommandProcessor::SuspendPm4() {
 	EXIT_IF(g_current_execution == nullptr);
+	if (FrameBreakdown::Enabled()) FrameBreakdown::SpecNoteWait();
 	g_current_execution->m_suspended = true;
 }
 
@@ -801,13 +1094,27 @@ const uint32_t* CommandProcessor::ShadowPm4Packet(const uint32_t* packet, uint32
 }
 
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
+	static const bool clean_backing = [] {
+		const char* setting = std::getenv("KYTY_PM4_CLEAN_BACKING");
+		return setting != nullptr && setting[0] == '1';
+	}();
+	// Only bypass exact-clean header reads. Some register handlers fuse adjacent packets,
+	// so their payload pointer and available stream length must remain the original ones.
+	struct FaultScopeRestore {
+		Pm4FaultScope previous = g_pm4_fault_scope;
+		~FaultScopeRestore() { g_pm4_fault_scope = previous; }
+	} fault_scope_restore;
 	while (!execution.m_buffer_stack.empty()) {
+		g_pm4_fault_scope = {};
 		if (g_gpu_state != nullptr) {
 			g_gpu_state->ProcessCommands();
 		}
 		auto& cursor = execution.m_buffer_stack.back();
 		EXIT_IF(cursor.offset_dw > cursor.commands.size());
 		if (cursor.offset_dw == cursor.commands.size()) {
+			if (execution.m_buffer_stack.size() > 1) {
+				m_renderer.BdaBatchBoundary(RenderContext::BdaBoundary::Ib);  // return edge of an indirect buffer call
+			}
 			execution.m_buffer_stack.pop_back();
 			continue;
 		}
@@ -819,8 +1126,15 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		    Common::Experiments::Enabled(Common::Experiments::FalseShareReads)
 		        ? ShadowPm4Packet(guest_packet, remaining_dw)
 		        : guest_packet;
-		const auto packet_header = packet[0];
+		g_pm4_fault_scope = {reinterpret_cast<uint64_t>(packet), 1, 0, false};
+		uint32_t packet_header = 0;
+		if (!clean_backing || !TryPeekGuest(packet, &packet_header, sizeof(packet_header))) {
+			packet_header = packet[0];
+		}
 		const auto        opcode        = (packet_header >> 8u) & 0xffu;
+		g_pm4_fault_scope = {reinterpret_cast<uint64_t>(packet),
+		                     std::min<uint32_t>(KYTY_PM4_LEN(packet_header), remaining_dw),
+		                     packet_header, true};
 		EXIT_NOT_IMPLEMENTED(remaining_dw > total_dw);
 
 		if (packet_header == 0x80000000u) {
@@ -830,6 +1144,8 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		}
 
 		EXIT_NOT_IMPLEMENTED(remaining_dw < 2);
+		const auto declared_dw = KYTY_PM4_LEN(packet_header);
+		EXIT_NOT_IMPLEMENTED(declared_dw > remaining_dw);
 
 		if (GraphicsRunDebugDumpEnabled()) {
 			LOGF("CP packet: offset=0x%05" PRIx32 " cmd_id=0x%08" PRIx32 " op=0x%02" PRIx32
@@ -883,14 +1199,34 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		}
 
 		BufferCache::PerfSetPm4Op(opcode);
-		const auto packet_dw =
-		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+		uint32_t packet_dw;
+		{
+			FrameBreakdown::GpuBusyScope busy_scope(PacketBusyBucket(opcode));
+			packet_dw = handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+		}
 		EXIT_IF(packet_dw > remaining_dw);
+		if (RenderContext::BdaBoundary bda_kind; BdaBoundaryKind(opcode, packet_header, bda_kind)) {
+			m_renderer.BdaBatchBoundary(bda_kind);  // after the handler, also when the packet suspended on a wait
+		}
 		if (execution.m_suspended) {
 			return;
 		}
 		cursor.offset_dw += packet_dw;
 		execution.m_made_progress = true;
+		if (g_submit_split.enabled && SubmitSplitIsWorkOpcode(opcode)) {
+			// Packet fully handled and cursor advanced: a flush here cannot separate a
+			// draw/dispatch from any later EOP/label packet in the stream.
+			const auto now = std::chrono::steady_clock::now();
+			if (g_submit_split.work++ == 0) {
+				g_submit_split.since = now;
+			} else if (g_submit_split.work >= SubmitSplitDraws() ||
+			           std::chrono::duration_cast<std::chrono::microseconds>(now - g_submit_split.since)
+			                   .count() >= SubmitSplitUs()) {
+				BufferFlush();
+				g_submit_split.work = 0;
+				g_submit_split_count.fetch_add(1, std::memory_order_relaxed);
+			}
+		}
 		if (!execution.m_next_buffer.empty()) {
 			// Chains and taken branches reuse the fetcher; only calls retain a return cursor.
 			if (execution.m_chain) {
@@ -1323,6 +1659,9 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
                                         uint32_t interrupt_context_id) {
 	static_assert(sizeof(T) == sizeof(uint32_t) || sizeof(T) == sizeof(uint64_t));
 
+	if (dst_gpu_addr != nullptr && FrameBreakdown::Enabled()) {
+		FrameBreakdown::SpecNotePktWrite(reinterpret_cast<uint64_t>(dst_gpu_addr), sizeof(T));
+	}
 	auto& command = CurrentBuffer();
 
 	if (GraphicsRunDebugDumpEnabled()) {
@@ -1370,6 +1709,9 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 		return setting != nullptr && setting[0] == '1';
 	}();
 	auto write_label = [&](void* destination, const void* data, uint64_t bytes) {
+		Common::EventTrace::Record(Common::EventTrace::LABEL_WRITE,
+		                           reinterpret_cast<uint64_t>(destination) & 0xffffffffu,
+		                           m_renderer.GetCommandScheduler().CurrentTick());
 		if (!direct_labels || !m_renderer.GetBufferCache().TryWriteLabel(
 		        reinterpret_cast<uint64_t>(destination), data, bytes)) {
 			std::memcpy(destination, data, static_cast<size_t>(bytes));
@@ -1555,22 +1897,27 @@ void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_
 
 void CommandProcessor::EmitGlobalBarrier() {
 	Common::LockGuard lock(m_renderer.GetMutex());
-	// KYTY_DEDUP_BARRIERS=1: a global barrier with no draw or dispatch recorded since the previous
-	// one in the same command buffer orders nothing new.
-	const bool dedup = Common::Experiments::Enabled(Common::Experiments::DedupBarriers);
-	static uint64_t last_epoch = UINT64_MAX;
-	static uint64_t last_tick  = UINT64_MAX;
-	if (dedup) {
-		const auto epoch = WorkEpoch();
-		const auto tick  = GetScheduler().CurrentTick();
-		if (epoch == last_epoch && tick == last_tick) {
-			BufferCache::PerfCount(BufferCache::PerfEvent::BarrierSkipped);
+	// KYTY_GUEST_BARRIER_DEDUP: a global barrier with no draw, dispatch or host helper pass (tiler, fault
+	// manager, blit, indirect prep: they bump the pipeline epochs) recorded since the previous one in the
+	// same command-buffer recording orders nothing new. A recording is identified by the scheduler tick.
+	static uint64_t last_work = UINT64_MAX, last_compute = UINT64_MAX, last_graphics = UINT64_MAX;
+	static uint64_t last_tick = UINT64_MAX;
+	if (Common::RuntimeFlags::Current().guest_barrier_dedup) {
+		const uint64_t work     = g_work_epoch.load(std::memory_order_relaxed);
+		const uint64_t compute  = g_compute_pipeline_epoch.load(std::memory_order_relaxed);
+		const uint64_t graphics = g_graphics_pipeline_epoch.load(std::memory_order_relaxed);
+		const uint64_t tick     = GetScheduler().CurrentTick();
+		const bool     redundant = work == last_work && compute == last_compute &&
+		                           graphics == last_graphics && tick == last_tick;
+		last_work = work; last_compute = compute; last_graphics = graphics; last_tick = tick;
+		if (redundant) {
+			FrameBreakdown::Add(FrameBreakdown::g_counters.port_guest_barriers_skipped);
 			return;
 		}
-		last_epoch = epoch;
-		last_tick  = tick;
+	} else {
+		last_tick = UINT64_MAX;
 	}
-	BufferCache::PerfCount(BufferCache::PerfEvent::GuestBarrier);
+	FrameBreakdown::Add(FrameBreakdown::g_counters.port_guest_barriers);
 
 	vk::MemoryBarrier2 barrier {};
 	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;

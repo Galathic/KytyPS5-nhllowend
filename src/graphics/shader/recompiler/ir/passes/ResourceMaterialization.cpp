@@ -1,4 +1,8 @@
+#include "common/runtimeFlags.h"
+#include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "graphics/shader/recompiler/ir/passes/SrtProf.h"
+#include "graphics/shader/recompiler/ir/passes/ResourcePlanFixture.h"
 
 #include "common/assert.h"
 #include "graphics/guest_gpu/gpu_format.h"
@@ -7,6 +11,8 @@
 #include "graphics/shader/shaderBindings.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <array>
 #include <bit>
 #include <chrono>
@@ -23,6 +29,7 @@ namespace {
 
 constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
 constexpr uint64_t MaxIndirectDescriptorProbes = 65536u;
+thread_local ResourceSpecializationCacheStats g_specialization_cache_stats;
 
 class MaterializationTimer {
 public:
@@ -170,11 +177,22 @@ bool DecodeBufferDescriptor(const DescriptorValue& descriptor, ShaderBufferResou
 struct ReadCapture {
 	SrtRuntime                                  source;
 	std::vector<std::pair<uint64_t, uint64_t>>& ranges;
+	bool                                        coalesce = false;
 };
 
 bool CaptureStrictRead(void* userdata, uint64_t address, std::span<uint32_t> values) {
 	auto& capture = *static_cast<ReadCapture*>(userdata);
 	if (!capture.source.read_specialization_memory(capture.source.userdata, address, values)) {
+		return false;
+	}
+	capture.ranges.emplace_back(address, values.size_bytes());
+	return true;
+}
+
+bool CaptureStrictSpan(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	auto& capture = *static_cast<ReadCapture*>(userdata);
+	if (capture.source.try_read_specialization_span == nullptr ||
+	    !capture.source.try_read_specialization_span(capture.source.userdata, address, values)) {
 		return false;
 	}
 	capture.ranges.emplace_back(address, values.size_bytes());
@@ -187,6 +205,23 @@ bool CaptureOrdinaryRead(void* userdata, uint64_t address, std::span<uint32_t> v
 		if (!capture.source.read_memory(capture.source.userdata, address, values)) return false;
 	} else {
 		std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
+	}
+	// Under KYTY_SRT_SOURCE_REUSE, extend the previous range when this read is exactly
+	// adjacent (the union of covered bytes is unchanged).
+	if (capture.coalesce && !capture.ranges.empty() &&
+	    capture.ranges.back().first + capture.ranges.back().second == address) {
+		capture.ranges.back().second += values.size_bytes();
+		return true;
+	}
+	capture.ranges.emplace_back(address, values.size_bytes());
+	return true;
+}
+
+bool CaptureOrdinarySpan(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	auto& capture = *static_cast<ReadCapture*>(userdata);
+	if (capture.source.try_read_memory_span == nullptr ||
+	    !capture.source.try_read_memory_span(capture.source.userdata, address, values)) {
+		return false;
 	}
 	capture.ranges.emplace_back(address, values.size_bytes());
 	return true;
@@ -533,7 +568,8 @@ private:
 };
 
 static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSnapshot& snapshot,
-                                        ResourceSpecialization& specialization) {
+                                        ResourceSpecialization& specialization,
+                                        ResourceSpecializationCache* cache) {
 	for (uint32_t i = 0; i < specialization.images.size(); i++) {
 		const auto& descriptor = snapshot.images[i];
 		auto&       image      = specialization.images[i];
@@ -546,16 +582,43 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		    (base.atomic && base.resource_class != ImageResourceClass::Storage)) {
 			return SpecializationFail(fmt::format("image resource {} has an invalid class", i));
 		}
+		ResourceSpecializationCache::ImageEntry* cached = nullptr;
+		std::array<uint32_t, 7> cache_key {};
+		const bool null = NullImageDescriptor(descriptor);
+		if (cache != nullptr) {
+			const auto* source = Source(program, base.source);
+			if (i < program.info.images.size() &&
+			    image.indirect_root == ImageResource::NoIndirectImage && source != nullptr &&
+			    !source->indirect_descriptor.has_value()) {
+				cached = &cache->images[i];
+				std::copy_n(descriptor.dwords.begin() + 1, cache_key.size(), cache_key.begin());
+				// Address word 0 changes independently of shader typing. Nullness is separate.
+				if (cached->valid && cached->key == cache_key && cached->null == null) {
+					image = cached->value;
+					++g_specialization_cache_stats.image_hits;
+					continue;
+				}
+				++g_specialization_cache_stats.image_misses;
+			} else {
+				++g_specialization_cache_stats.indirect_uncached;
+			}
+		}
+		const auto retain = [&] {
+			if (cached != nullptr) {
+				*cached = {.key = cache_key, .value = image, .null = null, .valid = true};
+			}
+		};
 		image.mip_count = ImageMipCount(base, descriptor);
 		if (image.mip_count == 0u) {
 			return SpecializationFail(
 			    fmt::format("image descriptor {} has an invalid mip range", i));
 		}
-		if (NullImageDescriptor(descriptor)) {
+		if (null) {
 			image.numeric_class = base.atomic ? Prospero::TextureNumericClass::Uint
 			                                  : Prospero::TextureNumericClass::Float;
 			image.dimension     = Decoder::ImageDimension::Dim2D;
 			image.cube          = false;
+			retain();
 			continue;
 		}
 		const auto descriptor_dimension = DescriptorDimension(descriptor, base.dimension);
@@ -613,6 +676,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			    fmt::format("sampled image descriptor {} uses unsupported format {}", i,
 			                static_cast<uint32_t>(format)));
 		}
+		retain();
 	}
 	for (uint32_t root_index = 0; root_index < specialization.images.size(); root_index++) {
 		auto& root = specialization.images[root_index];
@@ -1092,6 +1156,53 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		}
 	}
 	plan.srt_reads.reserve(program.srt_reads.size());
+	plan.descriptor_gathers.resize(plan.descriptor_sources.size());
+	for (size_t source_index = 0; source_index < plan.descriptor_sources.size(); ++source_index) {
+		const auto& source = plan.descriptor_sources[source_index];
+		auto& gather = plan.descriptor_gathers[source_index];
+		if (source.indirect_descriptor.has_value() || source.dword_count > gather.words.size()) continue;
+		gather.valid = true;
+		for (uint32_t word = 0; word < source.dword_count; ++word) {
+			const auto value = source.dwords[word].Resolve();
+			auto& target = gather.words[word];
+			if (value.IsImmediate()) {
+				switch (value.GetType()) {
+					case Type::U1: target.value = value.U1(); break;
+					case Type::U8: target.value = value.U8(); break;
+					case Type::U16: target.value = value.U16(); break;
+					case Type::U32: target.value = value.U32(); break;
+					case Type::U64: target.value = static_cast<uint32_t>(value.U64()); break;
+					case Type::F32: target.value = std::bit_cast<uint32_t>(value.F32Value()); break;
+					default: gather.valid = false; break;
+				}
+			} else if (const auto* inst = value.TryInstruction();
+			           inst != nullptr && inst->GetOpcode() == ValueOpcode::GetUserData) {
+				target.kind = ResourcePlan::DescriptorGather::Word::Kind::UserData;
+				target.value = RegIndex(inst->Arg(0).ScalarRegister());
+			} else if (const auto* inst = value.TryInstruction();
+			           inst != nullptr && inst->GetOpcode() == ValueOpcode::ReadConst) {
+				const auto slot = inst->Arg(1).Resolve();
+				if (!slot.IsImmediate() || slot.GetType() != Type::U32 ||
+				    slot.U32() >= program.srt_reads.size()) {
+					gather.valid = false;
+				} else {
+					target.kind = ResourcePlan::DescriptorGather::Word::Kind::Flat;
+					target.value = program.srt_reads[slot.U32()].flat_offset;
+					target.read_slot = slot.U32();
+					// Each cached slot must name one read, not a slot overwritten by
+					// a different read during the refresh.
+					gather.valid = target.value < program.srt_reads.size() &&
+					    std::ranges::count_if(program.srt_reads, [&](const auto& read) {
+						    return read.flat_offset == target.value;
+					    }) == 1;
+					gather.needs_flat = true;
+				}
+			} else {
+				gather.valid = false;
+			}
+			if (!gather.valid) break;
+		}
+	}
 	for (const auto& read: program.srt_reads) {
 		plan.srt_reads.push_back({Clone(read.value), read.flat_offset});
 	}
@@ -1220,8 +1331,87 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	return plan;
 }
 
-bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
+static std::atomic<uint64_t> g_compiled_verify_ticker {0};
+
+// Image typing depends only on image words 1..7 and the null flag when no table is indirect.
+static bool SpecializationReusable(const ResourcePlan& program, const ResourceSpecialization& specialization) {
+	if (specialization.images.size() != program.info.images.size()) return false;
+	for (uint32_t i = 0; i < program.info.images.size(); ++i) {
+		const auto* source = Source(program, program.info.images[i].source);
+		if (source == nullptr || source->indirect_descriptor.has_value() ||
+		    specialization.images[i].indirect_root != ImageResource::NoIndirectImage)
+			return false;
+	}
+	return true;
+}
+
+static bool TryReuseImageSpecialization(const ResourcePlan& program, ResourceDelta& delta,
+                                        ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+	if (!delta.spec_valid || delta.owner != &program || delta.spec_images_in.size() != snapshot.images.size() ||
+	    delta.spec_images_out.size() != snapshot.images.size() ||
+	    !SpecializationReusable(program, specialization))
+		return false;
+	for (size_t i = 0; i < snapshot.images.size(); ++i) {
+		const auto& before = delta.spec_images_in[i];
+		const auto& now    = snapshot.images[i];
+		if (before.dword_count != now.dword_count || NullImageDescriptor(before) != NullImageDescriptor(now)) return false;
+		for (uint32_t d = 1; d < 8; ++d) {
+			if (before.dwords[d] != now.dwords[d]) return false;
+		}
+	}
+	specialization.images = delta.spec_images_out;
+	CompactImages(snapshot.images, [&](size_t index) { return !specialization.images[index].fmask; });
+	return true;
+}
+
+static bool MaterializeResourcesCore(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+	SRT_PROF_SCOPE(SrtProf::MatTotal);
+	const Common::RuntimeFlags::EvaluationScope flags_scope;
+	FrameBreakdown::g_counters.mat_calls.fetch_add(FrameBreakdown::Enabled() ? 1u : 0u, std::memory_order_relaxed);
+	FrameBreakdown::Timer mat_total_timer(FrameBreakdown::g_counters.mat_total_ns);
+	// Measurement only: the low-level readers feed g_spec_collect, so straight-line (tape) reads
+	// that never reach snapshot.specialization_reads are still observed.
+	struct SpecScope {
+		const ResourceSnapshot&                    snap;
+		std::vector<std::pair<uint64_t, uint64_t>> collected;
+		std::vector<std::pair<uint64_t, uint64_t>>* previous = nullptr;
+		bool                                       active   = FrameBreakdown::Verbose();
+		SpecScope(const ResourceSnapshot& s) : snap(s) {
+			if (active) {
+				previous                      = FrameBreakdown::g_spec_collect;
+				FrameBreakdown::g_spec_collect = &collected;
+			}
+		}
+		~SpecScope() {
+			if (!active) return;
+			FrameBreakdown::g_spec_collect = previous;
+			FrameBreakdown::SpecObserve(collected.empty() ? snap.specialization_reads : collected);
+		}
+	} spec_scope {snapshot};
+	auto* cache = runtime.specialization_cache;
+	if (cache != nullptr && cache->active) cache = nullptr;
+	if (cache != nullptr) {
+		if (cache->owner != &program || cache->buffers.size() != program.info.buffers.size() ||
+		    cache->images.size() != program.info.images.size()) {
+			cache->Reset();
+			cache->owner = &program;
+			cache->buffers.resize(program.info.buffers.size());
+			cache->images.resize(program.info.images.size());
+		}
+		cache->active = true;
+		++g_specialization_cache_stats.calls;
+	}
+	struct CacheAttempt {
+		ResourceSpecializationCache* cache;
+		bool success = false;
+		~CacheAttempt() {
+			if (cache != nullptr) {
+				cache->active = false;
+				if (!success) cache->Reset();
+			}
+		}
+	} cache_attempt {cache};
 	if (!program.resource_tracking_complete ||
 	    (program.requires_specialization_memory && runtime.read_specialization_memory == nullptr)) {
 		return false;
@@ -1230,19 +1420,28 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	const bool capture_reads = program.capture_specialization_reads;
 	auto& reads = snapshot.specialization_reads;
 	reads.clear();
-	ReadCapture capture {runtime, reads};
+	ReadCapture capture {runtime, reads, Common::RuntimeFlags::Current().srt_source_reuse};
 	SrtRuntime observed = runtime;
 	if (capture_reads) {
 		observed.userdata = &capture;
 		observed.read_specialization_memory = runtime.read_specialization_memory != nullptr
 		                                         ? CaptureStrictRead : nullptr;
 		observed.read_memory = CaptureOrdinaryRead;
+		observed.try_read_specialization_span = runtime.try_read_specialization_span != nullptr
+		                                           ? CaptureStrictSpan : nullptr;
+		observed.try_read_memory_span = runtime.try_read_memory_span != nullptr
+		                                   ? CaptureOrdinarySpan : nullptr;
 	}
 	SrtWalker clean(program, CleanRuntime(observed));
 	SrtWalker walker(program, observed, program.clean_flat_slots,
 	                 capture_reads || program.requires_specialization_memory ? &clean : nullptr);
 	timer.Step(MaterializationTimings::Phase::Flat);
-	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
+	bool flat_ok;
+	{
+		FrameBreakdown::Timer timer(FrameBreakdown::g_counters.mat_flat_ns);
+		flat_ok = walker.RefreshFlatBuffer(snapshot.flattened_srt);
+	}
+	if (!flat_ok) {
 		return false;
 	}
 	timer.Step(MaterializationTimings::Phase::Fill);
@@ -1265,6 +1464,8 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			return false;
 		}
 		if (active.empty() || active[source]) {
+			FrameBreakdown::Timer timer(FrameBreakdown::g_counters.mat_eval_ns);
+			FrameBreakdown::g_counters.mat_evals.fetch_add(FrameBreakdown::Enabled() ? 1u : 0u, std::memory_order_relaxed);
 			return (capture_reads && written ? clean : walker).EvaluateDescriptor(source, value);
 		}
 		value = {};
@@ -1285,6 +1486,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			if (source->indirect_descriptor.has_value()) {
 				snapshot.buffers[i] = {.dword_count = 4u};
 				if (active.empty() || active[base.source]) {
+					FrameBreakdown::Timer indirect_timer(FrameBreakdown::g_counters.mat_indirect_ns);
 					if (!MaterializeIndirectDescriptor(
 					        program, *source->indirect_descriptor, i, 4u, observed, clean, snapshot,
 					        snapshot.buffers, specialization.buffers, ShaderInfo::MaxBuffers,
@@ -1304,6 +1506,25 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			descriptor_value.dwords.fill(0);
 			descriptor = {};
 		}
+		ResourceSpecializationCache::BufferEntry* cached = nullptr;
+		const std::array<uint32_t, 2> cache_key {descriptor.fields[1] & 0xffff0000u,
+		                                        descriptor.fields[3]};
+		if (cache != nullptr) {
+			const auto* source = Source(program, base.source);
+			if (i < program.info.buffers.size() && source != nullptr &&
+			    !source->indirect_descriptor.has_value()) {
+				cached = &cache->buffers[i];
+				// NumRecords and the 48-bit address stay live in snapshot, not specialization.
+				if (cached->valid && cached->key == cache_key) {
+					specialization.buffers[i] = cached->value;
+					++g_specialization_cache_stats.buffer_hits;
+					continue;
+				}
+				++g_specialization_cache_stats.buffer_misses;
+			} else {
+				++g_specialization_cache_stats.indirect_uncached;
+			}
+		}
 		auto       packed_stride = descriptor.PackedStride();
 		const auto stride        = packed_stride & 0x3fffu;
 		const bool swizzle       = stride != 0u && ((packed_stride >> 14u) & 1u) != 0u;
@@ -1318,6 +1539,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		    base.formatted ? descriptor.Format() : Prospero::BufferFormat::kInvalid;
 		buffer.descriptor_swizzle = base.formatted ? descriptor.DstSelXYZW() : DstSel(4, 5, 6, 7);
 		buffer.zero_stride_oob    = descriptor.OutOfBounds() == 0u && stride == 0u;
+		if (cached != nullptr) *cached = {.key = cache_key, .value = buffer, .valid = true};
 	}
 	timer.Step(MaterializationTimings::Phase::Images);
 	snapshot.images.resize(program.info.images.size());
@@ -1346,6 +1568,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			}
 			const auto& indirect = *source->indirect_descriptor;
 			const bool bounded_table = IsBoundedDescriptorTable(program, indirect);
+			FrameBreakdown::Timer indirect_timer(FrameBreakdown::g_counters.mat_indirect_ns);
 			if (!MaterializeIndirectDescriptor(
 			        program, indirect, i, 8u, observed, clean, snapshot, snapshot.images,
 			        specialization.images, UINT32_MAX, [&](DescriptorValue& value) {
@@ -1385,9 +1608,219 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	}
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 	timer.Step(MaterializationTimings::Phase::Specialization);
-	return BuildResourceSpecialization(program, snapshot, specialization);
+	{
+		FrameBreakdown::Timer timer(FrameBreakdown::g_counters.mat_spec_ns);
+		auto* delta = runtime.delta;
+		if (delta != nullptr && TryReuseImageSpecialization(program, *delta, snapshot, specialization)) {
+			// Same image words as the last successful build: the typing is the same function of them.
+			cache_attempt.success = true;
+			SrtCompiledCountSpec(false);
+		} else {
+			if (delta != nullptr) {
+				delta->spec_images_in = snapshot.images;
+				SrtCompiledCountSpec(true);
+			}
+			cache_attempt.success = BuildResourceSpecialization(program, snapshot, specialization, cache);
+			if (delta != nullptr) {
+				delta->owner      = &program;
+				delta->spec_valid = cache_attempt.success && SpecializationReusable(program, specialization);
+				if (delta->spec_valid) delta->spec_images_out = specialization.images;
+			}
+		}
+	}
+	return cache_attempt.success;
 }
 
+namespace {
+
+// The ChangeMask of this call against the same program's previous successful call. Compare-then-copy:
+// unchanged parts cost one pass and no copy.
+template <typename T>
+bool UpdateStored(std::vector<T>& stored, const std::vector<T>& current) {
+	if (stored == current) return false;
+	stored = current;
+	return true;
+}
+
+void UpdateDelta(ResourceDelta& delta, const ResourceSnapshot& snapshot) {
+	ResourceChangeMask mask;
+	mask.valid = delta.have;
+	if (delta.have && delta.buffers.size() == snapshot.buffers.size()) {
+		for (size_t i = 0; i < snapshot.buffers.size(); ++i) {
+			const auto& a = delta.buffers[i];
+			const auto& b = snapshot.buffers[i];
+			mask.buffer_addr |= a.dwords[0] != b.dwords[0] || ((a.dwords[1] ^ b.dwords[1]) & 0xffffu) != 0u;
+			mask.buffer_size |= a.dwords[2] != b.dwords[2];
+			bool fmt = a.dword_count != b.dword_count || ((a.dwords[1] ^ b.dwords[1]) & ~0xffffu) != 0u;
+			for (uint32_t d = 3; d < b.dword_count && d < 8; ++d) fmt |= a.dwords[d] != b.dwords[d];
+			mask.buffer_fmt |= fmt;
+		}
+	} else if (delta.have) {
+		mask.buffer_addr = mask.buffer_size = mask.buffer_fmt = true;
+	}
+	const bool images   = UpdateStored(delta.images, snapshot.images);
+	const bool samplers = UpdateStored(delta.samplers, snapshot.samplers);
+	const bool flat     = UpdateStored(delta.flat, snapshot.flattened_srt);
+	const bool user     = UpdateStored(delta.user_data, snapshot.user_data);
+	mask.images            = delta.have && images;
+	mask.samplers          = delta.have && samplers;
+	mask.flat_changed      = delta.have && flat;
+	mask.user_data_changed = delta.have && user;
+	if (!delta.have || mask.buffer_addr || mask.buffer_size || mask.buffer_fmt) delta.buffers = snapshot.buffers;
+	delta.mask = mask;
+	SrtCompiledCountMask(!delta.have, mask.images, mask.samplers, mask.buffer_fmt, mask.buffer_addr,
+	                     mask.buffer_size, mask.flat_changed, mask.user_data_changed);
+	delta.have = true;
+}
+
+bool SameRangeUnion(const std::vector<std::pair<uint64_t, uint64_t>>& a,
+                    const std::vector<std::pair<uint64_t, uint64_t>>& b) {
+	const auto normalize = [](const auto& ranges, std::vector<std::pair<uint64_t, uint64_t>>& result) {
+		for (const auto& [address, size]: ranges) {
+			if (size != 0u) result.emplace_back(address, address + size);
+		}
+		std::sort(result.begin(), result.end());
+		size_t write = 0;
+		for (size_t i = 0; i < result.size(); ++i) {
+			if (write != 0u && result[i].first <= result[write - 1].second)
+				result[write - 1].second = std::max(result[write - 1].second, result[i].second);
+			else
+				result[write++] = result[i];
+		}
+		result.resize(write);
+	};
+	std::vector<std::pair<uint64_t, uint64_t>> left, right;
+	normalize(a, left);
+	normalize(b, right);
+	return left == right;
+}
+
+// Names the first differing output, or nullptr when the two evaluations are bit-identical.
+const char* FirstDifference(const ResourceSnapshot& a, const ResourceSpecialization& sa,
+                            const ResourceSnapshot& b, const ResourceSpecialization& sb) {
+	if (a.buffers != b.buffers) return "buffers";
+	if (a.images != b.images) return "images";
+	if (a.samplers != b.samplers) return "samplers";
+	if (a.flattened_srt != b.flattened_srt) return "flattened_srt";
+	if (a.user_data != b.user_data) return "user_data";
+	if (!(a.uniform_fill == b.uniform_fill)) return "uniform_fill";
+	if (!(sa == sb)) return "specialization";
+	if (!SameRangeUnion(a.specialization_reads, b.specialization_reads)) return "specialization_reads";
+	return nullptr;
+}
+
+bool CompiledVerifyEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DRAWPREP_VERIFY");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+} // namespace
+
+// KYTY_SRT_COMPILED wrapper: the core evaluation, the per-program ChangeMask, and the sampled
+// KYTY_DRAWPREP_VERIFY check that re-runs the existing (non-compiled) path and compares everything.
+static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& runtime,
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+	if (!runtime.allow_compiled || !Common::RuntimeFlags::Current().srt_compiled)
+		return MaterializeResourcesCore(program, runtime, snapshot, specialization);
+	const bool ok = MaterializeResourcesCore(program, runtime, snapshot, specialization);
+	if (runtime.delta != nullptr) {
+		if (ok) UpdateDelta(*runtime.delta, snapshot);
+		else runtime.delta->Reset();
+	}
+	if (CompiledVerifyEnabled() && (g_compiled_verify_ticker.fetch_add(1, std::memory_order_relaxed) & 63u) == 0u) {
+		ResourceSnapshot       reference;
+		ResourceSpecialization reference_spec;
+		SrtRuntime             old_path = runtime;
+		old_path.allow_compiled         = false;
+		old_path.delta                  = nullptr;
+		old_path.specialization_cache   = nullptr;
+		const auto saved_active = program.active_sources;
+		const bool reference_ok = MaterializeResourcesCore(program, old_path, reference, reference_spec);
+		const char* difference  = nullptr;
+		if (reference_ok != ok) difference = "success";
+		else if (ok) difference = FirstDifference(snapshot, specialization, reference, reference_spec);
+		if (difference == nullptr && ok && program.active_sources != saved_active) difference = "active_sources";
+		SrtCompiledCountVerify(difference != nullptr);
+		if (difference != nullptr) {
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 8u) {
+				std::fprintf(stderr, "SRT compiled verify MISMATCH shader=0x%016llx stage=%u field=%s ok=%d ref_ok=%d\n",
+				             static_cast<unsigned long long>(program.shader_hash),
+				             static_cast<unsigned>(program.stage), difference, ok ? 1 : 0, reference_ok ? 1 : 0);
+			}
+			// The existing path is the reference: adopt its outputs.
+			if (reference_ok) {
+				snapshot       = std::move(reference);
+				specialization = std::move(reference_spec);
+			}
+			if (runtime.delta != nullptr) runtime.delta->Reset();
+			return reference_ok;
+		}
+	}
+	return ok;
+}
+
+ResourceSpecializationCacheStats GetResourceSpecializationCacheStats() {
+	return g_specialization_cache_stats;
+}
+
+bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+ // Separate opt-in from the legacy process-wide .arb recorder: those files lack
+ // plan identity and combine changing memory from many evaluations.
+ static const std::string directory = [] {
+  const char* p = std::getenv("KYTY_RESOURCE_PLAN_RECORD");
+  return std::string(p ? p : "");
+ }();
+ if (directory.empty() || program.srt_reads.empty())
+  return MaterializeResourcesImpl(program,runtime,snapshot,specialization);
+ // Optional scene gate. Touch this file after reaching the intended scene;
+ // no navigation, restart or capture of startup plans is required.
+ static const std::string trigger = [] {
+  const char* p = std::getenv("KYTY_RESOURCE_PLAN_TRIGGER");
+  return std::string(p ? p : "");
+ }();
+ if (!trigger.empty()) {
+  static thread_local auto next_poll = std::chrono::steady_clock::time_point{};
+  static thread_local bool armed = false;
+  if (!armed) {
+   const auto now = std::chrono::steady_clock::now();
+   if (now >= next_poll) {
+    next_poll = now + std::chrono::milliseconds(250);
+    std::error_code ec;
+    armed = std::filesystem::exists(trigger,ec) && !ec;
+   }
+   if (!armed) return MaterializeResourcesImpl(program,runtime,snapshot,specialization);
+  }
+ }
+ static std::atomic<bool> exhausted{false};
+ if (exhausted.load(std::memory_order_relaxed)) return MaterializeResourcesImpl(program,runtime,snapshot,specialization);
+ static std::mutex mutex;
+ static std::set<std::pair<uint64_t,uint32_t>> recorded;
+ static const uint64_t selected_hash = [] {
+  const char* p = std::getenv("KYTY_RESOURCE_PLAN_HASH");
+  return p ? std::strtoull(p,nullptr,16) : uint64_t{0};
+ }();
+ if (selected_hash && program.shader_hash != selected_hash)
+  return MaterializeResourcesImpl(program,runtime,snapshot,specialization);
+ bool capture = false;
+ {
+  std::lock_guard<std::mutex> lock(mutex);
+  if (recorded.size() < 32)
+   capture = recorded.emplace(program.shader_hash,static_cast<uint32_t>(program.stage)).second;
+  if (recorded.size()>=32) exhausted.store(true,std::memory_order_relaxed);
+ }
+ if (!capture) return MaterializeResourcesImpl(program,runtime,snapshot,specialization);
+ std::error_code ec;
+ std::filesystem::create_directories(directory,ec);
+ if (ec) return MaterializeResourcesImpl(program,runtime,snapshot,specialization);
+ const auto name = fmt::format("{:016x}-{}.rpf",program.shader_hash,static_cast<uint32_t>(program.stage));
+ return CaptureResourcePlan(program,runtime,snapshot,specialization,
+  (std::filesystem::path(directory)/name).string(),MaterializeResourcesImpl);
+}
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {
 	EXIT_IF(!program.resource_tracking_complete || program.shader_info_complete ||
 	        program.binding_layout_complete);

@@ -1,3 +1,4 @@
+#include "common/eventTrace.h"
 #include "kernel/semaphore.h"
 
 #include "common/assert.h"
@@ -291,7 +292,11 @@ int KYTY_SYSV_ABI KernelWaitSema(KernelSema sem, int need, KernelUseconds* time)
 		return KERNEL_ERROR_ESRCH;
 	}
 
+	Common::EventTrace::Record(Common::EventTrace::GUEST_SEMA_WAIT_BEGIN, reinterpret_cast<uint64_t>(sem),
+	                           static_cast<uint64_t>(need));
 	auto result = sem->Wait(need, time);
+	Common::EventTrace::Record(Common::EventTrace::GUEST_SEMA_WAIT_END, reinterpret_cast<uint64_t>(sem),
+	                           static_cast<uint64_t>(result));
 
 	int ret = OK;
 

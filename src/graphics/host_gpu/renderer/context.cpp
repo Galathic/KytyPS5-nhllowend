@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/host_gpu/renderer/frameDump.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -68,6 +69,7 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	}
 	EXIT_IF(state.width == 0 || state.height == 0 || state.num_layers == 0 ||
 	        state.num_color_attachments > RENDER_COLOR_ATTACHMENTS_MAX);
+	FrameBreakdown::GpuBusyScope busy_scope(FrameBreakdown::GB_RENDER_PASS);
 	EndRendering();
 	BufferCache::PerfCount(BufferCache::PerfEvent::RenderPassBegin);
 
@@ -115,6 +117,7 @@ void CommandBuffer::EndRendering() const {
 	if (!m_rendering) {
 		return;
 	}
+	FrameBreakdown::GpuBusyScope busy_scope(FrameBreakdown::GB_RENDER_PASS);
 	Handle().endRendering();
 	if (FrameDump::Active()) {
 		FrameDump::OnEndRendering(*this, m_render_state);

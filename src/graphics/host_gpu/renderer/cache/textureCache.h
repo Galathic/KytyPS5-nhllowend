@@ -14,6 +14,7 @@
 
 #include <atomic>
 #include <map>
+#include <mutex>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -51,6 +52,17 @@ public:
 	// the result is such a match (a valid hint for the next lookup).
 	[[nodiscard]] ImageId FindImageHinted(ImageDesc& desc, bool exact_format, ImageId hint,
 	                                      bool& exact);
+	// KYTY_DRAWPREP_DELTA: bumped whenever a previously resolved T# -> image binding could be stale.
+	[[nodiscard]] uint64_t      Generation() const noexcept { return m_generation.load(std::memory_order_relaxed); }
+	// Appends {new generation, [begin,end)} to the ring log and bumps the generation. The default range is a
+	// wildcard that overlaps every memo.
+	void BumpGeneration(uint64_t begin = 0, uint64_t end = UINT64_MAX) noexcept;
+	enum class GenCheck : uint8_t { Clean, Overlap, Overrun };
+	// Checks every log entry in (memo_gen, current] against the guest range [begin,end). `current` receives the
+	// generation the check was made against (read under the log lock). Clean = no entry overlaps.
+	[[nodiscard]] GenCheck CheckGenerationLog(uint64_t memo_gen, uint64_t begin, uint64_t end, uint64_t& current) const;
+	// The per-call bookkeeping FindImage does on a hit (last-access tick, LRU touch).
+	void                        NoteImageUse(ImageId id);
 	void                        UpdateImage(ImageId id);
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
@@ -187,6 +199,8 @@ private:
 	BufferCache&                                      m_buffer_cache;
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
+	// Registered images by exact start address (FindImage fast path).
+	std::unordered_map<uint64_t, std::vector<ImageId>> m_images_by_address;
 	std::unordered_map<vk::Format, ImageId>           m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
@@ -200,6 +214,15 @@ private:
 	bool             m_readback_linear_images = false;
 	// Set while an overlap/alias resolution frees an image; only those frees write back.
 	bool             m_alias_free_in_progress = false;
+	std::atomic<uint64_t> m_generation {0};
+	struct GenLogEntry {
+		uint64_t generation = 0;
+		uint64_t begin      = 0;
+		uint64_t end        = 0;
+	};
+	static constexpr uint64_t GEN_LOG_SIZE = 64;
+	mutable std::mutex        m_gen_log_mutex;
+	GenLogEntry               m_gen_log[GEN_LOG_SIZE] {};
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;

@@ -8,12 +8,28 @@
 #include "graphics/shader/shaderBindings.h"
 
 #include <array>
+#include <atomic>
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 
 namespace Libs::Graphics {
+
+// Codegen option: native f16 (Float16 capability) for V_PK_{ADD,MUL,FMA,FMAC}_F16 with plain
+// operands. Set once at device creation (KYTY_NATIVE_FP16=1 and shaderFloat16 supported). The mode
+// bits describe which float-controls f16 execution modes the device allows the emitter to declare.
+inline constexpr uint32_t kNativeFp16DenormPreserve = 1u << 0u;
+inline constexpr uint32_t kNativeFp16SignedZeroInfNan = 1u << 1u;
+inline constexpr uint32_t kNativeFp16RoundTiesEven = 1u << 2u;
+inline std::atomic<bool>     g_shader_native_fp16 {false};
+inline std::atomic<uint32_t> g_shader_native_fp16_modes {0};
+[[nodiscard]] inline bool ShaderNativeFp16() {
+	return g_shader_native_fp16.load(std::memory_order_relaxed);
+}
+[[nodiscard]] inline uint32_t ShaderNativeFp16Modes() {
+	return g_shader_native_fp16_modes.load(std::memory_order_relaxed);
+}
 
 namespace ShaderError {
 

@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/runtimeFlags.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
@@ -16,7 +17,9 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <magic_enum.hpp>
@@ -879,9 +882,30 @@ bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
 }
 
 bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
+	const bool fast = (Common::RuntimeFlags::g_published.load(std::memory_order_relaxed) & (uint64_t {1} << Common::RuntimeFlags::kBitSrtSourceReuse)) != 0;
 	return g_guest_address_space != nullptr &&
-	       g_guest_address_space->TryReadBacking(vaddr, data, size);
+	       g_guest_address_space->TryReadBacking(vaddr, data, size, fast);
 }
+
+namespace {
+// KYTY_PERF_STATS=1: synchronous downloads triggered by resource-materialization reads
+// (shader descriptor/SRT reads of GPU-dirty bytes). `unchanged` counts downloads whose
+// bytes were identical before and after, i.e. the range was marked dirty but the GPU had
+// not actually changed what was read. GPU thread only, so plain counters suffice.
+struct BufferBackingReadStats {
+	uint64_t downloads = 0, unchanged = 0, compared = 0, bytes = 0, ns = 0;
+	std::chrono::steady_clock::time_point last_print {};
+};
+BufferBackingReadStats g_backing_read_stats;
+
+bool BackingReadStatsEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PERF_STATS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+} // namespace
 
 bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
@@ -890,7 +914,34 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 		}
 		auto& buffers = GetGpuResources().GetBufferCache();
 		if (buffers.HasGpuDirtyBytes(vaddr, size)) {
-			buffers.ReadMemory(vaddr, size);
+			if (!BackingReadStatsEnabled()) {
+				buffers.ReadMemory(vaddr, size);
+			} else {
+				auto&                 stats = g_backing_read_stats;
+				std::array<uint8_t, 256> before {};
+				const bool compare = size <= before.size() && TryReadBacking(vaddr, before.data(), size);
+				const auto start   = std::chrono::steady_clock::now();
+				buffers.ReadMemory(vaddr, size);
+				const auto now = std::chrono::steady_clock::now();
+				stats.ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count());
+				stats.downloads++;
+				stats.bytes += size;
+				if (compare) {
+					std::array<uint8_t, 256> after {};
+					if (TryReadBacking(vaddr, after.data(), size)) {
+						stats.compared++;
+						stats.unchanged += std::memcmp(before.data(), after.data(), size) == 0 ? 1 : 0;
+					}
+				}
+				if (now - stats.last_print >= std::chrono::seconds(5)) {
+					std::printf("NHL27SRTREAD: downloads=%llu ms=%.1f bytes=%llu compared=%llu unchanged=%llu\n",
+					            static_cast<unsigned long long>(stats.downloads), static_cast<double>(stats.ns) / 1e6,
+					            static_cast<unsigned long long>(stats.bytes), static_cast<unsigned long long>(stats.compared),
+					            static_cast<unsigned long long>(stats.unchanged));
+					std::fflush(stdout);
+					stats.last_print = now;
+				}
+			}
 		}
 	}
 	return TryReadBacking(vaddr, data, size);
@@ -920,6 +971,28 @@ bool TryReadCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 		return false;
 	}
 	return TryReadBacking(vaddr, data, size);
+}
+
+bool TryReadCleanBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
+	if (g_gpu_resources == nullptr || !Graphics::GuestGpu::IsGpuThread() || data == nullptr ||
+	    !Graphics::GuestRange {vaddr, size}.Valid()) {
+		return false;
+	}
+	if (GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size)) return false;
+	// TryReadBacking validates every mapping before transferring any bytes, under
+	// its mapping lock. A unavailable/cross-gap span leaves output untouched.
+	return TryReadBacking(vaddr, data, size);
+}
+
+CleanBackingCompare TryValidateCleanBacking(uint64_t vaddr, const void* expected, uint64_t size) {
+	if (g_gpu_resources == nullptr || g_guest_address_space == nullptr || !Graphics::GuestGpu::IsGpuThread() ||
+	    expected == nullptr || !Graphics::GuestRange {vaddr, size}.Valid()) {
+		return CleanBackingCompare::Unavailable;
+	}
+	if (GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size)) return CleanBackingCompare::Dirty;
+	bool equal = false;
+	if (!g_guest_address_space->TryCompareBacking(vaddr, expected, size, equal)) return CleanBackingCompare::Unavailable;
+	return equal ? CleanBackingCompare::Equal : CleanBackingCompare::Different;
 }
 
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
@@ -960,6 +1033,7 @@ void InstallGpuResources(Graphics::RenderContext* resources) noexcept {
 }
 
 bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept {
+	Graphics::NotePm4MemoryFault(fault_vaddr, static_cast<uint32_t>(access));
 	return g_gpu_resources != nullptr && g_gpu_resources->HandleFault(access, fault_vaddr);
 }
 

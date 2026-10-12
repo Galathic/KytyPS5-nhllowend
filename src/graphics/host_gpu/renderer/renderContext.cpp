@@ -2,8 +2,11 @@
 
 #include "common/assert.h"
 #include "common/experiments.h"
+#include "common/hostException.h"
 #include "common/logging/log.h"
+#include "common/runtimeFlags.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
 
@@ -68,6 +71,39 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	}
 	ProtectStats::CountFault(access == PageFaultAccess::Write);
 	Common::Timeline::Mark(access == PageFaultAccess::Write ? "fault-write" : "fault-read", fault_vaddr);
+	// KYTY_PERF_STATS: fault time includes any synchronous readback it triggers (overlaps readback).
+	FrameBreakdown::Timer fault_timer(FrameBreakdown::g_counters.fault_ns);
+	FrameBreakdown::GpuBusyScope busy_scope(FrameBreakdown::GB_FAULT);
+	FrameBreakdown::Add(FrameBreakdown::g_counters.fault_count);
+	// NHL27FAULTCOST accounting (KYTY_PERF_STATS only).
+	struct FaultCostScope {
+		bool     active = FrameBreakdown::Enabled();
+		bool     gpu    = false;
+		uint64_t start  = 0;
+		~FaultCostScope() {
+			if (!active) {
+				return;
+			}
+			auto&          fc = FrameBreakdown::g_fault_cost;
+			const uint64_t ns = FrameBreakdown::NowNs() - start;
+			fc.total_ns.fetch_add(ns, std::memory_order_relaxed);
+			(gpu ? fc.total_gpu_ns : fc.total_guest_ns).fetch_add(ns, std::memory_order_relaxed);
+			FrameBreakdown::g_in_fault = false;
+		}
+	} cost_scope;
+	if (cost_scope.active) {
+		auto&          fc    = FrameBreakdown::g_fault_cost;
+		const uint64_t entry = Common::HostException::LastEntryTimeNs();
+		cost_scope.start     = FrameBreakdown::NowNs();
+		if (entry != 0 && cost_scope.start > entry) {
+			fc.veh_ns.fetch_add(cost_scope.start - entry, std::memory_order_relaxed);
+		}
+		cost_scope.gpu = GuestGpu::IsGpuThread();
+		fc.n[(cost_scope.gpu ? 0 : 2) + (access == PageFaultAccess::Write ? 1 : 0)].fetch_add(
+		    1, std::memory_order_relaxed);
+		FrameBreakdown::NoteFaultPage(fault_vaddr);
+		FrameBreakdown::g_in_fault = true;
+	}
 	if (access == PageFaultAccess::Write) {
 		if (Common::Experiments::Enabled(Common::Experiments::FaultCoalesce)) {
 			// Games stream per-frame data through CPU-written rings: one fault per page and one
@@ -83,9 +119,29 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 				m_buffer_cache.InvalidateCleanWindow(begin, window);
 			}
 		}
-		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
-		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
+		if (FrameBreakdown::Enabled()) {
+			FrameBreakdown::SpecNoteFault(fault_vaddr);
+		}
+		{
+			FrameBreakdown::FaultTimer t(FrameBreakdown::g_fault_cost.buf_inv_ns);
+			m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
+		}
+		{
+			FrameBreakdown::FaultTimer t(FrameBreakdown::g_fault_cost.tex_inv_ns);
+			m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
+		}
+		// KYTY_FAULT_AHEAD: streaming writers (ring buffers) fault on every page they touch
+		// each frame, and each page is re-protected after its upload. Unprotect the next
+		// pages of the buffer tracker up front so one fault covers the run.
+		if (Common::RuntimeFlags::Current().fault_ahead) {
+			constexpr uint64_t kAheadBytes = 15 * TRACKER_PAGE_SIZE;
+			const uint64_t next = (fault_vaddr & ~(TRACKER_PAGE_SIZE - 1)) + TRACKER_PAGE_SIZE;
+			if (IsMapped(next, kAheadBytes)) {
+				m_buffer_cache.MarkCpuDirtyAhead(next, kAheadBytes);
+			}
+		}
 	} else {
+		FrameBreakdown::FaultTimer t(FrameBreakdown::g_fault_cost.rd_readmem_ns);
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size, false, BufferCache::ReadCaller::Fault);
 	}
 	return true;
@@ -148,6 +204,11 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	m_gpu->SendCommandSync(unmap);
 }
 
+// Pages of TRACKER_PAGE_SIZE covering [start, end). Used only by the NHL27BDA counters.
+static uint64_t PagesIn(uint64_t start, uint64_t end) {
+	return (end - start + TRACKER_PAGE_SIZE - 1) / TRACKER_PAGE_SIZE;
+}
+
 void RenderContext::PrepareBda() {
 	if (!m_bda_logged) {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
@@ -165,7 +226,28 @@ void RenderContext::PrepareBda() {
 		const char* value = std::getenv("KYTY_BDA_DIRTY_REGIONS");
 		return value != nullptr && value[0] == '1' && value[1] == '\0';
 	}();
-	std::shared_lock lock(m_mapped_ranges_mutex);
+	FrameBreakdown::Add(FrameBreakdown::g_counters.bda_calls);
+	FrameBreakdown::Timer total_timer(FrameBreakdown::g_counters.bda_total_ns);
+	std::shared_lock<decltype(m_mapped_ranges_mutex)> lock;
+	{
+		FrameBreakdown::Timer lock_timer(FrameBreakdown::g_counters.bda_lock_ns);
+		lock = std::shared_lock(m_mapped_ranges_mutex);
+	}
+	auto& batch = FrameBreakdown::g_bda_batch;
+	if (stats_enabled) {
+		batch.active = true;
+		++batch.b_calls;
+	}
+	// KYTY_BDA_BATCH: only the first call of a batch synchronizes. A mapping change (unmap/map from the
+	// GPU command lane or a guest thread) always forces a sync. Writes that land after the batch's sync
+	// become visible at the next batch boundary (see NHL27BDABATCH for how often that window matters).
+	if (m_bda_batch_synced && Common::RuntimeFlags::g_published.load(std::memory_order_relaxed) >> Common::RuntimeFlags::kBitBdaBatch & 1u &&
+	    m_mapping_generation == m_bda_mapping_generation) {
+		if (stats_enabled) {
+			++batch.flag_skips;
+		}
+		return;
+	}
 	const auto cpu = m_buffer_cache.CpuModificationGeneration();
 	const auto registrations = m_buffer_cache.RegistrationGeneration();
 	const bool unchanged = cache_enabled && cpu == m_bda_cpu_generation &&
@@ -173,15 +255,36 @@ void RenderContext::PrepareBda() {
 	                       m_mapping_generation == m_bda_mapping_generation;
 	if (unchanged) {
 		++m_bda_stats.reused;
+		FrameBreakdown::Add(FrameBreakdown::g_counters.bda_skips);
 	} else {
 		++m_bda_stats.scans;
+		const bool extra_scan = batch.scanned;
+		if (stats_enabled) {
+			batch.collecting = true;
+			batch.scan_ranges.clear();
+		}
 		if (cache_enabled && dirty_regions) {
 			const bool full = m_mapping_generation != m_bda_mapping_generation;
 			m_bda_stats.full_scans += full;
-			m_bda_stats.dirty_regions += m_buffer_cache.SynchronizeBuffersInRanges(m_mapped_ranges, full);
+			if (full) {
+				FrameBreakdown::Add(FrameBreakdown::g_counters.bda_scans);
+			}
+			uint64_t drained = 0;
+			{
+				FrameBreakdown::Timer sync_timer(FrameBreakdown::g_counters.bda_sync_ns);
+				FrameBreakdown::BufScope buf_scope(2);
+				FrameBreakdown::VAdd(FrameBreakdown::g_buf.bda_syncs);
+				drained = m_buffer_cache.SynchronizeBuffersInRanges(m_mapped_ranges, full);
+			}
 		} else {
 			++m_bda_stats.full_scans;
+			FrameBreakdown::Add(FrameBreakdown::g_counters.bda_scans);
+			FrameBreakdown::Timer sync_timer(FrameBreakdown::g_counters.bda_sync_ns);
+			FrameBreakdown::BufScope buf_scope(2);
+			FrameBreakdown::VAdd(FrameBreakdown::g_buf.bda_syncs);
 			m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
+				FrameBreakdown::Add(FrameBreakdown::g_counters.bda_ranges);
+				FrameBreakdown::Add(FrameBreakdown::g_counters.bda_pages, PagesIn(start, end));
 				m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
 			});
 		}
@@ -190,7 +293,25 @@ void RenderContext::PrepareBda() {
 		m_bda_cpu_generation = cpu;
 		m_bda_registration_generation = registrations;
 		m_bda_mapping_generation = m_mapping_generation;
+		if (stats_enabled) {
+			batch.collecting = false;
+			++batch.b_scans;
+			batch.scanned = true;
+			if (extra_scan && !batch.scan_ranges.empty()) {
+				const uint32_t event = batch.b_events++;
+				for (const auto& r: batch.scan_ranges) {
+					batch.stale_bytes += r.second - r.first;
+					if (batch.late.size() < 8192) {
+						batch.late.push_back({r.first, r.second, event});
+					} else {
+						++batch.trunc;
+					}
+				}
+			}
+		}
 	}
+	m_bda_batch_synced = true;
+	total_timer.Stop();
 	// Lazy BDA faults still need processing even when uploads were unchanged.
 	m_fault_process_pending = true;
 	if (stats_enabled && ((m_bda_stats.scans + m_bda_stats.reused) & 4095u) == 0) {
@@ -207,7 +328,89 @@ void RenderContext::PrepareBda() {
 	}
 }
 
+static const char* const kBdaBoundaryNames[] = {"submit", "wait", "event", "acquire", "dma", "sync", "ib", "flip", "other"};
+
+void RenderContext::BdaBatchBoundary(BdaBoundary kind) {
+	m_bda_batch_synced = false;
+	if (!FrameBreakdown::Enabled()) {
+		return;
+	}
+	auto& b = FrameBreakdown::g_bda_batch;
+	++b.kind[static_cast<size_t>(kind)];
+	if (kind == BdaBoundary::Flip) {
+		++b.flips;
+	}
+	if (!b.active) {
+		b.used.clear();
+		b.late.clear();
+		b.b_events = 0;
+		return;
+	}
+	// Close the batch: classify stale-window events against the buffers requested during the batch.
+	++b.batches;
+	b.calls += b.b_calls;
+	b.scans += b.b_scans;
+	b.extra_scans += b.b_scans > 0 ? b.b_scans - 1 : 0;
+	b.max_calls = std::max<uint64_t>(b.max_calls, b.b_calls);
+	if (b.b_events != 0) {
+		std::sort(b.used.begin(), b.used.end());
+		std::vector<std::pair<uint64_t, uint64_t>> merged;
+		for (const auto& r: b.used) {
+			if (!merged.empty() && r.first <= merged.back().second) {
+				merged.back().second = std::max(merged.back().second, r.second);
+			} else {
+				merged.push_back(r);
+			}
+		}
+		std::vector<char> hit(b.b_events, 0);
+		for (const auto& l: b.late) {
+			auto it = std::upper_bound(merged.begin(), merged.end(), l.begin,
+			                           [](uint64_t v, const std::pair<uint64_t, uint64_t>& m) { return v < m.second; });
+			if (it != merged.end() && it->first < l.end) {
+				hit[l.event] = 1;
+			}
+		}
+		for (const char h: hit) {
+			++b.events;
+			(h ? b.ev_used : b.ev_unused) += 1;
+		}
+	}
+	b.active  = false;
+	b.scanned = false;
+	b.b_calls = b.b_scans = b.b_events = 0;
+	b.used.clear();
+	b.late.clear();
+	const auto now = std::chrono::steady_clock::now();
+	if (b.last_print == std::chrono::steady_clock::time_point {}) {
+		b.last_print = now;
+	}
+	if (now - b.last_print >= std::chrono::seconds(5)) {
+		const double flips   = static_cast<double>(std::max<uint64_t>(b.flips, 1));
+		const double batches = static_cast<double>(std::max<uint64_t>(b.batches, 1));
+		std::printf("NHL27BDABATCH flag=%d flips=%llu batches/flip=%.1f calls/batch=%.2f scans/batch=%.2f max_calls=%llu "
+		            "avoidable_syncs/flip=%.1f flag_skips/flip=%.1f stale_events/flip=%.2f (a_overlaps_used=%llu "
+		            "b_unused=%llu) stale_kb/flip=%.1f trunc=%llu bnd/flip[",
+		            static_cast<int>(Common::RuntimeFlags::g_published.load(std::memory_order_relaxed) >> Common::RuntimeFlags::kBitBdaBatch & 1u),
+		            static_cast<unsigned long long>(b.flips), static_cast<double>(b.batches) / flips,
+		            static_cast<double>(b.calls) / batches, static_cast<double>(b.scans) / batches,
+		            static_cast<unsigned long long>(b.max_calls), static_cast<double>(b.extra_scans) / flips,
+		            static_cast<double>(b.flag_skips) / flips, static_cast<double>(b.events) / flips,
+		            static_cast<unsigned long long>(b.ev_used), static_cast<unsigned long long>(b.ev_unused),
+		            static_cast<double>(b.stale_bytes) / 1024.0 / flips, static_cast<unsigned long long>(b.trunc));
+		for (size_t i = 0; i < static_cast<size_t>(BdaBoundary::Count); ++i) {
+			std::printf("%s%s=%.1f", i == 0 ? "" : " ", kBdaBoundaryNames[i], static_cast<double>(b.kind[i]) / flips);
+		}
+		std::printf("]\n");
+		std::fflush(stdout);
+		b.batches = b.calls = b.scans = b.extra_scans = b.events = b.ev_used = b.ev_unused = 0;
+		b.stale_bytes = b.trunc = b.flag_skips = b.flips = b.max_calls = 0;
+		std::fill(std::begin(b.kind), std::end(b.kind), 0);
+		b.last_print = now;
+	}
+}
+
 void RenderContext::RunGarbageCollector() {
+	FrameBreakdown::GpuBusyScope busy_scope(FrameBreakdown::GB_GC);
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;
 		m_buffer_cache.ProcessFaultBuffer();

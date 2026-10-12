@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/experiments.h"
+#include "common/runtimeFlags.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -10,6 +11,7 @@
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -21,6 +23,9 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cstring>
+#include <type_traits>
+#include <unordered_map>
 
 namespace Libs::Graphics {
 
@@ -42,7 +47,6 @@ static bool DccAlphaOnMsb(const HW::ColorInfo& info) {
 	       info.channel_order == Prospero::ChannelOrder::kAlt;
 }
 
-// NOLINTNEXTLINE(readability-function-cognitive-complexity)
 namespace {
 
 // Experiment RenderTargetMemo memoizes render-target descriptions: the decoding below is a
@@ -82,10 +86,13 @@ std::unordered_map<ColorTargetKey, CachedColorTarget, ColorTargetKeyHash>& Color
 
 } // namespace
 
+// NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& r,
                                               uint32_t         render_target_slice_offset,
                                               uint32_t rt_slot, bool ignore_target_mask,
                                               bool exact_format) {
+	FrameBreakdown::Timer prep_timer(FrameBreakdown::g_counters.prep_color_target_ns,
+	                                 FrameBreakdown::DetailEnabled());
 	KYTY_PROFILER_FUNCTION();
 	const auto& hw = buffer.GetRegisters();
 

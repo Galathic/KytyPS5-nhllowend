@@ -801,6 +801,24 @@ void DefineModule(EmitterState& state) {
 		// state.builder.RequireCapability(spv::CapabilityDenormPreserve);
 		// state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDenormPreserve, 64u);
 	}
+	if (state.requirements.float16) {
+		// Guest MODE (float_mode 0xc0): f16 rounds to nearest even and preserves denormals.
+		const auto modes = ShaderNativeFp16Modes();
+		state.builder.RequireCapability(spv::CapabilityFloat16);
+		if ((modes & kNativeFp16SignedZeroInfNan) != 0u) {
+			state.builder.RequireCapability(spv::CapabilitySignedZeroInfNanPreserve);
+			state.builder.AddExecutionMode(state.main_func,
+			                               spv::ExecutionModeSignedZeroInfNanPreserve, 16u);
+		}
+		if ((modes & kNativeFp16DenormPreserve) != 0u) {
+			state.builder.RequireCapability(spv::CapabilityDenormPreserve);
+			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDenormPreserve, 16u);
+		}
+		if ((modes & kNativeFp16RoundTiesEven) != 0u) {
+			state.builder.RequireCapability(spv::CapabilityRoundingModeRTE);
+			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeRoundingModeRTE, 16u);
+		}
+	}
 	if (const auto* cs = ShaderWorkgroupInput(state.program.stage, state.input_info)) {
 		uint32_t    local_x = state.requirements.compute_derivatives ? 2u : 1u;
 		uint32_t    local_y = state.requirements.compute_derivatives ? 2u : 1u;

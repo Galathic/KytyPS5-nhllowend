@@ -1,3 +1,4 @@
+#include "common/eventTrace.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -845,6 +846,7 @@ Swapchain::Status Swapchain::Present() {
 	vk::Result result;
 	{
 		Common::LockGuard lock(m_window.graphic_ctx.queue_mutex);
+		Common::EventTrace::Record(Common::EventTrace::PRESENT, m_image_index);
 		result = m_window.graphic_ctx.queue.presentKHR(&present);
 	}
 	switch (result) {

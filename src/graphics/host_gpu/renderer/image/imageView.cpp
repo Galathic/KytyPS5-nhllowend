@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 
 #include <cstdio>
@@ -327,6 +328,7 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	normalized.usage = is_storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlags {};
 	for (const auto& cached: views) {
 		if (cached.info == normalized) {
+			FrameBreakdown::TexAdd(FrameBreakdown::g_tex.view_hit);
 			return cached.view;
 		}
 	}
@@ -388,6 +390,7 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	create.subresourceRange.baseArrayLayer = normalized.base_layer;
 	create.subresourceRange.layerCount     = normalized.layer_count;
 
+	FrameBreakdown::TexAdd(FrameBreakdown::g_tex.view_created);
 	vk::ImageView view   = nullptr;
 	const auto    result = m_graphics.device.createImageView(&create, nullptr, &view);
 	if (result != vk::Result::eSuccess || view == nullptr) {

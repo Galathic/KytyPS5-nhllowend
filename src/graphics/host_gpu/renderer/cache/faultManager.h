@@ -28,11 +28,16 @@ private:
 	BufferCache&                               m_buffer_cache;
 	Buffer                                     m_fault_buffer;
 	Buffer                                     m_download_buffer;
+	Buffer                                     m_indirect_buffer;
 	std::array<uint64_t, MaxPendingFaults>      m_fault_areas {};
 	uint32_t                                   m_current_area = 0;
+	bool                                       m_gate_enabled = false; // KYTY_FAULT_PARSE_GATE=1
+	bool                                       m_gate_primed  = false; // first gated pass forces a parse
 	vk::DescriptorSetLayout                    m_fault_process_desc_layout = nullptr;
 	vk::Pipeline                               m_fault_process_pipeline = nullptr;
 	vk::PipelineLayout                         m_fault_process_pipeline_layout = nullptr;
+	vk::Pipeline                               m_fault_gate_pipeline = nullptr;
+	vk::PipelineLayout                         m_fault_gate_pipeline_layout = nullptr;
 };
 
 } // namespace Libs::Graphics

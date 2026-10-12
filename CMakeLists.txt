@@ -49,6 +49,7 @@ include("${KYTY_SOURCE_DIR}/utils.cmake")
 include(CTest)
 
 option(KYTY_ENABLE_CLANG_TIDY "Run clang-tidy checks during builds" OFF)
+option(KYTY_ENABLE_ITERATION_PCH "Enable reusable Vulkan precompiled headers for emulator iteration builds" OFF)
 
 set(KYTY_BUILD_ORIGIN "Source" CACHE STRING "Build provenance shown in diagnostics")
 set_property(CACHE KYTY_BUILD_ORIGIN PROPERTY STRINGS Source Official Fork)
@@ -297,6 +298,21 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${fault_buffer_shader_header}")
+
+set(fault_buffer_gate_source "${gpu_tiler_shader_dir}/fault_buffer_gate.comp")
+set(fault_buffer_gate_spv "${gpu_tiler_generated_dir}/fault_buffer_gate.spv")
+set(fault_buffer_gate_header "${gpu_tiler_generated_dir}/fault_buffer_gate_spv.h")
+add_custom_command(
+	OUTPUT "${fault_buffer_gate_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${fault_buffer_gate_spv}" "${fault_buffer_gate_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${fault_buffer_gate_spv} -DOUTPUT=${fault_buffer_gate_header}
+	        -DSYMBOL=FAULT_BUFFER_GATE_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${fault_buffer_gate_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${fault_buffer_gate_header}")
 list(APPEND kyty_emulator_src ${gpu_tiler_shader_headers})
 
 set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")
@@ -469,7 +485,15 @@ add_executable(resource_materialization_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
 )
 target_link_libraries(resource_materialization_tests fmt::fmt)
+if(KYTY_SRT_PROFILE)
+	# Offline TSC accumulators (SrtProf.h); never enabled for the emulator.
+	target_compile_definitions(resource_materialization_tests PRIVATE KYTY_SRT_PROFILE=1)
+endif()
 target_include_directories(resource_materialization_tests PRIVATE ${inc_headers})
+if(KYTY_CLANG_CL)
+	# Symbols for stack-sampling the offline plan benchmark (--benchmark-plans).
+	target_link_options(resource_materialization_tests PRIVATE "/DEBUG:FULL")
+endif()
 
 add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ResourceTrackingTests.cpp"
@@ -765,6 +789,27 @@ endif()
 # dlopen/dlsym/dladdr for RenderDoc.
 target_link_libraries(kyty_emulator ${CMAKE_DL_LIBS})
 target_include_directories(kyty_emulator PRIVATE ${inc_headers})
+
+# These two targets compile the same emulator source set with matching
+# compile options and definitions. Keep the opt-in PCH local to them so the
+# default build and all other targets remain unchanged.
+if(KYTY_ENABLE_ITERATION_PCH)
+	# Match the source-level definition used by kyty_emulator_src when creating the PCH;
+	# identical duplicate definitions on those source files are benign.
+	if(KYTY_CLANG_CL)
+		target_compile_definitions(kyty_emulator PRIVATE _TIMESPEC_DEFINED)
+		target_compile_definitions(shader_recompiler_compute_tests PRIVATE _TIMESPEC_DEFINED)
+	endif()
+	set_source_files_properties(
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/vma.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/vulkanCommon.cpp"
+		PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
+	target_precompile_headers(kyty_emulator PRIVATE
+		"$<$<COMPILE_LANGUAGE:CXX>:${KYTY_SOURCE_DIR}/graphics/host_gpu/vulkanCommon.h>")
+	# Keep headless GPU checks independent of the running emulator executable.
+	target_precompile_headers(shader_recompiler_compute_tests PRIVATE
+		"$<$<COMPILE_LANGUAGE:CXX>:${KYTY_SOURCE_DIR}/graphics/host_gpu/vulkanCommon.h>")
+endif()
 
 clang_tidy_check(kyty_emulator "" "${check_headers}" "${inc_headers}")
 

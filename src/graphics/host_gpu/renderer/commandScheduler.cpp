@@ -1,9 +1,12 @@
+#include "common/eventTrace.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/runtimeFlags.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include <algorithm>
@@ -12,6 +15,7 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <iterator>
 #include <map>
 #include <mutex>
@@ -19,6 +23,16 @@
 #include <string>
 #include <tuple>
 #include <vector>
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace Libs::Graphics {
 
@@ -382,11 +396,17 @@ void GpuTimingEnd(vk::CommandBuffer cmd, uint32_t slot_plus_one) {
 	                   (slot_plus_one - 1u) * 2u + 1u);
 }
 
+// KYTY_IDLE_TRACE per-command timestamps (defined with the rest of the GPU trace code below).
+uint32_t GpuTraceCmdBegin(GraphicContext& graphics, vk::CommandBuffer cmd, const char* kind,
+                          uint64_t hash_a, uint64_t hash_b, uint64_t info, uint64_t aux);
+void     GpuTraceCmdEnd(vk::CommandBuffer cmd, uint32_t slot_plus_one);
+
 } // namespace
 
 uint64_t BreadcrumbBegin(GraphicContext& graphics, vk::CommandBuffer cmd, const char* kind,
-                         uint64_t hash_a, uint64_t hash_b, uint64_t info) {
-	// Low 32 bits: breadcrumb id (0 = none). High 32 bits: GPU timing slot + 1 (0 = none).
+                         uint64_t hash_a, uint64_t hash_b, uint64_t info, uint64_t aux) {
+	// Bits 0-31: breadcrumb id (0 = none). Bits 32-46: KYTY_PERF_GPU_TIMING slot + 1 (0 = none).
+	// Bits 47-63: KYTY_IDLE_TRACE per-command slot + 1 (0 = none).
 	uint32_t id = 0;
 	if (!(g_breadcrumbs.initialized && !g_breadcrumbs.available)) {
 		std::lock_guard lock(g_breadcrumbs.mutex);
@@ -399,7 +419,8 @@ uint64_t BreadcrumbBegin(GraphicContext& graphics, vk::CommandBuffer cmd, const 
 		}
 	}
 	const uint32_t timing = GpuTimingBegin(graphics, cmd, kind, hash_a, hash_b, info);
-	return (static_cast<uint64_t>(timing) << 32u) | id;
+	const uint32_t trace = GpuTraceCmdBegin(graphics, cmd, kind, hash_a, hash_b, info, aux);
+	return (static_cast<uint64_t>(trace) << 47u) | (static_cast<uint64_t>(timing & 0x7fffu) << 32u) | id;
 }
 
 void ReportDeviceLost(GraphicContext& graphics) {
@@ -424,7 +445,8 @@ void BreadcrumbCaptureArgs(vk::CommandBuffer cmd, uint64_t id, vk::Buffer source
 
 void BreadcrumbEnd(GraphicContext& graphics, vk::CommandBuffer cmd, uint64_t id) {
 	(void)graphics;
-	GpuTimingEnd(cmd, static_cast<uint32_t>(id >> 32u));
+	GpuTraceCmdEnd(cmd, static_cast<uint32_t>(id >> 47u));
+	GpuTimingEnd(cmd, static_cast<uint32_t>((id >> 32u) & 0x7fffu));
 	const auto crumb = static_cast<uint32_t>(id);
 	if (crumb == 0 || !g_breadcrumbs.available) {
 		return;
@@ -440,6 +462,464 @@ void GpuTimingPoll() {
 	std::lock_guard lock(g_timing.mutex);
 	GpuTimingPollLocked();
 }
+
+// KYTY_IDLE_TRACE GPU timeline. While the event trace is capturing, every native command buffer gets a
+// top-of-pipe timestamp when it begins and a bottom-of-pipe timestamp just before it is ended; after
+// completion the pair is converted to the trace clock (Common::EventTrace::NowNs == steady_clock ns)
+// and emitted as GPU_BEGIN / GPU_END (a = tick). Independent of KYTY_PERF_GPU_TIMING.
+namespace {
+
+constexpr uint32_t GPU_TRACE_PAIRS = 4096; // 8192 queries
+// Per draw / dispatch (begin, end) pairs: 131072 queries.
+constexpr uint32_t GPU_TRACE_CMD_PAIRS = 65536;
+
+struct GpuTraceCmd {
+	uint32_t slot;
+	uint32_t index; // Command ordinal within its command buffer (counts skipped ones too).
+	bool     dispatch;
+	uint64_t identity; // Shader hash reported in the GPU_DRAW/GPU_DISPATCH event.
+	uint64_t size;     // Saturated vertex (draw) or thread-group (dispatch) count.
+};
+
+struct GpuTraceCmdPending {
+	uint64_t    tick;
+	GpuTraceCmd cmd;
+};
+
+// Side file row key: (kind, vs, ps/cs, aux). Identity = ps != 0 ? ps : vs for draws, cs for dispatch.
+using GpuTraceShaderKey = std::tuple<std::string, uint64_t, uint64_t, uint64_t>;
+
+struct GpuTracePending {
+	uint64_t tick;
+	uint32_t slot;
+};
+
+struct GpuTraceState {
+	std::mutex                   mutex;
+	bool                         initialized = false;
+	bool                         available   = false;
+	vk::Device                   device      = nullptr;
+	vk::QueryPool                pool        = nullptr;
+	double                       period_ns   = 0.0;
+	uint64_t                     valid_mask  = ~0ull;
+	unsigned                     valid_bits  = 64;
+	bool                         can_calibrate = false;
+	uint32_t                     time_domain = 0; // VkTimeDomainEXT of the CPU side
+	std::vector<uint32_t>        free_slots;
+	std::vector<GpuTracePending> pending; // in submit order
+	std::vector<uint64_t>        results;
+	// Per-capture clock mapping (keyed by g_start_ns).
+	int64_t  mapped_start_ns = -1;
+	bool     calibrated      = false; // false -> aligned fallback
+	bool     have_anchor     = false;
+	uint64_t anchor_gpu      = 0;
+	int64_t  anchor_cpu_ns   = 0;
+	bool     end_check_due   = false;
+	// Per-command timestamps.
+	vk::QueryPool                         cmd_pool = nullptr;
+	std::vector<uint32_t>                 cmd_free;
+	std::vector<GpuTraceCmd>              cmd_open; // Recorded into the command buffer being built.
+	uint32_t                              cmd_open_count = 0;
+	std::vector<GpuTraceCmdPending>       cmd_pending; // Submitted, in submit order.
+	std::vector<uint64_t>                 cmd_results;
+	uint64_t                              cmd_skipped = 0;
+	std::map<GpuTraceShaderKey, uint64_t> shader_rows; // -> draw count
+};
+
+GpuTraceState g_gtrace;
+
+int64_t GpuTraceSignedDelta(uint64_t now, uint64_t ref) {
+	uint64_t d = (now - ref) & g_gtrace.valid_mask;
+	if (g_gtrace.valid_bits < 64 && (d & (1ull << (g_gtrace.valid_bits - 1u))) != 0) {
+		d |= ~g_gtrace.valid_mask;
+	}
+	return static_cast<int64_t>(d);
+}
+
+// Samples (GPU ticks, CPU time in steady_clock ns) at the same instant. On Windows steady_clock is
+// QueryPerformanceCounter-based: ns = qpc * 1e9 / freq (the STL does exactly this, with epoch = QPC
+// zero), so QPC ticks convert to steady_clock ns directly. On other platforms CLOCK_MONOTONIC is
+// already steady_clock ns.
+bool GpuTraceCalibrate(uint64_t& gpu_ticks, int64_t& cpu_ns) {
+	if (!g_gtrace.can_calibrate) {
+		return false;
+	}
+	VkCalibratedTimestampInfoEXT infos[2] {};
+	infos[0].sType      = VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_EXT;
+	infos[0].timeDomain = VK_TIME_DOMAIN_DEVICE_EXT;
+	infos[1].sType      = VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_EXT;
+	infos[1].timeDomain = static_cast<VkTimeDomainEXT>(g_gtrace.time_domain);
+	uint64_t ts[2]      = {0, 0};
+	uint64_t deviation  = 0;
+	if (VULKAN_HPP_DEFAULT_DISPATCHER.vkGetCalibratedTimestampsEXT(
+	        static_cast<VkDevice>(g_gtrace.device), 2, infos, ts, &deviation) != VK_SUCCESS) {
+		return false;
+	}
+	gpu_ticks = ts[0] & g_gtrace.valid_mask;
+#if defined(_WIN32)
+	static const uint64_t freq = [] {
+		LARGE_INTEGER f {};
+		QueryPerformanceFrequency(&f);
+		return static_cast<uint64_t>(f.QuadPart);
+	}();
+	if (freq == 0) {
+		return false;
+	}
+	cpu_ns = static_cast<int64_t>((ts[1] / freq) * 1'000'000'000ull +
+	                              (ts[1] % freq) * 1'000'000'000ull / freq);
+#else
+	cpu_ns = static_cast<int64_t>(ts[1]);
+#endif
+	return true;
+}
+
+// Writes idle-trace-<unix>-shaders.csv (same unix time as the event CSV) and clears the rows.
+void GpuTraceWriteShaderFile(long long unix_s) {
+	std::lock_guard lock(g_gtrace.mutex);
+	if (!g_gtrace.shader_rows.empty()) {
+		char name[96];
+		std::snprintf(name, sizeof(name), "idle-trace-%lld-shaders.csv", unix_s);
+		if (FILE* f = std::fopen(name, "w")) {
+			std::fprintf(f, "identity,kind,vs,ps_or_cs,rt_format,rt_width,rt_height,draws\n");
+			for (const auto& [key, count]: g_gtrace.shader_rows) {
+				const uint64_t vs = std::get<1>(key), ps = std::get<2>(key), aux = std::get<3>(key);
+				const bool     dispatch = std::get<0>(key).rfind("dispatch", 0) == 0;
+				const uint64_t identity = dispatch ? vs : (ps != 0 ? ps : vs);
+				const auto     fmt      = static_cast<uint32_t>(aux >> 32u);
+				std::fprintf(f, "0x%016llx,%s,0x%016llx,0x%016llx,%s,%u,%u,%llu\n",
+				             static_cast<unsigned long long>(identity), std::get<0>(key).c_str(),
+				             static_cast<unsigned long long>(dispatch ? 0 : vs),
+				             static_cast<unsigned long long>(dispatch ? vs : ps),
+				             fmt != 0 ? vk::to_string(static_cast<vk::Format>(fmt)).c_str() : "none",
+				             static_cast<uint32_t>((aux >> 16u) & 0xffffu),
+				             static_cast<uint32_t>(aux & 0xffffu),
+				             static_cast<unsigned long long>(count));
+			}
+			std::fclose(f);
+			std::printf("NHL27IDLETRACE: wrote %s (%zu rows, %llu commands without a timestamp slot)\n",
+			            name, g_gtrace.shader_rows.size(),
+			            static_cast<unsigned long long>(g_gtrace.cmd_skipped));
+			std::fflush(stdout);
+		}
+	}
+	g_gtrace.shader_rows.clear();
+	g_gtrace.cmd_skipped = 0;
+}
+
+bool GpuTraceInitLocked(GraphicContext& graphics) {
+	if (g_gtrace.initialized) {
+		return g_gtrace.available;
+	}
+	g_gtrace.initialized = true;
+	if (!graphics.host_query_reset_enabled ||
+	    VULKAN_HPP_DEFAULT_DISPATCHER.vkResetQueryPool == nullptr) {
+		std::printf("NHL27IDLETRACE: hostQueryReset not available, GPU timeline disabled\n");
+		return false;
+	}
+	const auto families = graphics.physical_device.getQueueFamilyProperties();
+	if (graphics.queue_family >= families.size()) {
+		return false;
+	}
+	const uint32_t valid_bits = families[graphics.queue_family].timestampValidBits;
+	if (valid_bits == 0 || graphics.physical_device_properties.limits.timestampPeriod <= 0.0f) {
+		std::printf("NHL27IDLETRACE: timestamps unsupported, GPU timeline disabled\n");
+		return false;
+	}
+	g_gtrace.valid_bits = valid_bits >= 64 ? 64u : valid_bits;
+	g_gtrace.valid_mask = valid_bits >= 64 ? ~0ull : ((1ull << valid_bits) - 1ull);
+	g_gtrace.period_ns  = graphics.physical_device_properties.limits.timestampPeriod;
+
+	vk::QueryPoolCreateInfo create {};
+	create.queryType  = vk::QueryType::eTimestamp;
+	create.queryCount = GPU_TRACE_PAIRS * 2u;
+	if (graphics.device.createQueryPool(&create, nullptr, &g_gtrace.pool) != vk::Result::eSuccess) {
+		std::printf("NHL27IDLETRACE: query pool creation failed\n");
+		return false;
+	}
+	g_gtrace.device = graphics.device;
+	{
+		vk::QueryPoolCreateInfo cmd_create {};
+		cmd_create.queryType  = vk::QueryType::eTimestamp;
+		cmd_create.queryCount = GPU_TRACE_CMD_PAIRS * 2u;
+		if (graphics.device.createQueryPool(&cmd_create, nullptr, &g_gtrace.cmd_pool) !=
+		    vk::Result::eSuccess) {
+			std::printf("NHL27IDLETRACE: per-command query pool creation failed\n");
+			g_gtrace.cmd_pool = nullptr;
+		} else {
+			g_gtrace.cmd_results.resize(4);
+			g_gtrace.cmd_free.reserve(GPU_TRACE_CMD_PAIRS);
+			for (uint32_t i = GPU_TRACE_CMD_PAIRS; i > 0; i--) {
+				g_gtrace.cmd_free.push_back(i - 1u);
+			}
+		}
+	}
+	Common::EventTrace::g_csv_written_hook = &GpuTraceWriteShaderFile;
+	g_gtrace.results.resize(4);
+	g_gtrace.free_slots.reserve(GPU_TRACE_PAIRS);
+	for (uint32_t i = GPU_TRACE_PAIRS; i > 0; i--) {
+		g_gtrace.free_slots.push_back(i - 1u);
+	}
+
+	if (graphics.calibrated_timestamps_enabled &&
+	    VULKAN_HPP_DEFAULT_DISPATCHER.vkGetCalibratedTimestampsEXT != nullptr &&
+	    VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceCalibrateableTimeDomainsEXT != nullptr) {
+#if defined(_WIN32)
+		const VkTimeDomainEXT wanted = VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_EXT;
+#else
+		const VkTimeDomainEXT wanted = VK_TIME_DOMAIN_CLOCK_MONOTONIC_EXT;
+#endif
+		uint32_t count = 0;
+		VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceCalibrateableTimeDomainsEXT(
+		    static_cast<VkPhysicalDevice>(graphics.physical_device), &count, nullptr);
+		std::vector<VkTimeDomainEXT> domains(count);
+		if (count != 0) {
+			VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceCalibrateableTimeDomainsEXT(
+			    static_cast<VkPhysicalDevice>(graphics.physical_device), &count, domains.data());
+		}
+		bool has_device = false, has_cpu = false;
+		for (uint32_t i = 0; i < count; i++) {
+			has_device |= domains[i] == VK_TIME_DOMAIN_DEVICE_EXT;
+			has_cpu |= domains[i] == wanted;
+		}
+		if (has_device && has_cpu) {
+			g_gtrace.can_calibrate = true;
+			g_gtrace.time_domain   = static_cast<uint32_t>(wanted);
+		}
+	}
+	g_gtrace.available = true;
+	return true;
+}
+
+// Establishes the GPU->trace clock mapping for the current capture (once per capture).
+void GpuTraceMapCaptureLocked() {
+	const int64_t start = Common::EventTrace::g_start_ns;
+	if (g_gtrace.mapped_start_ns == start) {
+		return;
+	}
+	g_gtrace.mapped_start_ns = start;
+	g_gtrace.have_anchor     = false;
+	g_gtrace.end_check_due   = false;
+	uint64_t gpu = 0;
+	int64_t  cpu = 0;
+	if (GpuTraceCalibrate(gpu, cpu)) {
+		g_gtrace.calibrated    = true;
+		g_gtrace.have_anchor   = true;
+		g_gtrace.anchor_gpu    = gpu;
+		g_gtrace.anchor_cpu_ns = cpu;
+		g_gtrace.end_check_due = true;
+		std::printf("NHL27IDLETRACE: gpu_time_domain=calibrated\n");
+	} else {
+		g_gtrace.calibrated = false;
+		std::printf("NHL27IDLETRACE: gpu_time_domain=aligned\n");
+		std::printf("NHL27IDLETRACE: warning: calibrated timestamps unavailable; GPU times are "
+		            "aligned to the first observed completion (offset error up to the polling latency)\n");
+	}
+	std::fflush(stdout);
+}
+
+int64_t GpuTraceToCpuNs(uint64_t gpu) {
+	return g_gtrace.anchor_cpu_ns +
+	       static_cast<int64_t>(static_cast<double>(GpuTraceSignedDelta(gpu, g_gtrace.anchor_gpu)) *
+	                            g_gtrace.period_ns);
+}
+
+// Reads back completed draw / dispatch pairs in submit order. Event encoding:
+//   GPU_DRAW / GPU_DISPATCH          at begin time: a = tick, b = shader identity
+//   GPU_DRAW_END / GPU_DISPATCH_END  at end time:   a = tick, b = (command index in tick << 32) | size
+// size = saturated vertex count * instance count (draw) or x*y*z thread groups (dispatch, 0 if indirect).
+void GpuTraceCmdPollLocked() {
+	size_t consumed = 0;
+	for (; consumed < g_gtrace.cmd_pending.size(); consumed++) {
+		const auto& p = g_gtrace.cmd_pending[consumed];
+		const auto  r = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetQueryPoolResults(
+            static_cast<VkDevice>(g_gtrace.device), static_cast<VkQueryPool>(g_gtrace.cmd_pool),
+            p.cmd.slot * 2u, 2u, g_gtrace.cmd_results.size() * sizeof(uint64_t),
+            g_gtrace.cmd_results.data(), 2u * sizeof(uint64_t),
+            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+		const uint64_t* v = g_gtrace.cmd_results.data();
+		if ((r != VK_SUCCESS && r != VK_NOT_READY) || v[1] == 0 || v[3] == 0) {
+			break;
+		}
+		g_gtrace.cmd_free.push_back(p.cmd.slot);
+		if (!Common::EventTrace::g_capturing.load(std::memory_order_relaxed) ||
+		    g_gtrace.mapped_start_ns != Common::EventTrace::g_start_ns) {
+			continue;
+		}
+		const uint64_t begin = v[0] & g_gtrace.valid_mask;
+		const uint64_t end   = v[2] & g_gtrace.valid_mask;
+		if (!g_gtrace.have_anchor) {
+			g_gtrace.have_anchor   = true;
+			g_gtrace.anchor_gpu    = end;
+			g_gtrace.anchor_cpu_ns = Common::EventTrace::NowNs();
+		}
+		namespace ET = Common::EventTrace;
+		ET::RecordAt(p.cmd.dispatch ? ET::GPU_DISPATCH : ET::GPU_DRAW, GpuTraceToCpuNs(begin), p.tick,
+		             p.cmd.identity);
+		ET::RecordAt(p.cmd.dispatch ? ET::GPU_DISPATCH_END : ET::GPU_DRAW_END, GpuTraceToCpuNs(end),
+		             p.tick, (static_cast<uint64_t>(p.cmd.index) << 32u) | p.cmd.size);
+	}
+	if (consumed != 0) {
+		g_gtrace.cmd_pending.erase(g_gtrace.cmd_pending.begin(),
+		                           g_gtrace.cmd_pending.begin() + static_cast<std::ptrdiff_t>(consumed));
+	}
+}
+
+// Reads back completed command buffers in submit order, emits their events and recycles the slots.
+void GpuTracePollLocked() {
+	if (g_gtrace.end_check_due && !Common::EventTrace::g_capturing.load(std::memory_order_relaxed)) {
+		g_gtrace.end_check_due = false;
+		uint64_t gpu = 0;
+		int64_t  cpu = 0;
+		if (GpuTraceCalibrate(gpu, cpu)) {
+			const int64_t predicted = GpuTraceToCpuNs(gpu);
+			std::printf("NHL27IDLETRACE: gpu clock drift over capture = %.1f us\n",
+			            static_cast<double>(predicted - cpu) / 1000.0);
+			std::fflush(stdout);
+		}
+	}
+	size_t consumed = 0;
+	for (; consumed < g_gtrace.pending.size(); consumed++) {
+		const auto& p = g_gtrace.pending[consumed];
+		// 64-bit results, each followed by its availability value.
+		const auto r = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetQueryPoolResults(
+		    static_cast<VkDevice>(g_gtrace.device), static_cast<VkQueryPool>(g_gtrace.pool),
+		    p.slot * 2u, 2u, g_gtrace.results.size() * sizeof(uint64_t), g_gtrace.results.data(),
+		    2u * sizeof(uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+		const uint64_t* v = g_gtrace.results.data();
+		if ((r != VK_SUCCESS && r != VK_NOT_READY) || v[1] == 0 || v[3] == 0) {
+			break;
+		}
+		g_gtrace.free_slots.push_back(p.slot);
+		if (!Common::EventTrace::g_capturing.load(std::memory_order_relaxed) ||
+		    g_gtrace.mapped_start_ns != Common::EventTrace::g_start_ns) {
+			continue; // Capture over: just recycle.
+		}
+		const uint64_t begin = v[0] & g_gtrace.valid_mask;
+		const uint64_t end   = v[2] & g_gtrace.valid_mask;
+		if (!g_gtrace.have_anchor) {
+			// Aligned fallback: first completed GPU_END == the moment we observe it.
+			g_gtrace.have_anchor   = true;
+			g_gtrace.anchor_gpu    = end;
+			g_gtrace.anchor_cpu_ns = Common::EventTrace::NowNs();
+		}
+		Common::EventTrace::RecordAt(Common::EventTrace::GPU_BEGIN, GpuTraceToCpuNs(begin), p.tick, 0);
+		Common::EventTrace::RecordAt(Common::EventTrace::GPU_END, GpuTraceToCpuNs(end), p.tick, 0);
+	}
+	if (consumed != 0) {
+		g_gtrace.pending.erase(g_gtrace.pending.begin(),
+		                       g_gtrace.pending.begin() + static_cast<std::ptrdiff_t>(consumed));
+	}
+	if (g_gtrace.cmd_pool != nullptr) {
+		GpuTraceCmdPollLocked();
+	}
+}
+
+// Called right after vkBeginCommandBuffer. Returns slot + 1, or 0 when not tracing.
+uint32_t GpuTraceBegin(GraphicContext& graphics, vk::CommandBuffer cmd) {
+	if (!Common::EventTrace::g_capturing.load(std::memory_order_relaxed)) {
+		return 0;
+	}
+	std::lock_guard lock(g_gtrace.mutex);
+	if (!GpuTraceInitLocked(graphics)) {
+		return 0;
+	}
+	GpuTraceMapCaptureLocked();
+	if (g_gtrace.free_slots.empty()) {
+		GpuTracePollLocked();
+		if (g_gtrace.free_slots.empty()) {
+			return 0;
+		}
+	}
+	const uint32_t slot = g_gtrace.free_slots.back();
+	g_gtrace.free_slots.pop_back();
+	// The slot was read back (or never used), so no GPU work references it: host reset is safe.
+	// Resets happen here, outside any render pass; the timestamps themselves are legal anywhere.
+	VULKAN_HPP_DEFAULT_DISPATCHER.vkResetQueryPool(static_cast<VkDevice>(g_gtrace.device),
+	                                               static_cast<VkQueryPool>(g_gtrace.pool), slot * 2u, 2u);
+	cmd.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, g_gtrace.pool, slot * 2u);
+	return slot + 1u;
+}
+
+void GpuTraceEnd(vk::CommandBuffer cmd, uint32_t slot_plus_one) {
+	if (slot_plus_one != 0) {
+		cmd.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, g_gtrace.pool,
+		                   (slot_plus_one - 1u) * 2u + 1u);
+	}
+}
+
+// After vkQueueSubmit succeeded: remember which tick owns the slot.
+void GpuTraceSubmitted(uint32_t slot_plus_one, uint64_t tick) {
+	if (!g_gtrace.available) {
+		return;
+	}
+	std::lock_guard lock(g_gtrace.mutex);
+	for (const auto& cmd: g_gtrace.cmd_open) {
+		g_gtrace.cmd_pending.push_back({tick, cmd});
+	}
+	g_gtrace.cmd_open.clear();
+	g_gtrace.cmd_open_count = 0;
+	if (slot_plus_one != 0) {
+		g_gtrace.pending.push_back({tick, slot_plus_one - 1u});
+	}
+}
+
+// Cheap when idle: one relaxed-load check plus a mutex only if something is pending.
+void GpuTracePoll() {
+	if (!g_gtrace.available) {
+		return;
+	}
+	std::lock_guard lock(g_gtrace.mutex);
+	if (!g_gtrace.pending.empty() || !g_gtrace.cmd_pending.empty() || g_gtrace.end_check_due) {
+		GpuTracePollLocked();
+	}
+}
+
+uint32_t GpuTraceCmdBegin(GraphicContext& graphics, vk::CommandBuffer cmd, const char* kind,
+                          uint64_t hash_a, uint64_t hash_b, uint64_t info, uint64_t aux) {
+	if (!Common::EventTrace::g_capturing.load(std::memory_order_relaxed)) {
+		return 0;
+	}
+	std::lock_guard lock(g_gtrace.mutex);
+	if (!GpuTraceInitLocked(graphics) || g_gtrace.cmd_pool == nullptr) {
+		return 0;
+	}
+	GpuTraceMapCaptureLocked();
+	const bool dispatch = std::strncmp(kind, "dispatch", 8) == 0;
+	uint64_t   size     = 0;
+	if (!dispatch) {
+		size = (info >> 32u) * (info & 0xffffffffu);
+	} else if (std::strcmp(kind, "dispatch") == 0) {
+		size = ((info >> 40u) & 0xffffffu) * ((info >> 20u) & 0xfffffu) * (info & 0xfffffu);
+	}
+	size = std::min<uint64_t>(size, 0xffffffffu);
+	g_gtrace.shader_rows[GpuTraceShaderKey {kind, hash_a, dispatch ? 0 : hash_b, dispatch ? 0 : aux}]++;
+	const uint32_t index = g_gtrace.cmd_open_count++;
+	if (g_gtrace.cmd_free.empty()) {
+		GpuTracePollLocked();
+		if (g_gtrace.cmd_free.empty()) {
+			g_gtrace.cmd_skipped++;
+			return 0;
+		}
+	}
+	const uint32_t slot = g_gtrace.cmd_free.back();
+	g_gtrace.cmd_free.pop_back();
+	VULKAN_HPP_DEFAULT_DISPATCHER.vkResetQueryPool(static_cast<VkDevice>(g_gtrace.device),
+	                                               static_cast<VkQueryPool>(g_gtrace.cmd_pool),
+	                                               slot * 2u, 2u);
+	g_gtrace.cmd_open.push_back(
+	    {slot, index, dispatch, dispatch ? hash_a : (hash_b != 0 ? hash_b : hash_a), size});
+	cmd.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, g_gtrace.cmd_pool, slot * 2u);
+	return slot + 1u;
+}
+
+void GpuTraceCmdEnd(vk::CommandBuffer cmd, uint32_t slot_plus_one) {
+	if (slot_plus_one != 0) {
+		cmd.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, g_gtrace.cmd_pool,
+		                   (slot_plus_one - 1u) * 2u + 1u);
+	}
+}
+
+} // namespace
 
 namespace {
 
@@ -650,6 +1130,9 @@ void CommandScheduler::PopPendingOperations() {
 			m_pending_operations.pop();
 		}
 		WaitPriorityOperations(operation.tick);
+		Common::EventTrace::Record(Common::EventTrace::NATIVE_DONE, operation.tick);
+		GpuTracePoll();
+		FrameBreakdown::GpuBusyScope busy_scope(FrameBreakdown::GB_DEFERRED);
 		RunOperation(std::move(operation.callback));
 	}
 }
@@ -705,6 +1188,8 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 			m_priority_active_tick = operation.tick;
 		}
 		m_master.Wait(operation.tick);
+		Common::EventTrace::Record(Common::EventTrace::NATIVE_DONE, operation.tick);
+		GpuTracePoll();
 		if (!stop.stop_requested()) {
 			RunOperation(std::move(operation.callback));
 		}
@@ -761,6 +1246,7 @@ CommandBuffer& CommandScheduler::Current() {
 
 CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
+	FrameBreakdown::GpuBusyScope busy_scope(FrameBreakdown::GB_BEGIN_CMD);
 	m_command.m_buffer = m_command_pool.Commit();
 	if (BufferCache::PerfTimersEnabled()) {
 		const auto start = std::chrono::steady_clock::now();
@@ -771,18 +1257,34 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	} else {
 		m_command.Begin();
 	}
+	m_trace_slot = GpuTraceBegin(m_graphics, m_command.m_buffer);
 	return m_command;
 }
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
+	if (FrameBreakdown::Enabled()) {
+		FrameBreakdown::SpecNoteSubmit();
+	}
 	EXIT_IF(m_command.IsInvalid());
+	FrameBreakdown::GpuBusyScope busy_scope(FrameBreakdown::GB_SUBMIT);
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 
 	const bool timed       = BufferCache::PerfTimersEnabled();
 	const auto submit_start = timed ? std::chrono::steady_clock::now()
 	                                : std::chrono::steady_clock::time_point {};
+	if (m_trace_slot != 0) {
+		m_command.EndRendering(); // Idempotent; keeps the end timestamp after the last pass.
+		GpuTraceEnd(m_command.m_buffer, m_trace_slot);
+	}
 	m_command.End();
+
+	// Safe point for runtime experiment flags: the command buffer is complete and
+	// nothing is submitted yet, so the snapshot can be replaced without racing a
+	// reader mid-submission. Throttled internally.
+	Common::RuntimeFlags::Refresh();
+	Common::EventTrace::Poll();
+
 	const auto buffer   = m_command.m_buffer;
 	auto&      graphics = m_graphics;
 	EXIT_IF(graphics.queue == nullptr);
@@ -810,6 +1312,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
+		FrameBreakdown::GpuBusyScope queue_scope(FrameBreakdown::GB_QUEUE_SUBMIT);
 		result = graphics.queue.submit(1, &submit_info, nullptr);
 	}
 	if (timed) {
@@ -844,6 +1347,10 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	m_command.m_buffer = nullptr;
+	Common::EventTrace::Record(Common::EventTrace::NATIVE_SUBMIT, tick);
+	GpuTraceSubmitted(m_trace_slot, tick);
+	m_trace_slot = 0;
+	GpuTracePoll();
 	GpuTimingPoll();
 	return tick;
 }
