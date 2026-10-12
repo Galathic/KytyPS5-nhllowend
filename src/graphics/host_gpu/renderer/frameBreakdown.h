@@ -584,8 +584,7 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 			            ms(mat_indirect_ns), ms(mat_spec_ns), ms(mat_rest), per(mat_reuse_hits),
 			            per(mat_reuse_misses), per(mat_reuse_fallback));
 			std::printf("NHL27FLAT words=%.1f read=%.2fms(detail) ops=%.1f alloc=%.2fms(detail) "
-			            "trace_hit=%.1f trace_other=%.1f
-",
+			            "trace_hit=%.1f trace_other=%.1f\n",
 			            per(mat_flat_reads), ms(mat_flat_read_ns), per(mat_flat_ops), ms(mat_flat_alloc_ns),
 			            per(mat_flat_trace_hits), per(mat_flat_trace_other));
 			const double dc_named = ms(dc_materialize_ns) + ms(dc_textures_ns) + ms(dc_buffers_ns) +
