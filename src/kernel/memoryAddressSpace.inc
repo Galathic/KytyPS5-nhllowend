@@ -465,6 +465,17 @@ private:
 
 		std::lock_guard lock(m_mutex);
 		const auto      end     = vaddr + size;
+		{
+			// Single-mapping fast path (the common one-word SRT read): one lookup instead of
+			// a validation pass plus a transfer pass. Same checks, same result, same lock.
+			MapEntry first {};
+			if (FindContainingUnlocked(vaddr, 1, &first) && first.vaddr + first.size >= end &&
+			    RangeOk(first.backing_offset + vaddr - first.vaddr, size)) {
+				transfer(m_backing_base + first.backing_offset + (vaddr - first.vaddr), 0,
+				         static_cast<size_t>(size));
+				return true;
+			}
+		}
 		auto            current = vaddr;
 		while (current < end) {
 			MapEntry entry {};

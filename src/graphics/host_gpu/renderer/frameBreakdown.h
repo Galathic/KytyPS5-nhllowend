@@ -105,6 +105,12 @@ struct Counters {
 	std::atomic<uint64_t> mat_indirect_ns {0};  // MaterializeIndirectDescriptor
 	std::atomic<uint64_t> mat_spec_ns {0};      // BuildResourceSpecialization
 	std::atomic<uint64_t> mat_evals {0};        // EvaluateDescriptor calls
+	std::atomic<uint64_t> mat_flat_reads {0};     // RefreshFlatBuffer: guest-memory reader callbacks (words)
+	std::atomic<uint64_t> mat_flat_read_ns {0};   // time inside those callbacks (KYTY_PERF_DRAW_DETAIL=1 only)
+	std::atomic<uint64_t> mat_flat_ops {0};       // tape ops executed by RefreshFlatBuffer
+	std::atomic<uint64_t> mat_flat_alloc_ns {0};  // flat.assign + trace setup (KYTY_PERF_DRAW_DETAIL=1 only)
+	std::atomic<uint64_t> mat_flat_trace_hits {0};   // refreshes served by ReplayCfgTrace
+	std::atomic<uint64_t> mat_flat_trace_other {0};  // refreshes that were not (miss/ineligible/non-CFG)
 	std::atomic<uint64_t> mat_reuse_hits {0};   // KYTY_SRT_SOURCE_REUSE: gather output equals the previous one
 	std::atomic<uint64_t> mat_reuse_misses {0}; // gather output differs / first time
 	std::atomic<uint64_t> mat_reuse_fallback {0}; // sources not on the gather fast path
@@ -448,6 +454,12 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 	const uint64_t mat_indirect_ns   = Take(c.mat_indirect_ns);
 	const uint64_t mat_spec_ns       = Take(c.mat_spec_ns);
 	const uint64_t mat_evals         = Take(c.mat_evals);
+	const uint64_t mat_flat_reads    = Take(c.mat_flat_reads);
+	const uint64_t mat_flat_read_ns  = Take(c.mat_flat_read_ns);
+	const uint64_t mat_flat_ops      = Take(c.mat_flat_ops);
+	const uint64_t mat_flat_alloc_ns = Take(c.mat_flat_alloc_ns);
+	const uint64_t mat_flat_trace_hits  = Take(c.mat_flat_trace_hits);
+	const uint64_t mat_flat_trace_other = Take(c.mat_flat_trace_other);
 	const uint64_t mat_reuse_hits    = Take(c.mat_reuse_hits);
 	const uint64_t mat_reuse_misses  = Take(c.mat_reuse_misses);
 	const uint64_t mat_reuse_fallback = Take(c.mat_reuse_fallback);
@@ -571,6 +583,11 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 			            per(mat_calls), ms(mat_total_ns), ms(mat_flat_ns), ms(mat_eval_ns), per(mat_evals),
 			            ms(mat_indirect_ns), ms(mat_spec_ns), ms(mat_rest), per(mat_reuse_hits),
 			            per(mat_reuse_misses), per(mat_reuse_fallback));
+			std::printf("NHL27FLAT words=%.1f read=%.2fms(detail) ops=%.1f alloc=%.2fms(detail) "
+			            "trace_hit=%.1f trace_other=%.1f
+",
+			            per(mat_flat_reads), ms(mat_flat_read_ns), per(mat_flat_ops), ms(mat_flat_alloc_ns),
+			            per(mat_flat_trace_hits), per(mat_flat_trace_other));
 			const double dc_named = ms(dc_materialize_ns) + ms(dc_textures_ns) + ms(dc_buffers_ns) +
 			                        ms(dc_descriptors_ns) + ms(dc_pipeline_ns) + ms(dc_barrier_ns) +
 			                        ms(dc_record_ns);

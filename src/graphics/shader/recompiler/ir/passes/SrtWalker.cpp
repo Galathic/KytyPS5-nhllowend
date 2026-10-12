@@ -1730,7 +1730,11 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	                            !m_skip_tape && !m_cfg_schedule_enabled &&
 	                            !m_scalar_batch_enabled && m_active_mask.IsEmpty() &&
 	                            (m_clean_evaluator == nullptr || m_clean_evaluator->m_active_mask.IsEmpty());
-	if (trace_eligible && ReplayCfgTrace(flat) > 0) return true;
+	if (trace_eligible && ReplayCfgTrace(flat) > 0) {
+		if (FrameBreakdown::Enabled()) FrameBreakdown::g_counters.mat_flat_trace_hits.fetch_add(1, std::memory_order_relaxed);
+		return true;
+	}
+	if (FrameBreakdown::Enabled()) FrameBreakdown::g_counters.mat_flat_trace_other.fetch_add(1, std::memory_order_relaxed);
 	if (!m_program.control_flow.empty()) PrepareCfgTape();
 	auto& trace_steps = m_program.cfg_trace_scratch;
 	const auto record = [&](ResourcePlan::CfgTrace::Step step) {
@@ -2871,7 +2875,10 @@ int SrtWalker::ReplayCfgTrace(std::vector<uint32_t>& flat) {
 		return -1;
 	auto& values = m_context.tape_values;
 	if (values.size() < tape.ops.size()) values.resize(tape.ops.size());
-	flat.assign(m_program.srt_reads.size(), 0u);
+	{
+		FrameBreakdown::Timer alloc_timer(FrameBreakdown::g_counters.mat_flat_alloc_ns, FrameBreakdown::DetailEnabled());
+		flat.assign(m_program.srt_reads.size(), 0u);
+	}
 	auto& active = m_program.active_sources;
 	active = trace.base_active;
 	const auto context_for = [&](const ResourcePlan::SrtTape::Op& op) -> ResourcePlan::EvaluationContext& {
@@ -3114,6 +3121,7 @@ int SrtWalker::RunTape(std::vector<uint32_t>& flat) {
 bool SrtWalker::ExecuteTapeOp(const ResourcePlan::SrtTape::Op& op,
                               std::vector<uint64_t>& values, uint32_t index) {
 	if (m_runtime.evaluation_counts) ++m_runtime.evaluation_counts->tape_ops;
+	if (FrameBreakdown::Enabled()) FrameBreakdown::g_counters.mat_flat_ops.fetch_add(1, std::memory_order_relaxed);
 	uint64_t result = 0;
 	switch (op.kind) {
 		case ResourcePlan::SrtTape::Kind::Immediate:
@@ -3191,7 +3199,15 @@ bool SrtWalker::ExecuteTapeOp(const ResourcePlan::SrtTape::Op& op,
 			const auto reader = (is_vector || op.clean) ? m_runtime.read_specialization_memory
 			                                            : m_runtime.read_memory;
 			if (reader != nullptr) {
-				if (!reader(m_runtime.userdata, address, {&word, 1})) {
+				if (FrameBreakdown::Enabled()) {
+					auto& fc = FrameBreakdown::g_counters;
+					fc.mat_flat_reads.fetch_add(1, std::memory_order_relaxed);
+					FrameBreakdown::Timer read_timer(fc.mat_flat_read_ns, FrameBreakdown::DetailEnabled());
+					if (!reader(m_runtime.userdata, address, {&word, 1})) {
+						g_tape_stats.failed.fetch_add(1, std::memory_order_relaxed);
+						return false;
+					}
+				} else if (!reader(m_runtime.userdata, address, {&word, 1})) {
 					g_tape_stats.failed.fetch_add(1, std::memory_order_relaxed);
 					return false;
 				}
