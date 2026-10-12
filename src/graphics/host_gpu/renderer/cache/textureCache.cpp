@@ -232,6 +232,7 @@ TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 }
 
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
+	BumpGeneration();
 	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
 	if (!info.data.Empty()) {
 		RegisterImage(id);
@@ -258,6 +259,7 @@ void TextureCache::RegisterImage(ImageId id) {
 }
 
 void TextureCache::UnregisterImage(ImageId id) {
+	BumpGeneration();
 	auto& image = m_slot_images[id];
 	if (!image.registered) {
 		return;
@@ -296,6 +298,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 }
 
 void TextureCache::DeleteImage(ImageId id) {
+	BumpGeneration();
 	auto* image = m_slot_images.try_get(id);
 	if (image == nullptr || !image->registered) {
 		return;
@@ -405,6 +408,7 @@ bool TextureCache::WriteBackAliasedImage(ImageId id) {
 }
 
 void TextureCache::FreeImage(ImageId id) {
+	BumpGeneration();
 	auto& image = m_slot_images[id];
 	if (image.IsGpuModified()) {
 		// Only overlap/alias frees write back. Unmap and GC frees must not enqueue guest writes.
@@ -434,6 +438,7 @@ void TextureCache::TouchImage(Image& image) {
 }
 
 void TextureCache::MarkAsMaybeDirty(ImageId id, Image& image) {
+	BumpGeneration();
 	image.MarkMaybeCpuDirty();
 	if (image.NeedsMaybeCpuHash()) {
 		image.SetMaybeCpuHash(image.HashGuestEdges());
@@ -505,6 +510,7 @@ void TextureCache::UntrackImage(ImageId id) {
 	if (!image.IsTracked()) {
 		return;
 	}
+	BumpGeneration();
 	const auto address   = image.track_addr;
 	const auto size      = image.track_addr_end - image.track_addr;
 	image.track_addr     = 0;
@@ -520,6 +526,7 @@ void TextureCache::UntrackImageHead(ImageId id) {
 	if (!image.IsTracked() || begin < image.track_addr) {
 		return;
 	}
+	BumpGeneration();
 	const auto address = Common::AlignDown(begin + TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE);
 	const auto size    = address - begin;
 	image.track_addr   = address;
@@ -537,6 +544,7 @@ void TextureCache::UntrackImageTail(ImageId id) {
 	if (!image.IsTracked() || image.track_addr_end < end) {
 		return;
 	}
+	BumpGeneration();
 	const auto address   = Common::AlignDown(end, TRACKER_PAGE_SIZE);
 	const auto size      = end - address;
 	image.track_addr_end = address;
@@ -885,6 +893,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	replacement.usage         = cached.usage;
 	if (cached.binding.is_bound || cached.binding.is_target) {
 		cached.binding.needs_rebind = true;
+		BumpGeneration();
 	}
 	const char* copy_path = "none";
 	if (cached.backing.samples == replacement.backing.samples) {
@@ -1049,6 +1058,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			return {ExpandImage(requested, cached_id)};
 		}
 		cached.binding.needs_rebind |= cached.binding.is_bound || cached.binding.is_target;
+		BumpGeneration();
 		m_slot_images[merged_id].binding.is_target |= cached.binding.is_target;
 		CopyImageMip(merged_id, cached_id, static_cast<uint32_t>(mip),
 		             static_cast<uint32_t>(layer));
@@ -1082,6 +1092,7 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	auto&      source      = m_slot_images[source_id];
 	if (source.binding.is_bound || source.binding.is_target) {
 		source.binding.needs_rebind = true;
+		BumpGeneration();
 	}
 	InitializeImage(expanded_id);
 	const int32_t mip = source.info.MipOf(info);
@@ -1601,6 +1612,13 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		}
 	}
 	return result;
+}
+
+void TextureCache::NoteImageUse(ImageId id) {
+	std::scoped_lock lock {m_lock};
+	auto&            image = m_slot_images[id];
+	image.tick_accessed_last = m_scheduler.CurrentTick();
+	TouchImage(image);
 }
 
 void TextureCache::UpdateImage(ImageId id) {

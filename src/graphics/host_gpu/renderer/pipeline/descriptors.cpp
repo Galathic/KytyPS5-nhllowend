@@ -7,6 +7,7 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/runtimeFlags.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -898,6 +899,42 @@ void RenderExecutor::ResetBindings() {
 	m_bound_images.clear();
 }
 
+namespace {
+
+// KYTY_DRAWPREP_DELTA: hash of every ImageResource field that ResolveTexture reads.
+uint64_t ImageResourceKey(const ShaderRecompiler::IR::ImageResource& r) {
+	uint64_t h = 0xcbf29ce484222325ull;
+	const auto mix = [&h](uint64_t v) { h = (h ^ v) * 0x100000001b3ull; };
+	mix(r.source);
+	mix(r.first_use_pc);
+	mix(static_cast<uint64_t>(r.resource_class));
+	mix(static_cast<uint64_t>(r.numeric_class));
+	mix(static_cast<uint64_t>(r.dimension));
+	mix(static_cast<uint64_t>(r.mip_mode));
+	mix(r.mip_count);
+	mix(static_cast<uint64_t>(r.conversion_format));
+	mix(r.shader_swizzle);
+	mix(static_cast<uint64_t>(r.read) | (static_cast<uint64_t>(r.written) << 1u) |
+	    (static_cast<uint64_t>(r.atomic) << 2u) | (static_cast<uint64_t>(r.atomic64) << 3u) |
+	    (static_cast<uint64_t>(r.depth_compare) << 4u) | (static_cast<uint64_t>(r.cube) << 5u) |
+	    (static_cast<uint64_t>(r.r128) << 6u));
+	mix(r.indirect_root);
+	mix(r.indirect_mapping_offset);
+	mix(r.indirect_search_iterations);
+	mix(r.indirect_resources.size());
+	return h;
+}
+
+bool DrawPrepDeltaVerifyEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DRAWPREP_VERIFY");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+} // namespace
+
 void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
                                      PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
@@ -914,11 +951,90 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.samplers.clear();
 	prepared.shader_data.clear();
 	// NHL27DELTA (KYTY_PERF_STATS): compare this program's outputs with its previous use. Counters only.
-	auto* const delta = FrameBreakdown::Enabled() ? FrameBreakdown::DeltaCompare(snapshot) : nullptr;
+	auto* const delta = FrameBreakdown::Enabled() ? FrameBreakdown::DeltaCompare(snapshot, program.info.buffers.size())
+	                                                  : nullptr;
+	// KYTY_DRAWPREP_DELTA: reuse the previous ResolveTexture / sampler lookup of this program's slot when
+	// its inputs and the texture cache are provably unchanged (see TextureCache::Generation()).
+	const bool delta_on    = Common::RuntimeFlags::Current().drawprep_delta;
+	const bool delta_stats = delta_on && FrameBreakdown::Enabled();
+	StageBindingMemo* memo_stage = nullptr;
+	if (delta_on) {
+		memo_stage = &m_binding_memos[&snapshot];
+		memo_stage->images.resize(program.info.images.size());
+		memo_stage->samplers.resize(program.info.samplers.size());
+	}
 	{
 		FrameBreakdown::Timer textures_timer(FrameBreakdown::g_counters.dp_textures_ns);
+		auto& texture_cache = m_context.GetTextureCache();
 		for (uint32_t i = 0; i < program.info.images.size(); i++) {
-			auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
+			TextureBinding binding;
+			ImageSlotMemo* memo      = memo_stage != nullptr ? &memo_stage->images[i] : nullptr;
+			uint64_t       memo_key  = 0;
+			bool           reused    = false;
+			if (memo != nullptr) {
+				memo_key = ImageResourceKey(program.info.images[i]);
+				if (memo->valid && memo->resource_key == memo_key && memo->words == snapshot.images[i]) {
+					if (delta_stats) FrameBreakdown::g_delta.reuse_eligible.fetch_add(1, std::memory_order_relaxed);
+					if (memo->generation != texture_cache.Generation()) {
+						if (delta_stats) FrameBreakdown::g_delta.reuse_rej_gen.fetch_add(1, std::memory_order_relaxed);
+					} else if (const auto* cached = texture_cache.m_slot_images.try_get(memo->image_id);
+					           cached == nullptr || !cached->registered || cached->binding.needs_rebind) {
+						if (delta_stats) FrameBreakdown::g_delta.reuse_rej_state.fetch_add(1, std::memory_order_relaxed);
+					} else {
+						// FindImage's remaining per-call side effects on a hit: last-access tick + LRU touch.
+						texture_cache.NoteImageUse(memo->image_id);
+						binding.image_id = memo->image_id;
+						binding.desc     = memo->desc;
+						reused           = true;
+						if (delta_stats) FrameBreakdown::g_delta.reuse_hits.fetch_add(1, std::memory_order_relaxed);
+						static uint32_t verify_tick = 0;
+						if (DrawPrepDeltaVerifyEnabled() && (++verify_tick & 63u) == 0) {
+							// Full path on 1 of 64 hits; it is a normal ResolveTexture call. Keep its result.
+							auto full = ResolveTexture(program.info.images[i], snapshot.images[i]);
+							const auto& a = binding.desc.view_info;
+							const auto& b = full.desc.view_info;
+							const bool same = full.image_id == binding.image_id && a.format == b.format &&
+							                  a.type == b.type && a.base_level == b.base_level &&
+							                  a.level_count == b.level_count && a.base_layer == b.base_layer &&
+							                  a.layer_count == b.layer_count && full.desc.type == binding.desc.type &&
+							                  full.desc.info.data.address == binding.desc.info.data.address;
+							FrameBreakdown::g_delta.verify_checks.fetch_add(1, std::memory_order_relaxed);
+							if (!same) {
+								FrameBreakdown::g_delta.verify_mismatch.fetch_add(1, std::memory_order_relaxed);
+								std::fprintf(stderr, "NHL27DELTA verify mismatch: stage=%u shader=0x%016" PRIx64
+								             " image_slot=%u reused=%u:%u full=%u:%u\n",
+								             static_cast<unsigned>(program.stage), program.shader_hash, i,
+								             binding.image_id.index, binding.image_id.generation,
+								             full.image_id.index, full.image_id.generation);
+								std::fflush(stderr);
+								binding = std::move(full);
+								reused  = false;
+							}
+						}
+					}
+				}
+			}
+			if (!reused) {
+				binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
+				if (memo != nullptr) {
+					const auto* resolved = texture_cache.m_slot_images.try_get(binding.image_id);
+					const bool  memoable = resolved != nullptr && resolved->registered &&
+					                      !resolved->info.data.Empty() && !resolved->binding.needs_rebind &&
+					                      !resolved->depth_id && !resolved->info.IsDepth() &&
+					                      binding.desc.info.metadata.kind != ImageMetadataKind::Dcc &&
+					                      binding.desc.info.metadata.kind != ImageMetadataKind::Cmask;
+					memo->valid = memoable;
+					if (memoable) {
+						memo->words        = snapshot.images[i];
+						memo->resource_key = memo_key;
+						memo->generation   = texture_cache.Generation();
+						memo->image_id     = binding.image_id;
+						memo->desc         = binding.desc;
+					} else if (delta_stats) {
+						FrameBreakdown::g_delta.reuse_unmemoable.fetch_add(1, std::memory_order_relaxed);
+					}
+				}
+			}
 			if (delta != nullptr) {
 				const auto* resolved = m_context.GetTextureCache().m_slot_images.try_get(binding.image_id);
 				FrameBreakdown::DeltaImageSlot(
@@ -934,8 +1050,31 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	}
 	prepared.samplers.reserve(program.info.samplers.size());
 	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
-		prepared.samplers.push_back(NativeSampler(
-		    m_context, program, i, snapshot.samplers[program.info.samplers[i].snapshot_index]));
+		const auto& sampler_resource = program.info.samplers[i];
+		const auto& sampler_words    = snapshot.samplers[sampler_resource.snapshot_index];
+		if (memo_stage != nullptr) {
+			// Samplers are never destroyed by SamplerCache, so (S# words + the NativeSampler flags) fully
+			// determine the vk::Sampler.
+			auto&          memo = memo_stage->samplers[i];
+			const uint32_t key  = (sampler_resource.snapshot_index << 3u) |
+			                     (sampler_resource.force_point_filtering ? 1u : 0u) |
+			                     (sampler_resource.depth_compare ? 2u : 0u) |
+			                     (sampler_resource.integer_border ? 4u : 0u);
+			if (delta_stats) FrameBreakdown::g_delta.smp_slots_seen.fetch_add(1, std::memory_order_relaxed);
+			if (memo.valid && memo.key == key && memo.words == sampler_words) {
+				if (delta_stats) FrameBreakdown::g_delta.smp_reuse.fetch_add(1, std::memory_order_relaxed);
+				prepared.samplers.push_back(memo.sampler);
+			} else {
+				const auto sampler = NativeSampler(m_context, program, i, sampler_words);
+				memo.valid         = true;
+				memo.key           = key;
+				memo.words         = sampler_words;
+				memo.sampler       = sampler;
+				prepared.samplers.push_back(sampler);
+			}
+			continue;
+		}
+		prepared.samplers.push_back(NativeSampler(m_context, program, i, sampler_words));
 	}
 	prepared.shader_data.reserve(program.bindings.ShaderDataDwords());
 	for (const auto reg: program.bindings.user_data_registers) {

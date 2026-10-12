@@ -231,10 +231,20 @@ struct DeltaStats {
 	std::atomic<uint64_t> calls {0}, first {0}, cmp_calls {0};      // PrepareBindings calls / first use / compared
 	std::atomic<uint64_t> img_slots {0}, img_same {0}, img_reuse {0};
 	std::atomic<uint64_t> smp_slots {0}, smp_same {0};
-	std::atomic<uint64_t> buf_slots {0}, buf_addr_same {0}, buf_shape_same {0};
+	std::atomic<uint64_t> buf_slots {0}, buf_addr_same {0}, buf_fmt_same {0}, buf_size_same {0};  // used slots only
 	std::atomic<uint64_t> call_img_same {0}, call_smp_same {0}, call_shape_same {0}, call_all_same {0};
 	std::atomic<uint64_t> rt_draws {0}, rt_repeat {0};
 	std::atomic<uint64_t> overhead_ns {0};                         // time spent inside the counter work
+	// KYTY_DRAWPREP_DELTA (Stage 1) image/sampler binding reuse, counted per image slot / sampler slot.
+	std::atomic<uint64_t> reuse_hits {0};          // image slots that skipped ResolveTexture
+	std::atomic<uint64_t> reuse_eligible {0};      // memo valid and T# words + resource unchanged
+	std::atomic<uint64_t> reuse_rej_gen {0};       // eligible, rejected only because TextureCache::Generation() moved
+	std::atomic<uint64_t> reuse_rej_state {0};     // eligible, generation ok, image unregistered / needs_rebind
+	std::atomic<uint64_t> reuse_unmemoable {0};    // resolved image kind that is never memoized (null/depth/DCC/...)
+	std::atomic<uint64_t> verify_checks {0};       // reuse hits re-resolved with the full ResolveTexture
+	std::atomic<uint64_t> verify_mismatch {0};     // ... whose image id / view info differed (must be 0)
+	std::atomic<uint64_t> smp_slots_seen {0};      // sampler slots looked up by PrepareBindings (delta on)
+	std::atomic<uint64_t> smp_reuse {0};           // ... that reused the stored vk sampler
 };
 inline DeltaStats g_delta;
 struct DeltaProg {
@@ -251,7 +261,8 @@ inline uint64_t DeltaNowNs() {
 	    std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count());
 }
 // Compare one materialized snapshot against the same program's previous one. Returns the per-program state.
-inline DeltaProg* DeltaCompare(const ShaderRecompiler::IR::ResourceSnapshot& s) {
+inline DeltaProg* DeltaCompare(const ShaderRecompiler::IR::ResourceSnapshot& s, size_t used_buffers) {
+	used_buffers = std::min(used_buffers, s.buffers.size());
 	const uint64_t t0 = DeltaNowNs();
 	auto&          st = g_delta;
 	auto&          p  = g_delta_progs[&s];
@@ -263,7 +274,7 @@ inline DeltaProg* DeltaCompare(const ShaderRecompiler::IR::ResourceSnapshot& s) 
 		p.img_id.assign(s.images.size(), ~0ull);
 		p.img_same.assign(s.images.size(), 0);
 	} else {
-		uint64_t img_same = 0, smp_same = 0, addr_same = 0, shape_same = 0;
+		uint64_t img_same = 0, smp_same = 0, addr_same = 0, fmt_same = 0, size_same = 0;
 		const bool img_sz = p.images.size() == s.images.size();
 		const bool smp_sz = p.samplers.size() == s.samplers.size();
 		const bool buf_sz = p.buffers.size() == s.buffers.size();
@@ -279,29 +290,33 @@ inline DeltaProg* DeltaCompare(const ShaderRecompiler::IR::ResourceSnapshot& s) 
 			for (size_t i = 0; i < s.samplers.size(); ++i) smp_same += p.samplers[i] == s.samplers[i];
 		}
 		if (buf_sz) {
-			for (size_t i = 0; i < s.buffers.size(); ++i) {
+			for (size_t i = 0; i < used_buffers; ++i) {
 				const auto& a = p.buffers[i];
 				const auto& b = s.buffers[i];
-				bool addr = a.dword_count == b.dword_count && a.dwords[0] == b.dwords[0] &&
-				            ((a.dwords[1] ^ b.dwords[1]) & 0xffffu) == 0;
-				bool shape = a.dword_count == b.dword_count && ((a.dwords[1] ^ b.dwords[1]) & ~0xffffu) == 0;
-				for (uint32_t d = 2; d < b.dword_count && d < 8; ++d) shape &= a.dwords[d] == b.dwords[d];
+				const bool  addr = a.dword_count == b.dword_count && a.dwords[0] == b.dwords[0] &&
+				                  ((a.dwords[1] ^ b.dwords[1]) & 0xffffu) == 0;
+				// fmt: stride/swizzle/format bits (everything except the address and num_records).
+				bool fmt = a.dword_count == b.dword_count && ((a.dwords[1] ^ b.dwords[1]) & ~0xffffu) == 0;
+				for (uint32_t d = 3; d < b.dword_count && d < 8; ++d) fmt &= a.dwords[d] == b.dwords[d];
+				const bool size = a.dword_count == b.dword_count && (b.dword_count < 3 || a.dwords[2] == b.dwords[2]);
 				addr_same += addr;
-				shape_same += shape;
+				fmt_same += fmt;
+				size_same += size;
 			}
 		}
 		const bool all_img = img_sz && img_same == s.images.size();
 		const bool all_smp = smp_sz && smp_same == s.samplers.size();
-		const bool all_shp = buf_sz && shape_same == s.buffers.size();
-		const bool all_adr = buf_sz && addr_same == s.buffers.size();
+		const bool all_shp = buf_sz && fmt_same == used_buffers && size_same == used_buffers;
+		const bool all_adr = buf_sz && addr_same == used_buffers;
 		st.cmp_calls.fetch_add(1, std::memory_order_relaxed);
 		st.img_slots.fetch_add(s.images.size(), std::memory_order_relaxed);
 		st.img_same.fetch_add(img_same, std::memory_order_relaxed);
 		st.smp_slots.fetch_add(s.samplers.size(), std::memory_order_relaxed);
 		st.smp_same.fetch_add(smp_same, std::memory_order_relaxed);
-		st.buf_slots.fetch_add(s.buffers.size(), std::memory_order_relaxed);
+		st.buf_slots.fetch_add(buf_sz ? used_buffers : 0, std::memory_order_relaxed);
 		st.buf_addr_same.fetch_add(addr_same, std::memory_order_relaxed);
-		st.buf_shape_same.fetch_add(shape_same, std::memory_order_relaxed);
+		st.buf_fmt_same.fetch_add(fmt_same, std::memory_order_relaxed);
+		st.buf_size_same.fetch_add(size_same, std::memory_order_relaxed);
 		st.call_img_same.fetch_add(all_img, std::memory_order_relaxed);
 		st.call_smp_same.fetch_add(all_smp, std::memory_order_relaxed);
 		st.call_shape_same.fetch_add(all_shp, std::memory_order_relaxed);
@@ -947,7 +962,7 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 				const uint64_t d_is = Take(dl.img_slots), d_isame = Take(dl.img_same), d_ireuse = Take(dl.img_reuse);
 				const uint64_t d_ss = Take(dl.smp_slots), d_ssame = Take(dl.smp_same);
 				const uint64_t d_bs = Take(dl.buf_slots), d_basame = Take(dl.buf_addr_same);
-				const uint64_t d_bshape = Take(dl.buf_shape_same), d_ci = Take(dl.call_img_same);
+				const uint64_t d_bfmt = Take(dl.buf_fmt_same), d_bsize = Take(dl.buf_size_same), d_ci = Take(dl.call_img_same);
 				const uint64_t d_cs = Take(dl.call_smp_same), d_csh = Take(dl.call_shape_same);
 				const uint64_t d_call = Take(dl.call_all_same), d_rd = Take(dl.rt_draws);
 				const uint64_t d_rr = Take(dl.rt_repeat), d_ov = Take(dl.overhead_ns);
@@ -955,13 +970,22 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 					return b != 0 ? 100.0 * static_cast<double>(a) / static_cast<double>(b) : 0.0;
 				};
 				std::printf("NHL27DELTA calls=%.1f img_slots=%.1f img_same=%.1f%% img_reuse=%.1f%% "
-				            "smp_same=%.1f%% buf_addr_same=%.1f%% buf_shape_same=%.1f%% call_img_same=%.1f%% "
+				            "smp_same=%.1f%% buf_addr_same=%.1f%% buf_fmt_same=%.1f%% buf_size_same=%.1f%% call_img_same=%.1f%% "
 				            "call_shape_same=%.1f%% call_all_same=%.1f%% rt_repeat=%.1f%% overhead=%.2fms "
 				            "first=%.1f smp_slots=%.1f buf_slots=%.1f call_smp_same=%.1f%%\n",
 				            per(d_calls), per(d_is), pct(d_isame, d_is), pct(d_ireuse, d_is), pct(d_ssame, d_ss),
-				            pct(d_basame, d_bs), pct(d_bshape, d_bs), pct(d_ci, d_cmp), pct(d_csh, d_cmp),
+				            pct(d_basame, d_bs), pct(d_bfmt, d_bs), pct(d_bsize, d_bs), pct(d_ci, d_cmp), pct(d_csh, d_cmp),
 				            pct(d_call, d_cmp), pct(d_rr, d_rd), ms(d_ov), per(d_first), per(d_ss), per(d_bs),
 				            pct(d_cs, d_cmp));
+				const uint64_t r_hit = Take(dl.reuse_hits), r_el = Take(dl.reuse_eligible);
+				const uint64_t r_gen = Take(dl.reuse_rej_gen), r_st = Take(dl.reuse_rej_state);
+				const uint64_t r_um = Take(dl.reuse_unmemoable), r_vc = Take(dl.verify_checks);
+				const uint64_t r_vm = Take(dl.verify_mismatch), r_ss = Take(dl.smp_slots_seen);
+				const uint64_t r_sr = Take(dl.smp_reuse);
+				std::printf("NHL27DELTAREUSE reuse_hits=%.1f reuse_eligible=%.1f rejected_gen=%.1f rejected_state=%.1f "
+				            "unmemoable=%.1f verify_checks=%.1f verify_mismatch=%.1f smp_slots=%.1f smp_reuse=%.1f\n",
+				            per(r_hit), per(r_el), per(r_gen), per(r_st), per(r_um), per(r_vc), per(r_vm), per(r_ss),
+				            per(r_sr));
 			}
 		}
 		std::printf("NHL27BUFFERS vertex_index=%.2fms indirect=%.2fms find=%.2fms bda=%.2fms "

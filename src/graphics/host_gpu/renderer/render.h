@@ -18,6 +18,7 @@
 #include <optional>
 #include <memory>
 #include <span>
+#include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -315,6 +316,28 @@ private:
 		uint64_t                            size              = 0;
 	};
 	std::vector<TextureDescMemo> m_texture_desc_memo = std::vector<TextureDescMemo>(1024);
+	// KYTY_DRAWPREP_DELTA: per-program (keyed by the stage's ResourceSnapshot address) memo of the last
+	// PrepareBindings outputs per image / sampler slot. Every entry is revalidated against the slot's
+	// descriptor words, the slot's resource and TextureCache::Generation() before it is reused.
+	struct ImageSlotMemo {
+		bool                                         valid = false;
+		ShaderRecompiler::IR::DescriptorValue        words;
+		uint64_t                                     resource_key = 0;
+		uint64_t                                     generation   = 0;
+		ImageId                                      image_id;
+		TextureCache::ImageDesc                      desc;
+	};
+	struct SamplerSlotMemo {
+		bool                                         valid = false;
+		ShaderRecompiler::IR::DescriptorValue        words;
+		uint32_t                                     key = 0;
+		vk::Sampler                                  sampler = nullptr;
+	};
+	struct StageBindingMemo {
+		std::vector<ImageSlotMemo>   images;
+		std::vector<SamplerSlotMemo> samplers;
+	};
+	std::unordered_map<const void*, StageBindingMemo> m_binding_memos;
 	// CommitBindings scratch: ranges written by bound images / shader buffers.
 	std::vector<std::pair<uint64_t, uint64_t>> m_written_image_ranges;
 	std::vector<std::pair<uint64_t, uint64_t>> m_written_buffer_ranges;

@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
+#include <atomic>
 #include <map>
 #include <type_traits>
 #include <unordered_map>
@@ -44,6 +45,11 @@ public:
 	KYTY_CLASS_NO_COPY(TextureCache);
 
 	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false);
+	// KYTY_DRAWPREP_DELTA: bumped whenever a previously resolved T# -> image binding could be stale.
+	[[nodiscard]] uint64_t      Generation() const noexcept { return m_generation.load(std::memory_order_relaxed); }
+	void                        BumpGeneration() noexcept { m_generation.fetch_add(1, std::memory_order_relaxed); }
+	// The per-call bookkeeping FindImage does on a hit (last-access tick, LRU touch).
+	void                        NoteImageUse(ImageId id);
 	void                        UpdateImage(ImageId id);
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
@@ -190,6 +196,7 @@ private:
 	bool             m_readback_linear_images = false;
 	// Set while an overlap/alias resolution frees an image; only those frees write back.
 	bool             m_alias_free_in_progress = false;
+	std::atomic<uint64_t> m_generation {0};
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;
