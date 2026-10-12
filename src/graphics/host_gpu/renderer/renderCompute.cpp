@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/renderer/depthAliasLog.h"
 #include "graphics/host_gpu/renderer/frameDump.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
+#include "graphics/host_gpu/renderer/nativeIndirect.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -32,6 +33,7 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <tuple>
 #include <array>
 #include <atomic>
 #include <cmath>
@@ -753,6 +755,21 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
+	// KYTY_DISPATCH_ARGS_GUARD=0 disables the GPU-side check of the group counts.
+	static const bool guard_args = [] {
+		const char* value = std::getenv("KYTY_DISPATCH_ARGS_GUARD");
+		return value == nullptr || value[0] != '0';
+	}();
+	vk::Buffer indirect_buffer = args_buffer->Handle();
+	uint64_t   indirect_offset = args_offset;
+	if (guard_args) {
+		if (!m_dispatch_guard) {
+			m_dispatch_guard = std::make_shared<DispatchArgsGuard>(m_context.GetGraphics(),
+			                                                       m_context.GetCommandScheduler());
+		}
+		std::tie(indirect_buffer, indirect_offset) =
+		    m_dispatch_guard->Record(buffer, *args_buffer, args_offset);
+	}
 	RebindBuffers(bindings);
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
@@ -782,7 +799,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	                                   program.shader_hash, args_addr);
 	BreadcrumbCaptureArgs(vk_buffer, crumb, args_buffer->Handle(), args_offset,
 	                      sizeof(vk::DispatchIndirectCommand));
-	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+	vk_buffer.dispatchIndirect(indirect_buffer, indirect_offset);
 	BreadcrumbEnd(m_context.GetGraphics(), vk_buffer, crumb);
 	m_context.GetTextureCache().FlushStorageShadows();
 	if (!BufferCache::GuestSyncOnly()) {

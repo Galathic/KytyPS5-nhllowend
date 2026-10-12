@@ -40,6 +40,7 @@
 #include <fmt/format.h>
 #include <cstdlib>
 #include <limits>
+#include <unordered_map>
 #include <mutex>
 #include <span>
 #include <string_view>
@@ -555,28 +556,60 @@ static bool ResolveTextureMipView(const TileSurfaceDescription& description, boo
 	return false;
 }
 
-TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
-                                              const ShaderRecompiler::IR::DescriptorValue& value) {
-	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
-		EXIT("64-bit image atomics require shaderImageInt64Atomics\n");
-	}
-	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
-	if (resource.r128) {
-		// R128 image instructions fetch only dwords 0-3; whatever follows in memory is ignored.
-		descriptor.fields[4] = descriptor.fields[5] = descriptor.fields[6] = descriptor.fields[7] = 0;
-	}
-	const bool storage = resource.written;
-	if (storage) {
-		ValidateStorageImageResource(resource);
-	}
+namespace {
 
-	auto& texture_cache = m_context.GetTextureCache();
-	if (descriptor.IsNull()) {
-		auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
-		                                                    : TextureCache::BindingType::Texture);
-		const auto id   = texture_cache.FindImage(desc);
-		return {id, nullptr, std::move(desc)};
+// The descriptor-to-image-description half of ResolveTexture is a pure function of the shader's
+// image resource and the 8 descriptor dwords; draws rebind the same textures thousands of times
+// per frame, so it is memoized (experiment TextureDescCache). The texture-cache lookup and its
+// checks still run for every binding.
+struct ComputedTextureDesc {
+	TextureCache::ImageDesc desc;
+	bool                    shader_conversion = false;
+	vk::Format              pixel_format      = vk::Format::eUndefined;
+	vk::Format              view_format       = vk::Format::eUndefined;
+	uint64_t                size              = 0;
+};
+
+// Every ImageResource field the computation reads, plus the (r128-masked) descriptor.
+struct TextureDescKey {
+	std::array<uint32_t, 8>                 dwords {};
+	ShaderRecompiler::IR::ImageResourceClass resource_class = ShaderRecompiler::IR::ImageResourceClass::None;
+	Prospero::TextureNumericClass            numeric_class  = Prospero::TextureNumericClass::Unsupported;
+	ShaderRecompiler::Decoder::ImageDimension dimension     = ShaderRecompiler::Decoder::ImageDimension::Unknown;
+	ShaderRecompiler::IR::ImageMipMode       mip_mode       = ShaderRecompiler::IR::ImageMipMode::None;
+	bool                                     read           = false;
+	bool                                     written        = false;
+	bool                                     atomic         = false;
+	bool                                     atomic64       = false;
+	bool                                     depth_compare  = false;
+	bool                                     r128           = false;
+
+	TextureDescKey(const ShaderRecompiler::IR::ImageResource& resource, const uint32_t (&fields)[8])
+	    : dwords(std::to_array(fields)), resource_class(resource.resource_class), numeric_class(resource.numeric_class),
+	      dimension(resource.dimension), mip_mode(resource.mip_mode), read(resource.read),
+	      written(resource.written), atomic(resource.atomic), atomic64(resource.atomic64),
+	      depth_compare(resource.depth_compare), r128(resource.r128) {}
+	bool operator==(const TextureDescKey&) const = default;
+};
+
+struct TextureDescKeyHash {
+	size_t operator()(const TextureDescKey& key) const noexcept {
+		uint64_t hash = 0xcbf29ce484222325ull;
+		const auto mix = [&](uint64_t value) { hash = (hash ^ value) * 0x100000001b3ull; };
+		for (const auto word: key.dwords) mix(word);
+		mix(static_cast<uint64_t>(key.resource_class) | (static_cast<uint64_t>(key.numeric_class) << 8u) |
+		    (static_cast<uint64_t>(key.dimension) << 16u) | (static_cast<uint64_t>(key.mip_mode) << 24u));
+		mix(static_cast<uint64_t>(key.read) | (key.written ? 2u : 0u) | (key.atomic ? 4u : 0u) |
+		    (key.atomic64 ? 8u : 0u) | (key.depth_compare ? 16u : 0u) | (key.r128 ? 32u : 0u));
+		return static_cast<size_t>(hash ^ (hash >> 29u));
 	}
+};
+
+} // namespace
+
+static ComputedTextureDesc ComputeTextureDesc(RenderContext& m_context,
+                                              const ShaderRecompiler::IR::ImageResource& resource,
+                                              const ShaderTextureResource& descriptor, bool storage) {
 
 	const auto address         = descriptor.Base40();
 	const auto width           = static_cast<uint32_t>(descriptor.Width5()) + 1u;
@@ -716,6 +749,53 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	                                 view_levels, desc.info.resources.layers);
 	desc.view_info.base_level = view_base;
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
+	return {std::move(desc), shader_conversion, pixel_format, view_format, size.size};
+}
+
+TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
+                                              const ShaderRecompiler::IR::DescriptorValue& value) {
+	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
+		EXIT("64-bit image atomics require shaderImageInt64Atomics\n");
+	}
+	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
+	if (resource.r128) {
+		// R128 image instructions fetch only dwords 0-3; whatever follows in memory is ignored.
+		descriptor.fields[4] = descriptor.fields[5] = descriptor.fields[6] = descriptor.fields[7] = 0;
+	}
+	const bool storage = resource.written;
+	if (storage) {
+		ValidateStorageImageResource(resource);
+	}
+
+	auto& texture_cache = m_context.GetTextureCache();
+	if (descriptor.IsNull()) {
+		auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
+		                                                    : TextureCache::BindingType::Texture);
+		const auto id   = texture_cache.FindImage(desc);
+		return {id, nullptr, std::move(desc)};
+	}
+	ComputedTextureDesc computed_storage;
+	const ComputedTextureDesc* computed = nullptr;
+	static std::unordered_map<TextureDescKey, ComputedTextureDesc, TextureDescKeyHash> memo;
+	if (Common::Experiments::Enabled(Common::Experiments::TextureDescCache)) {
+		const TextureDescKey key(resource, descriptor.fields);
+		if (auto found = memo.find(key); found != memo.end()) {
+			computed = &found->second;
+		} else {
+			if (memo.size() > 65536u) memo.clear();
+			computed = &memo.emplace(key, ComputeTextureDesc(m_context, resource, descriptor, storage)).first->second;
+		}
+	} else {
+		computed_storage = ComputeTextureDesc(m_context, resource, descriptor, storage);
+		computed = &computed_storage;
+	}
+	auto       desc              = computed->desc;
+	const bool shader_conversion = computed->shader_conversion;
+	const auto pixel_format      = computed->pixel_format;
+	const auto view_format       = computed->view_format;
+	struct {
+		uint64_t size;
+	} size {computed->size};
 
 	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
 	auto*      image               = &texture_cache.GetImage(id);

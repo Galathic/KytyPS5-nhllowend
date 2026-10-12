@@ -40,6 +40,7 @@ struct DrawRenderState;
 class RenderContext;
 class CommandScheduler;
 class NativeIndirectPrep;
+class DispatchArgsGuard;
 struct RenderExecutorTestAccess;
 
 enum class CommandBufferDebugOp : uint32_t {
@@ -301,6 +302,7 @@ private:
 	RenderContext&                        m_context;
 	GraphicsBindings                     m_graphics_bindings;
 	std::shared_ptr<NativeIndirectPrep> m_native_indirect_prep;
+	std::shared_ptr<DispatchArgsGuard>   m_dispatch_guard;
 	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorBufferInfo> m_descriptor_buffers;
