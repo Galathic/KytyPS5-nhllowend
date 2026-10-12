@@ -23,6 +23,7 @@ enum Bit : uint32_t {
 	TextureDescCache   = 1u << 11u, // KYTY_TEXTURE_DESC_CACHE (memoized T# decoding per draw)
 	ImageLookupHint    = 1u << 12u, // KYTY_IMAGE_LOOKUP_HINT (skip the region scan for known images)
 	LongBufferGcAge    = 1u << 13u, // KYTY_LONG_BUFFER_GC_AGE (keep unused buffers 10x longer)
+	RenderTargetMemo   = 1u << 14u, // KYTY_RENDER_TARGET_MEMO (memoized color target decoding)
 };
 
 [[nodiscard]] bool Enabled(Bit bit) noexcept;

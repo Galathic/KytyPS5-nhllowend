@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 
 #include "common/assert.h"
+#include "common/experiments.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -14,6 +15,8 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <cstring>
+#include <unordered_map>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -40,6 +43,45 @@ static bool DccAlphaOnMsb(const HW::ColorInfo& info) {
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
+namespace {
+
+// Experiment RenderTargetMemo memoizes render-target descriptions: the decoding below is a
+// pure function of the slot's registers and the call arguments. The image lookup still runs per
+// draw (with the ImageLookupHint fast path).
+struct ColorTargetKey {
+	std::array<uint8_t, sizeof(HW::RenderTarget)> registers {};
+	uint32_t slice_offset = 0;
+	uint32_t slot         = 0;
+	uint32_t mask         = 0;
+	bool     ignore_mask  = false;
+	bool     exact_format = false;
+	bool operator==(const ColorTargetKey&) const = default;
+};
+
+struct ColorTargetKeyHash {
+	size_t operator()(const ColorTargetKey& key) const noexcept {
+		uint64_t hash = 0xcbf29ce484222325ull;
+		for (const auto byte: key.registers) hash = (hash ^ byte) * 0x100000001b3ull;
+		hash = (hash ^ key.slice_offset) * 0x100000001b3ull;
+		hash = (hash ^ (key.slot | (key.mask << 8u) | (key.ignore_mask ? 1u << 16u : 0u) |
+		                (key.exact_format ? 1u << 17u : 0u))) *
+		       0x100000001b3ull;
+		return static_cast<size_t>(hash ^ (hash >> 29u));
+	}
+};
+
+struct CachedColorTarget {
+	RenderColorInfo info;
+	ImageId         last_image {};
+};
+
+std::unordered_map<ColorTargetKey, CachedColorTarget, ColorTargetKeyHash>& ColorTargetMemo() {
+	static std::unordered_map<ColorTargetKey, CachedColorTarget, ColorTargetKeyHash> memo;
+	return memo;
+}
+
+} // namespace
+
 void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& r,
                                               uint32_t         render_target_slice_offset,
                                               uint32_t rt_slot, bool ignore_target_mask,
@@ -51,6 +93,32 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	auto        mask    = render_target_mask_slot(hw.GetRenderTargetMask(), rt_slot);
 	if (ignore_target_mask && rt.base.addr != 0 && mask == 0) {
 		mask = 0x0f;
+	}
+	const bool memoize = Common::Experiments::Enabled(Common::Experiments::RenderTargetMemo) &&
+	                     rt.base.addr != 0 && mask != 0;
+	ColorTargetKey key;
+	if (memoize) {
+		std::memcpy(key.registers.data(), &rt, sizeof(rt));
+		key.slice_offset = render_target_slice_offset;
+		key.slot         = rt_slot;
+		key.mask         = mask;
+		key.ignore_mask  = ignore_target_mask;
+		key.exact_format = exact_format;
+		auto& memo = ColorTargetMemo();
+		if (auto found = memo.find(key); found != memo.end()) {
+			r = found->second.info;
+			auto& texture_cache = m_context.GetTextureCache();
+			if (Common::Experiments::Enabled(Common::Experiments::ImageLookupHint)) {
+				bool exact = false;
+				r.image_id = texture_cache.FindImageHinted(r.desc, exact_format,
+				                                           found->second.last_image, exact);
+				found->second.last_image = exact ? r.image_id : ImageId {};
+			} else {
+				r.image_id = texture_cache.FindImage(r.desc, exact_format);
+			}
+			BindRenderTarget(r.image_id);
+			return;
+		}
 	}
 
 	r             = {};
@@ -335,6 +403,14 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	auto& texture_cache        = m_context.GetTextureCache();
 	r.guest_mip_level          = rt.view.current_mip_level;
 	r.guest_array_layer        = view.base_layer;
+	if (memoize) {
+		auto& memo = ColorTargetMemo();
+		if (memo.size() > 16384u) memo.clear();
+		auto& cached = memo[key];
+		cached.info                = r;
+		cached.info.export_mapping = target_format.export_mapping;
+		cached.last_image          = {};
+	}
 	r.image_id                 = texture_cache.FindImage(r.desc, exact_format);
 	r.export_mapping           = target_format.export_mapping;
 	BindRenderTarget(r.image_id);
