@@ -1161,9 +1161,11 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	}
 	{
 		FrameBreakdown::Timer textures_timer(FrameBreakdown::g_counters.dp_textures_ns);
+		FrameBreakdown::TexScope tex_scope;
 		if (draw.IsIndexed()) {
 			LogDrawPhase(draw.Name(), "ResolveRenderColorTarget");
 		}
+		FrameBreakdown::Timer rt_color_timer(FrameBreakdown::g_tex.rt_color_ns, FrameBreakdown::TexOn());
 		for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
 			if ((mrt_mask & (1u << slot)) != 0) {
 				ResolveRenderColorTarget(buffer, state.color_info[state.color_count],
@@ -1176,6 +1178,8 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		if (draw.IsIndexed()) {
 			LogDrawPhase(draw.Name(), "ResolveRenderDepthTarget");
 		}
+		rt_color_timer.Stop();
+		FrameBreakdown::Timer rt_depth_timer(FrameBreakdown::g_tex.rt_depth_ns, FrameBreakdown::TexOn());
 		ResolveRenderDepthTarget(buffer, state.depth_info);
 	}
 

@@ -232,6 +232,7 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 	if (barriers.empty()) {
 		return;
 	}
+	FrameBreakdown::TexAdd(FrameBreakdown::g_tex.transits);
 	FrameBreakdown::GpuBusyScope busy_scope(FrameBreakdown::GB_BARRIER);
 	m_scheduler.EndRendering();
 	vk::DependencyInfo dependency {};

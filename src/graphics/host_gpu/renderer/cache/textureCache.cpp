@@ -1429,6 +1429,8 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 }
 
 void TextureCache::RefreshImage(ImageId id) {
+	FrameBreakdown::Timer tex_timer(FrameBreakdown::g_tex.refresh_ns, FrameBreakdown::TexOn());
+	FrameBreakdown::TexAdd(FrameBreakdown::g_tex.refresh_calls);
 	auto& image = m_slot_images[id];
 	if (image.depth_id &&
 	    (m_slot_images[image.depth_id].info.metadata.stencil_compressed ||
@@ -1454,6 +1456,7 @@ void TextureCache::RefreshImage(ImageId id) {
 	if (!cpu_dirty) {
 		return;
 	}
+	FrameBreakdown::TexAdd(FrameBreakdown::g_tex.uploads);
 	InitializeImage(id);
 }
 

@@ -965,6 +965,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	}
 	{
 		FrameBreakdown::Timer textures_timer(FrameBreakdown::g_counters.dp_textures_ns);
+		FrameBreakdown::TexScope tex_scope;
 		auto& texture_cache = m_context.GetTextureCache();
 		for (uint32_t i = 0; i < program.info.images.size(); i++) {
 			TextureBinding binding;
@@ -1015,7 +1016,11 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 				}
 			}
 			if (!reused) {
-				binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
+				{
+					FrameBreakdown::Timer resolve_timer(FrameBreakdown::g_tex.resolve_ns, FrameBreakdown::TexOn());
+					FrameBreakdown::TexAdd(FrameBreakdown::g_tex.resolved);
+					binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
+				}
 				if (memo != nullptr) {
 					const auto* resolved = texture_cache.m_slot_images.try_get(binding.image_id);
 					const bool  memoable = resolved != nullptr && resolved->registered &&
@@ -1042,7 +1047,10 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 				    resolved != nullptr && (resolved->registered || resolved->info.data.Empty()) &&
 				        !resolved->binding.needs_rebind);
 			}
-			BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
+			{
+				FrameBreakdown::Timer bind_timer(FrameBreakdown::g_tex.bind_ns, FrameBreakdown::TexOn());
+				BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
+			}
 			binding.mip_views.swap(prepared.images[i].mip_views);
 			binding.mip_views.clear();
 			prepared.images[i] = std::move(binding);
@@ -1209,6 +1217,8 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			if (old_image != nullptr) {
 				old_image->binding = {};
 			}
+			FrameBreakdown::Timer rres_timer(FrameBreakdown::g_tex.rebind_resolve_ns, FrameBreakdown::TexOn());
+			FrameBreakdown::TexAdd(FrameBreakdown::g_tex.rebind_resolved);
 			images[i] = ResolveTexture(program.info.images[i], snapshot.images[i]);
 			BindImage(images[i].image_id,
 			          images[i].desc.type == TextureCache::BindingType::Storage);
@@ -1216,6 +1226,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		auto& binding = images[i];
 		binding.mip_views.clear();
 		const auto& resource = program.info.images[i];
+		FrameBreakdown::Timer view_timer(FrameBreakdown::g_tex.view_ns, FrameBreakdown::TexOn());
 		if (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::Dynamic) {
 			EXIT_IF(resource.mip_count == 0u ||
 			        resource.mip_count != binding.desc.view_info.level_count);
@@ -1232,6 +1243,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		} else {
 			binding.image_view = texture_cache.FindTexture(binding.image_id, binding.desc);
 		}
+		view_timer.Stop();
 		auto&      image   = texture_cache.GetImage(binding.image_id);
 		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
 		image.usage.storage |= storage;
@@ -1259,10 +1271,15 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	}
 	{
 		FrameBreakdown::Timer textures_timer(FrameBreakdown::g_counters.dp_textures_ns);
-		for (auto* stage: stages) {
-			RebindImages(*stage);
+		FrameBreakdown::TexScope tex_scope;
+		{
+			FrameBreakdown::Timer rebind_timer(FrameBreakdown::g_tex.rebind_ns, FrameBreakdown::TexOn());
+			for (auto* stage: stages) {
+				RebindImages(*stage);
+			}
 		}
 		auto& cache = m_context.GetTextureCache();
+		FrameBreakdown::Timer rediscover_timer(FrameBreakdown::g_tex.rt_rediscover_ns, FrameBreakdown::TexOn());
 		for (auto& target: colors) {
 			EXIT_IF(!target.image_id);
 			const auto old_image = cache.m_slot_images.try_get(target.image_id);

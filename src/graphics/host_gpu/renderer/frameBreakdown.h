@@ -537,6 +537,31 @@ private:
 	bool                   m_active;
 };
 
+// NHL27TEXTURES: breakdown of dp_textures_ns. Everything is gated on TexScope, which is held by the three
+// dp_textures_ns blocks (so compute / other callers of the same functions are not counted).
+// Top level (sequential, inside dp_textures_ns): resolve, bind, rebind, rt_rediscover, rt_color, rt_depth.
+// Nested: rebind_resolve and view are inside rebind; refresh is inside view / rt_*; transit counts barriers.
+struct TexStats {
+	std::atomic<uint64_t> resolve_ns {0}, bind_ns {0}, rebind_ns {0}, rebind_resolve_ns {0}, view_ns {0};
+	std::atomic<uint64_t> refresh_ns {0}, rt_rediscover_ns {0}, rt_color_ns {0}, rt_depth_ns {0};
+	std::atomic<uint64_t> resolved {0}, rebind_resolved {0}, view_hit {0}, view_created {0};
+	std::atomic<uint64_t> refresh_calls {0}, uploads {0}, transits {0};
+};
+inline TexStats g_tex;
+inline thread_local int g_tex_scope = 0;
+struct TexScope {
+	TexScope() noexcept { ++g_tex_scope; }
+	~TexScope() { --g_tex_scope; }
+	TexScope(const TexScope&)            = delete;
+	TexScope& operator=(const TexScope&) = delete;
+};
+inline bool TexOn() noexcept {
+	return g_tex_scope > 0 && Enabled();
+}
+inline void TexAdd(std::atomic<uint64_t>& counter) noexcept {
+	if (TexOn()) counter.fetch_add(1, std::memory_order_relaxed);
+}
+
 inline void Add(std::atomic<uint64_t>& counter, uint64_t amount = 1) noexcept {
 	if (Enabled()) {
 		counter.fetch_add(amount, std::memory_order_relaxed);
@@ -860,6 +885,25 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 		            "descriptors=%.2fms pipeline=%.2fms other=%.2fms\n",
 		            ms(draw_prep_ns), ms(dp_materialize_ns), ms(dp_textures_ns), ms(dp_buffers_ns),
 		            ms(dp_descriptors_ns), ms(dp_pipeline_ns), other_ms);
+		{
+			auto&          tx = g_tex;
+			const uint64_t t_res = Take(tx.resolve_ns), t_bind = Take(tx.bind_ns), t_reb = Take(tx.rebind_ns);
+			const uint64_t t_rres = Take(tx.rebind_resolve_ns), t_view = Take(tx.view_ns);
+			const uint64_t t_ref = Take(tx.refresh_ns), t_rtre = Take(tx.rt_rediscover_ns);
+			const uint64_t t_rtc = Take(tx.rt_color_ns), t_rtd = Take(tx.rt_depth_ns);
+			const uint64_t n_res = Take(tx.resolved), n_rres = Take(tx.rebind_resolved);
+			const uint64_t n_vh = Take(tx.view_hit), n_vc = Take(tx.view_created);
+			const uint64_t n_ref = Take(tx.refresh_calls), n_up = Take(tx.uploads), n_tr = Take(tx.transits);
+			const double   t_other = std::max(0.0, ms(dp_textures_ns) - ms(t_res) - ms(t_bind) - ms(t_reb) -
+			                                           ms(t_rtre) - ms(t_rtc) - ms(t_rtd));
+			std::printf("NHL27TEXTURES total=%.2fms resolve=%.2fms bind=%.2fms rebind=%.2fms(resolve=%.2f view=%.2f) "
+			            "rt_rediscover=%.2fms rt_color=%.2fms rt_depth=%.2fms other=%.2fms refresh=%.2fms(nested) "
+			            "resolved=%.1f rebind_resolved=%.1f views_hit=%.1f views_created=%.1f refresh_calls=%.1f "
+			            "uploads=%.1f transits=%.1f\n",
+			            ms(dp_textures_ns), ms(t_res), ms(t_bind), ms(t_reb), ms(t_rres), ms(t_view), ms(t_rtre),
+			            ms(t_rtc), ms(t_rtd), t_other, ms(t_ref), per(n_res), per(n_rres), per(n_vh), per(n_vc),
+			            per(n_ref), per(n_up), per(n_tr));
+		}
 		{
 			const uint64_t mat_named = mat_flat_ns + mat_eval_ns + mat_indirect_ns + mat_spec_ns;
 			const uint64_t mat_rest  = mat_total_ns > mat_named ? mat_total_ns - mat_named : 0;
