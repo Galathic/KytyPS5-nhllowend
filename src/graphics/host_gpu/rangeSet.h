@@ -58,6 +58,10 @@ public:
 
 	[[nodiscard]] bool Intersects(uint64_t address, uint64_t size) const {
 		const auto end = End(address, size);
+		// O(1) reject outside the overall span (stored ranges are disjoint and ordered).
+		if (m_ranges.empty() || end <= m_ranges.begin()->first || address >= m_ranges.rbegin()->second) {
+			return false;
+		}
 		auto       it  = m_ranges.lower_bound(address);
 		if (it != m_ranges.begin() && std::prev(it)->second > address) {
 			return true;

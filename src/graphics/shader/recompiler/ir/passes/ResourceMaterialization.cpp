@@ -151,6 +151,7 @@ bool DecodeBufferDescriptor(const DescriptorValue& descriptor, ShaderBufferResou
 struct ReadCapture {
 	SrtRuntime                                  source;
 	std::vector<std::pair<uint64_t, uint64_t>>& ranges;
+	bool                                        coalesce = false;
 };
 
 bool CaptureStrictRead(void* userdata, uint64_t address, std::span<uint32_t> values) {
@@ -178,6 +179,13 @@ bool CaptureOrdinaryRead(void* userdata, uint64_t address, std::span<uint32_t> v
 		if (!capture.source.read_memory(capture.source.userdata, address, values)) return false;
 	} else {
 		std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
+	}
+	// Under KYTY_SRT_SOURCE_REUSE, extend the previous range when this read is exactly
+	// adjacent (the union of covered bytes is unchanged).
+	if (capture.coalesce && !capture.ranges.empty() &&
+	    capture.ranges.back().first + capture.ranges.back().second == address) {
+		capture.ranges.back().second += values.size_bytes();
+		return true;
 	}
 	capture.ranges.emplace_back(address, values.size_bytes());
 	return true;
@@ -1219,7 +1227,7 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 	const bool capture_reads = program.capture_specialization_reads;
 	auto& reads = snapshot.specialization_reads;
 	reads.clear();
-	ReadCapture capture {runtime, reads};
+	ReadCapture capture {runtime, reads, Common::RuntimeFlags::Current().srt_source_reuse};
 	SrtRuntime observed = runtime;
 	if (capture_reads) {
 		observed.userdata = &capture;

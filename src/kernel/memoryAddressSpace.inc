@@ -104,6 +104,7 @@ public:
 			UnmapViewPreservePlaceholder(reinterpret_cast<void*>(entry.vaddr), entry.size);
 		}
 		m_maps.clear();
+		BumpMapGeneration();
 		if (m_backing_base != nullptr) {
 			UnmapViewOfFile(m_backing_base);
 		}
@@ -116,6 +117,7 @@ public:
 			    !UnmapViewPreservePlaceholder(reinterpret_cast<void*>(entry.vaddr), entry.size));
 		}
 		m_maps.clear();
+		BumpMapGeneration();
 		if (m_backing_base != nullptr) {
 			munmap(m_backing_base, m_size);
 		}
@@ -176,11 +178,32 @@ public:
 		                          });
 	}
 
-	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
+	// fast: enables the lock-free single-mapping read cache (KYTY_SRT_SOURCE_REUSE).
+	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size, bool fast = false) {
 		if (data == nullptr) {
 			return false;
 		}
 		auto* destination = static_cast<uint8_t*>(data);
+		if (fast) {
+			// Lock-free hit on this thread's last single-mapping read. Every m_maps mutation
+			// bumps m_map_gen (release, under m_mutex) right after mutating; the entry is
+			// used only if the generation is unchanged before AND after the copy, so a
+			// concurrent unmap/remap is either ordered after this read or forces the slow path.
+			auto&      c  = t_read_cache;
+			const auto g0 = m_map_gen.load(std::memory_order_acquire);
+			if (c.owner == this && c.gen == g0 && size != 0 && vaddr >= c.begin && vaddr - c.begin < c.length &&
+			    size <= c.length - (vaddr - c.begin)) {
+				std::memcpy(destination, c.host + (vaddr - c.begin), size);
+				std::atomic_thread_fence(std::memory_order_acquire);
+				if (m_map_gen.load(std::memory_order_relaxed) == g0) return true;
+			}
+			return TryTransferBacking(
+			    vaddr, size,
+			    [destination](uint8_t* backing, uint64_t data_offset, size_t bytes) {
+				    std::memcpy(destination + data_offset, backing, bytes);
+			    },
+			    true);
+		}
 		return TryTransferBacking(
 		    vaddr, size, [destination](uint8_t* backing, uint64_t data_offset, size_t bytes) {
 			    std::memcpy(destination + data_offset, backing, bytes);
@@ -252,6 +275,7 @@ public:
 		{
 			std::lock_guard lock(m_mutex);
 			EXIT_IF(!m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
+			BumpMapGeneration();
 		}
 		SetFailure(failure_reason, FailureReason::None);
 		return true;
@@ -263,6 +287,7 @@ public:
 		}
 		RemoveMappingsUnlocked(vaddr, size);
 		EXIT_IF(!m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
+		BumpMapGeneration();
 		SetFailure(failure_reason, FailureReason::None);
 		return true;
 #endif
@@ -350,6 +375,7 @@ public:
 					old = entry->second;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 					m_maps.erase(entry);
+					BumpMapGeneration();
 #endif
 				}
 			}
@@ -370,6 +396,7 @@ public:
 			if (!unmapped) {
 				std::lock_guard lock(m_mutex);
 				m_maps.emplace(old.vaddr, old);
+				BumpMapGeneration();
 				return false;
 			}
 			if (placeholder_preserved != nullptr) {
@@ -414,6 +441,7 @@ public:
 		}
 		std::lock_guard lock(m_mutex);
 		m_maps.emplace(old.vaddr, old);
+		BumpMapGeneration();
 		return false;
 #else
 		// Replace only the requested range so concurrent accesses and GPU watch
@@ -457,8 +485,21 @@ public:
 	}
 
 private:
+	struct ReadCache {
+		const void* owner  = nullptr;
+		uint64_t    gen    = 0;
+		uint64_t    begin  = 0;
+		uint64_t    length = 0;
+		uint8_t*    host   = nullptr;
+	};
+	static inline thread_local ReadCache t_read_cache;
+	static inline std::atomic<uint64_t> s_gen_epoch {0};
+	std::atomic<uint64_t>               m_map_gen {s_gen_epoch.fetch_add(uint64_t {1} << 32) + 1};
+	// Called with m_mutex held, after mutating m_maps.
+	void BumpMapGeneration() { m_map_gen.fetch_add(1, std::memory_order_release); }
+
 	template <typename Transfer>
-	bool TryTransferBacking(uint64_t vaddr, uint64_t size, Transfer transfer) {
+	bool TryTransferBacking(uint64_t vaddr, uint64_t size, Transfer transfer, bool fill_cache = false) {
 		if (!IsAvailable() || size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
@@ -473,6 +514,12 @@ private:
 			    RangeOk(first.backing_offset + vaddr - first.vaddr, size)) {
 				transfer(m_backing_base + first.backing_offset + (vaddr - first.vaddr), 0,
 				         static_cast<size_t>(size));
+				if (fill_cache) {
+					// m_mutex is held, so m_map_gen is stable and describes this entry.
+					const auto ok_len = std::min<uint64_t>(first.size, m_size - first.backing_offset);
+					t_read_cache = {this, m_map_gen.load(std::memory_order_relaxed), first.vaddr, ok_len,
+					                m_backing_base + first.backing_offset};
+				}
 				return true;
 			}
 		}
@@ -510,6 +557,7 @@ private:
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	void RemoveMappingsUnlocked(uint64_t vaddr, uint64_t size) {
+		BumpMapGeneration();
 		const auto end = vaddr + size;
 		auto       it = m_maps.upper_bound(vaddr);
 		if (it != m_maps.begin()) {
@@ -758,8 +806,8 @@ public:
 		return m_backing->TryWriteBacking(vaddr, data, size);
 	}
 
-	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
-		return m_backing->TryReadBacking(vaddr, data, size);
+	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size, bool fast = false) {
+		return m_backing->TryReadBacking(vaddr, data, size, fast);
 	}
 
 	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
