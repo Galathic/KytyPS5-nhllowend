@@ -1707,6 +1707,20 @@ bool SrtWalker::VerifyCfgRefresh(std::vector<uint32_t>& flat) {
 }
 
 bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
+	// KYTY_PERF_STATS: one clock pair per call, split by how the refresh was served.
+	struct FlatCallTimer {
+		bool                         active = FrameBreakdown::Enabled();
+		FrameBreakdown::Clock::time_point start {};
+		int                          kind = 0;  // 1 = trace hit, 2 = non-CFG tape/walker
+		FlatCallTimer() { if (active) start = FrameBreakdown::Clock::now(); }
+		~FlatCallTimer() {
+			if (!active || kind == 0) return;
+			auto& fc = FrameBreakdown::g_counters;
+			const auto ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+			    FrameBreakdown::Clock::now() - start).count());
+			(kind == 1 ? fc.mat_flat_hit_ns : fc.mat_flat_nocfg_ns).fetch_add(ns, std::memory_order_relaxed);
+		}
+	} call_timer;
 	if (m_cfg_gather_enabled) {
 		m_cfg_gather_ready_sources.assign(m_program.descriptor_sources.size(), 0u);
 		if (m_clean_evaluator != nullptr)
@@ -1736,10 +1750,12 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	}
 	if (trace_eligible && ReplayCfgTrace(flat) > 0) {
 		if (FrameBreakdown::Enabled()) FrameBreakdown::g_counters.mat_flat_trace_hits.fetch_add(1, std::memory_order_relaxed);
+		call_timer.kind = 1;
 		return true;
 	}
 	if (FrameBreakdown::Enabled()) FrameBreakdown::g_counters.mat_flat_trace_other.fetch_add(1, std::memory_order_relaxed);
 	if (!m_program.control_flow.empty()) PrepareCfgTape();
+	else call_timer.kind = 2;
 	auto& trace_steps = m_program.cfg_trace_scratch;
 	const auto record = [&](ResourcePlan::CfgTrace::Step step) {
 		if (m_cfg_trace_recording) trace_steps.push_back(step);
@@ -3098,6 +3114,22 @@ int SrtWalker::RunTape(std::vector<uint32_t>& flat) {
 	auto& vals = m_program.srt_tape_values;
 	vals.resize(tape.ops.size());
 
+	// Batched per-op counters: same totals as the old per-op increments, one atomic add per run.
+	struct TapeOpTally {
+		SrtWalker& walker;
+		uint64_t   executed = 0;
+		~TapeOpTally() {
+			if (executed == 0u) return;
+			if (walker.m_runtime.evaluation_counts) walker.m_runtime.evaluation_counts->tape_ops += executed;
+			if (FrameBreakdown::Enabled()) {
+				auto& fc = FrameBreakdown::g_counters;
+				fc.mat_flat_ops.fetch_add(executed, std::memory_order_relaxed);
+				if (walker.m_program.control_flow.empty()) {
+					fc.mat_flat_nocfg_ops.fetch_add(executed, std::memory_order_relaxed);
+				}
+			}
+		}
+	} tally {*this};
 	for (size_t i = 0; i < tape.ops.size();) {
 		if (m_scalar_batch_enabled &&
 		    tape.ops[i].kind == ResourcePlan::SrtTape::Kind::RawRead &&
@@ -3119,6 +3151,7 @@ int SrtWalker::RunTape(std::vector<uint32_t>& flat) {
 				continue;
 			}
 		}
+		++tally.executed;
 		if (!ExecuteTapeOp(tape.ops[i], vals, static_cast<uint32_t>(i))) return 0;
 		++i;
 	}
@@ -3143,8 +3176,7 @@ int SrtWalker::RunTape(std::vector<uint32_t>& flat) {
 
 bool SrtWalker::ExecuteTapeOp(const ResourcePlan::SrtTape::Op& op,
                               std::vector<uint64_t>& values, uint32_t index) {
-	if (m_runtime.evaluation_counts) ++m_runtime.evaluation_counts->tape_ops;
-	if (FrameBreakdown::Enabled()) FrameBreakdown::g_counters.mat_flat_ops.fetch_add(1, std::memory_order_relaxed);
+	// Per-op counters are tallied once per RunTape (RunTape::TapeOpTally).
 	uint64_t result = 0;
 	switch (op.kind) {
 		case ResourcePlan::SrtTape::Kind::Immediate:

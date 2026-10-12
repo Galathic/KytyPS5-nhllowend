@@ -110,6 +110,9 @@ struct Counters {
 	std::atomic<uint64_t> mat_flat_ops {0};       // tape ops executed by RefreshFlatBuffer
 	std::atomic<uint64_t> mat_flat_alloc_ns {0};  // flat.assign + trace setup (KYTY_PERF_DRAW_DETAIL=1 only)
 	std::atomic<uint64_t> mat_flat_trace_hits {0};   // refreshes served by ReplayCfgTrace
+	std::atomic<uint64_t> mat_flat_hit_ns {0};     // time in RefreshFlatBuffer calls served by trace replay
+	std::atomic<uint64_t> mat_flat_nocfg_ns {0};   // time in RefreshFlatBuffer calls on non-CFG plans
+	std::atomic<uint64_t> mat_flat_nocfg_ops {0};  // tape ops executed on non-CFG plans
 	std::atomic<uint64_t> mat_flat_trace_other {0};  // refreshes that were not (miss/ineligible/non-CFG)
 	std::atomic<uint64_t> mat_tr_why[16] {};  // ReplayCfgTrace outcome reasons (see NHL27TRACE print)
 	std::atomic<uint64_t> mat_reuse_hits {0};   // KYTY_SRT_SOURCE_REUSE: gather output equals the previous one
@@ -461,6 +464,9 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 	const uint64_t mat_flat_alloc_ns = Take(c.mat_flat_alloc_ns);
 	const uint64_t mat_flat_trace_hits  = Take(c.mat_flat_trace_hits);
 	const uint64_t mat_flat_trace_other = Take(c.mat_flat_trace_other);
+	const uint64_t mat_flat_hit_ns      = Take(c.mat_flat_hit_ns);
+	const uint64_t mat_flat_nocfg_ns    = Take(c.mat_flat_nocfg_ns);
+	const uint64_t mat_flat_nocfg_ops   = Take(c.mat_flat_nocfg_ops);
 	uint64_t mat_tr_why[16];
 	for (int i = 0; i < 16; ++i) mat_tr_why[i] = Take(c.mat_tr_why[i]);
 	const uint64_t mat_reuse_hits    = Take(c.mat_reuse_hits);
@@ -587,9 +593,14 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 			            ms(mat_indirect_ns), ms(mat_spec_ns), ms(mat_rest), per(mat_reuse_hits),
 			            per(mat_reuse_misses), per(mat_reuse_fallback));
 			std::printf("NHL27FLAT words=%.1f read=%.2fms(detail) ops=%.1f alloc=%.2fms(detail) "
-			            "trace_hit=%.1f trace_other=%.1f\n",
+			            "trace_hit=%.1f trace_other=%.1f hit_t=%.2fms(%.2fus/call) nocfg_t=%.2fms(%.2fus/call) "
+			            "nocfg_ops_per_call=%.1f\n",
 			            per(mat_flat_reads), ms(mat_flat_read_ns), per(mat_flat_ops), ms(mat_flat_alloc_ns),
-			            per(mat_flat_trace_hits), per(mat_flat_trace_other));
+			            per(mat_flat_trace_hits), per(mat_flat_trace_other), ms(mat_flat_hit_ns),
+			            mat_flat_trace_hits > 0 ? ms(mat_flat_hit_ns) * 1000.0 / per(mat_flat_trace_hits) : 0.0,
+			            ms(mat_flat_nocfg_ns),
+			            mat_tr_why[0] > 0 ? ms(mat_flat_nocfg_ns) * 1000.0 / per(mat_tr_why[0]) : 0.0,
+			            mat_tr_why[0] > 0 ? per(mat_flat_nocfg_ops) / per(mat_tr_why[0]) : 0.0);
 			std::printf("NHL27TRACE nocfg=%.1f flag_off=%.1f inelig_mode=%.1f empty=%.1f disabled=%.1f tape_nr=%.1f "
 			            "strict=%.1f m_memo=%.1f m_exec=%.1f m_memoslot=%.1f m_cond=%.1f m_eval=%.1f m_condeval=%.1f "
 			            "rec_abort=%.1f merge_refused=%.1f merge_new=%.1f\n",
