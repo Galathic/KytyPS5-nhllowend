@@ -28,12 +28,16 @@ public:
  DispatchArgsGuard(GraphicContext& graphics, CommandScheduler& scheduler);
  ~DispatchArgsGuard();
  // Records the guard; returns the buffer and offset to pass to vkCmdDispatchIndirect.
- std::pair<vk::Buffer, uint64_t> Record(CommandBuffer& buffer, const Buffer& args, uint64_t offset);
+ std::pair<vk::Buffer, uint64_t> Record(CommandBuffer& buffer, const Buffer& args, uint64_t offset,
+                                        uint64_t guest_address);
 private:
  static constexpr uint64_t SlotBytes = 16;
  static constexpr uint64_t SlotCount = 65536;
  GraphicContext& m_graphics;
  std::unique_ptr<Buffer> m_ring;
+ // Host-visible: count of zeroed records and the guest addresses of the last 16.
+ std::unique_ptr<Buffer> m_trips;
+ uint32_t m_reported_trips = 0;
  uint64_t m_next = 0;
  vk::PipelineLayout m_layout = nullptr;
  vk::Pipeline m_pipeline = nullptr;

@@ -768,7 +768,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 			                                                       m_context.GetCommandScheduler());
 		}
 		std::tie(indirect_buffer, indirect_offset) =
-		    m_dispatch_guard->Record(buffer, *args_buffer, args_offset);
+		    m_dispatch_guard->Record(buffer, *args_buffer, args_offset, args_addr);
 	}
 	RebindBuffers(bindings);
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
