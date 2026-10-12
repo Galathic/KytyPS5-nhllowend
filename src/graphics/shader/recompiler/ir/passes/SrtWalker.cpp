@@ -2939,12 +2939,21 @@ int SrtWalker::ReplayCfgTrace(std::vector<uint32_t>& flat) {
 		g_tape_stats.cfg_trace_misses.fetch_add(1, std::memory_order_relaxed);
 		return -1;
 	};
+	// KYTY_SRT_SOURCE_REUSE: hoisted loop invariants and one batched stats flush per replay.
+	const bool     reuse      = m_source_reuse_enabled;
+	const bool     stats      = FrameBreakdown::Enabled();
+	const auto*    steps_ptr  = trace.steps.data();
+	const auto*    ops_ptr    = tape.ops.data();
+	uint64_t       n_steps = 0, n_reads = 0, n_memo = 0;
+	if (reuse) published.reserve(tape.ops.size());
 	for (uint32_t pc = 0;;) {
-		const auto& step = trace.steps[pc];
+		const auto& step = reuse ? steps_ptr[pc] : trace.steps[pc];
+		if (stats) ++n_steps;
 		switch (step.kind) {
 			case TraceKind::Exec: {
 				// Recorded as executed: the DFS saw no memo (value, in-progress or failure) here.
-				const auto& op = tape.ops[step.a];
+				const auto& op = reuse ? ops_ptr[step.a] : tape.ops[step.a];
+				if (stats && op.kind == ResourcePlan::SrtTape::Kind::RawRead) ++n_reads;
 				if (op.memo_index != UINT32_MAX) {
 					const auto& context = context_for(op);
 					if (op.memo_index < context.values.size() &&
@@ -2954,7 +2963,7 @@ int SrtWalker::ReplayCfgTrace(std::vector<uint32_t>& flat) {
 					}
 				}
 				if (!ExecuteTapeOp(op, values, step.a)) { miss_why = 8; return miss(); }
-				if (op.memo_index != UINT32_MAX) published.emplace_back(step.a, 0u);
+				if (op.memo_index != UINT32_MAX) { published.emplace_back(step.a, 0u); ++n_memo; }
 				++pc;
 				break;
 			}
@@ -2967,6 +2976,7 @@ int SrtWalker::ReplayCfgTrace(std::vector<uint32_t>& flat) {
 					return miss();
 				}
 				values[step.a] = context.values[op.memo_index].value;
+				++n_memo;
 				++pc;
 				break;
 			}
@@ -3021,6 +3031,12 @@ int SrtWalker::ReplayCfgTrace(std::vector<uint32_t>& flat) {
 			}
 			case TraceKind::End:
 				++trace.hits;
+				if (stats) {
+					auto& fc = FrameBreakdown::g_counters;
+					fc.mat_hit_steps.fetch_add(n_steps, std::memory_order_relaxed);
+					fc.mat_hit_reads.fetch_add(n_reads, std::memory_order_relaxed);
+					fc.mat_hit_memo.fetch_add(n_memo, std::memory_order_relaxed);
+				}
 				g_tape_stats.cfg_trace_hits.fetch_add(1, std::memory_order_relaxed);
 				m_context.refreshed_flat = &flat;
 				if (m_clean_evaluator != nullptr) m_clean_evaluator->m_context.refreshed_flat = &flat;

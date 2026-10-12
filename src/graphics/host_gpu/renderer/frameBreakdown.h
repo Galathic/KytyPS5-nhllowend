@@ -112,6 +112,9 @@ struct Counters {
 	std::atomic<uint64_t> mat_flat_trace_hits {0};   // refreshes served by ReplayCfgTrace
 	std::atomic<uint64_t> mat_flat_hit_ns {0};     // time in RefreshFlatBuffer calls served by trace replay
 	std::atomic<uint64_t> mat_flat_nocfg_ns {0};   // time in RefreshFlatBuffer calls on non-CFG plans
+	std::atomic<uint64_t> mat_hit_steps {0};  // trace steps replayed on hits
+	std::atomic<uint64_t> mat_hit_reads {0};  // reader callbacks (RawRead execs) on hits
+	std::atomic<uint64_t> mat_hit_memo {0};   // memo saves (published) + restores (Memo steps) on hits
 	std::atomic<uint64_t> mat_flat_nocfg_ops {0};  // tape ops executed on non-CFG plans
 	std::atomic<uint64_t> mat_flat_trace_other {0};  // refreshes that were not (miss/ineligible/non-CFG)
 	std::atomic<uint64_t> mat_tr_why[16] {};  // ReplayCfgTrace outcome reasons (see NHL27TRACE print)
@@ -467,6 +470,9 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 	const uint64_t mat_flat_hit_ns      = Take(c.mat_flat_hit_ns);
 	const uint64_t mat_flat_nocfg_ns    = Take(c.mat_flat_nocfg_ns);
 	const uint64_t mat_flat_nocfg_ops   = Take(c.mat_flat_nocfg_ops);
+	const uint64_t mat_hit_steps        = Take(c.mat_hit_steps);
+	const uint64_t mat_hit_reads        = Take(c.mat_hit_reads);
+	const uint64_t mat_hit_memo         = Take(c.mat_hit_memo);
 	uint64_t mat_tr_why[16];
 	for (int i = 0; i < 16; ++i) mat_tr_why[i] = Take(c.mat_tr_why[i]);
 	const uint64_t mat_reuse_hits    = Take(c.mat_reuse_hits);
@@ -601,6 +607,10 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 			            ms(mat_flat_nocfg_ns),
 			            mat_tr_why[0] > 0 ? ms(mat_flat_nocfg_ns) * 1000.0 / per(mat_tr_why[0]) : 0.0,
 			            mat_tr_why[0] > 0 ? per(mat_flat_nocfg_ops) / per(mat_tr_why[0]) : 0.0);
+			std::printf("NHL27HIT steps_per_call=%.1f reads_per_call=%.1f memo_per_call=%.1f\n",
+			            mat_flat_trace_hits > 0 ? per(mat_hit_steps) / per(mat_flat_trace_hits) : 0.0,
+			            mat_flat_trace_hits > 0 ? per(mat_hit_reads) / per(mat_flat_trace_hits) : 0.0,
+			            mat_flat_trace_hits > 0 ? per(mat_hit_memo) / per(mat_flat_trace_hits) : 0.0);
 			std::printf("NHL27TRACE nocfg=%.1f flag_off=%.1f inelig_mode=%.1f empty=%.1f disabled=%.1f tape_nr=%.1f "
 			            "strict=%.1f m_memo=%.1f m_exec=%.1f m_memoslot=%.1f m_cond=%.1f m_eval=%.1f m_condeval=%.1f "
 			            "rec_abort=%.1f merge_refused=%.1f merge_new=%.1f\n",
