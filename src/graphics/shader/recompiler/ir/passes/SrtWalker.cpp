@@ -662,6 +662,16 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 			    slot.U32() >= m_program.srt_reads.size()) {
 				return false;
 			}
+			if (m_direct_flat != nullptr) {
+				// A direct refresh already fetched this word (and captured the read).
+				const auto offset = m_program.srt_reads[slot.U32()].flat_offset;
+				if (offset < m_direct_flat->size() &&
+				    (m_direct_filled == nullptr ||
+				     (offset < m_direct_filled->size() && (*m_direct_filled)[offset] != 0u))) {
+					result = (*m_direct_flat)[offset];
+					return true;
+				}
+			}
 			if (slot.U32() < m_clean_flat_slots.size() &&
 			    m_clean_flat_slots[slot.U32()] != 0u && m_clean_evaluator != nullptr) {
 				return m_clean_evaluator->EvaluateWide(m_program.srt_reads[slot.U32()].value,
@@ -1221,6 +1231,16 @@ bool SrtWalker::DirectReadRun(uint32_t slot, uint32_t count, std::vector<uint32_
 	return true;
 }
 
+void SrtWalker::ShareDirectFlat(const std::vector<uint32_t>& flat, const std::vector<uint8_t>* filled) {
+	// Experiment CleanFromDirect: branch conditions, uniform fills and written descriptors are
+	// evaluated strictly; their resource-table words need not be read a second time.
+	if (m_clean_evaluator == nullptr || !Common::Experiments::Enabled(Common::Experiments::CleanFromDirect)) {
+		return;
+	}
+	m_clean_evaluator->m_direct_flat   = &flat;
+	m_clean_evaluator->m_direct_filled = filled;
+}
+
 bool SrtWalker::RefreshDirectFlat(std::vector<uint32_t>& flat) {
 	const auto& direct = m_program.direct_srt_reads;
 	flat.resize(m_program.srt_reads.size());
@@ -1232,6 +1252,7 @@ bool SrtWalker::RefreshDirectFlat(std::vector<uint32_t>& flat) {
 	}
 	m_direct_flat   = &flat;
 	m_direct_filled = nullptr;
+	ShareDirectFlat(flat, nullptr);
 	return true;
 }
 
@@ -1277,6 +1298,8 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	flat.assign(m_program.srt_reads.size(), 0u);
 	if (direct) {
 		m_program.direct_filled.assign(m_program.srt_reads.size(), 0u);
+		// Conditions below see the words of the blocks visited so far.
+		ShareDirectFlat(flat, &m_program.direct_filled);
 	}
 	active.assign(m_program.descriptor_sources.size(), 1u);
 	for (const auto& block: m_program.control_flow) {

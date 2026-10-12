@@ -69,6 +69,8 @@ private:
 	bool RefreshReadBatch(uint32_t slot, uint32_t count, std::vector<uint32_t>& flat);
 	bool RefreshDirectFlat(std::vector<uint32_t>& flat);
 	bool DirectReadRun(uint32_t slot, uint32_t count, std::vector<uint32_t>& flat);
+	// Lets the strict evaluator take resource-table words the direct reads fetched.
+	void ShareDirectFlat(const std::vector<uint32_t>& flat, const std::vector<uint8_t>* filled);
 	bool EvaluateInst(const Inst& inst, uint64_t& result);
 
 	const ResourcePlan&              m_program;

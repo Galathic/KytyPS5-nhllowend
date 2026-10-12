@@ -27,6 +27,7 @@ enum Bit : uint32_t {
 	AdaptiveResourceMemo = 1u << 15u, // KYTY_ADAPTIVE_RESOURCE_MEMO (skip read capture for volatile inputs)
 	FaultCoalesce        = 1u << 16u, // KYTY_FAULT_COALESCE (a write fault releases its clean 64 KiB window)
 	SparseBufferGc       = 1u << 17u, // KYTY_SPARSE_BUFFER_GC (scan for idle buffers every 16th submission)
+	CleanFromDirect      = 1u << 18u, // KYTY_CLEAN_FROM_DIRECT (strict evaluator reuses direct SRT words)
 	// A/B only (no environment variable): selects the code a pending change replaces.
 	AbLegacy = 1u << 31u,
 };

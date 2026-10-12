@@ -34,6 +34,7 @@ uint32_t EnvironmentMask() {
 	if (EnvOn("KYTY_ADAPTIVE_RESOURCE_MEMO")) mask |= AdaptiveResourceMemo;
 	if (EnvOn("KYTY_FAULT_COALESCE")) mask |= FaultCoalesce;
 	if (EnvOn("KYTY_SPARSE_BUFFER_GC")) mask |= SparseBufferGc;
+	if (EnvOn("KYTY_CLEAN_FROM_DIRECT")) mask |= CleanFromDirect;
 	return mask;
 }
 
