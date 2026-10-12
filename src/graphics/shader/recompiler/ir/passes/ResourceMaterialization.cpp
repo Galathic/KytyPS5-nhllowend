@@ -1440,6 +1440,8 @@ ResourceSpecializationCacheStats GetResourceSpecializationCacheStats() {
 
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+ // KYTY_DRAWPREP_PREFETCH: the plan's mutable scratch is shared with the prefetch worker.
+ const PlanAccessGuard plan_access(program);
  // Separate opt-in from the legacy process-wide .arb recorder: those files lack
  // plan identity and combine changing memory from many evaluations.
  static const std::string directory = [] {

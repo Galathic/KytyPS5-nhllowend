@@ -31,12 +31,16 @@ namespace Libs::Graphics::FrameBreakdown {
 
 using Clock = std::chrono::steady_clock;
 
+// True on the KYTY_DRAWPREP_PREFETCH worker thread. Every probe below is gated on Enabled(), which is
+// false there, so worker materializations never add to (or race with) the GPU-thread statistics.
+inline thread_local bool g_prefetch_worker = false;
+
 inline bool Enabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_PERF_STATS");
 		return value != nullptr && value[0] == '1';
 	}();
-	return enabled;
+	return enabled && !g_prefetch_worker;
 }
 
 // Fine-grained CPU preparation timing is intentionally opt-in; it can perturb hot paths.
@@ -170,6 +174,30 @@ struct SpecStats {
 	std::atomic<uint64_t> blk_pw8 {0}, blk_pw48 {0};
 };
 inline SpecStats g_spec;
+
+// NHL27PREFETCH (KYTY_DRAWPREP_PREFETCH): content-validated compute materialization prefetch.
+// Counted on the GPU thread (scans, requests, adopt outcomes) and on the worker (done, aborts, worker_ns).
+struct PrefetchStats {
+	std::atomic<uint64_t> scans {0};            // look-aheads started (one per DISPATCH_DIRECT)
+	std::atomic<uint64_t> candidates {0};       // look-ahead dispatches decoded
+	std::atomic<uint64_t> requests {0};         // requests enqueued for the worker
+	std::atomic<uint64_t> skip_no_plan {0};     // program not seen yet (no plan to materialize against)
+	std::atomic<uint64_t> skip_likely_hit {0};  // the plan's memo already holds these register inputs
+	std::atomic<uint64_t> skip_dup {0};         // same request already pending or done
+	std::atomic<uint64_t> skip_full {0};        // queue or result store full
+	std::atomic<uint64_t> worker_done {0};      // results produced
+	std::atomic<uint64_t> abort_read {0};       // a read was not plainly readable guest backing
+	std::atomic<uint64_t> abort_fail {0};       // materialization reported failure on speculative data
+	std::atomic<uint64_t> abort_exc {0};        // exception in the worker
+	std::atomic<uint64_t> used {0};             // results adopted by the GPU thread
+	std::atomic<uint64_t> validate_fail {0};    // a result was found but its inputs or read set changed
+	std::atomic<uint64_t> not_found {0};        // memo miss with no matching result
+	std::atomic<uint64_t> unused {0};           // results replaced or dropped without being used
+	std::atomic<uint64_t> validate_ns {0};      // GPU thread: time spent in adopt attempts that found a result
+	std::atomic<uint64_t> worker_ns {0};        // worker: time spent materializing
+	std::atomic<uint64_t> used_worker_ns {0};   // worker time of the results that were used
+};
+inline PrefetchStats g_prefetch;
 inline constexpr uint64_t kSpecTableBits = 18;
 inline constexpr uint64_t kSpecTableSize = 1ull << kSpecTableBits;
 inline std::atomic<uint64_t> g_spec_fault_seq[kSpecTableSize];  // page -> seq of last CPU write fault
@@ -714,6 +742,28 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 				            per(Take(sp.blk_cpu8)), per(Take(sp.blk_cpu48)), per(Take(sp.blk_gpu)),
 				            per(Take(sp.noreads)),
 				            sm != 0 ? static_cast<double>(srg) / static_cast<double>(sm) : 0.0);
+			}
+			{
+				// Take() every counter into a local first: printf argument evaluation order is unspecified.
+				auto&          pf      = g_prefetch;
+				const uint64_t used_ns = Take(pf.used_worker_ns), val_ns = Take(pf.validate_ns);
+				const uint64_t work_ns = Take(pf.worker_ns);
+				const uint64_t ab_read = Take(pf.abort_read), ab_fail = Take(pf.abort_fail);
+				const uint64_t ab_exc  = Take(pf.abort_exc);
+				const uint64_t scans = Take(pf.scans), cands = Take(pf.candidates), reqs = Take(pf.requests);
+				const uint64_t sk_plan = Take(pf.skip_no_plan), sk_hit = Take(pf.skip_likely_hit);
+				const uint64_t sk_dup = Take(pf.skip_dup), sk_full = Take(pf.skip_full);
+				const uint64_t done = Take(pf.worker_done), used = Take(pf.used);
+				const uint64_t vfail = Take(pf.validate_fail), nfound = Take(pf.not_found);
+				const uint64_t unused = Take(pf.unused);
+				std::printf("NHL27PREFETCH scans=%.1f candidates=%.1f requests=%.1f skip_no_plan=%.1f "
+				            "skip_likely_hit=%.1f skip_dup=%.1f skip_full=%.1f worker_done=%.1f "
+				            "worker_aborts=%.1f(read=%.1f fail=%.1f exc=%.1f) used=%.1f validate_fail=%.1f "
+				            "not_found=%.1f unused=%.1f validate=%.3fms worker=%.3fms saved_est=%.3fms\n",
+				            per(scans), per(cands), per(reqs), per(sk_plan), per(sk_hit), per(sk_dup),
+				            per(sk_full), per(done), per(ab_read + ab_fail + ab_exc), per(ab_read),
+				            per(ab_fail), per(ab_exc), per(used), per(vfail), per(nfound), per(unused),
+				            ms(val_ns), ms(work_ns), ms(used_ns > val_ns ? used_ns - val_ns : 0));
 			}
 			std::printf("NHL27TRACE nocfg=%.1f flag_off=%.1f inelig_mode=%.1f empty=%.1f disabled=%.1f tape_nr=%.1f "
 			            "strict=%.1f m_memo=%.1f m_exec=%.1f m_memoslot=%.1f m_cond=%.1f m_eval=%.1f m_condeval=%.1f "
