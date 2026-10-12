@@ -1205,6 +1205,9 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 }
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
+	if (FrameBreakdown::Enabled()) {
+		FrameBreakdown::SpecNoteSubmit();
+	}
 	EXIT_IF(m_command.IsInvalid());
 	FrameBreakdown::GpuBusyScope busy_scope(FrameBreakdown::GB_SUBMIT);
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||

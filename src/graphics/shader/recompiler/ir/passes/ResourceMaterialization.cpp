@@ -1197,6 +1197,12 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 	const Common::RuntimeFlags::EvaluationScope flags_scope;
 	FrameBreakdown::g_counters.mat_calls.fetch_add(FrameBreakdown::Enabled() ? 1u : 0u, std::memory_order_relaxed);
 	FrameBreakdown::Timer mat_total_timer(FrameBreakdown::g_counters.mat_total_ns);
+	struct SpecScope {
+		const ResourceSnapshot& snap;
+		~SpecScope() {
+			if (FrameBreakdown::Enabled()) FrameBreakdown::SpecObserve(snap.specialization_reads);
+		}
+	} spec_scope {snapshot};
 	auto* cache = runtime.specialization_cache;
 	if (cache != nullptr && cache->active) cache = nullptr;
 	if (cache != nullptr) {

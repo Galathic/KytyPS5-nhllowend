@@ -1079,7 +1079,11 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		BufferCache::PerfSetPm4Op(opcode);
 		uint32_t packet_dw;
 		{
-			FrameBreakdown::GpuBusyScope busy_scope(PacketBusyBucket(opcode));
+			const auto packet_bucket = PacketBusyBucket(opcode);
+			if (packet_bucket == FrameBreakdown::GB_SYNC_PKT && FrameBreakdown::Enabled()) {
+				FrameBreakdown::SpecNoteWait();
+			}
+			FrameBreakdown::GpuBusyScope busy_scope(packet_bucket);
 			packet_dw = handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 		}
 		EXIT_IF(packet_dw > remaining_dw);

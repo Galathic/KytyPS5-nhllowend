@@ -170,6 +170,7 @@ void BufferCache::PerfMaybePrint() {
 }
 
 void BufferCache::LogGpuWrite(uint64_t vaddr, uint64_t size) {
+	FrameBreakdown::SpecNoteGpuWrite(vaddr, size);
 	constexpr size_t MaxRecords = 512;
 	const WriterRecord record {vaddr, vaddr + size, m_writer_hash, m_writer_kind};
 	if (m_writer_log.size() < MaxRecords) {

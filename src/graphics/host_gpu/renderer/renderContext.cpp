@@ -101,6 +101,9 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		FrameBreakdown::g_in_fault = true;
 	}
 	if (access == PageFaultAccess::Write) {
+		if (FrameBreakdown::Enabled()) {
+			FrameBreakdown::SpecNoteFault(fault_vaddr);
+		}
 		{
 			FrameBreakdown::FaultTimer t(FrameBreakdown::g_fault_cost.buf_inv_ns);
 			m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
