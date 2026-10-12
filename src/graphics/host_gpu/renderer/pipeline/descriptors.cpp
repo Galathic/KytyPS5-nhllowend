@@ -913,10 +913,19 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.images.resize(program.info.images.size());
 	prepared.samplers.clear();
 	prepared.shader_data.clear();
+	// NHL27DELTA (KYTY_PERF_STATS): compare this program's outputs with its previous use. Counters only.
+	auto* const delta = FrameBreakdown::Enabled() ? FrameBreakdown::DeltaCompare(snapshot) : nullptr;
 	{
 		FrameBreakdown::Timer textures_timer(FrameBreakdown::g_counters.dp_textures_ns);
 		for (uint32_t i = 0; i < program.info.images.size(); i++) {
 			auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
+			if (delta != nullptr) {
+				const auto* resolved = m_context.GetTextureCache().m_slot_images.try_get(binding.image_id);
+				FrameBreakdown::DeltaImageSlot(
+				    delta, i, binding.image_id.index, binding.image_id.generation,
+				    resolved != nullptr && (resolved->registered || resolved->info.data.Empty()) &&
+				        !resolved->binding.needs_rebind);
+			}
 			BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
 			binding.mip_views.swap(prepared.images[i].mip_views);
 			binding.mip_views.clear();

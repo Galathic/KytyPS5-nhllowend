@@ -10,10 +10,12 @@
 #include <cstdlib>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "common/runtimeFlags.h"
+#include "graphics/shader/recompiler/ir/ResourceSnapshot.h"
 
 // KYTY_PERF_STATS=1 frame time breakdown. Prints one line about once per second:
 //   NHL27FRAME fps=... frame=... gpu_thread_busy=... wait_gpu=... readback=... faults=...
@@ -221,6 +223,119 @@ struct PrefetchStats {
 	std::atomic<uint64_t> used_worker_ns {0};   // worker time of the results that were used
 };
 inline PrefetchStats g_prefetch;
+
+// NHL27DELTA (Stage 0 of "delta prep"): how much of each program's materialized output is unchanged since
+// that same program's previous use. Keyed by the program's ResourceSnapshot address (one per SourceEntry,
+// stable). GPU thread only (Enabled() is false on the prefetch worker), measurement only.
+struct DeltaStats {
+	std::atomic<uint64_t> calls {0}, first {0}, cmp_calls {0};      // PrepareBindings calls / first use / compared
+	std::atomic<uint64_t> img_slots {0}, img_same {0}, img_reuse {0};
+	std::atomic<uint64_t> smp_slots {0}, smp_same {0};
+	std::atomic<uint64_t> buf_slots {0}, buf_addr_same {0}, buf_shape_same {0};
+	std::atomic<uint64_t> call_img_same {0}, call_smp_same {0}, call_shape_same {0}, call_all_same {0};
+	std::atomic<uint64_t> rt_draws {0}, rt_repeat {0};
+	std::atomic<uint64_t> overhead_ns {0};                         // time spent inside the counter work
+};
+inline DeltaStats g_delta;
+struct DeltaProg {
+	std::vector<ShaderRecompiler::IR::DescriptorValue> images, samplers, buffers;
+	std::vector<uint32_t>                              flattened_srt, user_data;
+	std::vector<uint64_t>                              img_id;    // resolved image id (index<<32|generation) per slot
+	std::vector<uint8_t>                               img_same;  // this call: slot words unchanged
+	bool                                               seen = false;
+	bool                                               cmp  = false;  // this call was compared against a previous one
+};
+inline std::unordered_map<const void*, DeltaProg> g_delta_progs;
+inline uint64_t DeltaNowNs() {
+	return static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count());
+}
+// Compare one materialized snapshot against the same program's previous one. Returns the per-program state.
+inline DeltaProg* DeltaCompare(const ShaderRecompiler::IR::ResourceSnapshot& s) {
+	const uint64_t t0 = DeltaNowNs();
+	auto&          st = g_delta;
+	auto&          p  = g_delta_progs[&s];
+	st.calls.fetch_add(1, std::memory_order_relaxed);
+	p.cmp = p.seen;
+	if (!p.seen) {
+		st.first.fetch_add(1, std::memory_order_relaxed);
+		p.seen = true;
+		p.img_id.assign(s.images.size(), ~0ull);
+		p.img_same.assign(s.images.size(), 0);
+	} else {
+		uint64_t img_same = 0, smp_same = 0, addr_same = 0, shape_same = 0;
+		const bool img_sz = p.images.size() == s.images.size();
+		const bool smp_sz = p.samplers.size() == s.samplers.size();
+		const bool buf_sz = p.buffers.size() == s.buffers.size();
+		p.img_id.resize(s.images.size(), ~0ull);
+		p.img_same.assign(s.images.size(), 0);
+		if (img_sz) {
+			for (size_t i = 0; i < s.images.size(); ++i) {
+				p.img_same[i] = p.images[i] == s.images[i];
+				img_same += p.img_same[i];
+			}
+		}
+		if (smp_sz) {
+			for (size_t i = 0; i < s.samplers.size(); ++i) smp_same += p.samplers[i] == s.samplers[i];
+		}
+		if (buf_sz) {
+			for (size_t i = 0; i < s.buffers.size(); ++i) {
+				const auto& a = p.buffers[i];
+				const auto& b = s.buffers[i];
+				bool addr = a.dword_count == b.dword_count && a.dwords[0] == b.dwords[0] &&
+				            ((a.dwords[1] ^ b.dwords[1]) & 0xffffu) == 0;
+				bool shape = a.dword_count == b.dword_count && ((a.dwords[1] ^ b.dwords[1]) & ~0xffffu) == 0;
+				for (uint32_t d = 2; d < b.dword_count && d < 8; ++d) shape &= a.dwords[d] == b.dwords[d];
+				addr_same += addr;
+				shape_same += shape;
+			}
+		}
+		const bool all_img = img_sz && img_same == s.images.size();
+		const bool all_smp = smp_sz && smp_same == s.samplers.size();
+		const bool all_shp = buf_sz && shape_same == s.buffers.size();
+		const bool all_adr = buf_sz && addr_same == s.buffers.size();
+		st.cmp_calls.fetch_add(1, std::memory_order_relaxed);
+		st.img_slots.fetch_add(s.images.size(), std::memory_order_relaxed);
+		st.img_same.fetch_add(img_same, std::memory_order_relaxed);
+		st.smp_slots.fetch_add(s.samplers.size(), std::memory_order_relaxed);
+		st.smp_same.fetch_add(smp_same, std::memory_order_relaxed);
+		st.buf_slots.fetch_add(s.buffers.size(), std::memory_order_relaxed);
+		st.buf_addr_same.fetch_add(addr_same, std::memory_order_relaxed);
+		st.buf_shape_same.fetch_add(shape_same, std::memory_order_relaxed);
+		st.call_img_same.fetch_add(all_img, std::memory_order_relaxed);
+		st.call_smp_same.fetch_add(all_smp, std::memory_order_relaxed);
+		st.call_shape_same.fetch_add(all_shp, std::memory_order_relaxed);
+		st.call_all_same.fetch_add(all_img && all_smp && all_shp && all_adr &&
+		                               p.flattened_srt == s.flattened_srt && p.user_data == s.user_data,
+		                           std::memory_order_relaxed);
+	}
+	p.images        = s.images;
+	p.samplers      = s.samplers;
+	p.buffers       = s.buffers;
+	p.flattened_srt = s.flattened_srt;
+	p.user_data     = s.user_data;
+	st.overhead_ns.fetch_add(DeltaNowNs() - t0, std::memory_order_relaxed);
+	return &p;
+}
+// Image slot i resolved to image_id: a binding could have been reused when the T# words and the resolved
+// image id both equal this program's previous use and the image has no rebind/dirty condition (eligible).
+inline void DeltaImageSlot(DeltaProg* p, size_t i, uint32_t index, uint32_t generation, bool eligible) {
+	if (p == nullptr || i >= p->img_id.size()) return;
+	const uint64_t t0 = DeltaNowNs();
+	const uint64_t id = (static_cast<uint64_t>(index) << 32u) | generation;
+	if (p->cmp && p->img_same[i] != 0 && p->img_id[i] == id && eligible) {
+		g_delta.img_reuse.fetch_add(1, std::memory_order_relaxed);
+	}
+	p->img_id[i] = id;
+	g_delta.overhead_ns.fetch_add(DeltaNowNs() - t0, std::memory_order_relaxed);
+}
+// Hash of the CB/DB register words feeding the draw's render targets, versus the previous draw's hash.
+inline void DeltaRt(uint64_t hash) {
+	static uint64_t last = 0;
+	g_delta.rt_draws.fetch_add(1, std::memory_order_relaxed);
+	if (hash == last) g_delta.rt_repeat.fetch_add(1, std::memory_order_relaxed);
+	last = hash;
+}
 inline constexpr uint64_t kSpecTableBits = 18;
 inline constexpr uint64_t kSpecTableSize = 1ull << kSpecTableBits;
 inline std::atomic<uint64_t> g_spec_fault_seq[kSpecTableSize];  // page -> seq of last CPU write fault
@@ -826,6 +941,28 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 			            ms(dc_bda_ns), ms(dc_descriptors_ns), ms(dc_pipeline_ns), ms(dc_barrier_ns),
 			            ms(dc_record_ns), std::max(0.0, ms(dc_total_ns) - dc_named), per(dc_handled),
 			            per(dc_bind_skipped));
+			{
+				auto&          dl   = g_delta;
+				const uint64_t d_calls = Take(dl.calls), d_first = Take(dl.first), d_cmp = Take(dl.cmp_calls);
+				const uint64_t d_is = Take(dl.img_slots), d_isame = Take(dl.img_same), d_ireuse = Take(dl.img_reuse);
+				const uint64_t d_ss = Take(dl.smp_slots), d_ssame = Take(dl.smp_same);
+				const uint64_t d_bs = Take(dl.buf_slots), d_basame = Take(dl.buf_addr_same);
+				const uint64_t d_bshape = Take(dl.buf_shape_same), d_ci = Take(dl.call_img_same);
+				const uint64_t d_cs = Take(dl.call_smp_same), d_csh = Take(dl.call_shape_same);
+				const uint64_t d_call = Take(dl.call_all_same), d_rd = Take(dl.rt_draws);
+				const uint64_t d_rr = Take(dl.rt_repeat), d_ov = Take(dl.overhead_ns);
+				const auto     pct = [](uint64_t a, uint64_t b) {
+					return b != 0 ? 100.0 * static_cast<double>(a) / static_cast<double>(b) : 0.0;
+				};
+				std::printf("NHL27DELTA calls=%.1f img_slots=%.1f img_same=%.1f%% img_reuse=%.1f%% "
+				            "smp_same=%.1f%% buf_addr_same=%.1f%% buf_shape_same=%.1f%% call_img_same=%.1f%% "
+				            "call_shape_same=%.1f%% call_all_same=%.1f%% rt_repeat=%.1f%% overhead=%.2fms "
+				            "first=%.1f smp_slots=%.1f buf_slots=%.1f call_smp_same=%.1f%%\n",
+				            per(d_calls), per(d_is), pct(d_isame, d_is), pct(d_ireuse, d_is), pct(d_ssame, d_ss),
+				            pct(d_basame, d_bs), pct(d_bshape, d_bs), pct(d_ci, d_cmp), pct(d_csh, d_cmp),
+				            pct(d_call, d_cmp), pct(d_rr, d_rd), ms(d_ov), per(d_first), per(d_ss), per(d_bs),
+				            pct(d_cs, d_cmp));
+			}
 		}
 		std::printf("NHL27BUFFERS vertex_index=%.2fms indirect=%.2fms find=%.2fms bda=%.2fms "
 		            "rebind=%.2fms rebind_lookup=%.2fms rebind_upload=%.2fms\n",

@@ -1136,6 +1136,29 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		}
 	}
 	mrt_mask &= color_output_mask;
+	if (FrameBreakdown::Enabled()) {
+		// NHL27DELTA: hash of the CB/DB register state feeding the render targets (counters only).
+		const uint64_t t0 = FrameBreakdown::DeltaNowNs();
+		const auto&    hw = buffer.GetRegisters();
+		uint64_t       h  = 0xcbf29ce484222325ull;
+		const auto     mix = [&h](const void* data, size_t size) {
+			const auto* bytes = static_cast<const unsigned char*>(data);
+			for (size_t i = 0; i < size; ++i) h = (h ^ bytes[i]) * 0x100000001b3ull;
+		};
+		const uint32_t scalars[] {mrt_mask, hw.GetRenderTargetMask(), render_target_slice_offset};
+		mix(scalars, sizeof(scalars));
+		for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+			if ((mrt_mask & (1u << slot)) != 0) mix(&hw.GetRenderTarget(slot), sizeof(hw.GetRenderTarget(slot)));
+		}
+		mix(&hw.GetDepthRenderTarget(), sizeof(hw.GetDepthRenderTarget()));
+		mix(&hw.GetRenderControl(), sizeof(hw.GetRenderControl()));
+		mix(&hw.GetDepthControl(), sizeof(hw.GetDepthControl()));
+		mix(&hw.GetStencilControl(), sizeof(hw.GetStencilControl()));
+		mix(&hw.GetStencilMask(), sizeof(hw.GetStencilMask()));
+		FrameBreakdown::DeltaRt(h);
+		FrameBreakdown::g_delta.overhead_ns.fetch_add(FrameBreakdown::DeltaNowNs() - t0,
+		                                              std::memory_order_relaxed);
+	}
 	{
 		FrameBreakdown::Timer textures_timer(FrameBreakdown::g_counters.dp_textures_ns);
 		if (draw.IsIndexed()) {
