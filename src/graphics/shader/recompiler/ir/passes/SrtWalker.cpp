@@ -2407,7 +2407,11 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 			(kind == 1 ? fc.mat_flat_hit_ns : fc.mat_flat_nocfg_ns).fetch_add(ns, std::memory_order_relaxed);
 		}
 	} call_timer;
-	if (m_cfg_gather_enabled) {
+	// Direct plans never mark gathered sources; every reader bounds-checks this vector, so an
+	// empty one means "none ready" without allocating it for each fresh walker.
+	const bool direct_plan = DirectSrtReadsEnabled() && m_active_mask.IsEmpty() &&
+	                         m_program.direct_srt_state == ResourcePlan::DirectSrtState::Direct;
+	if (m_cfg_gather_enabled && !direct_plan) {
 		m_cfg_gather_ready_sources.assign(m_program.descriptor_sources.size(), 0u);
 		if (m_clean_evaluator != nullptr)
 			m_clean_evaluator->m_cfg_gather_ready_sources.assign(m_program.descriptor_sources.size(), 0u);

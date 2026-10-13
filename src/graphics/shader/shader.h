@@ -30,6 +30,10 @@ inline std::atomic<uint32_t> g_shader_native_fp16_modes {0};
 	return g_shader_native_fp16.load(std::memory_order_relaxed) &&
 	       Common::Experiments::Enabled(Common::Experiments::NativeFp16);
 }
+// Codegen option: experiment ExecSelects (IR::EliminateExecSelects). Part of every stage key.
+[[nodiscard]] inline bool ShaderExecSelects() {
+	return Common::Experiments::Enabled(Common::Experiments::ExecSelects);
+}
 [[nodiscard]] inline uint32_t ShaderNativeFp16Modes() {
 	return g_shader_native_fp16_modes.load(std::memory_order_relaxed);
 }

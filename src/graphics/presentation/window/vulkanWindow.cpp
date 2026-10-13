@@ -764,6 +764,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		image_atomic_int64.sparseImageInt64Atomics = VK_FALSE;
 		create_info.pNext = &image_atomic_int64;
 	}
+	vk::PhysicalDeviceConditionalRenderingFeaturesEXT conditional_rendering {};
+	if (graphics.conditional_rendering_enabled) {
+		conditional_rendering.pNext                = const_cast<void*>(create_info.pNext);
+		conditional_rendering.conditionalRendering = VK_TRUE;
+		create_info.pNext                          = &conditional_rendering;
+	}
 	vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR pipeline_executable {};
 	if (graphics.pipeline_stats_enabled) {
 		pipeline_executable.pNext                  = const_cast<void*>(create_info.pNext);
@@ -1204,6 +1210,10 @@ void WindowContext::CreateVulkan() {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}
+		}
+		if (HasExtension(available_extensions, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
+			graphic_ctx.conditional_rendering_enabled = true;
 		}
 		// KYTY_DBG_PIPELINE_STATS=<hex hash>[,...]: driver statistics and ISA of those shaders' pipelines.
 		if (std::getenv("KYTY_DBG_PIPELINE_STATS") != nullptr &&
