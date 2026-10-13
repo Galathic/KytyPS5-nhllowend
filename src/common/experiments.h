@@ -16,12 +16,14 @@ namespace Common::Experiments {
 // Features that also have a live runtime flag (common/runtimeFlags.h, flags.ctl) are NOT here:
 // KYTY_GUEST_SYNC, KYTY_LONG_BUFFER_GC_AGE, KYTY_RENDER_TARGET_MEMO (flag KYTY_RT_DECODE_MEMO),
 // KYTY_FAULT_COALESCE, KYTY_SPARSE_BUFFER_GC, KYTY_DIRECT_EOP_INTERRUPTS, KYTY_READBACK_QUEUE.
-// Their bit numbers (0, 13, 14, 16, 17, 19, 20) and the unused ones (2, 9) are retired; 8 is GpuThreadPriority.
+// Their bit numbers (0, 13, 14, 16, 17, 19, 20) and the unused one (2) are retired; 8 is GpuThreadPriority,
+// 9 ImageRecycle.
 // KYTY_RESOURCE_MULTI_CACHE (16-state resource memo) is read only by the resource memo itself.
 enum Bit : uint32_t {
 	SkipRedundantBinds = 1u << 1u, // KYTY_SKIP_REDUNDANT_BINDS (default on)
 	CpuCopyForward     = 1u << 3u, // KYTY_CPU_COPY_FORWARD (default off)
 	GpuThreadPriority  = 1u << 8u, // KYTY_GPU_THREAD_PRIORITY (default off; the GPU thread runs at highest priority)
+	ImageRecycle       = 1u << 9u, // KYTY_IMAGE_RECYCLE (default on; freed device images are reused by later images with the same parameters)
 	FalseShareReads    = 1u << 6u, // KYTY_FALSE_SHARE_READS (default off)
 	SrtBatchReads      = 1u << 7u, // KYTY_SRT_BATCH_READS (default on; also read by the program cache)
 	DirectSrtReads     = 1u << 10u, // KYTY_DIRECT_SRT_READS (default on; SRT reads without the IR walk)

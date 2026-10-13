@@ -45,6 +45,7 @@ uint32_t EnvironmentMask() {
 	set("KYTY_ADAPTIVE_RESOURCE_MEMO", AdaptiveResourceMemo, true);
 	set("KYTY_CLEAN_FROM_DIRECT", CleanFromDirect, true);
 	set("KYTY_LDS_LANE_SLOTS", LdsLaneSlots, true);
+	set("KYTY_IMAGE_RECYCLE", ImageRecycle, true);
 	// Not part of the recommended set: opt in with 1.
 	set("KYTY_CPU_COPY_FORWARD", CpuCopyForward, false);
 	set("KYTY_FALSE_SHARE_READS", FalseShareReads, false);

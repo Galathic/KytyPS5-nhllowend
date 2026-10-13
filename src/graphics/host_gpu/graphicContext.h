@@ -124,6 +124,26 @@ private:
 	                            vk::ImageCreateFlags>,
 	                 std::pair<vk::Result, vk::ImageFormatProperties>>
 	    m_image_format_properties;
+
+	// Experiment ImageRecycle: deleted images, idle on the GPU, that CreateImage hands out again for
+	// the same creation parameters instead of allocating (oldest first out when over the limits).
+	struct RecycledImage {
+		vk::ImageCreateFlags flags;
+		vk::ImageType        image_type;
+		vk::Format           format;
+		vk::Extent3D         extent;
+		uint32_t             mip_levels;
+		uint32_t             layers;
+		uint32_t             samples;
+		vk::ImageUsageFlags  usage;
+		vk::Image            image;
+		VmaAllocation        allocation;
+		uint64_t             bytes;
+	};
+	std::mutex                 m_recycle_mutex;
+	std::vector<RecycledImage> m_recycled_images;
+	uint64_t                   m_recycled_bytes = 0;
+	void                       DestroyRecycledImages();
 };
 
 struct VulkanImageState {
@@ -148,6 +168,9 @@ struct VulkanImage {
 	VulkanImageState              state;
 	std::vector<VulkanImageState> subresource_states;
 	VmaAllocation                allocation = nullptr;
+	// Created by GraphicContext::CreateImage from parameters it can match again (no pNext, optimal
+	// tiling, exclusive, undefined initial layout): DeleteImage may recycle it.
+	bool                         recyclable = false;
 };
 
 

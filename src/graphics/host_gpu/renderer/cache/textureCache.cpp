@@ -24,6 +24,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
@@ -265,14 +266,19 @@ TextureCache::GenCheck TextureCache::CheckGenerationLog(uint64_t memo_gen, uint6
 	return GenCheck::Clean;
 }
 
-// Diagnostic: KYTY_DBG_IMAGE_CHURN=1 prints image inserts and frees (first 4000).
+// Diagnostic: KYTY_DBG_IMAGE_CHURN=1 prints image inserts and frees (first 4000);
+// KYTY_DBG_IMAGE_CHURN=<seconds> starts that long after the first image (e.g. in a match).
 static bool ImageChurnLogLine() {
-	static const bool enabled = [] {
+	static const auto start = std::chrono::steady_clock::now();
+	static const int64_t from = [] {
 		const char* value = std::getenv("KYTY_DBG_IMAGE_CHURN");
-		return value != nullptr && value[0] == '1';
+		if (value == nullptr || value[0] < '1' || value[0] > '9') return int64_t {-1};
+		const auto seconds = std::strtoll(value, nullptr, 10);
+		return seconds == 1 ? int64_t {0} : static_cast<int64_t>(seconds);
 	}();
+	if (from < 0 || std::chrono::steady_clock::now() - start < std::chrono::seconds(from)) return false;
 	static std::atomic<uint32_t> lines {0};
-	return enabled && lines.fetch_add(1, std::memory_order_relaxed) < 4000;
+	return lines.fetch_add(1, std::memory_order_relaxed) < 4000;
 }
 
 ImageId TextureCache::InsertImage(const ImageInfo& info) {

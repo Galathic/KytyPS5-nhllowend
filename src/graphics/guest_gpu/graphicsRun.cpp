@@ -648,7 +648,8 @@ struct QueueTimeScope {
 		const uint64_t  items      = g_work_items - last_items;
 		last_items                 = g_work_items;
 		static uint64_t last_barriers = 0, last_breaks = 0;
-		std::string line = fmt::format("NHL27QUEUES items/s={:.0f} us/item={:.2f} barriers/s={:.0f} pass_breaks/s={:.0f} ms/s:",
+		std::string line = fmt::format("NHL27QUEUES mask={} items/s={:.0f} us/item={:.2f} barriers/s={:.0f} pass_breaks/s={:.0f} ms/s:",
+		                               static_cast<uint64_t>(Common::Experiments::Mask()),
 		                               static_cast<double>(items) / seconds,
 		                               items != 0 ? static_cast<double>(total_ns) / 1e3 / static_cast<double>(items) : 0.0,
 		                               static_cast<double>(g_guest_barriers - last_barriers) / seconds,
