@@ -656,6 +656,22 @@ struct ResourcePlan {
 	mutable std::vector<uint8_t>     direct_cf_active;
 	mutable int8_t                   direct_cf_batch = -1; // -1 = not built
 	mutable bool                     direct_cf_valid = false;
+	// Per block: the inputs its branch condition depends on (user data, flat words, shader base)
+	// when it depends on nothing else, and the result for the inputs seen last.
+	struct DirectCfCondition {
+		enum class Kind : uint8_t { UserData, Flat, ShaderBase };
+		struct Leaf {
+			Kind     kind  = Kind::UserData;
+			uint32_t index = 0;
+		};
+		static constexpr size_t MaxLeaves = 16;
+		std::vector<Leaf>     leaves;
+		std::vector<uint64_t> last_values;
+		uint32_t              last_result = 0;
+		bool                  cacheable   = false;
+		bool                  has_last    = false;
+	};
+	mutable std::vector<DirectCfCondition> direct_cf_conditions;
 	// Linearized SRT read expressions (KYTY_SRT_TAPE=1). Built lazily on the GPU thread,
 	// one per variant: [0] = no clean evaluator, [1] = with clean evaluator. Ops are in the
 	// exact order the recursive walker would evaluate them, so captured reads and failure

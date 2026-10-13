@@ -425,7 +425,8 @@ void BufferCache::ChangeRegister(BufferId id) {
 		EXIT_IF(!inserted);
 		m_memory_tracker.QueueCpuDirtyRange(buffer.CpuAddress(), buffer.Size());
 		m_total_used_memory += buffer.Size();
-		buffer.lru_id = m_lru_cache.Insert(id, m_gc_tick);
+		buffer.lru_id   = m_lru_cache.Insert(id, m_gc_tick);
+		buffer.lru_tick = m_gc_tick;
 		std::vector<vk::DeviceAddress> addresses;
 		addresses.reserve(size_pages);
 		for (uint64_t i = 0; i < size_pages; ++i) {
@@ -447,7 +448,9 @@ void BufferCache::ChangeRegister(BufferId id) {
 }
 
 void BufferCache::TouchBuffer(const Buffer& buffer) {
-	if (!buffer.is_deleted) {
+	// The LRU item lives in another allocation; skip it when this tick already touched it.
+	if (!buffer.is_deleted && buffer.lru_tick != m_gc_tick) {
+		buffer.lru_tick = m_gc_tick;
 		m_lru_cache.Touch(buffer.lru_id, m_gc_tick);
 	}
 }

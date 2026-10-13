@@ -56,8 +56,8 @@ public:
 	}
 
 	[[nodiscard]] bool is_allocated(SlotId id) const noexcept {
-		return id && id.index < m_values.size() &&
-		       m_values[id.index].generation == id.generation && m_values[id.index].value.has_value();
+		// m_live is compact (one word per slot); the slots themselves are large, scattered objects.
+		return id.generation != 0 && id.index < m_live.size() && m_live[id.index] == id.generation;
 	}
 
 	template <typename... Args>
@@ -66,6 +66,7 @@ public:
 		if (m_free_list.empty()) {
 			index = static_cast<uint32_t>(m_values.size());
 			m_values.emplace_back();
+			m_live.push_back(0);
 			m_values.back().value.emplace(std::forward<Args>(args)...);
 		} else {
 			index = m_free_list.back();
@@ -74,12 +75,14 @@ public:
 			m_values[index].value.emplace(std::forward<Args>(args)...);
 		}
 		++m_size;
+		m_live[index] = m_values[index].generation;
 		return SlotId {index, m_values[index].generation};
 	}
 
 	void erase(SlotId id) noexcept {
 		EXIT_IF(!is_allocated(id));
 		auto& slot = m_values[id.index];
+		m_live[id.index] = 0;
 		slot.value.reset();
 		if (++slot.generation == 0) {
 			slot.generation = 1;
@@ -116,6 +119,8 @@ private:
 	};
 
 	std::deque<Slot>             m_values;
+	// Generation of each allocated slot, 0 for a free one (generations start at 1 and skip 0).
+	std::vector<uint32_t>        m_live;
 	std::vector<uint32_t>        m_free_list;
 	size_t                       m_size = 0;
 };

@@ -312,6 +312,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	m_images_by_address[image.info.data.address].push_back(id);
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
+	image.lru_tick   = m_gc_tick;
 	m_total_used_memory += image.AccountedSize();
 }
 
@@ -501,7 +502,8 @@ void TextureCache::FreeImage(ImageId id) {
 }
 
 void TextureCache::TouchImage(Image& image) {
-	if (image.registered) {
+	if (image.registered && image.lru_tick != m_gc_tick) {
+		image.lru_tick = m_gc_tick;
 		m_lru_cache.Touch(image.lru_id, m_gc_tick);
 	}
 }
