@@ -31,6 +31,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <fmt/format.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -38,6 +39,7 @@
 #include <memory>
 #include <mutex>
 #include <semaphore>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -610,6 +612,45 @@ void GuestGpu::WaitForIdle() {
 	}
 }
 
+namespace {
+// KYTY_DBG_QUEUE_TIME=1: GPU-thread time spent processing each guest queue (0 = graphics,
+// 1.. = compute rings), printed every 5 s as NHL27QUEUES.
+struct QueueTimeScope {
+	static bool Enabled() {
+		static const bool enabled = std::getenv("KYTY_DBG_QUEUE_TIME") != nullptr;
+		return enabled;
+	}
+	explicit QueueTimeScope(uint32_t queue): queue(queue) {
+		if (Enabled()) start = std::chrono::steady_clock::now();
+	}
+	~QueueTimeScope() {
+		if (!Enabled()) return;
+		static std::array<uint64_t, 64> ns {};
+		static std::array<uint64_t, 64> slices {};
+		if (queue >= ns.size()) return;
+		static auto last = std::chrono::steady_clock::now();
+		const auto  now  = std::chrono::steady_clock::now();
+		ns[queue] += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count());
+		slices[queue]++;
+		if (now - last < std::chrono::seconds(5)) return;
+		const double seconds = std::chrono::duration<double>(now - last).count();
+		last = now;
+		std::string line = "NHL27QUEUES ms/s:";
+		for (uint32_t i = 0; i < ns.size(); i++) {
+			if (slices[i] == 0) continue;
+			line += fmt::format(" q{}={:.1f}({:.0f})", i, static_cast<double>(ns[i]) / 1e6 / seconds,
+			                    static_cast<double>(slices[i]) / seconds);
+		}
+		std::printf("%s\n", line.c_str());
+		std::fflush(stdout);
+		ns     = {};
+		slices = {};
+	}
+	uint32_t                              queue;
+	std::chrono::steady_clock::time_point start {};
+};
+} // namespace
+
 void GuestGpu::ThreadRun(void* data) {
 	auto* gpu = static_cast<GuestGpu*>(data);
 	EXIT_IF(gpu == nullptr);
@@ -712,6 +753,7 @@ void GuestGpu::ThreadRun(void* data) {
 			// kind: 2 + SubmissionType (graphics/compute/flip prep/suspend point), +0x100 when sliced/blocked
 			const uint64_t kind = 2 + static_cast<uint64_t>(submission.type);
 			Common::EventTrace::Record(Common::EventTrace::GPU_CMD_BEGIN, kind, gpu->m_submit_id);
+			QueueTimeScope queue_time(submission.queue_id);
 			complete = gpu->Process(submission);
 			Common::EventTrace::Record(Common::EventTrace::GPU_CMD_END, kind | (complete ? 0u : 0x100u),
 			                           gpu->m_submit_id);
