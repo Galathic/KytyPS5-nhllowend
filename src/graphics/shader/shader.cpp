@@ -611,6 +611,7 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 	key.push_back(info.scratch_size_dwords);
 	key.push_back(static_cast<uint32_t>(ShaderNativeFp16()));
 	key.push_back(static_cast<uint32_t>(ShaderExecSelects()));
+	key.push_back(static_cast<uint32_t>(ShaderLdsLaneSlots()));
 	key.push_back(info.pa_cl_vs_out_cntl);
 	key.push_back(static_cast<uint32_t>(info.clip_space.enabled));
 	if (info.clip_space.enabled) {
@@ -691,6 +692,7 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 	           std::begin(info.interpolator_settings) + info.input_num);
 	key.push_back(static_cast<uint32_t>(ShaderNativeFp16()));
 	key.push_back(static_cast<uint32_t>(ShaderExecSelects()));
+	key.push_back(static_cast<uint32_t>(ShaderLdsLaneSlots()));
 }
 
 void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_t>& key) {

@@ -68,6 +68,12 @@ struct SpirvRequirements {
 	bool compute_derivatives          = false;
 	bool image_gather_extended        = false;
 	bool function_lds                 = false;
+	// Every LDS access of a non-compute stage is LaneId * 4 plus constants (guest VGPR spills to
+	// per-lane LDS slots). The per-invocation array is then indexed by the constants alone: a
+	// shift by LaneId * 4 for every access, which keeps all aliasing, makes the array small
+	// (function_lds_dwords) and lets the host compiler keep it in registers.
+	bool     function_lds_lane_slots  = false;
+	uint32_t function_lds_dwords      = 0;
 	bool function_scratch             = false;
 	bool pixel_valid_mask             = false;
 	bool buffer_int64_atomics         = false;
@@ -83,6 +89,9 @@ struct SpirvRequirements {
 };
 
 SpirvRequirements AnalyzeProgramRequirements(const IR::Program& program);
+
+// True when an LDS address is LaneId * 4 plus a constant; the constant is returned.
+bool MatchLaneSlotLdsAddress(IR::Value address, uint32_t& constant);
 
 struct EmitterState {
 	EmitterState(const IR::Program& program_, ShaderStageInputInfo input_info_)

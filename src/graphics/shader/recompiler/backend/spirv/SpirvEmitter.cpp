@@ -191,6 +191,99 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 	}
 }
 
+uint32_t ImmediateU32OrMax(const IR::Value& value) {
+	return value.IsImmediate() && value.GetType() == IR::Type::U32 ? value.U32() : UINT32_MAX;
+}
+
+// Bytes a shared operation touches from its address (whole dwords: subword accesses read and
+// write the containing dword).
+uint32_t SharedAccessBytes(IR::ValueOpcode opcode) {
+	switch (opcode) {
+		case IR::ValueOpcode::LoadSharedU32x2:
+		case IR::ValueOpcode::WriteSharedU32x2: return 8u;
+		case IR::ValueOpcode::LoadSharedU32x3:
+		case IR::ValueOpcode::WriteSharedU32x3: return 12u;
+		case IR::ValueOpcode::LoadSharedU32x4:
+		case IR::ValueOpcode::WriteSharedU32x4: return 16u;
+		default: return 4u;
+	}
+}
+
+} // namespace
+
+bool Emitter::MatchLaneSlotLdsAddress(IR::Value address, uint32_t& constant) {
+	constant = 0;
+	for (int depth = 0; depth < 8; depth++) {
+		const auto* inst = address.Resolve().TryInstruction();
+		if (inst == nullptr) {
+			return false;
+		}
+		switch (inst->GetOpcode()) {
+			case IR::ValueOpcode::IAdd32: {
+				const auto lhs = inst->Arg(0).Resolve();
+				const auto rhs = inst->Arg(1).Resolve();
+				if (const auto value = ImmediateU32OrMax(rhs); value != UINT32_MAX) {
+					constant += value;
+					address = lhs;
+				} else if (const auto value2 = ImmediateU32OrMax(lhs); value2 != UINT32_MAX) {
+					constant += value2;
+					address = rhs;
+				} else {
+					return false;
+				}
+				break;
+			}
+			case IR::ValueOpcode::ShiftLeftLogical32: {
+				const auto* lane = inst->Arg(0).Resolve().TryInstruction();
+				return ImmediateU32OrMax(inst->Arg(1).Resolve()) == 2u && lane != nullptr &&
+				       lane->GetOpcode() == IR::ValueOpcode::LaneId;
+			}
+			default: return false;
+		}
+	}
+	return false;
+}
+
+namespace {
+
+// Decides SpirvRequirements::function_lds_lane_slots once every instruction is known.
+void AnalyzeLaneSlotLds(const IR::Program& program, Emitter::SpirvRequirements& requirements) {
+	if (!requirements.function_lds || requirements.shared_int64_atomics || !ShaderLdsLaneSlots()) {
+		return;
+	}
+	uint32_t end = 0;
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			const auto address_access = IR::AddressOpcodeInfoOf(inst.GetOpcode()).access;
+			if (address_access != IR::AddressAccess::None &&
+			    program.memory_info[inst.Flags<IR::MemoryFlags>().index].kind ==
+			        IR::ResourceKind::FlatLocal) {
+				return; // FLAT addresses reach LDS through the shared aperture
+			}
+			const auto shared_access = IR::SharedAccessOf(inst.GetOpcode());
+			if (shared_access == IR::SharedAccess::None) {
+				continue;
+			}
+			const auto& memory = program.memory_info[inst.Flags<IR::MemoryFlags>().index];
+			if (memory.kind != IR::ResourceKind::Lds) {
+				continue;
+			}
+			uint32_t constant = 0;
+			if (shared_access == IR::SharedAccess::Append || shared_access == IR::SharedAccess::Consume ||
+			    !Emitter::MatchLaneSlotLdsAddress(inst.Arg(0), constant)) {
+				return;
+			}
+			end = std::max(end, ((constant + memory.offset) & 0xffffu) + SharedAccessBytes(inst.GetOpcode()));
+		}
+	}
+	// The slots must fit the array the general path uses (8192 dwords).
+	if (end == 0 || end > 0x8000u) {
+		return;
+	}
+	requirements.function_lds_lane_slots = true;
+	requirements.function_lds_dwords     = (end + 3u) / 4u;
+}
+
 } // namespace
 
 Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program& program) {
@@ -368,6 +461,7 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 		requirements.workgroup_buffer_sync = true;
 		requirements.coherent_buffers      = true;
 	}
+	AnalyzeLaneSlotLds(program, requirements);
 	return requirements;
 }
 

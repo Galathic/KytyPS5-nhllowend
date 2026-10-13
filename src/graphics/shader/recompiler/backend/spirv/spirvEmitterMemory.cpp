@@ -267,6 +267,14 @@ uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memo
 		              Binary(ctx.state, spv::OpUGreaterThanEqual, TypeBool(ctx.state), address, prefix),
 		              address, ConstantU32(ctx.state, UINT32_MAX));
 	}
+	if (mem.kind == IR::ResourceKind::Lds && ctx.state.requirements.function_lds_lane_slots) {
+		// Per-lane slots: drop the LaneId * 4 every access shares (see SpirvRequirements).
+		uint32_t constant = 0;
+		if (!MatchLaneSlotLdsAddress(inst.Arg(0), constant)) {
+			EXIT("LDS lane slot address no longer matches\n");
+		}
+		return ConstantU32(ctx.state, (constant + mem.offset) & 0xffffu);
+	}
 	if (mem.kind == IR::ResourceKind::Lds || mem.kind == IR::ResourceKind::Gds) {
 		if (mem.offset == 0u) {
 			return ctx.Arg(inst, 0);

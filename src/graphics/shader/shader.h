@@ -41,6 +41,11 @@ inline std::atomic<uint32_t> g_shader_native_fp16_modes {0};
 	}();
 	return 0x100u | mode;
 }
+// Codegen option: experiment LdsLaneSlots (SpirvRequirements::function_lds_lane_slots). Part of the
+// vertex and pixel stage keys.
+[[nodiscard]] inline bool ShaderLdsLaneSlots() {
+	return Common::Experiments::Enabled(Common::Experiments::LdsLaneSlots);
+}
 [[nodiscard]] inline uint32_t ShaderNativeFp16Modes() {
 	return g_shader_native_fp16_modes.load(std::memory_order_relaxed);
 }

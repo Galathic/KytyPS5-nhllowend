@@ -38,6 +38,7 @@ enum Bit : uint32_t {
 	PooledBdaBuffers     = 1u << 27u, // KYTY_POOLED_BDA_BUFFERS (default off; small device-address buffers share VMA blocks)
 	AsyncGuestReads      = 1u << 28u, // KYTY_ASYNC_GUEST_READS (default off; a guest thread waits for its own readback)
 	BdaDirtyRegions      = 1u << 29u, // KYTY_BDA_DIRTY_REGIONS (default off; BDA preparation syncs only CPU-written regions)
+	LdsLaneSlots         = 1u << 30u, // KYTY_LDS_LANE_SLOTS (default on; per-lane LDS slots of non-compute stages as a small array, part of shader keys)
 	// A/B only (no environment variable): selects the code a pending change replaces.
 	AbLegacy = 1u << 31u,
 };
