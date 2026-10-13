@@ -741,8 +741,28 @@ struct PipelineCache::ProgramCache {
             // Frozen pipeline-record readers see single-dword requests only; never merge there.
             observed_runtime.allow_compiled = replaying == nullptr;
             observed_runtime.delta = runtime_flags.srt_compiled && replaying == nullptr ? &source.delta : nullptr;
-            const bool ok = source.resource_memo.Refresh(source.resource_plan, observed_runtime,
+            bool ok = source.resource_memo.Refresh(source.resource_plan, observed_runtime,
                 source.resources, source.specialization, memo_enabled, reused);
+            if (!ok && replaying == nullptr) {
+                // Port diagnostic: name the shader, then retry on the pre-port reference walker
+                // without the memo, delta or specialization cache. A failed Refresh already
+                // dropped the memo's entries.
+                auto reference                 = runtime;
+                reference.allow_compiled       = false;
+                reference.delta                = nullptr;
+                reference.specialization_cache = nullptr;
+                ok = ShaderRecompiler::IR::MaterializeResources(source.resource_plan, reference,
+                    source.resources, source.specialization);
+                reused = false;
+                static std::atomic<uint32_t> logged {0};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 32u) {
+                    std::printf("NHL27GTAPORT: materialization failed shader=0x%016" PRIx64
+                                " stage=%u user_data=%u reference_walker=%s\n",
+                                params.hash, static_cast<unsigned>(stage), params.user_data_count,
+                                ok ? "ok" : "failed");
+                    std::fflush(stdout);
+                }
+            }
             if (resource_timing) {
                 source.refresh_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now() - begin).count();

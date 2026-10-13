@@ -795,6 +795,13 @@ static void WindowCreate(WindowContext& context) {
 		SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "x11,wayland");
 	}
 #endif
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// With GameInput 3+ installed, SDL hands Xbox (GIP) pads to GameInput and XInput/RawInput
+	// skip them; where GameInput enumerates nothing, the pad never appears. Prefer XInput.
+	// SDL_SetHint keeps an environment override.
+	SDL_SetHint(SDL_HINT_JOYSTICK_GAMEINPUT, "0");
+	SDL_SetHint(SDL_HINT_JOYSTICK_GAMEINPUT_RAW, "0");
+#endif
 	if (!SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
 		EXIT("%s\n", SDL_GetError());
 	}
