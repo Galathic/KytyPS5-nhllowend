@@ -123,6 +123,18 @@ Windows), so without `KYTY_ASYNC_SUBMIT` the default thresholds are now 768 draw
 submissions (one host command buffer for many of them) lost 16%, because the GPU then idles while
 the GPU thread records.
 
+## Profile-guided build
+
+`-DKYTY_PGO=use` (clang-cl) builds the emulator and `common` with the NHL 27 gameplay profile in
+`tools/pgo/nhl27.profdata`: 18.6 vs 16.1 fps in gameplay (+15%, three boots of each build).
+The profile matches clang 22.1.8; other versions ignore it with a warning. `-DKYTY_PGO=generate`
+builds the instrumented emulator that records a new profile, and `-DKYTY_THIN_LTO=ON` adds
+ThinLTO; `tools/pgo/README.md` has the steps.
+
+Comparing builds needs separate boots, and scenes differ between boots, so compare the
+window-title fps over a few minutes of gameplay in several boots of each. `KYTY_PERF_STATS=1`
+must be off for such comparisons: its timers take tens of millions of timestamps per second.
+
 ## Always on
 
 `KYTY_DISPATCH_ARGS_GUARD` (a runtime flag, default on; set to `0` in the environment or `flags.ctl` to disable): every indirect dispatch reads its group counts
