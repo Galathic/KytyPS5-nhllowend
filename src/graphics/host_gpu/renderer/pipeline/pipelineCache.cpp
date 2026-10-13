@@ -1,5 +1,4 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
-#include "graphics/host_gpu/renderer/pipeline/computeLookahead.h"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -481,38 +480,8 @@ struct PipelineCache::ProgramCache {
             // Frozen pipeline-record readers see single-dword requests only; never merge there.
             observed_runtime.allow_compiled = replaying == nullptr;
             observed_runtime.delta = runtime_flags.srt_compiled && replaying == nullptr ? &source.delta : nullptr;
-            // Experiment ComputeLookahead: a worker may already have materialized this dispatch.
-            // Its walks and ours never overlap on one plan (the plans' scratch is mutable).
-            constexpr bool compute = std::is_same_v<InputInfo, ShaderComputeInputInfo>;
-            const bool lookahead = compute && replaying == nullptr && ComputeLookahead::Active();
-            bool adopted = false;
-            if (lookahead && !memo_enabled) {
-                ComputeLookahead::NoteProgram(runtime.shader_base, &source, &source.resource_plan, runtime.batch_reads);
-                adopted = ComputeLookahead::TryAdopt(&source, observed_runtime, source.resources, source.specialization);
-                if (adopted && observed_runtime.delta != nullptr) {
-                    ShaderRecompiler::IR::RecordDelta(*observed_runtime.delta, source.resources);
-                }
-            }
-            bool ok     = true;
-            bool locked = false;
-            if (!adopted && lookahead) {
-                ComputeLookahead::LockPlan(&source.resource_plan);
-                locked = true;
-                // The worker may have been preparing this very dispatch while we waited.
-                adopted = !memo_enabled &&
-                          ComputeLookahead::TryAdopt(&source, observed_runtime, source.resources, source.specialization);
-                if (adopted && observed_runtime.delta != nullptr) {
-                    ShaderRecompiler::IR::RecordDelta(*observed_runtime.delta, source.resources);
-                }
-            }
-            if (adopted) {
-                reused = false;
-            } else {
-                ok = source.resource_memo.Refresh(source.resource_plan, observed_runtime,
-                    source.resources, source.specialization, memo_enabled, reused);
-            }
-            if (locked) ComputeLookahead::UnlockPlan(&source.resource_plan);
-            if (lookahead) ComputeLookahead::PublishCurrent();
+            const bool ok = source.resource_memo.Refresh(source.resource_plan, observed_runtime,
+                source.resources, source.specialization, memo_enabled, reused);
             if (resource_timing) {
                 source.refresh_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now() - begin).count();

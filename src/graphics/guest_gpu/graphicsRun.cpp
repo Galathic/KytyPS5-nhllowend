@@ -15,7 +15,6 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
-#include "graphics/host_gpu/renderer/pipeline/computeLookahead.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -1263,10 +1262,6 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		}
 
 		BufferCache::PerfSetPm4Op(opcode);
-		if (opcode == Pm4::IT_DISPATCH_DIRECT && ComputeLookahead::Active() && declared_dw < remaining_dw) {
-			// Experiment ComputeLookahead: where the following dispatches start, for the worker.
-			ComputeLookahead::SetStream(guest_packet + declared_dw, remaining_dw - declared_dw);
-		}
 		uint32_t packet_dw;
 		{
 			FrameBreakdown::GpuBusyScope busy_scope(PacketBusyBucket(opcode));
@@ -1689,10 +1684,8 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 			}
 		}
 
-		ComputeLookahead::SetCurrent(&m_sh_ctx.GetCs());
 		m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
 		                                              thread_group_y, thread_group_z, mode);
-		ComputeLookahead::SetCurrent(nullptr);
 	}
 }
 

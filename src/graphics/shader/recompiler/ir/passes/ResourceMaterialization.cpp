@@ -34,13 +34,6 @@ void SetFaultPageReader(FaultPageReader reader) {
 	g_fault_page_reader_slot.store(reader, std::memory_order_relaxed);
 }
 
-void ReadOrdinaryMemory(uint64_t address, void* data, uint64_t size) {
-	const auto reader = g_fault_page_reader_slot.load(std::memory_order_relaxed);
-	if (reader == nullptr || !reader(address, data, size)) {
-		std::memcpy(data, reinterpret_cast<const void*>(address), size);
-	}
-}
-
 namespace {
 
 constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
@@ -1780,10 +1773,6 @@ static bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRunti
 		}
 	}
 	return ok;
-}
-
-void RecordDelta(ResourceDelta& delta, const ResourceSnapshot& snapshot) {
-	UpdateDelta(delta, snapshot);
 }
 
 ResourceSpecializationCacheStats GetResourceSpecializationCacheStats() {

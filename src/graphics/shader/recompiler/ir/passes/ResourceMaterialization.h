@@ -14,9 +14,6 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 // tried first; it returns false to keep the plain read (experiment FaultPageReads).
 using FaultPageReader = bool (*)(uint64_t address, void* data, uint64_t size);
 void SetFaultPageReader(FaultPageReader reader);
-// The ordinary (no reader callback) way the GPU thread reads resource-table memory: the fault-page
-// reader for pages that faulted before, else a plain load (which may fault and download).
-void ReadOrdinaryMemory(uint64_t address, void* data, uint64_t size);
 
 
 // Canonical module-affecting resource state. Runtime addresses and descriptor payloads remain in
@@ -133,10 +130,6 @@ ResourcePlan ExtractResourcePlan(const Program& program);
 // Refreshes cached resources and specialization in place. A failed refresh must not be used.
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
-
-// Records a successful refresh's outputs in the program's delta (KYTY_SRT_COMPILED); for callers
-// that install a snapshot produced elsewhere.
-void RecordDelta(ResourceDelta& delta, const ResourceSnapshot& snapshot);
 
 // Applies an already-derived specialization to native IR before layout and emission.
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);
