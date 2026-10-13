@@ -805,6 +805,35 @@ bool BufferCache::LazySharedWriteEligible(uint64_t vaddr, uint64_t size) {
 	return dirty != 0 && dirty <= 256;
 }
 
+bool BufferCache::OverlapsPendingGuestRead(uint64_t vaddr, uint64_t size) const {
+	for (const auto& read: m_pending_guest_reads) {
+		if (read.vaddr < vaddr + size && vaddr < read.vaddr + read.size) return true;
+	}
+	return false;
+}
+
+void BufferCache::FinishPendingGuestReads(uint64_t vaddr, uint64_t size) {
+	for (size_t i = 0; i < m_pending_guest_reads.size();) {
+		const auto read = m_pending_guest_reads[i];
+		if (!(read.vaddr < vaddr + size && vaddr < read.vaddr + read.size)) {
+			++i;
+			continue;
+		}
+		m_pending_guest_reads.erase(m_pending_guest_reads.begin() + static_cast<ptrdiff_t>(i));
+		// The publish wrote the downloaded bytes to guest memory. Pages the GPU wrote again since
+		// keep their protection, like ForgetGpuWrite.
+		m_scheduler.WaitPriorityOperations(read.tick);
+		const auto first = read.vaddr & ~(TRACKER_PAGE_SIZE - 1);
+		const auto last  = (read.vaddr + read.size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
+		for (auto page = first; page < last; page += TRACKER_PAGE_SIZE) {
+			if (!m_gpu_modified_ranges.Intersects(page, TRACKER_PAGE_SIZE) &&
+			    !OverlapsPendingGuestRead(page, TRACKER_PAGE_SIZE)) {
+				m_memory_tracker.UnmarkRegionAsGpuModified(page, TRACKER_PAGE_SIZE);
+			}
+		}
+	}
+}
+
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadCaller caller) {
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
@@ -814,11 +843,30 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadC
 	FrameBreakdown::FaultTimer fault_readmem_timer(FrameBreakdown::g_fault_cost.readmem_ns);
 	const bool     on_gpu = GuestGpu::IsGpuThread();
 	const uint64_t tid   = static_cast<uint64_t>(std::hash<std::thread::id> {}(std::this_thread::get_id()));
-	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write, caller, on_gpu, tid] {
+	// Experiment AsyncGuestReads: a guest thread's read is queued and submitted by the GPU
+	// thread, which then goes on recording; the guest thread waits for the copy itself.
+	uint64_t async_tick = 0;
+	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write, caller, on_gpu, tid,
+	                                                &async_tick] {
+		if (!m_pending_guest_reads.empty()) {
+			FinishPendingGuestReads(vaddr, size);
+		}
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
 		}
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+		if (!is_write && !on_gpu && Common::Experiments::Enabled(Common::Experiments::AsyncGuestReads)) {
+			if (DownloadBufferMemory<true>(buffer, vaddr, size)) {
+				// The download covers whole tracker pages; so does the pending record.
+				const auto first = vaddr & ~(TRACKER_PAGE_SIZE - 1);
+				const auto last  = (vaddr + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
+				async_tick       = m_scheduler.CurrentTick();
+				m_pending_guest_reads.push_back({first, last - first, async_tick});
+				m_scheduler.Flush();
+				Common::Timeline::Mark("async-guest-read", vaddr);
+			}
+			return;
+		}
 
 		const bool timed = PerfStatsEnabled();
 		const auto start = timed ? std::chrono::steady_clock::now()
@@ -913,6 +961,11 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadC
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 		}
 	});
+	if (async_tick != 0) {
+		m_scheduler.WaitPriorityOperations(async_tick);
+		m_scheduler.Context().GetGpu().SendCommandSync(
+		    [this, vaddr, size] { FinishPendingGuestReads(vaddr, size); });
+	}
 }
 
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
@@ -1333,7 +1386,8 @@ bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
-	return m_gpu_modified_ranges.Intersects(vaddr, size);
+	return m_gpu_modified_ranges.Intersects(vaddr, size) ||
+	       (!m_pending_guest_reads.empty() && OverlapsPendingGuestRead(vaddr, size));
 }
 
 bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
