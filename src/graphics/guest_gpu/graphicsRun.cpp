@@ -615,6 +615,8 @@ void GuestGpu::WaitForIdle() {
 namespace {
 // Draws and dispatches the GPU thread has processed (KYTY_DBG_QUEUE_TIME reports time per item).
 uint64_t g_work_items = 0;
+// The guest queue of the submission being processed (GPU thread only).
+uint32_t g_current_queue = 0;
 
 // KYTY_DBG_QUEUE_TIME=1: GPU-thread time spent processing each guest queue (0 = graphics,
 // 1.. = compute rings), printed every 5 s as NHL27QUEUES.
@@ -772,6 +774,7 @@ void GuestGpu::ThreadRun(void* data) {
 			const uint64_t kind = 2 + static_cast<uint64_t>(submission.type);
 			Common::EventTrace::Record(Common::EventTrace::GPU_CMD_BEGIN, kind, gpu->m_submit_id);
 			QueueTimeScope queue_time(submission.queue_id);
+			g_current_queue = submission.queue_id;
 			complete = gpu->Process(submission);
 			Common::EventTrace::Record(Common::EventTrace::GPU_CMD_END, kind | (complete ? 0u : 0x100u),
 			                           gpu->m_submit_id);
@@ -2162,6 +2165,10 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 
 void CommandProcessor::SynchronizeGpu() {
 	GetScheduler().Finish();
+}
+
+uint32_t GuestGpu::CurrentQueue() noexcept {
+	return g_current_queue;
 }
 
 bool GuestGpu::IsGpuThread() noexcept {

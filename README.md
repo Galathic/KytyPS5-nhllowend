@@ -114,6 +114,7 @@ KYTY_FAULT_PAGE_READS=1
 KYTY_GPU_COLOR_CLEAR=1
 KYTY_ASYNC_GUEST_READS=1
 KYTY_BDA_DIRTY_REGIONS=1
+KYTY_NATIVE_FP16=1
 ```
 
 Building with `-DKYTY_PGO=use` (clang-cl 22.1.8) adds about 15% from the NHL 27 gameplay profile in
