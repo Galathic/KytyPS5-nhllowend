@@ -613,6 +613,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	if (graphics.mesh_shader_enabled) {
 		subgroup_size_control.pNext = &graphics.mesh_shader_properties;
 	}
+	// KYTY_SKIP_BOUNDS_CHECKS needs the storage-buffer robustness alignment.
+	vk::PhysicalDeviceRobustness2PropertiesEXT robustness2_properties {};
+	if (robustness2_ext_enabled) {
+		robustness2_properties.pNext = properties2.pNext;
+		properties2.pNext            = &robustness2_properties;
+	}
 	physical_device.getProperties2(&properties2);
 
 	graphics.subgroup_size                 = properties11.subgroupSize;
@@ -763,6 +769,16 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	LOGF("Vulkan robustness: robustImageAccess=%s robustImageAccess2=%s\n",
 	     features13.robustImageAccess == VK_TRUE ? "true" : "false",
 	     robustness2_ext_enabled && robustness2.robustImageAccess2 == VK_TRUE ? "true" : "false");
+	{
+		// KYTY_SKIP_BOUNDS_CHECKS=1 relies on robustBufferAccess2 zeroing out-of-range dword reads.
+		const bool rba2  = robustness2_ext_enabled && robustness2.robustBufferAccess2 == VK_TRUE;
+		const auto align = static_cast<unsigned long long>(
+		    robustness2_properties.robustStorageBufferAccessSizeAlignment);
+		g_shader_robust_buffer2.store(rba2 && align <= 4u, std::memory_order_relaxed);
+		std::printf("NHL27CODEGEN robustBufferAccess2=%d storage_align=%llu skip_bounds_checks=%d\n",
+		            rba2 ? 1 : 0, align, ShaderSkipBoundsChecks() ? 1 : 0);
+		std::fflush(stdout);
+	}
 
 	vk::DeviceCreateInfo create_info {};
 	vk::PhysicalDeviceMeshShaderFeaturesEXT mesh_features {};

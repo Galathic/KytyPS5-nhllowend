@@ -44,6 +44,20 @@ inline std::atomic<uint32_t> g_shader_native_fp16_modes {0};
 	return enabled;
 }
 
+// Codegen experiment (KYTY_SKIP_BOUNDS_CHECKS=1): scalar buffer reads (s_buffer_load) skip the
+// explicit per-dword bounds check and rely on robustBufferAccess2, which returns zero for dwords
+// outside the bound range just like the check. Only active when the device runs with
+// robustBufferAccess2 and a storage-buffer robustness alignment of at most 4 bytes; vulkanWindow
+// sets g_shader_robust_buffer2 at device creation. Off by default.
+inline std::atomic<bool> g_shader_robust_buffer2 {false};
+[[nodiscard]] inline bool ShaderSkipBoundsChecks() {
+	static const bool requested = [] {
+		const char* value = std::getenv("KYTY_SKIP_BOUNDS_CHECKS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return requested && g_shader_robust_buffer2.load(std::memory_order_relaxed);
+}
+
 namespace ShaderError {
 
 [[nodiscard]] inline bool Fail(std::string* error, std::string_view message) {
