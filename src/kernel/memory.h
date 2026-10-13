@@ -118,6 +118,9 @@ bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t
 // GPU thread only: reads the backing when none of the bytes is GPU-dirty, so the CPU view of
 // them is already current. Never synchronizes with the GPU.
 bool                   TryReadCleanBacking(uint64_t vaddr, void* data, uint64_t size);
+// Guest threads only (KYTY_FALSE_SHARE_GUEST_READS): asks the GPU thread whether the bytes are clean
+// on a page that holds other GPU-dirty bytes, and reads the backing if so. Never downloads.
+bool                   TryReadCleanBackingForGuest(uint64_t vaddr, void* data, uint64_t size);
 // Optional GPU-thread clean peek: refusal never downloads, faults or changes output.
 bool                   TryReadCleanBufferBacking(uint64_t vaddr, void* data, uint64_t size);
 // GPU-thread clean validation (DRAWPREP prefetch): Equal = the backing bytes are not GPU-dirty and equal `expected`;

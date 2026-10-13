@@ -788,6 +788,18 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			Libs::Graphics::BufferCache::PerfCount(Libs::Graphics::BufferCache::PerfEvent::FalseShareRead);
 			return true;
 		}
+				// KYTY_FALSE_SHARE_GUEST_READS=1 (experiment, off by default): the same for guest threads. The
+		// GPU thread checks the dirty ranges (see TryReadCleanBackingForGuest); counted as false_share_reads.
+		static const bool false_share_guest_reads = [] {
+			const char* value = std::getenv("KYTY_FALSE_SHARE_GUEST_READS");
+			return value != nullptr && value[0] == '1';
+		}();
+		if (false_share_guest_reads && access == GpuAccess::Read && !Libs::Graphics::GuestGpu::IsGpuThread() &&
+		    Loader::X64InstructionEmulator::TryEmulateLoad(info->native_context,
+		                                                   Libs::LibKernel::Memory::TryReadCleanBackingForGuest)) {
+			Libs::Graphics::BufferCache::PerfCount(Libs::Graphics::BufferCache::PerfEvent::FalseShareRead);
+			return true;
+		}
 		Libs::Graphics::BufferCache::NoteFaultRip(info->exception_address);
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			return true;

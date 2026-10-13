@@ -1130,6 +1130,25 @@ bool TryReadCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
+// KYTY_FALSE_SHARE_GUEST_READS=1: a guest thread reads bytes the GPU never wrote, on a 4 KiB page that is
+// protected only because other bytes on it are GPU-dirty. The ordinary fault downloads those other bytes,
+// which waits for all queued GPU work (about 9 ms per fault in NHL 27 free skate). Ask the GPU thread,
+// which owns the dirty-range set, whether the read is clean, and serve it from the backing if so.
+// TryReadCleanBacking's per-page cap still applies; past it the fault downloads as before.
+bool TryReadCleanBackingForGuest(uint64_t vaddr, void* data, uint64_t size) {
+	if (g_gpu_resources == nullptr || size == 0 || Graphics::GuestGpu::IsGpuThread() ||
+	    Graphics::CommandScheduler::InDeferredOperation()) {
+		return false;
+	}
+	bool served = false;
+	GetGpuResources().GetGpu().SendUrgentCommandSync([vaddr, data, size, &served] {
+		auto&          buffers = GetGpuResources().GetBufferCache();
+		const uint64_t page    = vaddr & ~uint64_t {0xfff};
+		served = buffers.HasGpuDirtyBytes(page, 0x1000) && TryReadCleanBacking(vaddr, data, size);
+	});
+	return served;
+}
+
 bool TryReadCleanBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	if (g_gpu_resources == nullptr || !Graphics::GuestGpu::IsGpuThread() || data == nullptr ||
 	    !Graphics::GuestRange {vaddr, size}.Valid()) {
