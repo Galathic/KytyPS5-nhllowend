@@ -1019,8 +1019,90 @@ static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t
 }
 
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
+	NoteHostWrite(vaddr, size, HostWriteSource::Backing, data);
 	return g_guest_address_space != nullptr &&
 	       g_guest_address_space->TryWriteBacking(vaddr, data, size);
+}
+
+namespace {
+
+struct HostWriteEntry {
+	uint64_t        vaddr;
+	uint64_t        size;
+	uint64_t        first;
+	uint64_t        time_ms;
+	int             thread;
+	HostWriteSource source;
+	bool            all_ones; // some aligned qword of the data is 0xffffffffffffffff
+};
+
+// Two rings, so frequent label and command-processor dwords cannot push bulk writebacks out.
+constexpr uint64_t    HostWriteRingSize = uint64_t {1} << 18;
+HostWriteEntry        g_host_writes[2][HostWriteRingSize];
+std::atomic<uint64_t> g_host_write_next[2] {};
+
+uint64_t HostWriteNowMs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
+} // namespace
+
+void NoteHostWrite(uint64_t vaddr, uint64_t size, HostWriteSource source, const void* data) {
+	if (size == 0) return;
+	HostWriteEntry entry {};
+	entry.vaddr   = vaddr;
+	entry.size    = size;
+	entry.source  = source;
+	entry.thread  = Common::Thread::GetThreadIdUnique();
+	entry.time_ms = HostWriteNowMs();
+	if (data != nullptr) {
+		std::memcpy(&entry.first, data, std::min<uint64_t>(size, sizeof(entry.first)));
+		const auto* bytes = static_cast<const uint8_t*>(data);
+		const auto  scan  = std::min<uint64_t>(size, 4096) & ~uint64_t {7};
+		for (uint64_t i = 0; i < scan; i += 8) {
+			uint64_t q = 0;
+			std::memcpy(&q, bytes + i, sizeof(q));
+			if (q == ~uint64_t {0}) {
+				entry.all_ones = true;
+				break;
+			}
+		}
+	}
+	const int ring = size > 16 ? 1 : 0;
+	g_host_writes[ring][g_host_write_next[ring].fetch_add(1, std::memory_order_relaxed) &
+	                    (HostWriteRingSize - 1)] = entry;
+}
+
+void ReportHostWrites(const char* label, uint64_t vaddr, uint64_t window) {
+	static constexpr const char* Names[] = {"backing", "cp", "label", "dma"};
+	const uint64_t lo      = vaddr > window ? vaddr - window : 0;
+	const uint64_t hi      = vaddr + window;
+	const uint64_t now     = HostWriteNowMs();
+	uint64_t       count   = 0;
+	int            printed = 0;
+	// Bulk writebacks first, then label/command-processor dwords.
+	for (int ring = 1; ring >= 0; ring--) {
+		const uint64_t next   = g_host_write_next[ring].load(std::memory_order_relaxed);
+		const uint64_t logged = std::min(next, HostWriteRingSize);
+		count += logged;
+		for (uint64_t i = 0, shown = 0; i < logged && shown < 6; i++) {
+			const auto& e = g_host_writes[ring][(next - 1 - i) & (HostWriteRingSize - 1)];
+			if (e.size == 0 || e.vaddr >= hi || e.vaddr + e.size <= lo) continue;
+			std::printf("  %s 0x%016" PRIx64 ": host write %s vaddr=0x%016" PRIx64 " size=0x%" PRIx64
+			            " first=0x%016" PRIx64 " all_ones=%d age=%" PRIu64 "ms thread=%d\n",
+			            label, vaddr, Names[static_cast<int>(e.source)], e.vaddr, e.size, e.first,
+			            e.all_ones ? 1 : 0, now - e.time_ms, e.thread);
+			shown++;
+			printed++;
+		}
+	}
+	if (printed == 0) {
+		std::printf("  %s 0x%016" PRIx64 ": no host write within +-0x%" PRIx64
+		            " among the last %" PRIu64 " logged\n",
+		            label, vaddr, window, count);
+	}
 }
 
 bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {

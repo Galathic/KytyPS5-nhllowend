@@ -613,6 +613,8 @@ uint64_t CommandProcessor::Emit(GpuOperation&& operation) {
 
 void CommandProcessor::NoteGuestWrite(uint64_t sequence, uint64_t address, uint64_t size,
                                       const void* value) {
+	LibKernel::Memory::NoteHostWrite(address, size, LibKernel::Memory::HostWriteSource::CommandProcessor,
+	                                 value);
 	if (m_pipeline != nullptr && size != 0) {
 		m_pipeline->NoteGuestWrite(sequence, address, size, value);
 	}

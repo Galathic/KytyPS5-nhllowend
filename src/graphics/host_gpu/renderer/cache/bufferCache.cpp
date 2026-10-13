@@ -732,6 +732,8 @@ BufferCache::~BufferCache() {
 bool BufferCache::TryWriteLabel(uint64_t vaddr, const void* data, uint64_t size) {
 	if ((size != 4 && size != 8) || (vaddr & (size - 1)) != 0 || data == nullptr ||
 	    !GuestRange {vaddr, size}.Valid()) return false;
+	Libs::LibKernel::Memory::NoteHostWrite(vaddr, size, Libs::LibKernel::Memory::HostWriteSource::Label,
+	                                       data);
 	// Labels fit within one cache page. Do not create a buffer or change page ownership.
 	const auto found = m_buffers.upper_bound(vaddr);
 	if (found == m_buffers.begin()) return false;
@@ -1298,6 +1300,10 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
                              bool src_gds) {
 	m_gpu_write_generation++;
+	if (!dst_gds) {
+		Libs::LibKernel::Memory::NoteHostWrite(dst_vaddr, size,
+		                                       Libs::LibKernel::Memory::HostWriteSource::DmaCopy, nullptr);
+	}
 	const bool dst_memory = !dst_gds;
 	const bool src_memory = !src_gds;
 	if ((dst_memory && dst_vaddr == 0) || (src_memory && src_vaddr == 0) || size == 0 ||

@@ -811,6 +811,29 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		            info->rax, info->rbx, info->rcx, info->rdx, info->rsi, info->rdi, info->rbp,
 		            info->rsp, info->r8, info->r9, info->r10, info->r11, info->r12, info->r13,
 		            info->r14, info->r15);
+		{
+			// Which emulator (GPU / command processor) writes touched the memory this thread was
+			// using: a guest pointer that holds garbage written by the host points at the emulator.
+			const std::pair<const char*, uint64_t> regs[] = {
+			    {"fault", info->access_violation_vaddr}, {"rax", info->rax}, {"rbx", info->rbx},
+			    {"rcx", info->rcx}, {"rdx", info->rdx}, {"rsi", info->rsi}, {"rdi", info->rdi},
+			    {"rbp", info->rbp}, {"r8", info->r8}, {"r9", info->r9}, {"r10", info->r10},
+			    {"r11", info->r11}, {"r12", info->r12}, {"r13", info->r13}, {"r14", info->r14},
+			    {"r15", info->r15}};
+			std::printf("--- Host writes near guest pointers ---\n");
+			for (const auto& [name, value]: regs) {
+				if (value < 0x1000000000ull || value >= 0x4000000000ull) continue;
+				if (IsReadableRange(value & ~uint64_t {7}, 64)) {
+					const auto* words = reinterpret_cast<const uint64_t*>(value & ~uint64_t {7});
+					std::printf("  %s 0x%016" PRIx64 " =", name, value);
+					for (int i = 0; i < 8; i++) {
+						std::printf(" %016" PRIx64, words[i]);
+					}
+					std::printf("\n");
+				}
+				Libs::LibKernel::Memory::ReportHostWrites(name, value, 0x400);
+			}
+		}
 		if (IsReadableRange(info->exception_address - 48, 96)) {
 			const auto* code = reinterpret_cast<const uint8_t*>(info->exception_address - 48);
 			std::printf("code (pc-48 .. pc+48, fault at byte 48):");
