@@ -119,6 +119,8 @@ enum class HostWriteSource : uint8_t { Backing, CommandProcessor, Label, DmaCopy
 void                   NoteHostWrite(uint64_t vaddr, uint64_t size, HostWriteSource source,
                                      const void* data);
 void                   ReportHostWrites(const char* label, uint64_t vaddr, uint64_t window);
+// Writes the bytes of `data` whose backing still equals `expected` (see LazySharedWrites).
+bool                   TryMergeBacking(uint64_t vaddr, const void* data, const void* expected, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
 // GPU thread only: reads the backing when none of the bytes is GPU-dirty, so the CPU view of

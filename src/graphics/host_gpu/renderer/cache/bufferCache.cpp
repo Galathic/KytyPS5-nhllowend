@@ -496,8 +496,9 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	}
 }
 
-template <bool async>
+template <bool async, bool merge>
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	static_assert(async || !merge);
 	DropGpuFills(vaddr, size);
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size     = 0;
@@ -534,12 +535,36 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	for (auto& copy: copies) {
 		copy.dstOffset += offset;
 	}
-	auto publish = [this, mapped, offset, total_size, buffer_address,
-	                copies = copies, owner = std::move(temporary)]() mutable {
-		(owner ? *owner : m_download_buffer).Invalidate(offset, total_size);
+	// Experiment LazySharedWrites: the guest bytes as they are before the faulting CPU write runs.
+	std::vector<uint8_t> snapshot;
+	if constexpr (merge) {
+		snapshot.resize(m_last_download_bytes);
+		uint64_t at = 0;
 		for (const auto& copy: copies) {
-			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
-			                                      mapped + (copy.dstOffset - offset), copy.size);
+			if (!Libs::LibKernel::Memory::TryReadBacking(buffer_address + copy.srcOffset,
+			                                             snapshot.data() + at, copy.size)) {
+				snapshot.clear();
+				break;
+			}
+			at += copy.size;
+		}
+	}
+	auto publish = [this, mapped, offset, total_size, buffer_address, copies = copies,
+	                owner = std::move(temporary), snapshot = std::move(snapshot)]() mutable {
+		(owner ? *owner : m_download_buffer).Invalidate(offset, total_size);
+		uint64_t at = 0;
+		for (const auto& copy: copies) {
+			const auto* gpu = mapped + (copy.dstOffset - offset);
+			if (!snapshot.empty()) {
+				// Bytes the CPU stored since the download was queued are newer than the GPU's.
+				if (!Libs::LibKernel::Memory::TryMergeBacking(buffer_address + copy.srcOffset, gpu,
+				                                              snapshot.data() + at, copy.size)) {
+					EXIT("BufferCache: merge of a shared-page download failed\n");
+				}
+			} else {
+				Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset, gpu, copy.size);
+			}
+			at += copy.size;
 		}
 	};
 	if constexpr (!async) {
@@ -819,6 +844,20 @@ static void WriteBackRecord(uint64_t rip, uint64_t vaddr, uint64_t ns) {
 	std::fflush(stdout);
 }
 
+bool BufferCache::LazySharedWriteEligible(uint64_t vaddr, uint64_t size) {
+	// The stored bytes must not be GPU-written themselves, and the GPU must own only a few bytes
+	// of each page involved.
+	if (size == 0 || HasGpuDirtyBytes(vaddr, size)) {
+		return false;
+	}
+	const auto first = vaddr & ~(TRACKER_PAGE_SIZE - 1);
+	const auto last  = (vaddr + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
+	uint64_t   dirty = 0;
+	m_gpu_modified_ranges.ForEachInRange(first, last - first,
+	                                     [&](uint64_t start, uint64_t end) { dirty += end - start; });
+	return dirty != 0 && dirty <= 256;
+}
+
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadCaller caller) {
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
@@ -842,7 +881,18 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadC
 		                         : std::chrono::steady_clock::time_point {};
 		const bool exact_dirty =
 		    timed && caller == ReadCaller::Fault && !is_write && HasGpuDirtyBytes(vaddr, 1);
-		const bool downloaded = DownloadBufferMemory<false>(buffer, vaddr, size);
+		// Experiment LazySharedWrites: a guest thread's store next to a few GPU-written bytes
+		// (NHL 27 builds command buffers in pages a compute shader wrote 16 bytes of) need not wait
+		// for that shader. The download is queued and merged later, keeping any bytes the CPU
+		// changes meanwhile, which are newer.
+		const bool lazy = is_write && !on_gpu &&
+		                  Common::Experiments::Enabled(Common::Experiments::LazySharedWrites) &&
+		                  LazySharedWriteEligible(vaddr, size);
+		const bool downloaded = lazy ? DownloadBufferMemory<true, true>(buffer, vaddr, size)
+		                             : DownloadBufferMemory<false>(buffer, vaddr, size);
+		if (lazy) {
+			Common::Timeline::Mark("lazy-shared-write", vaddr);
+		}
 		if (timed) {
 			if (downloaded && !is_write) {
 				const auto page = vaddr & ~(TRACKER_PAGE_SIZE - 1);

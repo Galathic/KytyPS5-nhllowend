@@ -48,6 +48,7 @@ uint32_t EnvironmentMask() {
 	set("KYTY_CPU_COPY_FORWARD", CpuCopyForward, false);
 	set("KYTY_FALSE_SHARE_READS", FalseShareReads, false);
 	set("KYTY_SRT_JIT", SrtJit, false);
+	set("KYTY_LAZY_SHARED_WRITES", LazySharedWrites, false);
 	return mask;
 }
 
