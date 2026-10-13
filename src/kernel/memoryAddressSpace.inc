@@ -178,6 +178,33 @@ public:
 		                          });
 	}
 
+	// Writes each byte of `data` whose backing byte still equals `expected` (aligned dwords with one
+	// compare-exchange each, so a concurrent CPU store into the dword wins).
+	bool TryMergeBacking(uint64_t vaddr, const void* data, const void* expected, uint64_t size) {
+		if (data == nullptr || expected == nullptr) {
+			return false;
+		}
+		const auto* source = static_cast<const uint8_t*>(data);
+		const auto* old    = static_cast<const uint8_t*>(expected);
+		return TryTransferBacking(vaddr, size, [source, old](uint8_t* backing, uint64_t data_offset, size_t bytes) {
+			for (size_t i = 0; i < bytes;) {
+				const auto at = data_offset + i;
+				if ((reinterpret_cast<uintptr_t>(backing + i) & 3u) == 0 && bytes - i >= 4) {
+					uint32_t want = 0;
+					uint32_t seen = 0;
+					std::memcpy(&want, source + at, 4);
+					std::memcpy(&seen, old + at, 4);
+					std::atomic_ref<uint32_t>(*reinterpret_cast<uint32_t*>(backing + i))
+					    .compare_exchange_strong(seen, want);
+					i += 4;
+				} else {
+					if (backing[i] == old[at]) backing[i] = source[at];
+					++i;
+				}
+			}
+		});
+	}
+
 	// fast: enables the lock-free single-mapping read cache (KYTY_SRT_SOURCE_REUSE).
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size, bool fast = false) {
 		if (data == nullptr) {
@@ -840,6 +867,10 @@ public:
 
 	bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
 		return m_backing->TryWriteBacking(vaddr, data, size);
+	}
+
+	bool TryMergeBacking(uint64_t vaddr, const void* data, const void* expected, uint64_t size) {
+		return m_backing->TryMergeBacking(vaddr, data, expected, size);
 	}
 
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size, bool fast = false) {

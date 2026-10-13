@@ -1,6 +1,8 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 
 #include "common/alignment.h"
+#include "common/experiments.h"
+#include "graphics/host_gpu/renderer/nativeIndirect.h"
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
@@ -312,6 +314,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	m_images_by_address[image.info.data.address].push_back(id);
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
+	image.lru_tick   = m_gc_tick;
 	m_total_used_memory += image.AccountedSize();
 }
 
@@ -501,7 +504,8 @@ void TextureCache::FreeImage(ImageId id) {
 }
 
 void TextureCache::TouchImage(Image& image) {
-	if (image.registered) {
+	if (image.registered && image.lru_tick != m_gc_tick) {
+		image.lru_tick = m_gc_tick;
 		m_lru_cache.Touch(image.lru_id, m_gc_tick);
 	}
 }
@@ -1454,9 +1458,25 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	if (shadowed) {
 		BufferCache::PerfCount(BufferCache::PerfEvent::ColorClearShadowHit);
 	}
+	// Experiment GpuColorClear: the GPU wrote these metadata bytes. Check them on the GPU and clear
+	// through conditional rendering instead of reading them back, which waits for that GPU work.
+	if (!shadowed && selected_size != 0 && m_graphics.conditional_rendering_enabled &&
+	    Common::Experiments::Enabled(Common::Experiments::GpuColorClear) &&
+	    m_buffer_cache.HasGpuDirtyBytes(selected_address, selected_size) &&
+	    MaterializeColorClearOnGpu(id, desc, selected_address, slice_size, count, image_first)) {
+		return;
+	}
 	// This may submit; never hold the texture lock across the readback.
 	if (!shadowed && selected_size != 0 &&
 	    m_buffer_cache.HasGpuDirtyBytes(selected_address, selected_size)) {
+		static const bool debug_cpu = std::getenv("KYTY_DBG_GPU_CLEAR") != nullptr;
+		static uint32_t   cpu_logged = 0;
+		if (debug_cpu && cpu_logged++ < 32) {
+			std::printf("NHL27GPUCLEAR: cpu-readback address=0x%llx size=%llu cond=%d exp=%d\n",
+			            static_cast<unsigned long long>(selected_address),
+			            static_cast<unsigned long long>(selected_size), m_graphics.conditional_rendering_enabled ? 1 : 0,
+			            Common::Experiments::Enabled(Common::Experiments::GpuColorClear) ? 1 : 0);
+		}
 		m_buffer_cache.ReadMemory(selected_address, selected_size, false,
 		                          BufferCache::ReadCaller::ColorClear);
 	}
@@ -1506,6 +1526,106 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size());
 		}
 	}
+}
+
+bool TextureCache::MaterializeColorClearOnGpu(ImageId id, const ImageDesc& desc, uint64_t address,
+                                              uint64_t slice_size, uint32_t count, uint32_t image_first) {
+	const auto& view = desc.view_info;
+	// KYTY_DBG_GPU_CLEAR=1: which path the first checks take (NHL27GPUCLEAR).
+	static const bool debug = std::getenv("KYTY_DBG_GPU_CLEAR") != nullptr;
+	static uint32_t   logged = 0;
+	const auto        note   = [&](const char* what) {
+		if (debug && logged++ < 64) {
+			std::printf("NHL27GPUCLEAR: %s address=0x%llx slice=%llu count=%u levels=%u volume=%d type=%d\n", what,
+			            static_cast<unsigned long long>(address), static_cast<unsigned long long>(slice_size), count,
+			            view.level_count, desc.info.IsVolume() ? 1 : 0, static_cast<int>(desc.type));
+		}
+	};
+	if (count == 0 || count > 64 || view.level_count != 1 || desc.info.IsVolume() || slice_size % 4 != 0 ||
+	    slice_size / 4 > UINT32_MAX) {
+		note("shape");
+		return false;
+	}
+	// The codes a uniform slice could hold that decode to a clear color for this view.
+	std::array<uint8_t, 8>             codes {};
+	std::array<vk::ClearColorValue, 8> colors {};
+	size_t                             candidates = 0;
+	for (const uint8_t code: {uint8_t {0x00}, uint8_t {0x20}, uint8_t {0x40}, uint8_t {0x80}, uint8_t {0xc0}}) {
+		vk::ClearColorValue color {};
+		if (DecodeColorClear(desc, code, color)) {
+			codes[candidates]    = code;
+			colors[candidates++] = color;
+		}
+	}
+	if (candidates == 0) {
+		note("no-candidates");
+		return true; // No slice could clear: the CPU path would neither clear nor expand.
+	}
+	{
+		std::scoped_lock lock {m_lock};
+		auto&            image = m_slot_images[id];
+		if (!(image.backing.usage & vk::ImageUsageFlagBits::eColorAttachment)) {
+			note("no-attachment-usage");
+			return false;
+		}
+	}
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	const bool expand        = desc.type != BindingType::VideoOut;
+	const auto [buffer, offset] = m_buffer_cache.ObtainBuffer(address, slice_size * count, expand, false);
+	if (m_color_clear_check == nullptr) {
+		m_color_clear_check = std::make_shared<ColorClearCheck>(m_graphics, m_scheduler);
+	}
+	const auto [predicates, first] = m_color_clear_check->Record(
+	    command, buffer->BufferDeviceAddress() + offset, static_cast<uint32_t>(slice_size / 4), count,
+	    std::span(codes.data(), candidates), expand);
+	std::scoped_lock lock {m_lock};
+	auto&            image = m_slot_images[id];
+	TrackImage(id);
+	if (image.IsBufferModified() || image.IsCpuDirty()) {
+		InitializeImage(id);
+	}
+	const auto       native = command.Handle();
+	const vk::Extent2D extent {std::max(image.info.extent.width >> view.base_level, 1u),
+	                           std::max(image.info.extent.height >> view.base_level, 1u)};
+	for (uint32_t slice = 0; slice < count; slice++) {
+		ImageViewInfo target {};
+		target.format      = view.format;
+		target.type        = vk::ImageViewType::e2D;
+		target.base_level  = view.base_level;
+		target.base_layer  = image_first + slice;
+		target.layer_count = 1;
+		target.usage       = vk::ImageUsageFlagBits::eColorAttachment;
+		image.Transit(vk::ImageLayout::eColorAttachmentOptimal, vk::AccessFlagBits2::eColorAttachmentWrite, {}, native);
+		vk::RenderingAttachmentInfo attachment {};
+		attachment.imageView   = image.FindView(target);
+		attachment.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
+		attachment.loadOp      = vk::AttachmentLoadOp::eLoad;
+		attachment.storeOp     = vk::AttachmentStoreOp::eStore;
+		vk::RenderingInfo rendering {};
+		rendering.renderArea.extent = extent;
+		rendering.layerCount           = 1;
+		rendering.colorAttachmentCount = 1;
+		rendering.pColorAttachments    = &attachment;
+		native.beginRendering(&rendering);
+		for (size_t k = 0; k < candidates; k++) {
+			vk::ConditionalRenderingBeginInfoEXT condition {};
+			condition.buffer = predicates;
+			condition.offset = first + (static_cast<uint64_t>(slice) * 8u + k) * sizeof(uint32_t);
+			native.beginConditionalRenderingEXT(&condition);
+			vk::ClearAttachment clear {};
+			clear.aspectMask        = vk::ImageAspectFlagBits::eColor;
+			clear.colorAttachment   = 0;
+			clear.clearValue.color  = colors[k];
+			const vk::ClearRect rect {{{0, 0}, extent}, 0, 1};
+			native.clearAttachments(1, &clear, 1, &rect);
+			native.endConditionalRenderingEXT();
+		}
+		native.endRendering();
+	}
+	CommitGpuWrite(image);
+	note("gpu");
+	return true;
 }
 
 void TextureCache::RefreshImage(ImageId id) {

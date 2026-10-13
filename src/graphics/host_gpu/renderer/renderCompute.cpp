@@ -695,7 +695,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 		}
 	}
-	const auto crumb = BreadcrumbBegin(m_context.GetGraphics(), vk_buffer, "dispatch",
+	// GPU timing tells dispatches from the guest's compute rings apart ("dispatch-acq").
+	const auto crumb = BreadcrumbBegin(m_context.GetGraphics(), vk_buffer,
+	                                   GuestGpu::CurrentQueue() != 0 ? "dispatch-acq" : "dispatch",
 	                                   program.shader_hash,
 	                                   (static_cast<uint64_t>(thread_group_x) << 40u) |
 	                                       (static_cast<uint64_t>(thread_group_y) << 20u) |

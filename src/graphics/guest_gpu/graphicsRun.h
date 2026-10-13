@@ -47,6 +47,8 @@ public:
 	[[nodiscard]] int GetFrameNum() const;
 
 	[[nodiscard]] static bool IsGpuThread() noexcept;
+	// The guest queue the GPU thread is processing (0 = graphics ring, 1.. = compute rings).
+	[[nodiscard]] static uint32_t CurrentQueue() noexcept;
 
 private:
 	static constexpr uint32_t ComputePipeCount     = 7;

@@ -47,11 +47,21 @@ uint32_t EnvironmentMask() {
 	// Not part of the recommended set: opt in with 1.
 	set("KYTY_CPU_COPY_FORWARD", CpuCopyForward, false);
 	set("KYTY_FALSE_SHARE_READS", FalseShareReads, false);
+	set("KYTY_ASYNC_SUBMIT", AsyncSubmit, false);
+	set("KYTY_LAZY_SHARED_WRITES", LazySharedWrites, false);
+	set("KYTY_NATIVE_FP16", NativeFp16, false);
+	set("KYTY_FAULT_PAGE_READS", FaultPageReads, false);
+	set("KYTY_EXEC_SELECTS", ExecSelects, false);
+	set("KYTY_GPU_COLOR_CLEAR", GpuColorClear, false);
+	set("KYTY_POOLED_BDA_BUFFERS", PooledBdaBuffers, false);
+	set("KYTY_ASYNC_GUEST_READS", AsyncGuestReads, false);
+	set("KYTY_BDA_DIRTY_REGIONS", BdaDirtyRegions, false);
+	set("KYTY_GPU_THREAD_PRIORITY", GpuThreadPriority, false);
 	return mask;
 }
 
 struct State {
-	std::atomic<uint32_t> mask {0};
+	std::atomic<uint64_t>& mask = Detail::g_mask;
 
 	State() {
 		const uint32_t defaults = EnvironmentMask();
@@ -90,13 +100,14 @@ State& GetState() {
 
 } // namespace
 
-bool Enabled(Bit bit) noexcept {
-	return (GetState().mask.load(std::memory_order_relaxed) & bit) != 0;
-}
+namespace Detail {
+constinit std::atomic<uint64_t> g_mask {Uninitialized};
 
-uint32_t Mask() noexcept {
-	return GetState().mask.load(std::memory_order_relaxed);
+uint64_t InitMask() noexcept {
+	(void)GetState();
+	return g_mask.load(std::memory_order_relaxed);
 }
+} // namespace Detail
 
 } // namespace Common::Experiments
 

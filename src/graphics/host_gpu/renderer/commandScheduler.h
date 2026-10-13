@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 
 #include <condition_variable>
+#include <deque>
 #include <mutex>
 
 #include <queue>
@@ -74,6 +75,8 @@ public:
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
+	// Lets experiment AsyncSubmit hand this scheduler's plain submissions to a worker thread.
+	void AllowAsyncSubmit() noexcept { m_async_allowed = true; }
 
 private:
 	class CommandPool {
@@ -104,7 +107,25 @@ private:
 		uint64_t                     tick = 0;
 	};
 
-	void BeginNext();
+	struct SubmitDebug {
+		uint32_t op        = 0;
+		uint64_t submit_id = 0;
+		uint32_t args[4] {};
+		uint64_t arg4 = 0;
+	};
+	struct QueuedSubmit {
+		vk::CommandBuffer buffer = nullptr;
+		SubmitInfo        info;
+		uint64_t          tick = 0;
+		SubmitDebug       debug;
+	};
+
+	void       BeginNext();
+	vk::Result QueueSubmit(vk::CommandBuffer buffer, const SubmitInfo& submit);
+	void       CheckSubmitResult(vk::Result result, uint64_t tick, const SubmitDebug& debug);
+	void       SubmitThread(std::stop_token stop);
+	void       DrainSubmits();
+	void       StopSubmitThread();
 	void PriorityOperationsThread(std::stop_token stop);
 	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
@@ -123,6 +144,14 @@ private:
 	uint64_t                     m_priority_active_tick = 0;
 	OperationState               m_operation_state      = OperationState::Open;
 	uint32_t                     m_trace_slot           = 0; // KYTY_IDLE_TRACE GPU timeline slot + 1
+	// Experiment AsyncSubmit: queued submissions in tick order, submitted by m_submit_thread.
+	bool                         m_async_allowed = false;
+	bool                         m_submit_busy   = false;
+	std::deque<QueuedSubmit>     m_submits;
+	std::mutex                   m_submit_mutex;
+	std::condition_variable_any  m_submit_available;
+	std::condition_variable      m_submit_idle;
+	std::jthread                 m_submit_thread;
 };
 
 } // namespace Libs::Graphics

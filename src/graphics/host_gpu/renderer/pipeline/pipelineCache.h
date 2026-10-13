@@ -9,9 +9,11 @@
 #include "graphics/shader/shader.h"
 
 #include <cstddef>
+#include <atomic>
 #include <filesystem>
 #include <memory>
 #include <span>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
 
@@ -180,6 +182,10 @@ private:
 	std::filesystem::path         m_driver_cache_path;
 	uint64_t                      m_unsaved_pipelines = 0;
 	uint64_t                      m_last_save_ms      = 0;
+	// AutoSave writes the driver cache on this thread: serializing and writing it (tens of MB)
+	// on the GPU thread took about 2% of its time in gameplay. One save runs at a time.
+	std::thread                   m_save_thread;
+	std::atomic<bool>             m_save_running {false};
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;

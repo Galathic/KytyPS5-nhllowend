@@ -16,6 +16,9 @@ using LoadReader = bool (*)(uint64_t address, void* out, uint64_t size);
 // without touching the context for anything else.
 [[nodiscard]] bool TryEmulateLoad(void* native_context, LoadReader reader);
 
+// Debugging: "<mnemonic> <prefix> mem=<bytes>" for the instruction at the context's RIP.
+bool DescribeInstruction(void* native_context, char* out, uint32_t out_size);
+
 } // namespace Loader::X64InstructionEmulator
 
 #endif /* KYTY_LOADER_X64_INSTRUCTION_EMULATOR_H_ */

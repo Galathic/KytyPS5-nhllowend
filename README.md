@@ -99,6 +99,27 @@ KYTY_PROGRAM_RESOURCE_CACHE=1
 KYTY_PERF_NO_SYNC_READBACK=1
 ```
 
+Performance switches measured on NHL 27 (`docs/claude-nhl27.md` has what each does):
+
+```
+KYTY_READBACK_QUEUE=1
+KYTY_DIRECT_EOP_INTERRUPTS=1
+KYTY_LONG_BUFFER_GC_AGE=1
+KYTY_SPARSE_BUFFER_GC=1
+KYTY_PM4_WRITE_DATA_FAST=1
+KYTY_FALSE_SHARE_READS=1
+KYTY_ASYNC_SUBMIT=1
+KYTY_LAZY_SHARED_WRITES=1
+KYTY_FAULT_PAGE_READS=1
+KYTY_GPU_COLOR_CLEAR=1
+KYTY_ASYNC_GUEST_READS=1
+KYTY_BDA_DIRTY_REGIONS=1
+KYTY_NATIVE_FP16=1
+```
+
+Building with `-DKYTY_PGO=use` (clang-cl 22.1.8) adds about 15% from the NHL 27 gameplay profile in
+`tools/pgo`.
+
 Useful debug options:
 
 | Variable | What it does |

@@ -14,6 +14,7 @@
 
 #include <atomic>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <type_traits>
 #include <unordered_map>
@@ -21,6 +22,8 @@
 #include <vector>
 
 namespace Libs::Graphics {
+
+class ColorClearCheck;
 
 struct GraphicContext;
 class Buffer;
@@ -162,6 +165,11 @@ private:
 	void                        RefreshImage(ImageId id);
 	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	                                                uint32_t metadata_base_layer);
+	// Experiment GpuColorClear: checks GPU-written metadata slices on the GPU and clears the
+	// matching image slices through conditional rendering. False when it cannot (CPU path).
+	[[nodiscard]] bool          MaterializeColorClearOnGpu(ImageId id, const ImageDesc& desc,
+	                                                       uint64_t address, uint64_t slice_size,
+	                                                       uint32_t count, uint32_t image_first);
 	void                        InitializeImage(ImageId id);
 	[[nodiscard]] TextureTransfer
 	BuildTextureTransfer(const Image& image, BindingType binding, TransferDirection direction) const;
@@ -195,6 +203,7 @@ private:
 	std::atomic_bool                                 m_storage_shadows_pending {false};
 	PageManager&                                      m_page_manager;
 	BlitHelper                                        m_blit_helper;
+	std::shared_ptr<ColorClearCheck>                  m_color_clear_check;
 	TileManager                                       m_tiler;
 	BufferCache&                                      m_buffer_cache;
 	Common::SlotVector<Image>                         m_slot_images;

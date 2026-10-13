@@ -31,6 +31,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <fmt/format.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -38,6 +39,7 @@
 #include <memory>
 #include <mutex>
 #include <semaphore>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -610,6 +612,64 @@ void GuestGpu::WaitForIdle() {
 	}
 }
 
+namespace {
+// Draws and dispatches the GPU thread has processed (KYTY_DBG_QUEUE_TIME reports time per item).
+uint64_t g_work_items = 0;
+// The guest queue of the submission being processed (GPU thread only).
+uint32_t g_current_queue = 0;
+// Guest barriers emitted, and how many of them ended a render pass (KYTY_DBG_QUEUE_TIME).
+uint64_t g_guest_barriers = 0, g_guest_barrier_breaks = 0;
+
+// KYTY_DBG_QUEUE_TIME=1: GPU-thread time spent processing each guest queue (0 = graphics,
+// 1.. = compute rings), printed every 5 s as NHL27QUEUES.
+struct QueueTimeScope {
+	static bool Enabled() {
+		static const bool enabled = std::getenv("KYTY_DBG_QUEUE_TIME") != nullptr;
+		return enabled;
+	}
+	explicit QueueTimeScope(uint32_t queue): queue(queue) {
+		if (Enabled()) start = std::chrono::steady_clock::now();
+	}
+	~QueueTimeScope() {
+		if (!Enabled()) return;
+		static std::array<uint64_t, 64> ns {};
+		static std::array<uint64_t, 64> slices {};
+		if (queue >= ns.size()) return;
+		static auto last = std::chrono::steady_clock::now();
+		const auto  now  = std::chrono::steady_clock::now();
+		ns[queue] += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count());
+		slices[queue]++;
+		if (now - last < std::chrono::seconds(5)) return;
+		const double seconds = std::chrono::duration<double>(now - last).count();
+		last = now;
+		uint64_t total_ns = 0;
+		for (const auto value: ns) total_ns += value;
+		static uint64_t last_items = 0;
+		const uint64_t  items      = g_work_items - last_items;
+		last_items                 = g_work_items;
+		static uint64_t last_barriers = 0, last_breaks = 0;
+		std::string line = fmt::format("NHL27QUEUES items/s={:.0f} us/item={:.2f} barriers/s={:.0f} pass_breaks/s={:.0f} ms/s:",
+		                               static_cast<double>(items) / seconds,
+		                               items != 0 ? static_cast<double>(total_ns) / 1e3 / static_cast<double>(items) : 0.0,
+		                               static_cast<double>(g_guest_barriers - last_barriers) / seconds,
+		                               static_cast<double>(g_guest_barrier_breaks - last_breaks) / seconds);
+		last_barriers = g_guest_barriers;
+		last_breaks   = g_guest_barrier_breaks;
+		for (uint32_t i = 0; i < ns.size(); i++) {
+			if (slices[i] == 0) continue;
+			line += fmt::format(" q{}={:.1f}({:.0f})", i, static_cast<double>(ns[i]) / 1e6 / seconds,
+			                    static_cast<double>(slices[i]) / seconds);
+		}
+		std::printf("%s\n", line.c_str());
+		std::fflush(stdout);
+		ns     = {};
+		slices = {};
+	}
+	uint32_t                              queue;
+	std::chrono::steady_clock::time_point start {};
+};
+} // namespace
+
 void GuestGpu::ThreadRun(void* data) {
 	auto* gpu = static_cast<GuestGpu*>(data);
 	EXIT_IF(gpu == nullptr);
@@ -617,7 +677,15 @@ void GuestGpu::ThreadRun(void* data) {
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
 
+	bool high_priority = false;
 	for (;;) {
+		// Experiment GpuThreadPriority: this thread limits the frame rate; guest threads that spin
+		// should not preempt it.
+		if (const bool want = Common::Experiments::Enabled(Common::Experiments::GpuThreadPriority);
+		    want != high_priority) {
+			Common::Thread::SetCurrentHighPriority(want);
+			high_priority = want;
+		}
 		Submission                   submission;
 		Common::UniqueFunction<void> command;
 		bool                         has_submission = false;
@@ -712,6 +780,8 @@ void GuestGpu::ThreadRun(void* data) {
 			// kind: 2 + SubmissionType (graphics/compute/flip prep/suspend point), +0x100 when sliced/blocked
 			const uint64_t kind = 2 + static_cast<uint64_t>(submission.type);
 			Common::EventTrace::Record(Common::EventTrace::GPU_CMD_BEGIN, kind, gpu->m_submit_id);
+			QueueTimeScope queue_time(submission.queue_id);
+			g_current_queue = submission.queue_id;
 			complete = gpu->Process(submission);
 			Common::EventTrace::Record(Common::EventTrace::GPU_CMD_END, kind | (complete ? 0u : 0x100u),
 			                           gpu->m_submit_id);
@@ -758,15 +828,18 @@ static std::atomic<uint32_t> g_split_draws {0};
 static std::atomic<int64_t>  g_split_us {0};
 
 static void SubmitSplitRefresh() {
+	// Measured best on an RX 9070 XT: 768 draws / 12 ms when each split costs this thread a
+	// vkQueueSubmit, 48 draws / 0.75 ms with experiment AsyncSubmit (+4.5% paused match).
+	const bool            async     = Common::Experiments::Enabled(Common::Experiments::AsyncSubmit);
 	static const uint32_t env_draws = [] {
 		const char* s = std::getenv("KYTY_SUBMIT_SPLIT_DRAWS");
 		const long  n = s != nullptr ? std::atol(s) : 0;
-		return n > 0 ? static_cast<uint32_t>(n) : 768u;
+		return n > 0 ? static_cast<uint32_t>(n) : 0u;
 	}();
 	static const int64_t env_us = [] {
 		const char* s = std::getenv("KYTY_SUBMIT_SPLIT_US");
 		const long  n = s != nullptr ? std::atol(s) : 0;
-		return n > 0 ? static_cast<int64_t>(n) : int64_t {12000};
+		return n > 0 ? static_cast<int64_t>(n) : int64_t {0};
 	}();
 	static auto last = std::chrono::steady_clock::time_point {};
 	const auto  now  = std::chrono::steady_clock::now();
@@ -774,8 +847,8 @@ static void SubmitSplitRefresh() {
 		return;
 	}
 	last           = now;
-	uint32_t draws = env_draws;
-	int64_t  us    = env_us;
+	uint32_t draws = env_draws != 0 ? env_draws : async ? 48u : 768u;
+	int64_t  us    = env_us != 0 ? env_us : async ? int64_t {750} : int64_t {12000};
 	if (FILE* file = std::fopen("split.ctl", "r"); file != nullptr) {
 		char line[64];
 		while (std::fgets(line, sizeof(line), file) != nullptr) {
@@ -1360,6 +1433,7 @@ uint32_t CommandProcessor::ResolveNumInstances() {
 }
 
 void CommandProcessor::DrawIndex(DrawIndexArgs args) {
+	++g_work_items;
 	ResolveNativeShaderRegisters();
 	args.index_type_and_size = m_index_type_and_size;
 	if (args.instance_count == 0) {
@@ -1377,6 +1451,7 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 }
 
 void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_count) {
+	++g_work_items;
 	uint64_t index_size = 0;
 	switch (m_index_type_and_size) {
 		case 0: index_size = 2; break;
@@ -1443,6 +1518,7 @@ void CommandProcessor::ResolveNativeShaderRegisters() {
 
 void CommandProcessor::DrawIndirect(uint32_t data_offset, IndirectDrawRegisters registers,
                                     uint32_t draw_initiator, bool indexed) {
+	++g_work_items;
 	const auto args_size = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
 	DrawIndirectMulti(data_offset, 1, nullptr, args_size, registers, draw_initiator, indexed);
 }
@@ -1451,6 +1527,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
                                          const volatile uint32_t* count_addr,
                                          uint32_t stride_in_bytes, IndirectDrawRegisters registers,
                                          uint32_t draw_initiator, bool indexed) {
+	++g_work_items;
 	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != (indexed ? 0u : 2u));
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
 
@@ -1592,6 +1669,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 
 void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y,
                                       uint32_t thread_group_z, uint32_t mode) {
+	++g_work_items;
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
 
 	uint32_t frame_num = 0;
@@ -1622,6 +1700,7 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 }
 
 void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
+	++g_work_items;
 	EXIT_NOT_IMPLEMENTED(args_addr == 0 || (args_addr & 3u) != 0);
 	if ((mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0) {
 		const auto* args = reinterpret_cast<const vk::DispatchIndirectCommand*>(args_addr);
@@ -1633,6 +1712,7 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 }
 
 void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
+	++g_work_items;
 	ResolveNativeShaderRegisters();
 	if (args.instance_count == 0) {
 		const bool from_pending = !m_pending_instances.empty();
@@ -1918,6 +1998,11 @@ void CommandProcessor::EmitGlobalBarrier() {
 		last_tick = UINT64_MAX;
 	}
 	FrameBreakdown::Add(FrameBreakdown::g_counters.port_guest_barriers);
+	++g_guest_barriers;
+	if (CurrentBuffer().IsRendering()) {
+		// Dropping these (keeping the render pass) measured no GPU gain: about 40 per frame.
+		++g_guest_barrier_breaks;
+	}
 
 	vk::MemoryBarrier2 barrier {};
 	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
@@ -2092,6 +2177,10 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 
 void CommandProcessor::SynchronizeGpu() {
 	GetScheduler().Finish();
+}
+
+uint32_t GuestGpu::CurrentQueue() noexcept {
+	return g_current_queue;
 }
 
 bool GuestGpu::IsGpuThread() noexcept {

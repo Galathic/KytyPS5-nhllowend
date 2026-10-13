@@ -881,6 +881,11 @@ bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
 	       g_guest_address_space->TryWriteBacking(vaddr, data, size);
 }
 
+bool TryMergeBacking(uint64_t vaddr, const void* data, const void* expected, uint64_t size) {
+	return g_guest_address_space != nullptr &&
+	       g_guest_address_space->TryMergeBacking(vaddr, data, expected, size);
+}
+
 bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 	const bool fast = (Common::RuntimeFlags::g_published.load(std::memory_order_relaxed) & (uint64_t {1} << Common::RuntimeFlags::kBitSrtSourceReuse)) != 0;
 	return g_guest_address_space != nullptr &&
@@ -971,6 +976,47 @@ bool TryReadCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 		return false;
 	}
 	return TryReadBacking(vaddr, data, size);
+}
+
+namespace {
+thread_local std::array<uint64_t, 16> t_read_fault_pages {};
+thread_local uint32_t                 t_read_fault_next = 0;
+// One bit per (page number % 256) of the pages in t_read_fault_pages: resource-table reads ask
+// IsReadFaultPage hundreds of thousands of times per frame and nearly always miss.
+thread_local std::array<uint64_t, 4> t_read_fault_filter {};
+
+constexpr uint64_t FaultFilterBit(uint64_t page) noexcept {
+	return uint64_t {1} << ((page >> 12u) & 63u);
+}
+constexpr size_t FaultFilterWord(uint64_t page) noexcept {
+	return (page >> 18u) & 3u;
+}
+} // namespace
+
+void NoteReadFaultPage(uint64_t vaddr) noexcept {
+	const auto page = vaddr & ~uint64_t {0xfff};
+	for (const auto known: t_read_fault_pages) {
+		if (known == page) return;
+	}
+	t_read_fault_pages[t_read_fault_next++ % t_read_fault_pages.size()] = page;
+	t_read_fault_filter = {};
+	for (const auto known: t_read_fault_pages) {
+		if (known != 0) t_read_fault_filter[FaultFilterWord(known)] |= FaultFilterBit(known);
+	}
+}
+
+bool IsReadFaultPage(uint64_t vaddr, uint64_t size) noexcept {
+	if (size == 0) return false;
+	const auto first = vaddr & ~uint64_t {0xfff};
+	const auto last  = (vaddr + size - 1) & ~uint64_t {0xfff};
+	if ((t_read_fault_filter[FaultFilterWord(first)] & FaultFilterBit(first)) == 0 &&
+	    (t_read_fault_filter[FaultFilterWord(last)] & FaultFilterBit(last)) == 0) {
+		return false;
+	}
+	for (const auto known: t_read_fault_pages) {
+		if (known != 0 && (known == first || known == last)) return true;
+	}
+	return false;
 }
 
 bool TryReadCleanBufferBacking(uint64_t vaddr, void* data, uint64_t size) {

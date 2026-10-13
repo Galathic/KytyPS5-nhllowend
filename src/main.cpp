@@ -10,9 +10,11 @@
 #include "kytyGitVersion.h"
 
 #include <charconv>
+#include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <string_view>
+#include <thread>
 #include <vector>
 #include <fmt/format.h>
 #include <magic_enum.hpp>
@@ -469,9 +471,39 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 	return show_help || (!options.app0_dir.empty() && !options.elf.empty());
 }
 
+#if defined(KYTY_PGO_GENERATE)
+extern "C" int  __llvm_profile_write_file(void);
+extern "C" void __llvm_profile_reset_counters(void);
+
+// Instrumented build (KYTY_PGO=generate): the emulator can end without running atexit handlers,
+// so write LLVM_PROFILE_FILE every 30 s. Creating the file "pgo.reset" in the working directory
+// drops the counts so far (e.g. the boot), so the profile describes gameplay.
+static void StartProfileWriter() {
+	std::thread([] {
+		auto last_write = std::chrono::steady_clock::now();
+		for (;;) {
+			std::this_thread::sleep_for(std::chrono::seconds(1));
+			std::error_code error;
+			if (std::filesystem::remove("pgo.reset", error)) {
+				__llvm_profile_reset_counters();
+				::printf("NHL27PGO: counters reset\n");
+				std::fflush(stdout);
+			}
+			if (std::chrono::steady_clock::now() - last_write >= std::chrono::seconds(30)) {
+				__llvm_profile_write_file();
+				last_write = std::chrono::steady_clock::now();
+			}
+		}
+	}).detach();
+}
+#endif
+
 static int Main(int argc, char* argv[]) {
 	VirtualMemory::Init();
 	InitializeThreads();
+#if defined(KYTY_PGO_GENERATE)
+	StartProfileWriter();
+#endif
 
 	RunOptions options;
 	bool       show_help = false;
