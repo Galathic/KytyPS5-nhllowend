@@ -829,6 +829,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			Libs::LibKernel::Memory::NoteReadFaultPage(info->access_violation_vaddr);
 			return true;
 		}
+		Libs::Graphics::BufferCache::NoteFaultRip(info->exception_address);
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			return true;
 		}
