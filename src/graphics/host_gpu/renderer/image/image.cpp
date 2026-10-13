@@ -225,7 +225,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 }
 
 void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
-                    std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer) {
+                    std::optional<ImageSubresourceRange> range, CommandRecorder command_buffer) {
 	const auto transfer_access =
 	    vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite;
 	vk::PipelineStageFlags2 destination_stage {};
@@ -817,7 +817,7 @@ Image::ShadowLevel& Image::ShadowLevelAt(uint32_t level) {
 	return *slot;
 }
 
-void Image::ShadowBarrier(ShadowLevel& shadow, vk::CommandBuffer command,
+void Image::ShadowBarrier(ShadowLevel& shadow, const CommandRecorder& command,
                           vk::PipelineStageFlags2 destination_stage,
                           vk::AccessFlags2        destination_access) {
 	vk::ImageMemoryBarrier2 barrier {};
@@ -841,7 +841,7 @@ void Image::ShadowBarrier(ShadowLevel& shadow, vk::CommandBuffer command,
 }
 
 void Image::CopyStorageShadow(const ImageSubresourceRange& range, bool to_shadow,
-                              vk::CommandBuffer command) {
+                              const CommandRecorder& command) {
 	const bool volume = backing.image_type == vk::ImageType::e3D;
 	for (uint32_t level = range.base_level;
 	     level < range.base_level + range.level_count && level < backing.mip_levels; level++) {

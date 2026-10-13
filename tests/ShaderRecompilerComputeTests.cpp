@@ -123,8 +123,13 @@ namespace Libs::Graphics {
 struct CommandProcessorTestAccess {
   static void Pending(CommandProcessor& cp, NativeIndirectDraw source) {
     cp.m_pending_instances.push_back(std::move(source));
+    cp.m_pending_instances_sequence = cp.m_num_instances.sequence;
   }
-  static uint32_t Instances(CommandProcessor& cp) { return cp.ResolveNumInstances(); }
+  static uint32_t Instances(CommandProcessor& cp) {
+    GpuOperation operation;
+    operation.num_instances = cp.m_num_instances;
+    return cp.ResolveNumInstances(operation);
+  }
   static void PendingShader(CommandProcessor& cp, NativeIndirectDraw source) {
     cp.m_pending_shader_offsets.push_back(std::move(source));
   }
@@ -228,7 +233,7 @@ struct ImageTestAccess {
   static VulkanImage& StorageShadow(Image& image, uint32_t level) {
     return image.ShadowLevelAt(level).image;
   }
-  static void ShadowTransferWrite(Image& image, uint32_t level, vk::CommandBuffer command) {
+  static void ShadowTransferWrite(Image& image, uint32_t level, const CommandRecorder& command) {
     image.ShadowBarrier(image.ShadowLevelAt(level), command,
         vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
   }
@@ -1042,6 +1047,8 @@ void EnsureConfigInitialized(bool renderdoc = false, bool guest_memory = true) {
     options.printf_direction = renderdoc ? Config::LogDirection::Console
                                         : Config::LogDirection::Silent;
     options.renderdoc_enabled = renderdoc;
+    // The checks drive the renderer and inspect its Vulkan command buffers synchronously.
+    options.gpu_pipeline_stages = 0;
     Config::Load(options);
     subsystems.Initialize<Log::Lifecycle>();
     if (guest_memory) subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
@@ -2276,14 +2283,14 @@ public:
     scheduler.Begin(registers, user_config, shaders);
 
     auto *command = &scheduler.Current();
-    const auto original_handle = command->Handle();
+    const auto original_handle = command->Handle().Direct();
     HW::Context next_registers{};
     HW::UserConfig next_user_config{};
     HW::Shader next_shaders{};
     scheduler.Begin(next_registers, next_user_config, next_shaders);
     Require("SchedulerTimeline", "guest context rebind",
             &scheduler.Current() == command &&
-                command->Handle() == original_handle &&
+                command->Handle().Direct() == original_handle &&
                 &command->GetRegisters() == &next_registers &&
                 &command->GetUserConfig() == &next_user_config &&
                 &command->GetShaders() == &next_shaders,
@@ -2360,7 +2367,7 @@ public:
     constexpr size_t blocked_submission_count = 6;
     std::array<vk::CommandBuffer, blocked_submission_count> blocked_handles{};
     for (size_t i = 0; i < blocked_submission_count; ++i) {
-      blocked_handles[i] = scheduler.Current().Handle();
+      blocked_handles[i] = scheduler.Current().Handle().Direct();
       if (i == 0) {
         scheduler.Flush(external_wait);
       } else {
@@ -2394,7 +2401,7 @@ public:
     scheduler.Flush();
     Require(
         "SchedulerTimeline", "timeline pool reuse",
-        std::ranges::find(blocked_handles, scheduler.Current().Handle()) !=
+        std::ranges::find(blocked_handles, scheduler.Current().Handle().Direct()) !=
             blocked_handles.end(),
         "completed command buffers were not reused after timeline progress");
     scheduler.Shutdown();
@@ -9841,7 +9848,7 @@ public:
       clear.float32[3] = 4.0f;
       const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0,
                                             1, 0, 1};
-      scheduler.Current().Handle().clearColorImage(
+      scheduler.Current().Handle().Direct().clearColorImage(
           image.backing.image, vk::ImageLayout::eTransferDstOptimal, clear,
           range);
       cache.MarkGpuWritten(id);
@@ -15000,7 +15007,8 @@ public:
               "raw image synchronization should be disabled by default");
       for (const auto [sync_raw, formatted] :
            {std::pair{false, false}, {true, false}, {false, true}, {true, true}}) {
-        Config::Load({.sync_raw_image_buffers = sync_raw});
+        // The checks drive the renderer synchronously (see EnsureConfigInitialized).
+        Config::Load({.sync_raw_image_buffers = sync_raw, .gpu_pipeline_stages = 0});
         const bool sync_image = sync_raw || formatted;
         const uint32_t before = 0x13579bd0u | (uint32_t(sync_raw) << 1u) | uint32_t(formatted);
         constexpr uint32_t guard = 0x2468ace0u;
@@ -15080,7 +15088,7 @@ public:
         clear_attachment.clearValue.color.uint32[0] = after;
         const vk::ClearRect clear_rect{{{0, 0}, {128, 128}}, 0, 1};
         scheduler.BeginRendering(rendering);
-        scheduler.Current().Handle().clearAttachments(1, &clear_attachment, 1, &clear_rect);
+        scheduler.Current().Handle().Direct().clearAttachments(1, &clear_attachment, 1, &clear_rect);
         scheduler.EndRendering();
         scheduler.Finish();
         Require(name, "buffer alias observes prior GPU contents",
@@ -15095,7 +15103,7 @@ public:
                 "attachment rendering lost its new color or changed the untouched array layer");
         RenderExecutorTestAccess::ResetBindings(executor);
       }
-      Config::Load({});
+      Config::Load({.gpu_pipeline_stages = 0});
 
       auto colliding_msaa_texture = array_texture;
       colliding_msaa_texture.fields[3] =
@@ -16854,7 +16862,7 @@ public:
       rendering.color_attachments[0].is_clear = true;
       rendering.color_attachments[0].clear_value = clear_value;
       command.BeginRendering(rendering);
-      auto cmd = command.Handle();
+      auto cmd = command.Handle().Direct();
       cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, selected.pipeline);
       const vk::Viewport viewport{0, 0, static_cast<float>(extent),
                                   static_cast<float>(extent), 0, 1};

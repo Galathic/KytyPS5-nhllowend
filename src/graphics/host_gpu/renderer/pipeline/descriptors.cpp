@@ -1777,11 +1777,11 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	if (skip_redundant) {
 		const auto tick  = m_context.GetCommandScheduler().CurrentTick();
 		const auto epoch = BindEpoch();
-		if (last.tick != tick || last.epoch != epoch || last.buffer != vk_buffer ||
+		if (last.tick != tick || last.epoch != epoch || last.buffer != vk_buffer.Key() ||
 		    last.layout != pipeline.pipeline_layout) {
 			last.tick              = tick;
 			last.epoch             = epoch;
-			last.buffer            = vk_buffer;
+			last.buffer            = vk_buffer.Key();
 			last.layout            = pipeline.pipeline_layout;
 			last.descriptors_valid = false;
 			last.push_valid        = false;

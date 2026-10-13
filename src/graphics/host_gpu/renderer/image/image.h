@@ -5,6 +5,7 @@
 #include "common/assert.h"
 #include "common/slotVector.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 
 #include <compare>
@@ -73,7 +74,7 @@ public:
 	                                   vk::PipelineStageFlags2              destination_stage,
 	                                   std::optional<ImageSubresourceRange> range);
 	void Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
-	             std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer);
+	             std::optional<ImageSubresourceRange> range, CommandRecorder command_buffer);
 	void Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
 	            uint64_t size);
 	void Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
@@ -189,10 +190,10 @@ private:
 		std::vector<ImageSubresourceRange>        pending;
 	};
 	ShadowLevel& ShadowLevelAt(uint32_t level);
-	void ShadowBarrier(ShadowLevel& shadow, vk::CommandBuffer command,
+	void ShadowBarrier(ShadowLevel& shadow, const CommandRecorder& command,
 	                   vk::PipelineStageFlags2 destination_stage, vk::AccessFlags2 destination_access);
 	void CopyStorageShadow(const ImageSubresourceRange& range, bool to_shadow,
-	                       vk::CommandBuffer command);
+	                       const CommandRecorder& command);
 
 	GraphicContext&   m_graphics;
 	CommandScheduler& m_scheduler;

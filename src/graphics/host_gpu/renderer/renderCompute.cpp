@@ -360,9 +360,10 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 // VkCommandBuffer handle never matches. Every other compute bind (tiler, fault manager, native
 // indirect prep) bumps g_compute_pipeline_epoch, which invalidates the cache. Called with the
 // context mutex held, so the statics are not racy.
-static bool ShouldBindComputePipeline(RenderContext& context, vk::CommandBuffer cmd,
+static bool ShouldBindComputePipeline(RenderContext& context, const CommandRecorder& recorder,
                                       vk::Pipeline pipeline) {
-	static vk::CommandBuffer last_cmd {};
+	const void*        cmd = recorder.Key();
+	static const void* last_cmd {};
 	static uint64_t          last_tick  = 0;
 	static uint64_t          last_epoch = 0;
 	static vk::Pipeline      last_pipeline {};

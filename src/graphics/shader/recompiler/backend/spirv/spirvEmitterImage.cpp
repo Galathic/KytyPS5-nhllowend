@@ -966,16 +966,15 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			    state, ctx.Def(handle->Arg(0)), static_cast<uint32_t>(samplers.size()),
 			    TypeU32(state), [&](uint32_t ordinal) { return ConstantU32(state, samplers[ordinal]); });
 		}
-		if (layout.offset != NoImageComponent &&
-		    !offset_value.IsImmediate()) {
-			ctx.Fail(inst, "has a nonconstant sample texel offset");
-		}
+		// Sampling takes only constant offsets in SPIR-V. A computed offset is dropped, as it was
+		// before offsets were emitted natively; NHL27 has such shaders.
+		const bool sample_offset = layout.offset != NoImageComponent && offset_value.IsImmediate();
 		const auto sampler_id = LoadSamplerDescriptor(state, mem.sampler, sampler_index);
 		const auto EmitSample = [&](uint32_t resource, uint32_t array_index) {
 			const auto& candidate = state.program.info.images[resource];
 			auto sample_operands = operands;
 			auto sample_operand_count = operand_count;
-			if (layout.offset != NoImageComponent) {
+			if (sample_offset) {
 				sample_operand_count = std::max(size_t{1}, sample_operand_count);
 				sample_operands[sample_operand_count++] = PackedOffset(
 				    ctx, offset_value, candidate.dimension, sample_operands[0]);

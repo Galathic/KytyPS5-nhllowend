@@ -54,8 +54,10 @@ void CheckBlockStorageShadow() {
       std::vector<u32> replacement(words_per_block, 0x12340000u + pass);
       auto update = CreateHostBuffer(name, replacement.size() * sizeof(u32),
           vk::BufferUsageFlagBits::eTransferSrc, replacement);
-      const auto command = scheduler.Current().Handle();
-      ImageTestAccess::ShadowTransferWrite(image, mip, command);
+      // The checks run without a GPU pipeline, so the recorder is direct.
+      const auto recorder = scheduler.Current().Handle();
+      const auto command  = recorder.Direct();
+      ImageTestAccess::ShadowTransferWrite(image, mip, recorder);
       vk::BufferImageCopy write{};
       write.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, layer, 1};
       write.imageOffset = {mip == 0 ? 1 : 0, 0, 0};

@@ -3,6 +3,8 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/emulatorConfig.h"
+#include "common/profiler.h"
 #include "common/runtimeFlags.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
@@ -17,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -353,7 +356,7 @@ void GpuTimingPollLocked() {
 }
 
 // Returns the slot index + 1, or 0 when timing is off or the sample is dropped.
-uint32_t GpuTimingBegin(GraphicContext& graphics, vk::CommandBuffer cmd, const char* kind,
+uint32_t GpuTimingBegin(GraphicContext& graphics, const CommandRecorder& cmd, const char* kind,
                         uint64_t hash_a, uint64_t hash_b, uint64_t info) {
 	if (g_timing.initialized && !g_timing.available) {
 		return 0;
@@ -388,7 +391,7 @@ uint32_t GpuTimingBegin(GraphicContext& graphics, vk::CommandBuffer cmd, const c
 	return slot + 1u;
 }
 
-void GpuTimingEnd(vk::CommandBuffer cmd, uint32_t slot_plus_one) {
+void GpuTimingEnd(const CommandRecorder& cmd, uint32_t slot_plus_one) {
 	if (slot_plus_one == 0) {
 		return;
 	}
@@ -397,13 +400,13 @@ void GpuTimingEnd(vk::CommandBuffer cmd, uint32_t slot_plus_one) {
 }
 
 // KYTY_IDLE_TRACE per-command timestamps (defined with the rest of the GPU trace code below).
-uint32_t GpuTraceCmdBegin(GraphicContext& graphics, vk::CommandBuffer cmd, const char* kind,
+uint32_t GpuTraceCmdBegin(GraphicContext& graphics, const CommandRecorder& cmd, const char* kind,
                           uint64_t hash_a, uint64_t hash_b, uint64_t info, uint64_t aux);
-void     GpuTraceCmdEnd(vk::CommandBuffer cmd, uint32_t slot_plus_one);
+void     GpuTraceCmdEnd(const CommandRecorder& cmd, uint32_t slot_plus_one);
 
 } // namespace
 
-uint64_t BreadcrumbBegin(GraphicContext& graphics, vk::CommandBuffer cmd, const char* kind,
+uint64_t BreadcrumbBegin(GraphicContext& graphics, const CommandRecorder& cmd, const char* kind,
                          uint64_t hash_a, uint64_t hash_b, uint64_t info, uint64_t aux) {
 	// Bits 0-31: breadcrumb id (0 = none). Bits 32-46: KYTY_PERF_GPU_TIMING slot + 1 (0 = none).
 	// Bits 47-63: KYTY_IDLE_TRACE per-command slot + 1 (0 = none).
@@ -427,7 +430,7 @@ void ReportDeviceLost(GraphicContext& graphics) {
 	DumpDeviceFault(graphics.device);
 }
 
-void BreadcrumbCaptureArgs(vk::CommandBuffer cmd, uint64_t id, vk::Buffer source, uint64_t offset,
+void BreadcrumbCaptureArgs(const CommandRecorder& cmd, uint64_t id, vk::Buffer source, uint64_t offset,
                            uint32_t bytes) {
 	const auto crumb = static_cast<uint32_t>(id);
 	if (crumb == 0 || !g_breadcrumbs.available || g_breadcrumbs.args_buffer == VK_NULL_HANDLE ||
@@ -443,7 +446,7 @@ void BreadcrumbCaptureArgs(vk::CommandBuffer cmd, uint64_t id, vk::Buffer source
 	cmd.copyBuffer(source, vk::Buffer(g_breadcrumbs.args_buffer), 1, &copy);
 }
 
-void BreadcrumbEnd(GraphicContext& graphics, vk::CommandBuffer cmd, uint64_t id) {
+void BreadcrumbEnd(GraphicContext& graphics, const CommandRecorder& cmd, uint64_t id) {
 	(void)graphics;
 	GpuTraceCmdEnd(cmd, static_cast<uint32_t>(id >> 47u));
 	GpuTimingEnd(cmd, static_cast<uint32_t>((id >> 32u) & 0x7fffu));
@@ -815,7 +818,7 @@ void GpuTracePollLocked() {
 }
 
 // Called right after vkBeginCommandBuffer. Returns slot + 1, or 0 when not tracing.
-uint32_t GpuTraceBegin(GraphicContext& graphics, vk::CommandBuffer cmd) {
+uint32_t GpuTraceBegin(GraphicContext& graphics, const CommandRecorder& cmd) {
 	if (!Common::EventTrace::g_capturing.load(std::memory_order_relaxed)) {
 		return 0;
 	}
@@ -840,7 +843,7 @@ uint32_t GpuTraceBegin(GraphicContext& graphics, vk::CommandBuffer cmd) {
 	return slot + 1u;
 }
 
-void GpuTraceEnd(vk::CommandBuffer cmd, uint32_t slot_plus_one) {
+void GpuTraceEnd(const CommandRecorder& cmd, uint32_t slot_plus_one) {
 	if (slot_plus_one != 0) {
 		cmd.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, g_gtrace.pool,
 		                   (slot_plus_one - 1u) * 2u + 1u);
@@ -874,7 +877,7 @@ void GpuTracePoll() {
 	}
 }
 
-uint32_t GpuTraceCmdBegin(GraphicContext& graphics, vk::CommandBuffer cmd, const char* kind,
+uint32_t GpuTraceCmdBegin(GraphicContext& graphics, const CommandRecorder& cmd, const char* kind,
                           uint64_t hash_a, uint64_t hash_b, uint64_t info, uint64_t aux) {
 	if (!Common::EventTrace::g_capturing.load(std::memory_order_relaxed)) {
 		return 0;
@@ -912,7 +915,7 @@ uint32_t GpuTraceCmdBegin(GraphicContext& graphics, vk::CommandBuffer cmd, const
 	return slot + 1u;
 }
 
-void GpuTraceCmdEnd(vk::CommandBuffer cmd, uint32_t slot_plus_one) {
+void GpuTraceCmdEnd(const CommandRecorder& cmd, uint32_t slot_plus_one) {
 	if (slot_plus_one != 0) {
 		cmd.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, g_gtrace.cmd_pool,
 		                   (slot_plus_one - 1u) * 2u + 1u);
@@ -969,11 +972,26 @@ size_t CommandScheduler::CommandPool::Grow() {
 }
 
 vk::CommandBuffer CommandScheduler::CommandPool::Commit() {
+	return m_buffers[Acquire(m_master.CurrentTick())];
+}
+
+std::pair<vk::CommandBuffer, size_t> CommandScheduler::CommandPool::CommitDeferred() {
+	const auto index = Acquire(std::numeric_limits<uint64_t>::max());
+	return {m_buffers[index], index};
+}
+
+void CommandScheduler::CommandPool::Retire(size_t index, uint64_t tick) {
+	EXIT_IF(index >= m_ticks.size() || m_ticks[index] != std::numeric_limits<uint64_t>::max());
+	m_ticks[index] = tick;
+}
+
+size_t CommandScheduler::CommandPool::Acquire(uint64_t busy_until) {
 	auto       gpu_tick = m_master.KnownGpuTick();
-	const auto search   = [this, &gpu_tick](size_t begin, size_t end) -> std::optional<size_t> {
+	const auto search   = [this, &gpu_tick, busy_until](size_t begin,
+	                                                  size_t end) -> std::optional<size_t> {
 		for (size_t index = begin; index < end; ++index) {
 			if (gpu_tick >= m_ticks[index]) {
-				m_ticks[index] = m_master.CurrentTick();
+				m_ticks[index] = busy_until;
 				return index;
 			}
 		}
@@ -991,21 +1009,27 @@ vk::CommandBuffer CommandScheduler::CommandPool::Commit() {
 	}
 	if (!found) {
 		found           = Grow();
-		m_ticks[*found] = m_master.CurrentTick();
+		m_ticks[*found] = busy_until;
 	}
 
 	m_hint = (*found + 1) % m_ticks.size();
-	return m_buffers[*found];
+	return *found;
 }
 
 bool CommandScheduler::InDeferredOperation() noexcept {
 	return g_deferred_callback_scheduler != nullptr;
 }
 
-CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics)
+CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics,
+                                   bool deferred_recording)
     : m_master(graphics), m_context(context), m_graphics(graphics),
-      m_command_pool(graphics, m_master), m_command(*this),
-      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {}
+      m_command_pool(graphics, m_master), m_deferred(deferred_recording),
+      m_stream(&m_chunk_queue), m_command(*this, deferred_recording ? &m_stream : nullptr),
+      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {
+	if (m_deferred) {
+		m_recording_thread = std::jthread([this] { RecordingThread(); });
+	}
+}
 
 CommandScheduler::~CommandScheduler() {
 	Shutdown();
@@ -1035,6 +1059,11 @@ void CommandScheduler::Shutdown() {
 		Submit();
 	}
 	m_master.Wait(CurrentTick() - 1);
+	if (m_recording_thread.joinable()) {
+		// Every recorded submission has completed.
+		m_chunk_queue.Stop();
+		m_recording_thread.join();
+	}
 	PopPendingOperations();
 	DrainPriorityOperations();
 	m_priority_thread.request_stop();
@@ -1051,17 +1080,20 @@ void CommandScheduler::Shutdown() {
 	m_operation_available.notify_all();
 }
 
-void CommandScheduler::Begin(HW::Context& registers, HW::UserConfig& user_config,
-                             HW::Shader& shaders) {
+void CommandScheduler::Begin(const HW::Context& registers, const HW::UserConfig& user_config,
+                             const HW::Shader& shaders) {
+	// Every GPU operation binds its register state. A shutdown submits the open command buffer
+	// before it closes the scheduler, so an open command buffer means an open scheduler.
+	if (!m_command.IsInvalid()) {
+		m_command.Bind(registers, user_config, shaders);
+		return;
+	}
 	{
 		std::lock_guard lock(m_operation_mutex);
 		EXIT_IF(m_operation_state != OperationState::Open);
 	}
 	m_command.Bind(registers, user_config, shaders);
-
-	if (m_command.IsInvalid()) {
-		BeginNext();
-	}
+	BeginNext();
 }
 
 void CommandScheduler::BeginRendering(const RenderState& state) {
@@ -1117,14 +1149,25 @@ void CommandScheduler::Wait(uint64_t tick) {
 }
 
 void CommandScheduler::PopPendingOperations() {
-	m_master.Refresh();
+	// Every draw and dispatch comes here: only query the timeline semaphore (a driver call) when
+	// the oldest operation is not already known to be free.
+	bool refreshed = false;
 	for (;;) {
 		PendingOperation operation;
 		{
 			std::lock_guard lock(m_operation_mutex);
-			if (m_pending_operations.empty() ||
-			    !m_master.IsFree(m_pending_operations.front().tick)) {
+			if (m_pending_operations.empty()) {
 				return;
+			}
+			if (!m_master.IsFree(m_pending_operations.front().tick)) {
+				if (refreshed) {
+					return;
+				}
+				m_master.Refresh();
+				refreshed = true;
+				if (!m_master.IsFree(m_pending_operations.front().tick)) {
+					return;
+				}
 			}
 			operation = std::move(m_pending_operations.front());
 			m_pending_operations.pop();
@@ -1247,7 +1290,11 @@ CommandBuffer& CommandScheduler::Current() {
 CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
 	FrameBreakdown::GpuBusyScope busy_scope(FrameBreakdown::GB_BEGIN_CMD);
-	m_command.m_buffer = m_command_pool.Commit();
+	if (m_deferred) {
+		m_command.m_open = true;
+	} else {
+		m_command.m_buffer = m_command_pool.Commit();
+	}
 	if (BufferCache::PerfTimersEnabled()) {
 		const auto start = std::chrono::steady_clock::now();
 		m_command.Begin();
@@ -1258,7 +1305,7 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 		m_command.Begin();
 	}
 	m_dynamic_state.Invalidate();
-	m_trace_slot = GpuTraceBegin(m_graphics, m_command.m_buffer);
+	m_trace_slot = GpuTraceBegin(m_graphics, m_command.Handle());
 	return m_command;
 }
 
@@ -1276,7 +1323,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	                                : std::chrono::steady_clock::time_point {};
 	if (m_trace_slot != 0) {
 		m_command.EndRendering(); // Idempotent; keeps the end timestamp after the last pass.
-		GpuTraceEnd(m_command.m_buffer, m_trace_slot);
+		GpuTraceEnd(m_command.Handle(), m_trace_slot);
 	}
 	m_command.End();
 
@@ -1286,40 +1333,69 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	Common::RuntimeFlags::Refresh();
 	Common::EventTrace::Poll();
 
-	const auto buffer   = m_command.m_buffer;
-	auto&      graphics = m_graphics;
-	EXIT_IF(graphics.queue == nullptr);
-
-	vk::Result result;
-	uint64_t   tick;
-	{
-		Common::LockGuard lock(graphics.queue_mutex);
-		tick = m_master.NextTick();
-		submit.AddSignal(m_master.Handle(), tick);
-
-		vk::TimelineSemaphoreSubmitInfo timeline_info {};
-		timeline_info.waitSemaphoreValueCount   = submit.num_wait_semaphores;
-		timeline_info.pWaitSemaphoreValues      = submit.wait_ticks.data();
-		timeline_info.signalSemaphoreValueCount = submit.num_signal_semaphores;
-		timeline_info.pSignalSemaphoreValues    = submit.signal_ticks.data();
-
-		vk::SubmitInfo submit_info {};
-		submit_info.pNext                = &timeline_info;
-		submit_info.waitSemaphoreCount   = submit.num_wait_semaphores;
-		submit_info.pWaitSemaphores      = submit.wait_semaphores.data();
-		submit_info.pWaitDstStageMask    = submit.wait_stages.data();
-		submit_info.commandBufferCount   = 1;
-		submit_info.pCommandBuffers      = &buffer;
-		submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
-		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
-
-		FrameBreakdown::GpuBusyScope queue_scope(FrameBreakdown::GB_QUEUE_SUBMIT);
-		result = graphics.queue.submit(1, &submit_info, nullptr);
+	// Only this scheduler's owner allocates its ticks, in submission order.
+	const auto     tick = m_master.NextTick();
+	RecordedSubmit debug {};
+	debug.debug_op        = m_command.m_debug_op;
+	debug.debug_submit_id = m_command.m_debug_submit_id;
+	debug.debug_arg0      = m_command.m_debug_arg0;
+	debug.debug_arg1      = m_command.m_debug_arg1;
+	debug.debug_arg2      = m_command.m_debug_arg2;
+	debug.debug_arg3      = m_command.m_debug_arg3;
+	debug.debug_arg4      = m_command.m_debug_arg4;
+	if (m_deferred) {
+		// Waiting for the tick waits for the recording thread too: the timeline semaphore only
+		// reaches it after the thread submitted the commands recorded until now.
+		auto* recorded = m_stream.RecordSpecial<RecordedSubmit>(CommandStream::RecordKind::Submit);
+		*recorded      = debug;
+		recorded->info = submit;
+		recorded->tick = tick;
+		m_stream.Publish();
+		m_command.m_open = false;
+	} else {
+		QueueSubmit(m_command.m_buffer, submit, tick, debug);
+		m_command.m_buffer = nullptr;
 	}
 	if (timed) {
 		BufferCache::PerfAddTime(BufferCache::PerfTimer::Submit,
 		                         static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
 		                             std::chrono::steady_clock::now() - submit_start).count()));
+	}
+	Common::EventTrace::Record(Common::EventTrace::NATIVE_SUBMIT, tick);
+	GpuTraceSubmitted(m_trace_slot, tick);
+	m_trace_slot = 0;
+	GpuTracePoll();
+	GpuTimingPoll();
+	return tick;
+}
+
+void CommandScheduler::QueueSubmit(vk::CommandBuffer buffer, SubmitInfo& submit, uint64_t tick,
+                                   const RecordedSubmit& debug) {
+	auto& graphics = m_graphics;
+	EXIT_IF(graphics.queue == nullptr);
+	submit.AddSignal(m_master.Handle(), tick);
+
+	vk::TimelineSemaphoreSubmitInfo timeline_info {};
+	timeline_info.waitSemaphoreValueCount   = submit.num_wait_semaphores;
+	timeline_info.pWaitSemaphoreValues      = submit.wait_ticks.data();
+	timeline_info.signalSemaphoreValueCount = submit.num_signal_semaphores;
+	timeline_info.pSignalSemaphoreValues    = submit.signal_ticks.data();
+
+	vk::SubmitInfo submit_info {};
+	submit_info.pNext                = &timeline_info;
+	submit_info.waitSemaphoreCount   = submit.num_wait_semaphores;
+	submit_info.pWaitSemaphores      = submit.wait_semaphores.data();
+	submit_info.pWaitDstStageMask    = submit.wait_stages.data();
+	submit_info.commandBufferCount   = buffer != nullptr ? 1 : 0;
+	submit_info.pCommandBuffers      = buffer != nullptr ? &buffer : nullptr;
+	submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
+	submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
+
+	vk::Result result;
+	{
+		Common::LockGuard lock(graphics.queue_mutex);
+		FrameBreakdown::GpuBusyScope queue_scope(FrameBreakdown::GB_QUEUE_SUBMIT);
+		result = graphics.queue.submit(1, &submit_info, nullptr);
 	}
 
 	if (result == vk::Result::eErrorDeviceLost) {
@@ -1340,20 +1416,55 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		}
 	}
 	if (result != vk::Result::eSuccess) {
-		ReportVulkanFatal("vkQueueSubmit", result, tick, m_command.m_debug_op,
-		                  m_command.m_debug_submit_id, m_command.m_debug_arg0,
-		                  m_command.m_debug_arg1, m_command.m_debug_arg2, m_command.m_debug_arg3,
-		                  m_command.m_debug_arg4);
+		ReportVulkanFatal("vkQueueSubmit", result, tick, debug.debug_op, debug.debug_submit_id,
+		                  debug.debug_arg0, debug.debug_arg1, debug.debug_arg2, debug.debug_arg3,
+		                  debug.debug_arg4);
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+}
 
-	m_command.m_buffer = nullptr;
-	Common::EventTrace::Record(Common::EventTrace::NATIVE_SUBMIT, tick);
-	GpuTraceSubmitted(m_trace_slot, tick);
-	m_trace_slot = 0;
-	GpuTracePoll();
-	GpuTimingPoll();
-	return tick;
+void CommandScheduler::RecordingThread() {
+	KYTY_PROFILER_THREAD("Thread_GpuRecord");
+	Config::ConfigureGpuStageThread(Config::GpuStageThread::Recording);
+	vk::CommandBuffer buffer       = nullptr;
+	size_t            buffer_index = 0;
+	const auto        acquire      = [this, &buffer, &buffer_index] {
+		if (buffer == nullptr) {
+			std::tie(buffer, buffer_index) = m_command_pool.CommitDeferred();
+			vk::CommandBufferBeginInfo begin_info {};
+			begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+			EXIT_NOT_IMPLEMENTED(buffer.begin(&begin_info) != vk::Result::eSuccess);
+		}
+		return buffer;
+	};
+	for (;;) {
+		auto chunk = m_chunk_queue.Pop();
+		if (chunk == nullptr) {
+			break;
+		}
+		CommandStream::Replay(*chunk, acquire, [&](const CommandStream::Entry& entry) {
+			EXIT_IF(entry.kind != CommandStream::RecordKind::Submit);
+			SubmitRecorded(buffer, buffer_index,
+			               *static_cast<const RecordedSubmit*>(entry.Payload()));
+		});
+		m_chunk_queue.Recycle(std::move(chunk));
+	}
+	// A scheduler only stops after its last submission.
+	EXIT_IF(buffer != nullptr);
+}
+
+void CommandScheduler::SubmitRecorded(vk::CommandBuffer& buffer, size_t buffer_index,
+                                      const RecordedSubmit& recorded) {
+	if (buffer != nullptr) {
+		EXIT_NOT_IMPLEMENTED(buffer.end() != vk::Result::eSuccess);
+	}
+	// A submission without commands still signals its tick.
+	auto submit = recorded.info;
+	QueueSubmit(buffer, submit, recorded.tick, recorded);
+	if (buffer != nullptr) {
+		m_command_pool.Retire(buffer_index, recorded.tick);
+		buffer = nullptr;
+	}
 }
 
 void CommandScheduler::BeginNext() {

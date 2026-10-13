@@ -288,11 +288,11 @@ void CaptureBindings(const PreparedBindings& b, uint32_t seq, uint64_t ps_hash) 
 	}
 }
 
-void RecordReadback(GraphicContext& gfx, vk::CommandBuffer cmd, const Target& t, const char* label,
+void RecordReadback(GraphicContext& gfx, const CommandRecorder& cmd, const Target& t, const char* label,
                     uint32_t seq);
 
 // Records the GPU->host copies of the queued buffers and volumes. cmd must be outside a render pass.
-void FlushRequests(GraphicContext& gfx, vk::CommandBuffer cmd) {
+void FlushRequests(GraphicContext& gfx, const CommandRecorder& cmd) {
 	if (g_bufreq.empty() && g_volreq.empty()) return;
 	using S = vk::PipelineStageFlagBits2;
 	using A = vk::AccessFlagBits2;
@@ -911,7 +911,7 @@ void ProcessOne(Pending& p) {
 	g_log += line;
 }
 
-void BarrierImage(vk::CommandBuffer cmd, const Target& t, vk::ImageLayout from, vk::ImageLayout to,
+void BarrierImage(const CommandRecorder& cmd, const Target& t, vk::ImageLayout from, vk::ImageLayout to,
                   vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access,
                   vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access) {
 	vk::ImageMemoryBarrier2 b {};
@@ -936,7 +936,7 @@ void BarrierImage(vk::CommandBuffer cmd, const Target& t, vk::ImageLayout from, 
 }
 
 // Must be called with g_mutex held. Records the copy into cmd.
-void RecordReadback(GraphicContext& gfx, vk::CommandBuffer cmd, const Target& t, const char* label,
+void RecordReadback(GraphicContext& gfx, const CommandRecorder& cmd, const Target& t, const char* label,
                     uint32_t seq) {
 	char line[256];
 	if (t.w < kMinSize || (t.h < kMinSize && !t.img3d)) return;
