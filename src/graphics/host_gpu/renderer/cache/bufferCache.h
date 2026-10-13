@@ -99,6 +99,19 @@ public:
 	// KYTY_PERF_STATS=1: the faulting guest instruction of the calling thread, so CPU-write
 	// readbacks can be attributed to the code that caused them (NHL27WRITEBACK).
 	static void               NoteFaultRip(uint64_t rip);
+	// NHL27WRITEBACK: the emulator path behind a GPU-thread CPU-write readback, which has no guest
+	// instruction. Logged in place of the rip (rip=0 is a GPU-thread write nobody tagged).
+	enum class WriteTag : uint64_t { None = 0, EopLabel, WriteData, TextureKeys, Unmap, Fill, Count };
+	class WriteTagScope {
+	public:
+		explicit WriteTagScope(WriteTag tag) noexcept;
+		~WriteTagScope();
+		WriteTagScope(const WriteTagScope&)            = delete;
+		WriteTagScope& operator=(const WriteTagScope&) = delete;
+
+	private:
+		WriteTag m_saved;
+	};
 	[[nodiscard]] static uint64_t PerfFlipCount();
 	// KYTY_PERF_STATS: device memory use the texture/buffer collectors last saw.
 	static void PerfSetMemoryUsage(uint64_t used, uint64_t texture_trigger, uint64_t buffer_trigger);

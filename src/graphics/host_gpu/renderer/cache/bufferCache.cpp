@@ -759,6 +759,23 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 }
 
 static thread_local uint64_t g_fault_rip = 0;
+static thread_local BufferCache::WriteTag g_write_tag = BufferCache::WriteTag::None;
+
+BufferCache::WriteTagScope::WriteTagScope(WriteTag tag) noexcept: m_saved(g_write_tag) {
+	g_write_tag = tag;
+}
+
+BufferCache::WriteTagScope::~WriteTagScope() {
+	g_write_tag = m_saved;
+}
+
+// Index Count: a guest thread's invalidation outside a write fault (file I/O, unmap).
+static const char* WriteTagName(uint64_t rip) {
+	static constexpr const char* names[] = {"gpu-untagged", "eop-label", "write-data",    "texture-keys",
+	                                        "unmap",        "fill",      "guest-no-fault"};
+	static_assert(std::size(names) == static_cast<size_t>(BufferCache::WriteTag::Count) + 1);
+	return rip < std::size(names) ? names[rip] : nullptr;
+}
 
 void BufferCache::NoteFaultRip(uint64_t rip) {
 	g_fault_rip = rip;
@@ -789,8 +806,14 @@ static void WriteBackRecord(uint64_t rip, uint64_t vaddr, uint64_t ns) {
 	std::vector<std::pair<uint64_t, WriteBackStat>> top(g_writeback.begin(), g_writeback.end());
 	std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
 	for (size_t i = 0; i < top.size() && i < 12; i++) {
-		std::printf("NHL27WRITEBACK: rip=0x%016" PRIx64 " count=%" PRIu64 " ms=%.1f last_vaddr=0x%016" PRIx64 "\n",
-		            top[i].first, top[i].second.count, static_cast<double>(top[i].second.ns) / 1e6,
+		char rip[32];
+		if (const char* name = WriteTagName(top[i].first)) {
+			std::snprintf(rip, sizeof(rip), "%s", name);
+		} else {
+			std::snprintf(rip, sizeof(rip), "0x%016" PRIx64, top[i].first);
+		}
+		std::printf("NHL27WRITEBACK: rip=%s count=%" PRIu64 " ms=%.1f last_vaddr=0x%016" PRIx64 "\n",
+		            rip, top[i].second.count, static_cast<double>(top[i].second.ns) / 1e6,
 		            top[i].second.vaddr);
 	}
 	std::fflush(stdout);
@@ -805,7 +828,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadC
 	FrameBreakdown::FaultTimer fault_readmem_timer(FrameBreakdown::g_fault_cost.readmem_ns);
 	const bool     on_gpu = GuestGpu::IsGpuThread();
 	const uint64_t tid   = static_cast<uint64_t>(std::hash<std::thread::id> {}(std::this_thread::get_id()));
-	const uint64_t fault_rip = on_gpu ? 0 : g_fault_rip;
+	const uint64_t fault_rip = on_gpu             ? static_cast<uint64_t>(g_write_tag)
+	                           : g_fault_rip != 0 ? g_fault_rip
+	                                              : static_cast<uint64_t>(WriteTag::Count);
 	m_scheduler.Context().GetGpu().SendUrgentCommandSync([this, vaddr, size, is_write, caller, on_gpu, tid, fault_rip] {
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
@@ -1282,6 +1307,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	if (!IsRegionGpuModified(vaddr, size)) {
 		// Invalidate cached buffers and images for the whole range up front, as the write
 		// faults would page by page, so the fill below does not fault on every tracked page.
+		WriteTagScope tag(WriteTag::Fill);
 		InvalidateMemory(vaddr, size);
 		m_texture_cache.InvalidateMemory(vaddr, size);
 		auto* destination = reinterpret_cast<uint32_t*>(vaddr);

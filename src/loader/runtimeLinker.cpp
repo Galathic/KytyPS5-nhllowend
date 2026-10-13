@@ -789,7 +789,10 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			return true;
 		}
 		Libs::Graphics::BufferCache::NoteFaultRip(info->exception_address);
-		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
+		const bool handled = Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr);
+		// Later invalidations on this thread outside a fault must not be billed to this instruction.
+		Libs::Graphics::BufferCache::NoteFaultRip(0);
+		if (handled) {
 			return true;
 		}
 	}

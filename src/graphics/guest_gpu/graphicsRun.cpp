@@ -912,6 +912,7 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	// The source dwords are in the command buffer, which stays valid until the guest sees a
 	// later label.
 	const auto sequence = EmitCallback([this, dst, src, dw_num, write_one_address] {
+		BufferCache::WriteTagScope tag(BufferCache::WriteTag::WriteData);
 		m_renderer.PrepareGpuWrite(dst, uint64_t {write_one_address ? 1u : dw_num} * sizeof(uint32_t));
 		if (write_one_address) {
 			for (uint32_t i = 0; i < dw_num; i++) {
@@ -2485,8 +2486,12 @@ void CommandProcessor::ExecuteWriteAtEndOfPipe(uint64_t submit_id, uint32_t eop_
 		Common::EventTrace::Record(Common::EventTrace::LABEL_WRITE,
 		                           reinterpret_cast<uint64_t>(destination) & 0xffffffffu,
 		                           m_renderer.GetCommandScheduler().CurrentTick());
+		// The exact-range label write goes first: preparing the page for a host store downloads
+		// and unprotects it, waiting for all queued GPU work.
 		if (!direct_labels || !m_renderer.GetBufferCache().TryWriteLabel(
 		        reinterpret_cast<uint64_t>(destination), data, bytes)) {
+			BufferCache::WriteTagScope tag(BufferCache::WriteTag::EopLabel);
+			m_renderer.PrepareGpuWrite(destination, bytes);
 			std::memcpy(destination, data, static_cast<size_t>(bytes));
 		} else {
 			static std::atomic_flag reported = ATOMIC_FLAG_INIT;
@@ -2502,7 +2507,6 @@ void CommandProcessor::ExecuteWriteAtEndOfPipe(uint64_t submit_id, uint32_t eop_
 		auto  data = static_cast<uint32_t>(value);
 		EXIT_IF(dst == nullptr);
 		(void)command.Handle();
-		m_renderer.PrepareGpuWrite(dst, sizeof(data));
 		write_label(dst, &data, sizeof(data));
 
 		if (with_interrupt) {
@@ -2546,7 +2550,6 @@ void CommandProcessor::ExecuteWriteAtEndOfPipe(uint64_t submit_id, uint32_t eop_
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
 					EXIT_IF(dst == nullptr);
 					(void)command.Handle();
-					m_renderer.PrepareGpuWrite(dst, sizeof(value));
 					write_label(dst, &value, sizeof(value));
 
 					if (with_interrupt) {
