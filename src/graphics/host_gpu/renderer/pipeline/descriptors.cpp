@@ -41,6 +41,7 @@
 #include <cstdio>
 #include <fmt/format.h>
 #include <cstdlib>
+#include <functional>
 #include <limits>
 #include <mutex>
 #include <span>
@@ -1413,7 +1414,22 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	}
 	// The written ranges do not depend on the read, so collect them once per commit
 	// (bound images can number in the hundreds; slot lookups per read dominated here).
-	bool written_ready = false;
+	bool     written_ready = false;
+	uint64_t written_lo    = UINT64_MAX;
+	uint64_t written_hi    = 0;
+	const auto check_read = [&](uint64_t address, uint64_t size) {
+		if (address >= written_hi || address + size <= written_lo) return;
+		for (const auto& [written_address, written_size]: m_written_image_ranges) {
+			if (ImageRangeOverlaps(address, size, written_address, written_size)) {
+				EXIT("scalar resource reads overlap an image or attachment write\n");
+			}
+		}
+		for (const auto& [written_address, written_size]: m_written_buffer_ranges) {
+			if (ImageRangeOverlaps(address, size, written_address, written_size)) {
+				EXIT("scalar resource reads overlap a shader buffer write\n");
+			}
+		}
+	};
 	for (const auto* reader: prepared_bindings) {
 		const auto& reads = reader->runtime->resources->specialization_reads;
 		if (reads.empty()) continue;
@@ -1444,19 +1460,28 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					if (written.size != 0) m_written_buffer_ranges.emplace_back(written.address, written.size);
 				}
 			}
+			for (const auto& ranges: {std::cref(m_written_image_ranges), std::cref(m_written_buffer_ranges)}) {
+				for (const auto& [written_address, written_size]: ranges.get()) {
+					written_lo = std::min(written_lo, written_address);
+					written_hi = std::max(written_hi, written_address + written_size);
+				}
+			}
 		}
+		// Reads are hundreds per draw, mostly adjacent and in address order: check each run of
+		// touching reads once, and skip runs outside the span of all writes.
+		uint64_t run_begin = 0;
+		uint64_t run_end   = 0;
 		for (const auto [address, size]: reads) {
-			for (const auto& [written_address, written_size]: m_written_image_ranges) {
-				if (ImageRangeOverlaps(address, size, written_address, written_size)) {
-					EXIT("scalar resource reads overlap an image or attachment write\n");
-				}
+			if (size == 0) continue;
+			if (run_end != 0 && address >= run_begin && address <= run_end) {
+				run_end = std::max(run_end, address + size);
+				continue;
 			}
-			for (const auto& [written_address, written_size]: m_written_buffer_ranges) {
-				if (ImageRangeOverlaps(address, size, written_address, written_size)) {
-					EXIT("scalar resource reads overlap a shader buffer write\n");
-				}
-			}
+			if (run_end != 0) check_read(run_begin, run_end - run_begin);
+			run_begin = address;
+			run_end   = address + size;
 		}
+		if (run_end != 0) check_read(run_begin, run_end - run_begin);
 	}
 	m_descriptor_buffers.clear();
 	m_descriptor_images.clear();

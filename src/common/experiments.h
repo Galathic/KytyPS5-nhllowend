@@ -1,6 +1,7 @@
 #ifndef EMULATOR_SRC_COMMON_EXPERIMENTS_H_
 #define EMULATOR_SRC_COMMON_EXPERIMENTS_H_
 
+#include <atomic>
 #include <cstdint>
 
 namespace Common::Experiments {
@@ -32,13 +33,31 @@ enum Bit : uint32_t {
 	NativeFp16           = 1u << 23u, // KYTY_NATIVE_FP16 (default off; f16vec2 math for packed f16 ops, needs shaderFloat16)
 	FaultPageReads       = 1u << 24u, // KYTY_FAULT_PAGE_READS (default off; SRT reads of pages that faulted before use the backing)
 	GpuColorClear        = 1u << 26u, // KYTY_GPU_COLOR_CLEAR (default off; fast-clear checks of GPU-written metadata on the GPU)
-	ExecSelects          = 1u << 25u, // KYTY_EXEC_SELECTS (default off; drop EXEC-mask selects nobody observes, part of shader keys)
+	ExecSelects          = 1u << 25u,
+	PooledBdaBuffers     = 1u << 27u, // KYTY_POOLED_BDA_BUFFERS (default off; small device-address buffers share VMA blocks) // KYTY_EXEC_SELECTS (default off; drop EXEC-mask selects nobody observes, part of shader keys)
 	// A/B only (no environment variable): selects the code a pending change replaces.
 	AbLegacy = 1u << 31u,
 };
 
-[[nodiscard]] bool Enabled(Bit bit) noexcept;
-[[nodiscard]] uint32_t Mask() noexcept;
+namespace Detail {
+// The live mask; bit 32 stays set until the first use reads the environment. Enabled() runs
+// millions of times per second on the GPU thread, so its fast path is inline.
+inline constexpr uint64_t Uninitialized = uint64_t {1} << 32u;
+extern std::atomic<uint64_t> g_mask;
+[[nodiscard]] uint64_t InitMask() noexcept;
+} // namespace Detail
+
+[[nodiscard]] inline uint32_t Mask() noexcept {
+	uint64_t mask = Detail::g_mask.load(std::memory_order_relaxed);
+	if ((mask & Detail::Uninitialized) != 0) [[unlikely]] {
+		mask = Detail::InitMask();
+	}
+	return static_cast<uint32_t>(mask);
+}
+
+[[nodiscard]] inline bool Enabled(Bit bit) noexcept {
+	return (Mask() & bit) != 0;
+}
 
 } // namespace Common::Experiments
 

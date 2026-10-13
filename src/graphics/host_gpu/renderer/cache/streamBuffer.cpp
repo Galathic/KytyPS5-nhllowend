@@ -2,6 +2,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/experiments.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
@@ -67,8 +68,14 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	buffer_info.usage       = flags;
 
 	const bool with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
+	// Experiment PooledBdaBuffers: small device-address buffers come from VMA's shared blocks. The
+	// game makes a few new buffers of ~100 KiB per frame, and a dedicated allocation costs a
+	// kernel call each (vkAllocateMemory, 2% of the GPU thread).
+	constexpr uint64_t PooledBdaLimit = uint64_t {32} << 20u;
+	const bool pooled = with_bda && size <= PooledBdaLimit &&
+	                    Common::Experiments::Enabled(Common::Experiments::PooledBdaBuffers);
 	const VmaAllocationCreateFlags bda_flag =
-	    with_bda ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
+	    with_bda && !pooled ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
 	VmaAllocationCreateInfo allocation_info {};
 	allocation_info.flags =
 	    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag | AllocationFlags(usage);

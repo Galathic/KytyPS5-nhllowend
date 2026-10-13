@@ -274,6 +274,9 @@ private:
 		uint32_t value;
 	};
 	std::vector<GpuFill>                              m_gpu_fills;
+	// One bit per (64 KiB chunk % 256) that a recorded fill touches (a superset). DropGpuFills runs
+	// for every written buffer binding and nearly always misses; the filter skips the fill scan.
+	std::array<uint64_t, 4>                           m_gpu_fill_filter {};
 	struct WriterRecord {
 		uint64_t    begin;
 		uint64_t    end;

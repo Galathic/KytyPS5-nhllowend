@@ -779,12 +779,17 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			if (count == 1 || count == 10 || count == 100 || count % 1000 == 0) {
 				const auto rip = info->exception_address;
 				const bool host = rip >= host_base && rip < host_base + 0x10000000u;
+				char       text[96];
+				if (!Loader::X64InstructionEmulator::DescribeInstruction(info->native_context, text,
+				                                                         sizeof(text))) {
+					std::snprintf(text, sizeof(text), "?");
+				}
 				std::printf("NHL27FAULTRIP: %s rip=0x%016llx host+0x%llx vaddr=0x%016llx access=%d "
-				            "count=%llu\n",
+				            "count=%llu insn=%s\n",
 				            host ? "host" : "other", static_cast<unsigned long long>(rip),
 				            static_cast<unsigned long long>(host ? rip - host_base : 0),
 				            static_cast<unsigned long long>(info->access_violation_vaddr),
-				            static_cast<int>(access), static_cast<unsigned long long>(count));
+				            static_cast<int>(access), static_cast<unsigned long long>(count), text);
 			}
 		}
 		// KYTY_DBG_SHARED_WRITES=1 (diagnostic): the instruction behind each guest write fault,

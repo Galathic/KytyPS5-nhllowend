@@ -32,8 +32,8 @@ RenderContext::RenderContext(GraphicContext& graphics)
 	// (the GPU wrote other bytes of it) read clean bytes through the backing instead of faulting
 	// again; GPU-written bytes still fault and download.
 	ShaderRecompiler::IR::SetFaultPageReader([](uint64_t address, void* data, uint64_t size) {
-		return LibKernel::Memory::IsReadFaultPage(address, size) &&
-		       Common::Experiments::Enabled(Common::Experiments::FaultPageReads) &&
+		return Common::Experiments::Enabled(Common::Experiments::FaultPageReads) &&
+		       LibKernel::Memory::IsReadFaultPage(address, size) &&
 		       LibKernel::Memory::TryReadCleanBufferBacking(address, data, size);
 	});
 }

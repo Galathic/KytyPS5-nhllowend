@@ -78,9 +78,13 @@ struct FaultPageStat {
 };
 std::unordered_map<uint64_t, FaultPageStat> g_fault_pages;
 
+// Namespace-scope constants: these gates run on every buffer operation, and a function-local
+// static costs a thread-safe-static guard check per call.
+const bool g_perf_stats_enabled = EnvFlag("KYTY_PERF_STATS");
+const bool g_perf_no_sync_readback = EnvFlag("KYTY_PERF_NO_SYNC_READBACK");
+
 bool PerfStatsEnabled() {
-	static const bool enabled = EnvFlag("KYTY_PERF_STATS");
-	return enabled;
+	return g_perf_stats_enabled;
 }
 
 } // namespace
@@ -90,8 +94,7 @@ bool BufferCache::GuestSyncOnly() {
 }
 
 bool BufferCache::PerfNoSyncReadback() {
-	static const bool enabled = EnvFlag("KYTY_PERF_NO_SYNC_READBACK");
-	return enabled;
+	return g_perf_no_sync_readback;
 }
 
 void BufferCache::PerfSetPm4Op(uint32_t opcode) {
@@ -320,12 +323,45 @@ void BufferCache::LogGpuWrite(uint64_t vaddr, uint64_t size) {
 	}
 }
 
+namespace {
+constexpr uint32_t GpuFillChunkShift = 16;
+
+// Sets (or tests) the m_gpu_fill_filter bits of the 64 KiB chunks [begin, end) touches.
+void MarkGpuFillChunks(std::array<uint64_t, 4>& filter, uint64_t begin, uint64_t end) {
+	const uint64_t first = begin >> GpuFillChunkShift;
+	const uint64_t last  = (end - 1) >> GpuFillChunkShift;
+	if (last - first >= 255u) {
+		filter.fill(~uint64_t {0});
+		return;
+	}
+	for (uint64_t chunk = first; chunk <= last; chunk++) {
+		filter[(chunk >> 6u) & 3u] |= uint64_t {1} << (chunk & 63u);
+	}
+}
+} // namespace
+
 void BufferCache::DropGpuFills(uint64_t vaddr, uint64_t size) {
 	if (m_gpu_fills.empty()) {
 		return;
 	}
 	const auto end = vaddr + size;
+	if (size != 0 && ((end - 1) >> GpuFillChunkShift) - (vaddr >> GpuFillChunkShift) < 8u) {
+		bool hit = false;
+		for (uint64_t chunk = vaddr >> GpuFillChunkShift; chunk <= (end - 1) >> GpuFillChunkShift; chunk++) {
+			hit = hit || (m_gpu_fill_filter[(chunk >> 6u) & 3u] & (uint64_t {1} << (chunk & 63u))) != 0;
+		}
+		if (!hit) {
+			return;
+		}
+	}
+	const auto before = m_gpu_fills.size();
 	std::erase_if(m_gpu_fills, [&](const GpuFill& fill) { return fill.begin < end && vaddr < fill.end; });
+	if (m_gpu_fills.size() != before) {
+		m_gpu_fill_filter = {};
+		for (const auto& fill: m_gpu_fills) {
+			MarkGpuFillChunks(m_gpu_fill_filter, fill.begin, fill.end);
+		}
+	}
 }
 
 void BufferCache::RecordGpuFill(uint64_t vaddr, uint64_t size, uint32_t value) {
@@ -339,6 +375,7 @@ void BufferCache::RecordGpuFill(uint64_t vaddr, uint64_t size, uint32_t value) {
 		m_gpu_fills.erase(m_gpu_fills.begin());
 	}
 	m_gpu_fills.push_back({vaddr, vaddr + size, value});
+	MarkGpuFillChunks(m_gpu_fill_filter, vaddr, vaddr + size);
 }
 
 bool BufferCache::TryGetGpuFill(uint64_t vaddr, uint64_t size, uint32_t& value) const {
