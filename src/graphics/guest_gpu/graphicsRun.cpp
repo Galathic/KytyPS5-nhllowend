@@ -617,6 +617,8 @@ namespace {
 uint64_t g_work_items = 0;
 // The guest queue of the submission being processed (GPU thread only).
 uint32_t g_current_queue = 0;
+// Guest barriers emitted, and how many of them ended a render pass (KYTY_DBG_QUEUE_TIME).
+uint64_t g_guest_barriers = 0, g_guest_barrier_breaks = 0;
 
 // KYTY_DBG_QUEUE_TIME=1: GPU-thread time spent processing each guest queue (0 = graphics,
 // 1.. = compute rings), printed every 5 s as NHL27QUEUES.
@@ -645,9 +647,14 @@ struct QueueTimeScope {
 		static uint64_t last_items = 0;
 		const uint64_t  items      = g_work_items - last_items;
 		last_items                 = g_work_items;
-		std::string line = fmt::format("NHL27QUEUES items/s={:.0f} us/item={:.2f} ms/s:",
+		static uint64_t last_barriers = 0, last_breaks = 0;
+		std::string line = fmt::format("NHL27QUEUES items/s={:.0f} us/item={:.2f} barriers/s={:.0f} pass_breaks/s={:.0f} ms/s:",
 		                               static_cast<double>(items) / seconds,
-		                               items != 0 ? static_cast<double>(total_ns) / 1e3 / static_cast<double>(items) : 0.0);
+		                               items != 0 ? static_cast<double>(total_ns) / 1e3 / static_cast<double>(items) : 0.0,
+		                               static_cast<double>(g_guest_barriers - last_barriers) / seconds,
+		                               static_cast<double>(g_guest_barrier_breaks - last_breaks) / seconds);
+		last_barriers = g_guest_barriers;
+		last_breaks   = g_guest_barrier_breaks;
 		for (uint32_t i = 0; i < ns.size(); i++) {
 			if (slices[i] == 0) continue;
 			line += fmt::format(" q{}={:.1f}({:.0f})", i, static_cast<double>(ns[i]) / 1e6 / seconds,
@@ -1991,6 +1998,11 @@ void CommandProcessor::EmitGlobalBarrier() {
 		last_tick = UINT64_MAX;
 	}
 	FrameBreakdown::Add(FrameBreakdown::g_counters.port_guest_barriers);
+	++g_guest_barriers;
+	if (CurrentBuffer().IsRendering()) {
+		// Dropping these (keeping the render pass) measured no GPU gain: about 40 per frame.
+		++g_guest_barrier_breaks;
+	}
 
 	vk::MemoryBarrier2 barrier {};
 	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
