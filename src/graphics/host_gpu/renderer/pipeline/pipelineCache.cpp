@@ -862,6 +862,9 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 }
 
 PipelineCache::~PipelineCache() {
+	if (m_save_thread.joinable()) {
+		m_save_thread.join();
+	}
 	Save();
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& [key, pipeline]: pipelines) {
@@ -976,8 +979,17 @@ void PipelineCache::AutoSave() {
 	if (m_last_save_ms == 0) {
 		m_last_save_ms = now;
 	}
-	if (now - m_last_save_ms >= 30000 || m_unsaved_pipelines >= 128) {
-		Save();
+	if ((now - m_last_save_ms >= 30000 || m_unsaved_pipelines >= 128) &&
+	    !m_save_running.load(std::memory_order_acquire)) {
+		if (m_save_thread.joinable()) {
+			m_save_thread.join();
+		}
+		m_save_running.store(true, std::memory_order_release);
+		// The driver cache is internally synchronized, so pipelines can be created meanwhile.
+		m_save_thread = std::thread([this] {
+			Save();
+			m_save_running.store(false, std::memory_order_release);
+		});
 		m_unsaved_pipelines = 0;
 		m_last_save_ms      = now;
 	}
@@ -1149,6 +1161,7 @@ void PipelineCache::WarmUp(PipelineRecord::Records& records) {
         CreatePipelineInternal(m_graphics, *pipeline, record.compute, program.module, m_driver_cache);
         m_compute_pipelines.emplace(program.id, std::move(pipeline)); ++compute_count;
     }
+    if (m_save_thread.joinable()) m_save_thread.join();
     Save();
     PipelineCacheLog("Shader warm-up: {} programs, {} graphics and {} compute pipelines in {:.1f}s",
         std::ranges::count_if(handles, [](const auto& handle) { return bool(handle); }),

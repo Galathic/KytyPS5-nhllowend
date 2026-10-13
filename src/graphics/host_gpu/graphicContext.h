@@ -39,6 +39,10 @@ struct GraphicContext {
 	bool native_draw_parameters_enabled = false;
 	bool                                      host_query_reset_enabled              = false;
 	bool                                      calibrated_timestamps_enabled         = false;
+	// KYTY_DBG_PIPELINE_STATS: VK_KHR_pipeline_executable_properties is enabled.
+	bool                                      pipeline_stats_enabled                = false;
+	// VK_EXT_conditional_rendering: GPU-side fast-clear checks (experiment GpuColorClear).
+	bool                                      conditional_rendering_enabled         = false;
 	bool                                      mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
 	uint32_t                           subgroup_size                         = 0;

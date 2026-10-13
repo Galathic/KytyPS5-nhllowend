@@ -4,6 +4,7 @@
 
 #include <Zydis/Zydis.h>
 #include <bit>
+#include <cstdio>
 #include <cstring>
 #include <emmintrin.h>
 #include <xmmintrin.h>
@@ -970,6 +971,35 @@ bool TryEmulateLoad(void* native_context, LoadReader reader) {
 	std::memcpy(context.Xmm(static_cast<uint8_t>(id)), data, 16);
 	context.Advance(instruction.length);
 	return true;
+#endif
+}
+
+bool DescribeInstruction(void* native_context, char* out, uint32_t out_size) {
+	if (native_context == nullptr || out == nullptr || out_size == 0) {
+		return false;
+	}
+	out[0] = '\0';
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	Context                 context {static_cast<PCONTEXT>(native_context)};
+	ZydisDecoder            decoder {};
+	ZydisDecodedInstruction instruction {};
+	ZydisDecodedOperand     operands[ZYDIS_MAX_OPERAND_COUNT] {};
+	if (!ZYAN_SUCCESS(ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64)) ||
+	    !ZYAN_SUCCESS(ZydisDecoderDecodeFull(&decoder, reinterpret_cast<const void*>(context.Rip()),
+	                                         ZYDIS_MAX_INSTRUCTION_LENGTH, &instruction, operands))) {
+		return false;
+	}
+	uint32_t mem_bits = 0;
+	for (uint8_t i = 0; i < instruction.operand_count_visible; ++i) {
+		if (operands[i].type == ZYDIS_OPERAND_TYPE_MEMORY) mem_bits = operands[i].size;
+	}
+	const bool rep = (instruction.attributes & (ZYDIS_ATTRIB_HAS_REP | ZYDIS_ATTRIB_HAS_REPE |
+	                                            ZYDIS_ATTRIB_HAS_REPNE)) != 0;
+	std::snprintf(out, out_size, "%s%s mem=%u", rep ? "rep " : "",
+	              ZydisMnemonicGetString(instruction.mnemonic), mem_bits / 8u);
+	return true;
+#else
+	return false;
 #endif
 }
 

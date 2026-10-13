@@ -8,6 +8,8 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/presentation/videoOut.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "kernel/memory.h"
 #include "libs/errno.h"
 
 #include <algorithm>
@@ -25,6 +27,15 @@ RenderContext::RenderContext(GraphicContext& graphics)
       m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache),
       m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	m_command_scheduler.AllowAsyncSubmit();
+	// Experiment FaultPageReads: resource-table reads of a page the GPU thread took a read fault on
+	// (the GPU wrote other bytes of it) read clean bytes through the backing instead of faulting
+	// again; GPU-written bytes still fault and download.
+	ShaderRecompiler::IR::SetFaultPageReader([](uint64_t address, void* data, uint64_t size) {
+		return Common::Experiments::Enabled(Common::Experiments::FaultPageReads) &&
+		       LibKernel::Memory::IsReadFaultPage(address, size) &&
+		       LibKernel::Memory::TryReadCleanBufferBacking(address, data, size);
+	});
 }
 
 RenderContext::~RenderContext() {
@@ -147,6 +158,9 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		}
 	} else {
 		FrameBreakdown::FaultTimer t(FrameBreakdown::g_fault_cost.rd_readmem_ns);
+		if (GuestGpu::IsGpuThread()) {
+			LibKernel::Memory::NoteReadFaultPage(fault_vaddr);
+		}
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size, false, BufferCache::ReadCaller::Fault);
 	}
 	return true;
@@ -227,10 +241,9 @@ void RenderContext::PrepareBda() {
 		const char* value = std::getenv("KYTY_PERF_STATS");
 		return value != nullptr && value[0] == '1';
 	}();
-	static const bool dirty_regions = [] {
-		const char* value = std::getenv("KYTY_BDA_DIRTY_REGIONS");
-		return value != nullptr && value[0] == '1' && value[1] == '\0';
-	}();
+	// KYTY_BDA_DIRTY_REGIONS (experiment bit, switchable while running: the dirty-region queue
+	// fills either way, and a full scan covers whatever it holds).
+	const bool dirty_regions = Common::Experiments::Enabled(Common::Experiments::BdaDirtyRegions);
 	FrameBreakdown::Add(FrameBreakdown::g_counters.bda_calls);
 	FrameBreakdown::Timer total_timer(FrameBreakdown::g_counters.bda_total_ns);
 	std::shared_lock<decltype(m_mapped_ranges_mutex)> lock;

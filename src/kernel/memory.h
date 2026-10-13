@@ -113,6 +113,8 @@ int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t size, 
                          int memory_type, int64_t* phys_addr_out, bool automatic = false);
 int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
+// Writes the bytes of `data` whose backing still equals `expected` (see LazySharedWrites).
+bool                   TryMergeBacking(uint64_t vaddr, const void* data, const void* expected, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
 // GPU thread only: reads the backing when none of the bytes is GPU-dirty, so the CPU view of
@@ -120,6 +122,11 @@ bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t
 bool                   TryReadCleanBacking(uint64_t vaddr, void* data, uint64_t size);
 // Optional GPU-thread clean peek: refusal never downloads, faults or changes output.
 bool                   TryReadCleanBufferBacking(uint64_t vaddr, void* data, uint64_t size);
+// The last 16 pages on which this thread took a GPU-tracking read fault (they are protected because
+// the GPU wrote some of their bytes). Readers of guest memory can read such pages through the
+// backing when their bytes are clean instead of faulting again.
+void                   NoteReadFaultPage(uint64_t vaddr) noexcept;
+[[nodiscard]] bool     IsReadFaultPage(uint64_t vaddr, uint64_t size) noexcept;
 // GPU-thread clean validation (DRAWPREP prefetch): Equal = the backing bytes are not GPU-dirty and equal `expected`;
 // Different = clean but unequal; Dirty = GPU-dirty bytes (never downloaded); Unavailable = preconditions or mapping failed.
 // Never copies, downloads, faults or changes any state.

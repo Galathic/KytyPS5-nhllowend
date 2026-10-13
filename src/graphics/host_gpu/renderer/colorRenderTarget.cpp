@@ -65,7 +65,15 @@ struct ColorTargetKey {
 struct ColorTargetKeyHash {
 	size_t operator()(const ColorTargetKey& key) const noexcept {
 		uint64_t hash = 0xcbf29ce484222325ull;
-		for (const auto byte: key.registers) hash = (hash ^ byte) * 0x100000001b3ull;
+		// Eight register bytes per step; the tail (if any) bytewise.
+		size_t at = 0;
+		for (; at + 8 <= key.registers.size(); at += 8) {
+			uint64_t word = 0;
+			std::memcpy(&word, key.registers.data() + at, 8);
+			hash = (hash ^ word) * 0x100000001b3ull;
+			hash ^= hash >> 32u;
+		}
+		for (; at < key.registers.size(); ++at) hash = (hash ^ key.registers[at]) * 0x100000001b3ull;
 		hash = (hash ^ key.slice_offset) * 0x100000001b3ull;
 		hash = (hash ^ (key.slot | (key.mask << 8u) | (key.ignore_mask ? 1u << 16u : 0u) |
 		                (key.exact_format ? 1u << 17u : 0u))) *
@@ -82,6 +90,17 @@ struct CachedColorTarget {
 std::unordered_map<ColorTargetKey, CachedColorTarget, ColorTargetKeyHash>& ColorTargetMemo() {
 	static std::unordered_map<ColorTargetKey, CachedColorTarget, ColorTargetKeyHash> memo;
 	return memo;
+}
+
+// The entry each render-target slot used last: consecutive draws mostly keep their targets.
+// Cleared with the memo (entries are node-stable until then).
+struct LastColorTarget {
+	ColorTargetKey     key;
+	CachedColorTarget* entry = nullptr;
+};
+std::array<LastColorTarget, 8>& LastColorTargets() {
+	static std::array<LastColorTarget, 8> last;
+	return last;
 }
 
 } // namespace
@@ -111,15 +130,26 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		key.mask         = mask;
 		key.ignore_mask  = ignore_target_mask;
 		key.exact_format = exact_format;
-		auto& memo = ColorTargetMemo();
-		if (auto found = memo.find(key); found != memo.end()) {
-			r = found->second.info;
+		auto&              memo   = ColorTargetMemo();
+		CachedColorTarget* cached = nullptr;
+		auto*              last   = rt_slot < 8 ? &LastColorTargets()[rt_slot] : nullptr;
+		if (last != nullptr && last->entry != nullptr && last->key == key) {
+			cached = last->entry;
+		} else if (auto found = memo.find(key); found != memo.end()) {
+			cached = &found->second;
+			if (last != nullptr) {
+				last->key   = key;
+				last->entry = cached;
+			}
+		}
+		if (cached != nullptr) {
+			r = cached->info;
 			auto& texture_cache = m_context.GetTextureCache();
 			if (Common::Experiments::Enabled(Common::Experiments::ImageLookupHint)) {
 				bool exact = false;
 				r.image_id = texture_cache.FindImageHinted(r.desc, exact_format,
-				                                           found->second.last_image, exact);
-				found->second.last_image = exact ? r.image_id : ImageId {};
+				                                           cached->last_image, exact);
+				cached->last_image = exact ? r.image_id : ImageId {};
 			} else {
 				r.image_id = texture_cache.FindImage(r.desc, exact_format);
 			}
@@ -412,7 +442,10 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	r.guest_array_layer        = view.base_layer;
 	if (memoize) {
 		auto& memo = ColorTargetMemo();
-		if (memo.size() > 16384u) memo.clear();
+		if (memo.size() > 16384u) {
+			memo.clear();
+			LastColorTargets() = {};
+		}
 		auto& cached = memo[key];
 		cached.info                = r;
 		cached.info.export_mapping = target_format.export_mapping;

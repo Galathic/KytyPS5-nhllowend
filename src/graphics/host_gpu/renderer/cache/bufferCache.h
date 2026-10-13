@@ -243,8 +243,14 @@ private:
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
-	template <bool async>
+	// merge (async only): the publish keeps bytes the CPU changed since the download was queued.
+	template <bool async, bool merge = false>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool LazySharedWriteEligible(uint64_t vaddr, uint64_t size);
+	// Experiment AsyncGuestReads (GPU thread): waits for the asynchronous guest reads overlapping
+	// the range and releases their pages that hold no newer GPU-written bytes.
+	void FinishPendingGuestReads(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool OverlapsPendingGuestRead(uint64_t vaddr, uint64_t size) const;
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -275,6 +281,18 @@ private:
 		uint32_t value;
 	};
 	std::vector<GpuFill>                              m_gpu_fills;
+	// Experiment AsyncGuestReads: downloads queued for a guest thread's read fault. Until the
+	// guest thread finishes one, its pages stay protected but m_gpu_modified_ranges no longer
+	// lists their bytes, so HasGpuDirtyBytes reports them and readers finish the read first.
+	struct PendingGuestRead {
+		uint64_t vaddr;
+		uint64_t size;
+		uint64_t tick;
+	};
+	std::vector<PendingGuestRead>                     m_pending_guest_reads;
+	// One bit per (64 KiB chunk % 256) that a recorded fill touches (a superset). DropGpuFills runs
+	// for every written buffer binding and nearly always misses; the filter skips the fill scan.
+	std::array<uint64_t, 4>                           m_gpu_fill_filter {};
 	struct WriterRecord {
 		uint64_t    begin;
 		uint64_t    end;

@@ -25,6 +25,15 @@
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
+
+namespace {
+std::atomic<FaultPageReader> g_fault_page_reader_slot {nullptr};
+}
+
+void SetFaultPageReader(FaultPageReader reader) {
+	g_fault_page_reader_slot.store(reader, std::memory_order_relaxed);
+}
+
 namespace {
 
 constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
@@ -204,7 +213,10 @@ bool CaptureOrdinaryRead(void* userdata, uint64_t address, std::span<uint32_t> v
 	if (capture.source.read_memory != nullptr) {
 		if (!capture.source.read_memory(capture.source.userdata, address, values)) return false;
 	} else {
-		std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
+		const auto reader = g_fault_page_reader_slot.load(std::memory_order_relaxed);
+		if (reader == nullptr || !reader(address, values.data(), values.size_bytes())) {
+			std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
+		}
 	}
 	// Under KYTY_SRT_SOURCE_REUSE, extend the previous range when this read is exactly
 	// adjacent (the union of covered bytes is unchanged).
