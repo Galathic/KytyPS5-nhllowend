@@ -9,6 +9,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <span>
 #include <string>
 #include <string_view>
@@ -29,6 +30,18 @@ inline std::atomic<uint32_t> g_shader_native_fp16_modes {0};
 }
 [[nodiscard]] inline uint32_t ShaderNativeFp16Modes() {
 	return g_shader_native_fp16_modes.load(std::memory_order_relaxed);
+}
+
+// Codegen experiment (KYTY_FAST_MINMAX=1): float min/max/min3/max3/med3 use GLSL NMin/NMax
+// directly instead of emulating the guest's signed-zero ordering and NaN operand selection.
+// NMin/NMax still return the non-NaN operand; only -0/+0 ordering and NaN payloads may differ.
+// Read once per process; off by default.
+[[nodiscard]] inline bool ShaderFastMinMax() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_FAST_MINMAX");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
 }
 
 namespace ShaderError {
