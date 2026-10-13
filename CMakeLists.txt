@@ -295,7 +295,7 @@ add_custom_command(
 	OUTPUT "${fault_buffer_shader_header}"
 	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
 	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
-	        -DCACHING_PAGEBITS=14 -DMAX_PAGE_FAULTS=1024
+	        -DCACHING_PAGEBITS=14
 	        -o "${fault_buffer_shader_spv}" "${fault_buffer_shader_source}"
 	COMMAND ${CMAKE_COMMAND} -DINPUT=${fault_buffer_shader_spv} -DOUTPUT=${fault_buffer_shader_header}
 	        -DSYMBOL=FAULT_BUFFER_PROCESS_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
@@ -624,6 +624,22 @@ add_kyty_full_emulator_test(virtual_memory_allocation_tests "${KYTY_TESTS_DIR}/V
 target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 	KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1)
 
+# Common::SoftExitScope turns a fatal error of the current thread into a C++ exception: its
+# thrower and the renderer code that catches it need exceptions where they are off by default.
+if(NOT KYTY_CLANG_CL)
+	target_compile_options(common PRIVATE -fexceptions)
+	set_source_files_properties(
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/descriptors.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp"
+		PROPERTIES COMPILE_OPTIONS -fexceptions)
+else()
+	target_compile_options(common PRIVATE /EHsc)
+	set_source_files_properties(
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/descriptors.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp"
+		PROPERTIES COMPILE_OPTIONS /EHsc)
+endif()
+
 # These tests use exceptions.
 if(NOT KYTY_CLANG_CL)
 	foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests
@@ -714,6 +730,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --compute-meta-clear-only)
 	add_test(NAME buffer_cache_dirty_gc
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-gc-only)
+	add_test(NAME indirect_write_tables
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --indirect-write-tables-only)
 	add_test(NAME color_render_target_1d
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --rt1d-only)
 

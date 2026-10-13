@@ -61,6 +61,30 @@ static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::Descriptor
 	return true;
 }
 
+// Stores through V#s selected from a descriptor table write guest memory by device address.
+// Cache every target of the tables so the BDA page table covers them. Returns whether any table
+// names a target.
+static bool PrepareIndirectWriteTargets(RenderContext& context, const PreparedBindings& bindings) {
+	const auto& program = *bindings.runtime->program;
+	bool        prepared = false;
+	for (const auto& resource: program.info.buffers) {
+		// Buffer sources follow the bound resources, which leave out buffers the shader never
+		// accesses, not the shader's buffer list.
+		if (!resource.indirect_write_table || resource.descriptor_index == UINT32_MAX ||
+		    resource.descriptor_index >= bindings.buffer_sources.size()) {
+			continue;
+		}
+		const auto& table = bindings.buffer_sources[resource.descriptor_index];
+		if (table.address == 0 || table.size <= resource.indirect_table_offset) {
+			continue;
+		}
+		prepared |= context.GetIndirectWriteTables().Prepare(
+		    table.address + resource.indirect_table_offset,
+		    table.size - resource.indirect_table_offset);
+	}
+	return prepared;
+}
+
 bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
                                                 const CommandBuffer&          buffer) {
 	const auto& program   = *input.stage.program;
@@ -249,7 +273,17 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 		return false;
 	}
 	if (!cache.ClearImageFromBuffer(command, descriptor.Base48(), size, packed_clear)) {
-		return false;
+		// A uniform fill of memory no image covers is performed like a DMA fill: on the CPU while
+		// the GPU does not own the range. DCC metadata cleared this way is read by fast-clear
+		// discovery without draining the GPU first.
+		// Larger fills stay on the GPU: a CPU fill would also have to be uploaded again.
+		constexpr uint64_t MaxBufferFill = uint64_t {1} << 20u;
+		if (((descriptor.Base48() | size) & 3u) != 0 || size > MaxBufferFill ||
+		    cache.HasImagesInRegion(descriptor.Base48(), size)) {
+			return false;
+		}
+		m_context.GetBufferCache().FillBuffer(descriptor.Base48(), size, packed_clear, false);
+		return true;
 	}
 	static std::atomic<uint32_t> logged_clears {0};
 	if (logged_clears.fetch_add(1, std::memory_order_relaxed) < 32) {
@@ -449,7 +483,6 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		ResetBindings();
 		return;
 	}
-
 	// KYTY_PERF_NO_SYNC_READBACK: a proven uniform dword fill that still executes (e.g. a DCC or
 	// CMASK clear) is remembered so color-clear decoding need not read the metadata back.
 	uint64_t known_fill_address = 0;
@@ -530,9 +563,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	pipeline_timer.Stop();
 	PreparedBindings* descriptor_stage = &bindings;
+	bool indirect_writes = false;
 	{
 		FrameBreakdown::Timer buffers_timer(FrameBreakdown::g_counters.dc_buffers_ns);
 		FindBuffers(std::span {&descriptor_stage, 1u});
+		// New target buffers must exist before PrepareBda uploads the CPU writes of cached buffers.
+		indirect_writes = PrepareIndirectWriteTargets(m_context, bindings);
 		if (program.info.uses_dma) {
 			FrameBreakdown::Timer bda_timer(FrameBreakdown::g_counters.dc_bda_ns);
 			m_context.PrepareBda();
@@ -555,7 +591,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		               std::span {&descriptor_stage, 1u});
 	}
 	bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
-	    HasShaderBufferWrites(input_info.stage);
+	    HasShaderBufferWrites(input_info.stage) || indirect_writes;
 	has_storage_writes =
 	    std::any_of(program.info.images.begin(), program.info.images.end(),
 	                [](const auto& image) {
@@ -820,9 +856,12 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	pipeline_timer.Stop();
 	PreparedBindings* descriptor_stage = &bindings;
 	const auto& program = *input_info.stage.program;
+	bool indirect_writes = false;
 	{
 		FrameBreakdown::Timer buffers_timer(FrameBreakdown::g_counters.dc_buffers_ns);
 		FindBuffers(std::span {&descriptor_stage, 1u});
+		// New target buffers must exist before PrepareBda uploads the CPU writes of cached buffers.
+		indirect_writes = PrepareIndirectWriteTargets(m_context, bindings);
 		if (program.info.uses_dma) {
 			FrameBreakdown::Timer bda_timer(FrameBreakdown::g_counters.dc_bda_ns);
 			m_context.PrepareBda();
@@ -859,7 +898,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	const auto vk_buffer = buffer.Handle();
 	const bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
-	    HasShaderBufferWrites(input_info.stage) ||
+	    HasShaderBufferWrites(input_info.stage) || indirect_writes ||
 	    std::any_of(program.info.images.begin(), program.info.images.end(), [](const auto& image) {
 		    return image.written && image.resource_class ==
 		                                ShaderRecompiler::IR::ImageResourceClass::Storage;

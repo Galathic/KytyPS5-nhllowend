@@ -23,7 +23,6 @@
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
-#include "kytyGitVersion.h"
 #include "loader/systemContent.h"
 
 #include <algorithm>
@@ -31,6 +30,7 @@
 #include <atomic>
 #include <chrono>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -87,8 +87,10 @@ std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties)
 		uuid[i * 2]     = hex[properties.pipelineCacheUUID[i] >> 4u];
 		uuid[i * 2 + 1] = hex[properties.pipelineCacheUUID[i] & 0xfu];
 	}
-	return fmt::format("KytyPC2:{:08x}:{:08x}:{:08x}:{}\n",
-	                   properties.vendorID, properties.deviceID, properties.driverVersion, uuid);
+	// The driver validates the data by pipelineCacheUUID and looks pipelines up by content, so
+	// data from another emulator build is safe to reuse.
+	return fmt::format("KytyPC2:{:08x}:{:08x}:{:08x}:{}\n", properties.vendorID,
+	                   properties.deviceID, properties.driverVersion, uuid);
 }
 
 std::string PipelineCacheTitleId() {
@@ -951,17 +953,6 @@ void PipelineCache::InitializeDriverCache() {
 		PipelineCacheLog("Vulkan pipeline cache: disabled (non-Release build)");
 		return;
 	}
-	const std::string_view git_hash     = KYTY_GIT_HASH;
-	const std::string_view git_revision = KYTY_GIT_REVISION;
-	if (git_hash == "unknown" || git_revision == "unknown") {
-		PipelineCacheLog("Vulkan pipeline cache: disabled (unknown git revision)");
-		return;
-	}
-	const char* allow_dirty = std::getenv("KYTY_PIPELINE_CACHE_DIRTY");
-	if (git_hash.ends_with("-dirty") && !(allow_dirty != nullptr && allow_dirty[0] == '1')) {
-		PipelineCacheLog("Vulkan pipeline cache: disabled (dirty build)");
-		return;
-	}
 
 	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
 	const auto path         = Common::PathToString(m_driver_cache_path);
@@ -1027,30 +1018,38 @@ void PipelineCache::InitializeDriverCache() {
 	} else {
 		PipelineCacheLog("Vulkan pipeline cache: initialized empty");
 	}
-}
-
-void PipelineCache::AutoSave() {
-	if (m_driver_cache == nullptr) {
-		return;
-	}
-	m_unsaved_pipelines++;
-	const auto now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-	                                           std::chrono::steady_clock::now().time_since_epoch())
-	                                           .count());
-	if (m_last_save_ms == 0) {
-		m_last_save_ms = now;
-	}
-	if (now - m_last_save_ms >= 30000 || m_unsaved_pipelines >= 128) {
-		Save();
-		m_unsaved_pipelines = 0;
-		m_last_save_ms      = now;
-	}
+	m_save_thread = std::jthread([this](const std::stop_token& stop) {
+		constexpr auto Period = std::chrono::seconds(60);
+		auto           next   = std::chrono::steady_clock::now() + Period;
+		while (!stop.stop_requested()) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(250));
+			if (std::chrono::steady_clock::now() < next) {
+				continue;
+			}
+			next = std::chrono::steady_clock::now() + Period;
+			if (m_unsaved_pipelines.exchange(0) != 0) {
+				WriteDriverCache();
+			}
+		}
+	});
 }
 
 void PipelineCache::Save() {
+	if (m_save_thread.joinable()) {
+		m_save_thread.request_stop();
+		m_save_thread.join();
+	}
 	if (m_driver_cache == nullptr) {
 		return;
 	}
+	WriteDriverCache();
+	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
+	m_driver_cache = nullptr;
+}
+
+void PipelineCache::WriteDriverCache() {
+	// Pipeline creation may continue meanwhile: the driver synchronizes the cache object.
+	Common::LockGuard lock(m_write_mutex);
 
 	size_t               size = 0;
 	vk::Result           result;
@@ -1213,7 +1212,9 @@ void PipelineCache::WarmUp(PipelineRecord::Records& records) {
         CreatePipelineInternal(m_graphics, *pipeline, record.compute, program.module, m_driver_cache);
         m_compute_pipelines.emplace(program.id, std::move(pipeline)); ++compute_count;
     }
-    Save();
+    if (m_driver_cache != nullptr) {
+        WriteDriverCache();
+    }
     PipelineCacheLog("Shader warm-up: {} programs, {} graphics and {} compute pipelines in {:.1f}s",
         std::ranges::count_if(handles, [](const auto& handle) { return bool(handle); }),
         graphics_count, compute_count,
@@ -1605,6 +1606,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
 	                       ps_input_info, programs, static_params, m_driver_cache);
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
+	m_unsaved_pipelines.fetch_add(1, std::memory_order_relaxed);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
@@ -1612,7 +1614,6 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	RecordGraphicsPipeline(key, vertex_info, ps_input_info);
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 	EXIT_IF(!inserted);
-	AutoSave();
 
 	return *iter->second;
 }
@@ -1640,6 +1641,7 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	auto cached = std::make_unique<Pipeline>();
 	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
+	m_unsaved_pipelines.fetch_add(1, std::memory_order_relaxed);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
@@ -1650,7 +1652,6 @@ if (m_record != nullptr && m_record->IsOpen() && m_program_cache->replaying == n
     }
     auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
 	EXIT_IF(!inserted);
-	AutoSave();
 
 	return *iter->second;
 }

@@ -177,6 +177,7 @@ private:
 	void FloatTernary(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool accumulator,
 	                  bool mix);
 	void V_FREXP_MANT_F32(const Decoder::Instruction& inst);
+	void V_FRACT(const Decoder::Instruction& inst, bool half);
 	void V_DOT2C_F32_F16(const Decoder::Instruction& inst);
 	void V_CUBEID_F32(const Decoder::Instruction& inst);
 	void V_CUBESC_F32(const Decoder::Instruction& inst);
@@ -234,6 +235,7 @@ private:
 	void    V_LSHL_OR_B32(const Decoder::Instruction& inst);
 	void    V_CNDMASK_B32(const Decoder::Instruction& inst);
 	void    PackB16(const Decoder::Instruction& inst, bool high0, bool high1);
+	void    V_CVT_PK_16_32(const Decoder::Instruction& inst, bool sign);
 
 	void S_SUBVECTOR_LOOP(const Decoder::Instruction& inst, bool begin);
 	void S_SAVEEXEC(const Decoder::Instruction& inst, IR::ValueOpcode operation, bool negate_exec,

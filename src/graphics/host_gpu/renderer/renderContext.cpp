@@ -67,7 +67,11 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.
 	constexpr uint64_t fault_size = 1;
 	if (!IsMapped(fault_vaddr, fault_size)) {
-		return false;
+		// Cache tracking may still protect a page whose range left the GPU-mapped set; that
+		// fault is ours to resolve, not a guest access violation.
+		if (!GuestRange {fault_vaddr, fault_size}.Valid() || !m_page_manager.IsWatched(fault_vaddr)) {
+			return false;
+		}
 	}
 	ProtectStats::CountFault(access == PageFaultAccess::Write);
 	Common::Timeline::Mark(access == PageFaultAccess::Write ? "fault-write" : "fault-read", fault_vaddr);
@@ -169,11 +173,17 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 	return m_mapped_ranges.Contains(vaddr, size);
 }
 
+uint64_t RenderContext::MappedRangesVersion() const noexcept {
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	return m_mapped_ranges_version;
+}
+
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	Common::Timeline::Mark("map", size);
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
 	++m_mapping_generation;
+	m_mapped_ranges_version++;
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -199,6 +209,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
 		++m_mapping_generation;
+		m_mapped_ranges_version++;
 	};
 	// Shutdown still owns the GPU while queued rendering drains, but its command lane no
 	// longer accepts external work. Use the guest GPU's state for the teardown route.
@@ -209,16 +220,12 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	m_gpu->SendCommandSync(unmap);
 }
 
-// Pages of TRACKER_PAGE_SIZE covering [start, end). Used only by the NHL27BDA counters.
-static uint64_t PagesIn(uint64_t start, uint64_t end) {
-	return (end - start + TRACKER_PAGE_SIZE - 1) / TRACKER_PAGE_SIZE;
-}
-
 void RenderContext::PrepareBda() {
 	if (!m_bda_logged) {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		m_bda_logged = true;
 	}
+	m_buffer_cache.PrepareFaultBuffer();
 	static const bool cache_enabled = [] {
 		const char* value = std::getenv("KYTY_BDA_DIRTY_CACHE");
 		return value != nullptr && value[0] == '1' && value[1] == '\0';
@@ -282,16 +289,24 @@ void RenderContext::PrepareBda() {
 				drained = m_buffer_cache.SynchronizeBuffersInRanges(m_mapped_ranges, full);
 			}
 		} else {
-			++m_bda_stats.full_scans;
-			FrameBreakdown::Add(FrameBreakdown::g_counters.bda_scans);
-			FrameBreakdown::Timer sync_timer(FrameBreakdown::g_counters.bda_sync_ns);
-			FrameBreakdown::BufScope buf_scope(2);
-			FrameBreakdown::VAdd(FrameBreakdown::g_buf.bda_syncs);
-			m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
-				FrameBreakdown::Add(FrameBreakdown::g_counters.bda_ranges);
-				FrameBreakdown::Add(FrameBreakdown::g_counters.bda_pages, PagesIn(start, end));
-				m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
-			});
+			// Nothing to upload when no page became CPU dirty, no buffer was registered and no
+			// range was mapped since the last synchronization started. Otherwise only the tracking
+			// regions whose pages became CPU dirty since are visited, unless a new buffer or mapped
+			// range may cover CPU-dirty pages that earlier passes skipped.
+			const std::array<uint64_t, 3> epochs {RegionManager::CpuDirtyEpoch(), registrations,
+			                                      m_mapping_generation};
+			if (epochs != m_bda_sync_epochs) {
+				const bool all = epochs[1] != m_bda_sync_epochs[1] || epochs[2] != m_bda_sync_epochs[2];
+				m_bda_stats.full_scans += all;
+				FrameBreakdown::Add(FrameBreakdown::g_counters.bda_scans);
+				FrameBreakdown::Timer sync_timer(FrameBreakdown::g_counters.bda_sync_ns);
+				FrameBreakdown::BufScope buf_scope(2);
+				FrameBreakdown::VAdd(FrameBreakdown::g_buf.bda_syncs);
+				m_buffer_cache.SynchronizeDirtyRegionsInRanges(m_mapped_ranges, all);
+				m_bda_sync_epochs = epochs;
+			} else {
+				FrameBreakdown::Add(FrameBreakdown::g_counters.bda_skips);
+			}
 		}
 		// Save the pre-scan stamps: a CPU write concurrent with the scan must force
 		// another scan, even if it targets a range we already visited.
@@ -419,6 +434,11 @@ void RenderContext::RunGarbageCollector() {
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;
 		m_buffer_cache.ProcessFaultBuffer();
+	}
+	if (m_indirect_write_tables.TakePendingWrites()) {
+		m_buffer_cache.ProcessWriteBuffer([this](std::span<const uint64_t> pages) {
+			m_indirect_write_tables.NoteWrites(pages);
+		});
 	}
 	m_texture_cache.ProcessDownloadImages();
 	m_texture_cache.RunGarbageCollector();

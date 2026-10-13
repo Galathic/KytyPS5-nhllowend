@@ -19,18 +19,20 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <vector>
 
 namespace Libs::Graphics {
 
 namespace {
 
-constexpr size_t MaxPageFaults    = 1024;
-constexpr size_t PageFaultAreaSize = MaxPageFaults * sizeof(uint64_t);
+constexpr size_t MaxPageFaults = 1024;
+// Pages V#-table stores may write between two reads; more stay in the bitmap for the next read.
+constexpr size_t MaxPageWrites = 16384;
 
 // Fault bitmap: one bit per cache page, read and cleared word by word by the parser.
 constexpr uint32_t FaultBitmapWords = static_cast<uint32_t>(BufferCache::CACHING_NUMPAGES / 32);
-// Dirty word placed right after the bitmap. RecordBdaFault stores 1 here whenever it sets a bit.
-constexpr uint32_t DirtyWordIndex = FaultBitmapWords;
+// Dirty word placed after both bitmaps. RecordBdaFault stores 1 here whenever it sets a bit.
+constexpr uint32_t DirtyWordIndex = static_cast<uint32_t>(BufferCache::FAULT_DIRTY_WORD);
 // Parser dispatch: one invocation per bitmap word, 64 invocations per workgroup.
 constexpr uint32_t ParserWorkgroups = (FaultBitmapWords + 63) / 64;
 
@@ -42,13 +44,18 @@ struct FaultGatePush {
 
 } // namespace
 
+FaultManager::Reader::Reader(GraphicContext& graphics, CommandScheduler& scheduler,
+                             size_t capacity)
+    : download(graphics, scheduler, MemoryUsage::Download, 0, AllFlags,
+               MaxPendingFaults * capacity * sizeof(uint64_t)),
+      area_size(capacity * sizeof(uint64_t)) {}
+
 FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler,
                            BufferCache& buffer_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_buffer_cache(buffer_cache),
       m_fault_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
-                     BufferCache::CACHING_NUMPAGES / 8 + sizeof(uint32_t)),
-      m_download_buffer(graphics, scheduler, MemoryUsage::Download, 0, AllFlags,
-                        MaxPendingFaults * PageFaultAreaSize),
+                     BufferCache::FAULT_BUFFER_SIZE + sizeof(uint32_t)),
+      m_faults(graphics, scheduler, MaxPageFaults), m_writes(graphics, scheduler, MaxPageWrites),
       m_indirect_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
                         3 * sizeof(uint32_t)) {
 	SetVulkanObjectNameF(m_graphics.device, m_fault_buffer.Handle(), "Fault Buffer");
@@ -132,22 +139,49 @@ FaultManager::~FaultManager() {
 	m_graphics.device.destroyDescriptorSetLayout(m_fault_process_desc_layout, nullptr);
 }
 
-// Gated pass (KYTY_FAULT_PARSE_GATE=1):
+void FaultManager::PrepareFaultBuffer() {
+	if (!m_cleared) {
+		// Shaders only set bits: both bitmaps must start clear.
+		m_fault_buffer.Fill(0, m_fault_buffer.Size(), 0);
+		m_cleared = true;
+	}
+}
+
+void FaultManager::ProcessFaultBuffer() {
+	Process(m_faults, 0, [this](std::span<const uint64_t> pages) {
+		RangeSet fault_ranges;
+		for (const auto address: pages) {
+			fault_ranges.Add(address, BufferCache::CACHING_PAGESIZE);
+			LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", address);
+		}
+		fault_ranges.ForEach([this](uint64_t start, uint64_t end) {
+			EXIT_IF(end - start > std::numeric_limits<uint32_t>::max());
+			(void)m_buffer_cache.FindBuffer(start, end - start);
+		});
+	});
+}
+
+void FaultManager::ProcessWriteBuffer(PagesHandler&& handler) {
+	Process(m_writes, BufferCache::WRITE_BITMAP_OFFSET, std::move(handler));
+}
+
+// Gated pass (KYTY_FAULT_PARSE_GATE=1, fault bitmap only):
 //   pre barrier -> gate (1 invocation: read+clear dirty word, write indirect args)
 //   -> barrier (shader write -> indirect read) -> parser via vkCmdDispatchIndirect -> post barrier.
-// Invariant: after every gated pass the bitmap is all zero and the dirty word is zero.
+// Invariant: after every gated pass the fault bitmap is all zero and the dirty word is zero.
 //   - RecordBdaFault stores the bit and then dirty=1 in the same invocation, so a set bit is
 //     always accompanied by dirty==1 that the gate of the next pass will observe (barrier-ordered).
 //   - The gate clears dirty and, when it saw dirty==0, no bit was set since the previous parser
 //     clear, so the bitmap is already zero and skipping the parser loses nothing.
-//   - When dirty!=0 the parser runs over every bitmap word and clears it.
-//   - The bitmap buffer is not guaranteed zeroed at creation, so the first gated pass forces a
-//     parse (force_parse=1), which clears the whole bitmap.
-// The download slot is host-visible and zeroed by the CPU before the pass, so a skipped parser
-// leaves count==0 in place and the existing deferred readback is still correct.
-void FaultManager::ProcessFaultBuffer() {
-	Common::EventTrace::Record(Common::EventTrace::FAULT_PARSE, m_current_area);
-	if (const auto wait_tick = m_fault_areas[m_current_area]; wait_tick != 0) {
+//   - When dirty!=0 the parser runs over every bitmap word and clears it, except the pages the
+//     download area has no room for: those keep their bits, and the readback that sees the
+//     overflow forces the next gated pass to parse (m_gate_force).
+//   - The first gated pass forces a parse (force_parse=1).
+// The dirty word follows both bitmaps (BufferCache::FAULT_DIRTY_WORD). The download slot's count
+// is zeroed by the CPU before the pass, so a skipped parser leaves count==0 in place.
+void FaultManager::Process(Reader& reader, uint64_t bitmap_offset, PagesHandler&& handler) {
+	Common::EventTrace::Record(Common::EventTrace::FAULT_PARSE, reader.current);
+	if (const auto wait_tick = reader.ticks[reader.current]; wait_tick != 0) {
 		// Ring slot reuse: the previous pass on this slot may still be in flight. Time only the
 		// wait itself (a slot that already finished costs ~0).
 		{
@@ -157,34 +191,40 @@ void FaultManager::ProcessFaultBuffer() {
 		m_scheduler.PopPendingOperations();
 	}
 	FrameBreakdown::Add(FrameBreakdown::g_counters.fault_parse_passes);
-	const bool gate = m_gate_enabled || Common::RuntimeFlags::Current().fault_parse_gate;
+	const bool gate =
+	    bitmap_offset == 0 && (m_gate_enabled || Common::RuntimeFlags::Current().fault_parse_gate);
 
-	const auto offset = m_current_area * PageFaultAreaSize;
-	auto*      mapped = m_download_buffer.Mapped().data() + offset;
-	std::memset(mapped, 0, PageFaultAreaSize);
-	m_download_buffer.Flush(offset, PageFaultAreaSize);
+	const auto area_size = reader.area_size;
+	const auto offset    = reader.current * area_size;
+	auto*      mapped    = reader.download.Mapped().data() + offset;
+	// The parser appends after the count; the host reads only the entries it counted.
+	std::memset(mapped, 0, sizeof(uint64_t));
+	reader.download.Flush(offset, sizeof(uint64_t));
 
+	constexpr auto bitmap_size = BufferCache::CACHING_NUMPAGES / 8;
 	vk::BufferMemoryBarrier2 pre_barrier {};
 	pre_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
 	pre_barrier.srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
 	pre_barrier.dstStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
 	pre_barrier.dstAccessMask = vk::AccessFlagBits2::eShaderRead;
 	pre_barrier.buffer        = m_fault_buffer.Handle();
-	pre_barrier.offset        = 0;
-	pre_barrier.size          = m_fault_buffer.Size();
+	pre_barrier.offset        = bitmap_offset;
+	pre_barrier.size          = bitmap_size;
 	if (gate) {
 		// The gate clears the dirty word, so the pre barrier must also order prior writes.
+		pre_barrier.offset        = 0;
+		pre_barrier.size          = m_fault_buffer.Size();
 		pre_barrier.dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
 	}
-	auto post_barrier         = pre_barrier;
+	auto post_barrier          = pre_barrier;
 	post_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
 	post_barrier.srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
 	post_barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
 	post_barrier.dstAccessMask = vk::AccessFlagBits2::eShaderWrite;
 
 	const vk::DescriptorBufferInfo infos[] {
-	    {m_fault_buffer.Handle(), 0, m_fault_buffer.Size()},
-	    {m_download_buffer.Handle(), offset, PageFaultAreaSize},
+	    {m_fault_buffer.Handle(), bitmap_offset, bitmap_size},
+	    {reader.download.Handle(), offset, area_size},
 	};
 	std::array<vk::WriteDescriptorSet, 2> writes {};
 	for (uint32_t index = 0; index < writes.size(); ++index) {
@@ -225,9 +265,10 @@ void FaultManager::ProcessFaultBuffer() {
 		const FaultGatePush push {
 		    ParserWorkgroups,
 		    DirtyWordIndex,
-		    m_gate_primed ? 0u : 1u,
+		    m_gate_primed && !m_gate_force ? 0u : 1u,
 		};
 		m_gate_primed = true;
+		m_gate_force  = false;
 
 		Libs::Graphics::g_compute_pipeline_epoch.fetch_add(1, std::memory_order_relaxed);
 		InvalidateRedundantBinds();
@@ -269,30 +310,37 @@ void FaultManager::ProcessFaultBuffer() {
 	dependency.pBufferMemoryBarriers = &post_barrier;
 	command.pipelineBarrier2(dependency);
 
-	const auto area = m_current_area;
-	m_scheduler.DeferOperation([this, mapped, offset, area] {
-		m_download_buffer.Invalidate(offset, PageFaultAreaSize);
-		RangeSet    fault_ranges;
-		const auto* faults = std::bit_cast<const uint64_t*>(mapped);
-		const auto  count  = static_cast<uint32_t>(faults[0]);
-		FrameBreakdown::Add(FrameBreakdown::g_counters.fault_parse_faults, count);
-		if (count == 0) {
-			FrameBreakdown::Add(FrameBreakdown::g_counters.fault_parse_zero);
+	const auto area = reader.current;
+	m_scheduler.DeferOperation([this, &reader, mapped, offset, area, area_size, bitmap_offset,
+	                            handler = std::move(handler)] {
+		reader.download.Invalidate(offset, area_size);
+		const auto* entries = std::bit_cast<const uint64_t*>(mapped);
+		// The parser counts every set bit but stores only the entries the area holds; it leaves
+		// the others set for the next read.
+		const auto capacity = area_size / sizeof(uint64_t) - 1;
+		const auto count    = std::min<uint64_t>(static_cast<uint32_t>(entries[0]), capacity);
+		if (bitmap_offset == 0) {
+			if (static_cast<uint32_t>(entries[0]) > capacity) {
+				m_gate_force = true;
+			}
+			FrameBreakdown::Add(FrameBreakdown::g_counters.fault_parse_faults, count);
+			if (count == 0) {
+				FrameBreakdown::Add(FrameBreakdown::g_counters.fault_parse_zero);
+			}
 		}
-		for (uint32_t index = 1; index <= count; ++index) {
-			const auto address = BufferCache::GuestAddress(faults[index]);
-			fault_ranges.Add(address, BufferCache::CACHING_PAGESIZE);
-			LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", address);
+		std::vector<uint64_t> pages;
+		pages.reserve(count);
+		for (uint64_t index = 1; index <= count; ++index) {
+			pages.push_back(BufferCache::GuestAddress(entries[index]));
 		}
-		fault_ranges.ForEach([this](uint64_t start, uint64_t end) {
-			EXIT_IF(end - start > std::numeric_limits<uint32_t>::max());
-			(void)m_buffer_cache.FindBuffer(start, end - start);
-		});
-		m_fault_areas[area] = 0;
+		if (!pages.empty()) {
+			handler(pages);
+		}
+		reader.ticks[area] = 0;
 	});
 
-	m_fault_areas[m_current_area++] = m_scheduler.CurrentTick();
-	m_current_area %= MaxPendingFaults;
+	reader.ticks[reader.current++] = m_scheduler.CurrentTick();
+	reader.current %= MaxPendingFaults;
 }
 
 } // namespace Libs::Graphics

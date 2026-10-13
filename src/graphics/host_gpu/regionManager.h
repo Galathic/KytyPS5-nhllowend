@@ -85,8 +85,22 @@ public:
 			EXIT("invalid region tracking manager construction\n");
 		}
 		m_cpu_dirty.Fill();
+		m_cpu_written.Fill();
 		m_writable.Fill();
 		m_readable.Fill();
+		s_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel);
+	}
+
+	// Advances whenever pages of any region become CPU dirty: while it is unchanged, no page
+	// was dirtied since a synchronization that started after reading it.
+	[[nodiscard]] static uint64_t CpuDirtyEpoch() {
+		return s_cpu_dirty_epoch.load(std::memory_order_acquire);
+	}
+
+	// Advances, after the pages change under the lock, whenever pages of this region become CPU
+	// dirty; a new region starts dirty at 1.
+	[[nodiscard]] uint64_t RegionCpuDirtyEpoch() const {
+		return m_cpu_dirty_epoch.load(std::memory_order_acquire);
 	}
 
 	KYTY_CLASS_NO_COPY(RegionManager);
@@ -118,6 +132,12 @@ public:
 			bits.UnsetRange(start, end);
 		}
 		if constexpr (source == DirtySource::Cpu) {
+			if constexpr (enable) {
+				m_cpu_written.SetRange(start, end);
+				m_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel);
+				s_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel);
+			}
+			m_has_cpu_dirty.store(m_cpu_dirty.Any(), std::memory_order_release);
 			UpdateProtection<!enable, false>();
 		} else {
 			UpdateProtection<enable, true>();
@@ -135,6 +155,7 @@ public:
 		if constexpr (clear) {
 			bits.UnsetRange(start, end);
 			if constexpr (source == DirtySource::Cpu) {
+				m_has_cpu_dirty.store(m_cpu_dirty.Any(), std::memory_order_release);
 				UpdateProtection<true, false>();
 			} else {
 				UpdateProtection<false, true>();
@@ -143,6 +164,44 @@ public:
 		for (const auto [first, last]: mask) {
 			func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
 		}
+	}
+
+	// Calls func(address, size) for the runs of pages in the range that became CPU dirty since
+	// the previous call over them, or are still CPU dirty (further writes to a dirty page do not
+	// fault), and forgets the former. Callers hold the lock.
+	template <typename Func>
+	void ConsumeCpuWritten(uint64_t vaddr, uint64_t size, Func&& func) {
+		const auto [start, end] = GetPageRange(vaddr, size);
+		RegionBits mask(m_cpu_written, start, end);
+		mask |= RegionBits(m_cpu_dirty, start, end);
+		m_cpu_written.UnsetRange(start, end);
+		for (const auto [first, last]: mask) {
+			func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
+		}
+	}
+
+	// Marks the pages of the range GPU dirty unless they are CPU dirty, and calls func(address,
+	// size) for the runs it marked. Callers hold the lock.
+	template <typename Func>
+	void MarkGpuDirtyUnlessCpuDirty(uint64_t vaddr, uint64_t size, Func&& func) {
+		const auto [start, end] = GetPageRange(vaddr, size);
+		RegionBits mask(~m_cpu_dirty, start, end);
+		if (mask.None()) {
+			return;
+		}
+		for (const auto [first, last]: mask) {
+			m_gpu_dirty.SetRange(first, last);
+		}
+		UpdateProtection<true, true>();
+		for (const auto [first, last]: mask) {
+			func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
+		}
+	}
+
+	// Whether any page holds CPU writes not yet uploaded. Read without the lock: a concurrent
+	// CPU write that is not observed yet is equivalent to one that lands after the read.
+	[[nodiscard]] bool HasCpuDirty() const {
+		return m_has_cpu_dirty.load(std::memory_order_acquire);
 	}
 
 	TrackingSpinLock lock;
@@ -194,9 +253,16 @@ private:
 	PageManager& m_page_manager;
 	uint64_t     m_cpu_addr = 0;
 	RegionBits   m_cpu_dirty;
+	// Pages that became CPU dirty since ConsumeCpuWritten last visited them.
+	RegionBits   m_cpu_written;
 	RegionBits   m_gpu_dirty;
 	RegionBits   m_writable;
 	RegionBits   m_readable;
+	// A new region starts with every page CPU dirty.
+	std::atomic_bool      m_has_cpu_dirty {true};
+	std::atomic<uint64_t> m_cpu_dirty_epoch {1};
+
+	inline static std::atomic<uint64_t> s_cpu_dirty_epoch {0};
 };
 
 } // namespace Libs::Graphics
