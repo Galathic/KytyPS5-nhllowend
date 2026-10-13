@@ -125,6 +125,10 @@ bool                   TryReadCleanBufferBacking(uint64_t vaddr, void* data, uin
 // Never copies, downloads, faults or changes any state.
 enum class CleanBackingCompare { Equal, Different, Dirty, Unavailable };
 CleanBackingCompare    TryValidateCleanBacking(uint64_t vaddr, const void* expected, uint64_t size);
+// Where the backing store keeps [vaddr, vaddr + size) when one mapping holds it, else null. The
+// pointer stays readable for the emulator's lifetime and reads what TryReadBacking() reads.
+[[nodiscard]] const void* FindBackingPointer(uint64_t vaddr, uint64_t size);
+bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 // Whether TryReadBacking or TryReadSparseBacking can read the whole range.
 bool                   IsBackingReadable(uint64_t vaddr, uint64_t size);

@@ -52,12 +52,16 @@ public:
 	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+	// Before the emulated GPU writes guest memory (labels, WRITE_DATA): resolves a tracked page
+	// as its write fault would, without raising the exception.
+	void PrepareGpuWrite(const void* destination, uint64_t size) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	// Advances whenever a range is mapped or unmapped.
 	[[nodiscard]] uint64_t MappedRangesVersion() const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
+	void               CacheDmaBases(const ShaderStageRuntime& runtime);
 	void               PrepareBda();
 	// KYTY_BDA_BATCH: a point where guest memory can become ordered for the GPU or CPU. The next PrepareBda
 	// syncs again. GPU command thread only.
