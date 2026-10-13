@@ -10,6 +10,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <span>
 #include <string>
 #include <string_view>
@@ -30,9 +31,15 @@ inline std::atomic<uint32_t> g_shader_native_fp16_modes {0};
 	return g_shader_native_fp16.load(std::memory_order_relaxed) &&
 	       Common::Experiments::Enabled(Common::Experiments::NativeFp16);
 }
-// Codegen option: experiment ExecSelects (IR::EliminateExecSelects). Part of every stage key.
-[[nodiscard]] inline bool ShaderExecSelects() {
-	return Common::Experiments::Enabled(Common::Experiments::ExecSelects);
+// Codegen option: experiment ExecSelects (IR::EliminateExecSelects) and its rule set
+// (KYTY_DBG_EXECSEL_MODE, default 16). Part of every stage key: 0 when off.
+[[nodiscard]] inline uint32_t ShaderExecSelects() {
+	if (!Common::Experiments::Enabled(Common::Experiments::ExecSelects)) return 0;
+	static const uint32_t mode = [] {
+		const char* value = std::getenv("KYTY_DBG_EXECSEL_MODE");
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0)) : 16u;
+	}();
+	return 0x100u | mode;
 }
 [[nodiscard]] inline uint32_t ShaderNativeFp16Modes() {
 	return g_shader_native_fp16_modes.load(std::memory_order_relaxed);
