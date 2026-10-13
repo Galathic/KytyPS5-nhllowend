@@ -8,6 +8,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
+#include "graphics/host_gpu/renderer/pipeline/computeLookahead.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/videoOut.h"
@@ -1323,6 +1324,106 @@ KYTY_CP_OP_PARSER(CpOpAcquireMem) {
 		cp.EmitGlobalBarrier();
 	}
 	return (cmd_id == 0xc0061050 ? 7 : 6);
+}
+
+// ---- Experiment ComputeLookahead: the worker's model of the compute registers ----------------------
+// Everything here is a prediction. The worker's result is used only after the real dispatch compares
+// program, shader base, workgroup counts, user data and every recorded read, so a gap in this model
+// costs a wasted materialization, never a different result.
+
+// Applies one SET_SH_REG packet to a copy of the compute registers, as the handlers above would.
+// False when the packet touches compute state in a way this model does not reproduce.
+static bool LookaheadApplyShRegs(HW::ComputeShaderInfo& cs, const uint32_t* packet, uint32_t len) {
+	constexpr uint32_t kComputeBegin = 0x200u;
+	constexpr uint32_t kComputeEnd   = Pm4::COMPUTE_USER_DATA_15 + 1u;
+	const uint32_t     offset        = packet[1];
+	const uint32_t     num           = len - 2u;
+	if (offset == Pm4::SH_NOP) return true;
+	if (num == 0 || offset >= Pm4::SH_NUM || num > Pm4::SH_NUM - offset) return false;
+	const uint32_t end = offset + num;
+	if (end <= kComputeBegin || offset >= kComputeEnd) return true; // graphics stages only
+	if (offset < kComputeBegin) return false;                       // straddles into compute space
+	const uint32_t* values = packet + 2;
+	if (offset >= Pm4::COMPUTE_USER_ACCUM_0 && end <= Pm4::COMPUTE_USER_ACCUM_0 + 4u) return true; // ignored
+	if (offset >= Pm4::COMPUTE_USER_DATA_0) {
+		const uint32_t slot = offset - Pm4::COMPUTE_USER_DATA_0;
+		if (slot >= 16u || num > 16u - slot) return false;
+		for (uint32_t i = 0; i < num; i++) {
+			cs.cs_user_sgpr.value[slot + i] = values[i];
+			cs.cs_user_sgpr.count           = std::max(cs.cs_user_sgpr.count, slot + i + 1u);
+		}
+		return true;
+	}
+	auto regs = cs.cs_regs;
+	for (uint32_t i = 0; i < num; i++) {
+		if (!ApplyCsRegister(regs, offset + i, values[i])) return false;
+	}
+	cs.cs_regs = regs;
+	return true;
+}
+
+uint32_t ComputeLookahead::ScanCompute(HW::ComputeShaderInfo cs, std::span<const uint32_t> stream,
+                                       std::span<Dispatch> out) {
+	uint32_t found = 0;
+	uint32_t pos   = 0;
+	for (uint32_t packets = 0; pos < stream.size() && found < out.size() && packets < 256u; ++packets) {
+		const uint32_t header = stream[pos];
+		if (header == 0x80000000u) { // padding, as in ProcessPm4
+			++pos;
+			continue;
+		}
+		// Plain, unpredicated type-3 packets that fit in the window; anything else ends the scan.
+		if ((header >> 30u) != 3u || (header & 1u) != 0u || stream.size() - pos < 2u) break;
+		const uint32_t len = KYTY_PM4_LEN(header);
+		if (len < 2u || len > stream.size() - pos) break;
+		const uint32_t  opcode = (header >> 8u) & 0xffu;
+		const uint32_t* packet = stream.data() + pos;
+		bool            stop   = false;
+		switch (opcode) {
+			case Pm4::IT_SET_SH_REG: stop = !LookaheadApplyShRegs(cs, packet, len); break;
+			case Pm4::IT_DISPATCH_DIRECT: {
+				if (len != 5u) {
+					stop = true;
+					break;
+				}
+				const uint32_t mode  = packet[4];
+				cs.cs_regs.wave_size = Pm4::ComputeWaveSize(mode); // DispatchDirect does this first
+				if (cs.cs_regs.data_addr == 0 || packet[1] == 0 || packet[2] == 0 || packet[3] == 0) break;
+				auto& dispatch     = out[found++];
+				dispatch.offset_dw = pos;
+				dispatch.cs        = cs;
+				dispatch.groups    = {packet[1], packet[2], packet[3]};
+				if ((mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0) {
+					const uint32_t sizes[] = {cs.cs_regs.num_thread_x, cs.cs_regs.num_thread_y,
+					                          cs.cs_regs.num_thread_z};
+					for (uint32_t axis = 0; axis < 3u; ++axis) {
+						const auto size        = std::max(sizes[axis], 1u);
+						dispatch.groups[axis] = dispatch.groups[axis] / size + (dispatch.groups[axis] % size != 0u);
+					}
+				}
+				break;
+			}
+			// Packets that cannot change the compute registers. Memory they write is caught by the
+			// read check at adoption.
+			case Pm4::IT_DRAW_INDEX_AUTO:
+			case Pm4::IT_DRAW_INDEX_2:
+			case Pm4::IT_DRAW_INDEX_OFFSET_2:
+			case Pm4::IT_SET_CONTEXT_REG:
+			case Pm4::IT_SET_UCONFIG_REG:
+			case Pm4::IT_INDEX_TYPE:
+			case Pm4::IT_NUM_INSTANCES:
+			case Pm4::IT_INDEX_BASE:
+			case Pm4::IT_INDEX_BUFFER_SIZE:
+			case Pm4::IT_EVENT_WRITE:
+			case Pm4::IT_ACQUIRE_MEM:
+			case Pm4::IT_WRITE_DATA: break;
+			case Pm4::IT_NOP: stop = KYTY_PM4_R(header) != 0u; break; // custom R-coded NOPs end it
+			default: stop = true; break; // waits, indirect buffers, indirect SH writes, DMA, ...
+		}
+		if (stop) break;
+		pos += len;
+	}
+	return found;
 }
 
 KYTY_CP_OP_PARSER(CpOpDispatchDirect) {

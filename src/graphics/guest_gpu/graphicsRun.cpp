@@ -15,6 +15,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
+#include "graphics/host_gpu/renderer/pipeline/computeLookahead.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -613,6 +614,9 @@ void GuestGpu::WaitForIdle() {
 }
 
 namespace {
+// Draws and dispatches the GPU thread has processed (KYTY_DBG_QUEUE_TIME reports time per item).
+uint64_t g_work_items = 0;
+
 // KYTY_DBG_QUEUE_TIME=1: GPU-thread time spent processing each guest queue (0 = graphics,
 // 1.. = compute rings), printed every 5 s as NHL27QUEUES.
 struct QueueTimeScope {
@@ -635,7 +639,14 @@ struct QueueTimeScope {
 		if (now - last < std::chrono::seconds(5)) return;
 		const double seconds = std::chrono::duration<double>(now - last).count();
 		last = now;
-		std::string line = "NHL27QUEUES ms/s:";
+		uint64_t total_ns = 0;
+		for (const auto value: ns) total_ns += value;
+		static uint64_t last_items = 0;
+		const uint64_t  items      = g_work_items - last_items;
+		last_items                 = g_work_items;
+		std::string line = fmt::format("NHL27QUEUES items/s={:.0f} us/item={:.2f} ms/s:",
+		                               static_cast<double>(items) / seconds,
+		                               items != 0 ? static_cast<double>(total_ns) / 1e3 / static_cast<double>(items) : 0.0);
 		for (uint32_t i = 0; i < ns.size(); i++) {
 			if (slices[i] == 0) continue;
 			line += fmt::format(" q{}={:.1f}({:.0f})", i, static_cast<double>(ns[i]) / 1e6 / seconds,
@@ -658,7 +669,15 @@ void GuestGpu::ThreadRun(void* data) {
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
 
+	bool high_priority = false;
 	for (;;) {
+		// Experiment GpuThreadPriority: this thread limits the frame rate; guest threads that spin
+		// should not preempt it.
+		if (const bool want = Common::Experiments::Enabled(Common::Experiments::GpuThreadPriority);
+		    want != high_priority) {
+			Common::Thread::SetCurrentHighPriority(want);
+			high_priority = want;
+		}
 		Submission                   submission;
 		Common::UniqueFunction<void> command;
 		bool                         has_submission = false;
@@ -1244,6 +1263,10 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		}
 
 		BufferCache::PerfSetPm4Op(opcode);
+		if (opcode == Pm4::IT_DISPATCH_DIRECT && ComputeLookahead::Active() && declared_dw < remaining_dw) {
+			// Experiment ComputeLookahead: where the following dispatches start, for the worker.
+			ComputeLookahead::SetStream(guest_packet + declared_dw, remaining_dw - declared_dw);
+		}
 		uint32_t packet_dw;
 		{
 			FrameBreakdown::GpuBusyScope busy_scope(PacketBusyBucket(opcode));
@@ -1405,6 +1428,7 @@ uint32_t CommandProcessor::ResolveNumInstances() {
 }
 
 void CommandProcessor::DrawIndex(DrawIndexArgs args) {
+	++g_work_items;
 	ResolveNativeShaderRegisters();
 	args.index_type_and_size = m_index_type_and_size;
 	if (args.instance_count == 0) {
@@ -1422,6 +1446,7 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 }
 
 void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_count) {
+	++g_work_items;
 	uint64_t index_size = 0;
 	switch (m_index_type_and_size) {
 		case 0: index_size = 2; break;
@@ -1488,6 +1513,7 @@ void CommandProcessor::ResolveNativeShaderRegisters() {
 
 void CommandProcessor::DrawIndirect(uint32_t data_offset, IndirectDrawRegisters registers,
                                     uint32_t draw_initiator, bool indexed) {
+	++g_work_items;
 	const auto args_size = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
 	DrawIndirectMulti(data_offset, 1, nullptr, args_size, registers, draw_initiator, indexed);
 }
@@ -1496,6 +1522,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
                                          const volatile uint32_t* count_addr,
                                          uint32_t stride_in_bytes, IndirectDrawRegisters registers,
                                          uint32_t draw_initiator, bool indexed) {
+	++g_work_items;
 	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != (indexed ? 0u : 2u));
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
 
@@ -1637,6 +1664,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 
 void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y,
                                       uint32_t thread_group_z, uint32_t mode) {
+	++g_work_items;
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
 
 	uint32_t frame_num = 0;
@@ -1661,12 +1689,15 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 			}
 		}
 
+		ComputeLookahead::SetCurrent(&m_sh_ctx.GetCs());
 		m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
 		                                              thread_group_y, thread_group_z, mode);
+		ComputeLookahead::SetCurrent(nullptr);
 	}
 }
 
 void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
+	++g_work_items;
 	EXIT_NOT_IMPLEMENTED(args_addr == 0 || (args_addr & 3u) != 0);
 	if ((mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0) {
 		const auto* args = reinterpret_cast<const vk::DispatchIndirectCommand*>(args_addr);
@@ -1678,6 +1709,7 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 }
 
 void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
+	++g_work_items;
 	ResolveNativeShaderRegisters();
 	if (args.instance_count == 0) {
 		const bool from_pending = !m_pending_instances.empty();
