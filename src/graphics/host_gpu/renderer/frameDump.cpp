@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/shader.h"
 
+#include <cerrno>
 #include <set>
 #include <algorithm>
 #include <bit>
@@ -1063,6 +1064,10 @@ void BeginCapture(CommandBuffer& buffer) {
 		}
 	}
 	std::filesystem::create_directories(g_dir, ec);
+	if (ec || !std::filesystem::is_directory(g_dir)) {
+		std::printf("NHL27FRAMEDUMP: cannot create %s: %s (%d)\n", g_dir.c_str(), ec.message().c_str(),
+		            ec.value());
+	}
 	g_targets.clear();
 	g_pending.clear();
 	g_log.clear();
@@ -1115,6 +1120,8 @@ void FinishCapture(CommandBuffer& buffer) {
 	if (FILE* f = std::fopen((g_dir + "/frame.txt").c_str(), "wb")) {
 		std::fwrite(out.data(), 1, out.size(), f);
 		std::fclose(f);
+	} else {
+		std::printf("NHL27FRAMEDUMP: cannot write %s/frame.txt: errno %d\n", g_dir.c_str(), errno);
 	}
 	std::printf("NHL27FRAMEDUMP: done, %u draws/dispatches, %u images -> %s\n", g_seq, n, g_dir.c_str());
 	std::fflush(stdout);

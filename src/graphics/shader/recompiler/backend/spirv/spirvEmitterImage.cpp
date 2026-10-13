@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstdlib>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -968,7 +969,13 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		}
 		// Sampling takes only constant offsets in SPIR-V. A computed offset is dropped, as it was
 		// before offsets were emitted natively; NHL27 has such shaders.
-		const bool sample_offset = layout.offset != NoImageComponent && offset_value.IsImmediate();
+		// KYTY_DBG_SAMPLE_OFFSETS=0: drop all sample offsets, as before native offsets (bisect aid).
+		static const bool sample_offsets_enabled = [] {
+			const char* setting = std::getenv("KYTY_DBG_SAMPLE_OFFSETS");
+			return setting == nullptr || setting[0] != '0';
+		}();
+		const bool sample_offset = sample_offsets_enabled && layout.offset != NoImageComponent &&
+		                           offset_value.IsImmediate();
 		const auto sampler_id = LoadSamplerDescriptor(state, mem.sampler, sampler_index);
 		const auto EmitSample = [&](uint32_t resource, uint32_t array_index) {
 			const auto& candidate = state.program.info.images[resource];

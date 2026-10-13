@@ -1049,6 +1049,12 @@ void EnsureConfigInitialized(bool renderdoc = false, bool guest_memory = true) {
     options.renderdoc_enabled = renderdoc;
     // The checks drive the renderer and inspect its Vulkan command buffers synchronously.
     options.gpu_pipeline_stages = 0;
+    // Cover the opt-in BC alias resolution too.
+#ifdef _WIN32
+    _putenv_s("KYTY_BC_ALIAS", "1");
+#else
+    setenv("KYTY_BC_ALIAS", "1", 1);
+#endif
     Config::Load(options);
     subsystems.Initialize<Log::Lifecycle>();
     if (guest_memory) subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();

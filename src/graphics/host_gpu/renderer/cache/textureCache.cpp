@@ -1047,7 +1047,15 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 namespace BcAlias {
 
 bool Matches(const ImageInfo& requested, const ImageInfo& cached) {
-	return requested.guest_format != cached.guest_format &&
+	// KYTY_BC_ALIAS=1 (off by default): resolve block/non-block aliases by publishing and freeing
+	// one image. Off, compute writes to BC images go through their storage shadows; with both,
+	// NHL27's GPU-composited kit textures were freed before their shadows flushed and rendered
+	// as the uncoloured template.
+	static const bool enabled = [] {
+		const char* setting = std::getenv("KYTY_BC_ALIAS");
+		return setting != nullptr && setting[0] == '1';
+	}();
+	return enabled && requested.guest_format != cached.guest_format &&
 	       requested.IsBlock() != cached.IsBlock() &&
 	       requested.tile_mode == cached.tile_mode &&
 	       requested.bytes_per_block == cached.bytes_per_block &&
