@@ -33,9 +33,10 @@ enum Bit : uint32_t {
 	NativeFp16           = 1u << 23u, // KYTY_NATIVE_FP16 (default off; f16vec2 math for packed f16 ops, needs shaderFloat16)
 	FaultPageReads       = 1u << 24u, // KYTY_FAULT_PAGE_READS (default off; SRT reads of pages that faulted before use the backing)
 	GpuColorClear        = 1u << 26u, // KYTY_GPU_COLOR_CLEAR (default off; fast-clear checks of GPU-written metadata on the GPU)
-	ExecSelects          = 1u << 25u,
+	ExecSelects          = 1u << 25u, // KYTY_EXEC_SELECTS (default off; drop EXEC-mask selects nobody observes, part of shader keys)
 	PooledBdaBuffers     = 1u << 27u, // KYTY_POOLED_BDA_BUFFERS (default off; small device-address buffers share VMA blocks)
-	AsyncGuestReads      = 1u << 28u, // KYTY_ASYNC_GUEST_READS (default off; a guest thread waits for its own readback) // KYTY_EXEC_SELECTS (default off; drop EXEC-mask selects nobody observes, part of shader keys)
+	AsyncGuestReads      = 1u << 28u, // KYTY_ASYNC_GUEST_READS (default off; a guest thread waits for its own readback)
+	BdaDirtyRegions      = 1u << 29u, // KYTY_BDA_DIRTY_REGIONS (default off; BDA preparation syncs only CPU-written regions)
 	// A/B only (no environment variable): selects the code a pending change replaces.
 	AbLegacy = 1u << 31u,
 };

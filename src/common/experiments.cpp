@@ -55,6 +55,7 @@ uint32_t EnvironmentMask() {
 	set("KYTY_GPU_COLOR_CLEAR", GpuColorClear, false);
 	set("KYTY_POOLED_BDA_BUFFERS", PooledBdaBuffers, false);
 	set("KYTY_ASYNC_GUEST_READS", AsyncGuestReads, false);
+	set("KYTY_BDA_DIRTY_REGIONS", BdaDirtyRegions, false);
 	return mask;
 }
 

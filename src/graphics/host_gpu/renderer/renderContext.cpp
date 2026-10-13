@@ -241,10 +241,9 @@ void RenderContext::PrepareBda() {
 		const char* value = std::getenv("KYTY_PERF_STATS");
 		return value != nullptr && value[0] == '1';
 	}();
-	static const bool dirty_regions = [] {
-		const char* value = std::getenv("KYTY_BDA_DIRTY_REGIONS");
-		return value != nullptr && value[0] == '1' && value[1] == '\0';
-	}();
+	// KYTY_BDA_DIRTY_REGIONS (experiment bit, switchable while running: the dirty-region queue
+	// fills either way, and a full scan covers whatever it holds).
+	const bool dirty_regions = Common::Experiments::Enabled(Common::Experiments::BdaDirtyRegions);
 	FrameBreakdown::Add(FrameBreakdown::g_counters.bda_calls);
 	FrameBreakdown::Timer total_timer(FrameBreakdown::g_counters.bda_total_ns);
 	std::shared_lock<decltype(m_mapped_ranges_mutex)> lock;
