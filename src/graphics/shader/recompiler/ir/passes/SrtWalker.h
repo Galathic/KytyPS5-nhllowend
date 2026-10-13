@@ -5,6 +5,8 @@
 
 #include <array>
 #include <span>
+#include <utility>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -59,7 +61,21 @@ struct SrtRuntime {
 	ResourceDelta* delta = nullptr;
 };
 
-enum class RuntimeValueType { Any, Integer };
+class SrtReadCapture {
+public:
+	SrtReadCapture(SrtRuntime source, std::vector<std::pair<uint64_t, uint64_t>>& ranges):
+	    m_source(source), m_ranges(ranges) {}
+	SrtRuntime ObservedRuntime();
+
+private:
+	static bool ReadStrict(void* userdata, uint64_t address, std::span<uint32_t> values);
+	static bool ReadOrdinary(void* userdata, uint64_t address, std::span<uint32_t> values);
+
+	SrtRuntime                                  m_source;
+	std::vector<std::pair<uint64_t, uint64_t>>& m_ranges;
+};
+
+enum class RuntimeValueType { Any, Integer, ImmutableInteger };
 
 // Direct SRT reads (experiment DirectSrtReads, KYTY_DIRECT_SRT_READS): tests force them on (1),
 // off (0) or follow the experiment mask (-1, default).
@@ -67,6 +83,7 @@ void SetDirectSrtReadsOverride(int value);
 
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
                           RuntimeValueType type = RuntimeValueType::Any);
+void CompileSrtWalker(ResourcePlan& program);
 // Uses the strict reader for values that affect shader specialization.
 SrtRuntime CleanRuntime(SrtRuntime runtime);
 

@@ -324,17 +324,33 @@ struct PipelineCache::ProgramCache {
 	};
 
 	struct Permutation {
+		std::vector<uint32_t>                       function_code;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		ShaderRecompiler::IR::CompiledShaderInfo     program;
 		ShaderProgram                                handle;
 	};
 
 	struct SourceEntry {
-		explicit SourceEntry(ShaderRecompiler::IR::ResourcePlan plan)
-		    : resource_plan(std::move(plan)) {
+		SourceEntry(ShaderRecompiler::IR::ResourcePlan plan,
+		            std::unique_ptr<ShaderRecompiler::ShaderSource> call_source)
+		    : call_source(std::move(call_source)), resource_plan(std::move(plan)) {
 			permutations.reserve(8);
 		}
 
+		std::span<const uint32_t> FunctionCode() const {
+			return call_source
+			    ? std::span<const uint32_t>(call_source->linked->code).subspan(call_source->code.size())
+			    : std::span<const uint32_t>{};
+		}
+
+		bool RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime) {
+			const auto revision = call_source->revision;
+			ShaderRecompiler::RefreshShaderSource(*call_source, runtime);
+			resource_plan.source_reads = call_source->reads;
+			return revision != call_source->revision;
+		}
+
+		std::unique_ptr<ShaderRecompiler::ShaderSource> call_source;
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
@@ -372,7 +388,8 @@ struct PipelineCache::ProgramCache {
 	                               const ShaderRecompiler::CompileOptions&      options,
 	                               ShaderRecompiler::TranslateResult            translated,
 	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
-	                               uint32_t push_data_start_dword) {
+	                               uint32_t push_data_start_dword,
+	                               std::span<const uint32_t> function_code) {
 		// KYTY_PERF_STATS: shader permutation compile time (SPIR-V generation and module creation).
 		FrameBreakdown::Timer compile_timer(FrameBreakdown::g_counters.compile_ns);
 		FrameBreakdown::Add(FrameBreakdown::g_counters.compile_count);
@@ -392,6 +409,7 @@ struct PipelineCache::ProgramCache {
 			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
 		}
 		return {
+		    .function_code  = {function_code.begin(), function_code.end()},
 		    .specialization = std::move(specialization),
 		    .program        = std::move(result.program).TakeCompiledInfo(),
 		    .handle         = {.id = ++next_shader_id, .module = module},
@@ -513,7 +531,23 @@ struct PipelineCache::ProgramCache {
 			}
 			return allowed;
 		};
-		if (entry != nullptr) {
+		// A permutation matches the push-data slot, the specialization and, for shaders with a
+		// SWAPPC call, the callee code it was linked against.
+		const auto permutation_matches = [&](const SourceEntry& source, const Permutation& candidate) {
+			const auto& layout = candidate.program.bindings;
+			return layout.push_data_start_dword ==
+			           ShaderRecompiler::IR::PushData::StartFor(push_data_cursor,
+			                                                    layout.ShaderDataDwords()) &&
+			       candidate.specialization == source.specialization &&
+			       (!source.call_source ||
+			        std::ranges::equal(candidate.function_code, source.FunctionCode()));
+		};
+		bool source_changed = false;
+		if (entry != nullptr && entry->call_source) {
+			// The callee lives in guest memory; a changed callee retranslates the program below.
+			source_changed = entry->RefreshCallSource(runtime);
+		}
+		if (entry != nullptr && !source_changed) {
 			if (!check_native_plan(*entry)) return {};
 			bool reused = false;
 			if (!refresh(*entry, reused)) return {};
@@ -522,25 +556,17 @@ struct PipelineCache::ProgramCache {
 			if (memo_enabled && !reused) ++resource_misses[static_cast<size_t>(entry->resource_memo.LastMiss())];
 			if (reuse_enabled && entry->last_permutation < entry->permutations.size()) {
 				const auto& candidate = entry->permutations[entry->last_permutation];
-				const auto& layout = candidate.program.bindings;
-				if (layout.push_data_start_dword == ShaderRecompiler::IR::PushData::StartFor(
-				        push_data_cursor, layout.ShaderDataDwords()) &&
-				    candidate.specialization == entry->specialization) {
+				if (permutation_matches(*entry, candidate)) {
 					++permutation_hits;
 					input_info.stage = {.program = &candidate.program, .resources = &entry->resources};
-					layout.AdvancePushData(push_data_cursor);
+					candidate.program.bindings.AdvancePushData(push_data_cursor);
 					PrintStats(reuse_enabled);
 					return candidate.handle;
 				}
 			}
 			if (const auto permutation = std::ranges::find_if(
-			        entry->permutations, [&](const Permutation& candidate) {
-				        const auto& layout = candidate.program.bindings;
-				        return layout.push_data_start_dword ==
-				                   ShaderRecompiler::IR::PushData::StartFor(
-				                       push_data_cursor, layout.ShaderDataDwords()) &&
-				               candidate.specialization == entry->specialization;
-			        });
+			        entry->permutations,
+			        [&](const Permutation& candidate) { return permutation_matches(*entry, candidate); });
 			    permutation != entry->permutations.end()) {
 				entry->last_permutation = static_cast<size_t>(permutation - entry->permutations.begin());
 				input_info.stage = {.program   = &permutation->program,
@@ -597,26 +623,63 @@ struct PipelineCache::ProgramCache {
 			options.wave_size = input_info.wave_size;
 		}
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
-		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
+		ShaderRecompiler::ShaderSource source;
+		if (entry == nullptr) source = ShaderRecompiler::PrepareShaderSource(params.code, options);
+		auto* current = entry == nullptr ? &source : entry->call_source.get();
+		ShaderRecompiler::TranslateResult translated;
+		if (current != nullptr && current->call) {
+			if (entry == nullptr) ShaderRecompiler::RefreshShaderSource(*current, runtime);
+			translated = ShaderRecompiler::TranslateProgram(current->linked->decoded, options);
+			translated.program.source_reads = current->reads;
+		} else if (current != nullptr) {
+			translated = ShaderRecompiler::TranslateProgram(current->decoded, options);
+		} else {
+			translated = ShaderRecompiler::TranslateProgram(params.code, options);
+		}
 		if (translated.build_failed) {
 			// NHL debugging: KYTY_DBG_SKIP_BAD_SHADERS=1 turned the CFG failure into a skipped draw.
 			failed_shaders.emplace(params.hash, 0u);
 			return {};
 		}
 		if (entry == nullptr) {
+			auto retained = source.call
+			                    ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source))
+			                    : nullptr;
 			const auto found = programs.try_emplace(lookup_key,
-			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program)).first;
+			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program), std::move(retained)).first;
 			entry = &found->second;
 			last = {&found->first, entry};
 			if (!check_native_plan(*entry)) return {};
 			bool reused = false;
 			if (!refresh(*entry, reused)) return {};
 			++materializations;
+		} else if (source_changed) {
+			// New callee: the plan's reads changed, so every plan-derived memo starts over.
+			entry->resource_plan        = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+			entry->resource_memo        = ResourceMemo {};
+			entry->specialization_cache = {};
+			entry->delta                = {};
+			entry->native_plan_checked  = false;
+			entry->last_permutation     = std::numeric_limits<size_t>::max();
+			if (!check_native_plan(*entry)) return {};
+			bool reused = false;
+			if (!refresh(*entry, reused)) return {};
+			++materializations;
+			if (const auto permutation = std::ranges::find_if(
+			        entry->permutations,
+			        [&](const Permutation& candidate) { return permutation_matches(*entry, candidate); });
+			    permutation != entry->permutations.end()) {
+				entry->last_permutation = static_cast<size_t>(permutation - entry->permutations.begin());
+				input_info.stage = {.program = &permutation->program, .resources = &entry->resources};
+				permutation->program.bindings.AdvancePushData(push_data_cursor);
+				return permutation->handle;
+			}
 		}
 
         PipelineRecord::Program recorded;
         bool recording = record != nullptr && record->IsOpen() && replaying == nullptr &&
-                         PipelineRecord::IsRecordableStage(stage);
+                         PipelineRecord::IsRecordableStage(stage) &&
+                         !entry->call_source;
         if (recording) {
             recorded.stage = stage; recorded.hash = params.hash;
             recorded.shader_base = params.Base(); recorded.push_data_cursor = push_data_cursor;
@@ -643,7 +706,8 @@ struct PipelineCache::ProgramCache {
                         captured_specialization == entry->specialization;
         }
         entry->permutations.push_back(CompilePermutation(
-		    stage_name, options, std::move(translated), entry->specialization, push_data_cursor));
+		    stage_name, options, std::move(translated), entry->specialization, push_data_cursor,
+		    entry->FunctionCode()));
 		entry->last_permutation = entry->permutations.size() - 1;
 		const auto& permutation = entry->permutations.back();
         if (recording) ordinals[permutation.handle.id] = record->AppendProgram(recorded);
@@ -1223,6 +1287,13 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 			return flag != nullptr && flag[0] == '1';
 		}();
 		pixel_info.pixel_quad_correct = quad_enabled && m_graphics.pixel_quad_supported;
+		if (!mesh_active && !tess_active && Prospero::IsRectList(user_config.GetPrimType())) {
+			pixel_info.parameter_mode = ShaderPixelParameterMode::Rectangle;
+		} else if (context.GetModeControl().provoking_vtx_last) {
+			pixel_info.parameter_mode = ShaderPixelParameterMode::LastVertex;
+		} else {
+			pixel_info.parameter_mode = ShaderPixelParameterMode::FirstVertex;
+		}
 		const auto& blend = context.GetBlendControl(0);
 		pixel_info.dual_source_blending =
 		    blend.enable && !context.GetRenderTarget(0).info.blend_bypass &&

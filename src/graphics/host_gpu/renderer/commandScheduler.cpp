@@ -1257,6 +1257,7 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	} else {
 		m_command.Begin();
 	}
+	m_dynamic_state.Invalidate();
 	m_trace_slot = GpuTraceBegin(m_graphics, m_command.m_buffer);
 	return m_command;
 }

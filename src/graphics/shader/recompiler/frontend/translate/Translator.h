@@ -23,14 +23,15 @@ struct Fp16Coverage {
 class Translator {
 public:
 	Translator(IR::Program& program, IR::Block* block, uint32_t vector_limit,
-	           bool flush_f32_inputs, Fp16Coverage* fp16_coverage = nullptr)
+	           bool flush_f32_inputs, bool graphics_compute, Fp16Coverage* fp16_coverage = nullptr)
 	    : program(program), ir(block), current_vector_limit(vector_limit),
-	      flush_f32_inputs(flush_f32_inputs), fp16_coverage(fp16_coverage) {}
+	      flush_f32_inputs(flush_f32_inputs), graphics_compute(graphics_compute), fp16_coverage(fp16_coverage) {}
 
 	void TranslateInstruction(const Decoder::Instruction& inst);
 	void TranslateEmbeddedFetch(const Decoder::Instruction& inst, uint32_t attribute,
 	                            uint32_t component_count, const ShaderBufferResource& resource);
-	void AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlock& source, IR::BlockInfo& info);
+	void AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlock& source,
+	                        IR::Block& info);
 
 private:
 	const Decoder::Operand& SourceAt(const Decoder::Instruction& inst, uint32_t index);
@@ -134,12 +135,13 @@ private:
 	void EmitCompareResult(const Decoder::Instruction& inst, IR::U1 value, bool scalar, bool cmpx);
 	void EmitCompareConstant(const Decoder::Instruction& inst, bool value, bool scalar, bool cmpx);
 	void EmitIntegerCompare(const Decoder::Instruction& inst, IR::ValueOpcode opcode, IR::Type type,
-	                        bool scalar, bool cmpx);
+	                        bool scalar, bool cmpx, bool swap_operands = false);
 	void EmitInteger16Compare(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
 	                          bool signed_value, bool cmpx);
 	void EmitFloatCompare(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool half,
 	                      bool cmpx);
-	void EmitFloatOrderedCompare(const Decoder::Instruction& inst, bool ordered, bool cmpx);
+	void EmitFloatOrderedCompare(const Decoder::Instruction& inst, bool ordered, bool cmpx,
+	                             bool is64 = false);
 	void EmitFloatClassCompare(const Decoder::Instruction& inst, bool cmpx, bool half = false);
 	void V_CVT_F32_UBYTE(const Decoder::Instruction& inst, uint32_t byte_index);
 	void V_CVT_F32_U32(const Decoder::Instruction& inst);
@@ -202,7 +204,7 @@ private:
 	void V_AND_OR_B32(const Decoder::Instruction& inst);
 	void V_OR3_B32(const Decoder::Instruction& inst);
 	void V_XOR3_B32(const Decoder::Instruction& inst);
-	void S_FF1_I32_B64(const Decoder::Instruction& inst);
+	void S_FF_I32_B64(const Decoder::Instruction& inst, bool find_zero);
 	void V_FFBH_32(const Decoder::Instruction& inst, bool sign);
 	void S_FLBIT_I32_B64(const Decoder::Instruction& inst);
 	void Integer24(const Decoder::Instruction& inst, bool sign, bool addend);
@@ -282,6 +284,7 @@ private:
 	uint32_t        current_pc           = 0;
 	uint32_t        current_vector_limit = 1;
 	bool            flush_f32_inputs;
+	bool            graphics_compute;
 	Fp16Coverage*   fp16_coverage = nullptr;
 	bool            fp16_native   = false;
 };

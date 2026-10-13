@@ -687,7 +687,8 @@ void Translator::IMAGE_SAMPLE(const Decoder::Instruction& inst) {
 	const auto resource = GetImageResource(memory);
 	const auto sampler  = GetSamplerResource(memory);
 	const auto address  = MakeImageAddress(inst, MemorySourceAt(inst, 0));
-	const auto result   = ir.Emit(IR::ValueOpcode::ImageSampleRaw, {resource, sampler, address},
+	const auto result   = ir.Emit(IR::ValueOpcode::ImageSampleRaw,
+	                              {resource, sampler, address, ir.GetExec()},
 	                              AddMemoryInfo(memory, inst.pc));
 	const bool dref     = (memory.image_sample_flags & Decoder::ImageSampleFlagCompare) != 0u;
 	if (dref && memory.data_bits != 16u) {
@@ -714,7 +715,7 @@ void Translator::IMAGE_GATHER(const Decoder::Instruction& inst) {
 	     has_lod ? resource.Instruction()->Arg(1) : IR::Value(0u),
 	     has_lod ? resource.Instruction()->Arg(3) : IR::Value(0u),
 	     has_lod ? sampler.Instruction()->Arg(1) : IR::Value(0u),
-	     has_lod ? sampler.Instruction()->Arg(2) : IR::Value(0u)},
+	     has_lod ? sampler.Instruction()->Arg(2) : IR::Value(0u), ir.GetExec()},
 	    AddMemoryInfo(memory, inst.pc));
 	for (uint32_t index = 0; index < memory.data_dwords; index++) {
 		WriteOperand(OffsetOperand(inst.dst, index),
@@ -973,6 +974,8 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::BUFFER_LOAD_SBYTE:
 		case Decoder::Opcode::BUFFER_LOAD_USHORT:
 		case Decoder::Opcode::BUFFER_LOAD_SSHORT:
+		case Decoder::Opcode::BUFFER_LOAD_SHORT_D16:
+		case Decoder::Opcode::BUFFER_LOAD_SHORT_D16_HI:
 		case Decoder::Opcode::BUFFER_LOAD_DWORD:
 		case Decoder::Opcode::BUFFER_LOAD_DWORDX2:
 		case Decoder::Opcode::BUFFER_LOAD_DWORDX3:

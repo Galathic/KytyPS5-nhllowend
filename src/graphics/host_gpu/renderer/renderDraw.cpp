@@ -323,72 +323,11 @@ static void LogDrawInputState(const CommandBuffer& buffer, const RenderColorInfo
 	}
 }
 
-// KYTY_PIPELINE_MEMO: last value passed to every dynamic-state command of SetGraphicsDynamicParams. A slot is
-// only consulted while the very same graphics pipeline stays bound in the same command-buffer recording (see
-// the invalidation rules at the call site), so a command whose arguments are bit-identical to the previous one
-// would re-set exactly the state the command buffer already holds. Conditional commands (depth bounds, depth
-// bias, stencil) update their slot only when they are issued, so the slot always mirrors the last value set.
-constexpr uint32_t kDynViewportSlots = std::size(HW::ScreenViewport {}.viewports);
-template <typename T>
-struct DynSlot {
-	static_assert(std::is_trivially_copyable_v<T>);
-	bool valid = false;
-	T    value {};
-};
-struct DynViewports {
-	uint32_t                                  count = 0;
-	std::array<vk::Viewport, kDynViewportSlots> items {};
-};
-struct DynScissors {
-	uint32_t                                count = 0;
-	std::array<vk::Rect2D, kDynViewportSlots> items {};
-};
-struct DynDepthBias {
-	float constant = 0.0f, clamp = 0.0f, slope = 0.0f;
-};
-struct DynDepthBounds {
-	float min = 0.0f, max = 0.0f;
-};
-struct DynColorWrite {
-	uint32_t   count = 0;
-	vk::Bool32 enable[RENDER_COLOR_ATTACHMENTS_MAX] = {};
-};
-struct GfxDynMemo {
-	DynSlot<DynViewports>           viewports;
-	DynSlot<DynScissors>            scissors;
-	DynSlot<float>                  line_width;
-	DynSlot<std::array<float, 4>>   blend;
-	DynSlot<vk::Bool32>             depth_test, depth_write, depth_bounds_enable, depth_bias_enable, stencil_test;
-	DynSlot<vk::CompareOp>          depth_compare;
-	DynSlot<DynDepthBounds>         depth_bounds;
-	DynSlot<DynDepthBias>           depth_bias;
-	DynSlot<vk::StencilOpState>     stencil_front, stencil_back;
-	DynSlot<DynColorWrite>          color_write;
-};
-// True when the command must be issued (and records the value as the new mirror); counts issued / skipped.
-template <typename T>
-static bool DynNeedsSet(DynSlot<T>* slot, const T& value) {
-	if (slot != nullptr) {
-		if (slot->valid && std::memcmp(&slot->value, &value, sizeof(T)) == 0) {
-			FrameBreakdown::VAdd(FrameBreakdown::g_pl.dyn_cmds_skipped);
-			return false;
-		}
-		slot->valid = true;
-		slot->value = value;
-	}
-	FrameBreakdown::VAdd(FrameBreakdown::g_pl.dyn_cmds);
-	return true;
-}
-
-static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuffer vk_buffer,
-                                     const ShaderVertexInputInfo& vs_input_info,
-                                     const RenderDepthInfo& depth, const RenderState& rendering,
-                                     GfxDynMemo* memo = nullptr) {
+static void UpdateGraphicsDynamicState(const CommandBuffer& buffer, DynamicState& dynamic_state,
+                                       const ShaderVertexInputInfo& vs_input_info,
+                                       const RenderDepthInfo& depth, const RenderState& rendering) {
 	KYTY_PROFILER_FUNCTION();
 	FrameBreakdown::VAdd(FrameBreakdown::g_pl.dyn_calls);
-	const auto slot = [memo](auto GfxDynMemo::*field) {
-		return memo != nullptr ? &(memo->*field) : nullptr;
-	};
 
 	const auto& ctx = buffer.GetRegisters();
 	const auto&        vp  = ctx.GetScreenViewport();
@@ -431,20 +370,8 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 			scissor.extent = {0, 0};
 		}
 	}
-	{
-		DynViewports vp_state {};
-		vp_state.count = viewport_count;
-		vp_state.items = viewports;
-		if (DynNeedsSet(slot(&GfxDynMemo::viewports), vp_state)) {
-			vk_buffer.setViewportWithCount(viewport_count, viewports.data());
-		}
-		DynScissors sc_state {};
-		sc_state.count = viewport_count;
-		sc_state.items = scissors;
-		if (DynNeedsSet(slot(&GfxDynMemo::scissors), sc_state)) {
-			vk_buffer.setScissorWithCount(viewport_count, scissors.data());
-		}
-	}
+	dynamic_state.SetViewports(std::span {viewports}.first(viewport_count));
+	dynamic_state.SetScissors(std::span {scissors}.first(viewport_count));
 
 	float line_width = ctx.GetLineWidth();
 	if (line_width != 1.0f) {
@@ -457,35 +384,17 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 		}
 		line_width = 1.0f;
 	}
-	if (DynNeedsSet(slot(&GfxDynMemo::line_width), line_width)) {
-		vk_buffer.setLineWidth(line_width);
-	}
+	dynamic_state.SetLineWidth(line_width);
 	const auto&      blend = ctx.GetBlendColor();
 	const std::array blend_constants {blend.red, blend.green, blend.blue, blend.alpha};
-	if (DynNeedsSet(slot(&GfxDynMemo::blend), blend_constants)) {
-		vk_buffer.setBlendConstants(blend_constants.data());
-	}
-	const vk::Bool32 depth_test_enable  = depth.depth_test_enable ? VK_TRUE : VK_FALSE;
-	const vk::Bool32 depth_write_enable = depth.depth_write_enable ? VK_TRUE : VK_FALSE;
-	if (DynNeedsSet(slot(&GfxDynMemo::depth_test), depth_test_enable)) {
-		vk_buffer.setDepthTestEnable(depth_test_enable);
-	}
-	if (DynNeedsSet(slot(&GfxDynMemo::depth_write), depth_write_enable)) {
-		vk_buffer.setDepthWriteEnable(depth_write_enable);
-	}
-	if (DynNeedsSet(slot(&GfxDynMemo::depth_compare), depth.depth_compare_op)) {
-		vk_buffer.setDepthCompareOp(depth.depth_compare_op);
-	}
+	dynamic_state.SetBlendConstants(blend_constants);
+	dynamic_state.SetDepthTestEnabled(depth.depth_test_enable);
+	dynamic_state.SetDepthWriteEnabled(depth.depth_write_enable);
+	dynamic_state.SetDepthCompareOp(depth.depth_compare_op);
 #if !defined(__APPLE__)
-	const vk::Bool32 depth_bounds_enable = depth.depth_bounds_test_enable ? VK_TRUE : VK_FALSE;
-	if (DynNeedsSet(slot(&GfxDynMemo::depth_bounds_enable), depth_bounds_enable)) {
-		vk_buffer.setDepthBoundsTestEnable(depth_bounds_enable);
-	}
+	dynamic_state.SetDepthBoundsTestEnabled(depth.depth_bounds_test_enable);
 	if (depth.depth_bounds_test_enable) {
-		const DynDepthBounds bounds {ctx.GetDepthBoundsMin(), ctx.GetDepthBoundsMax()};
-		if (DynNeedsSet(slot(&GfxDynMemo::depth_bounds), bounds)) {
-			vk_buffer.setDepthBounds(bounds.min, bounds.max);
-		}
+		dynamic_state.SetDepthBounds(ctx.GetDepthBoundsMin(), ctx.GetDepthBoundsMax());
 	}
 #endif
 
@@ -494,10 +403,7 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 	const bool  use_front         = mode.poly_offset_front_enable && !mode.cull_front;
 	const bool  use_back          = mode.poly_offset_back_enable && !mode.cull_back;
 	const bool  depth_bias_enable = use_front || use_back;
-	const vk::Bool32 depth_bias_enable_value = depth_bias_enable ? VK_TRUE : VK_FALSE;
-	if (DynNeedsSet(slot(&GfxDynMemo::depth_bias_enable), depth_bias_enable_value)) {
-		vk_buffer.setDepthBiasEnable(depth_bias_enable_value);
-	}
+	dynamic_state.SetDepthBiasEnabled(depth_bias_enable);
 	if (depth_bias_enable) {
 		// Vulkan has one bias for both faces. Prefer a visible front face when both are enabled.
 		const float guest_constant_factor =
@@ -506,29 +412,18 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 		    guest_constant_factor, poly_offset, depth.desc.view_info.format);
 		const float slope_factor =
 		    (use_front ? poly_offset.front_scale : poly_offset.back_scale) / 16.0f;
-		const DynDepthBias bias {constant_factor, poly_offset.clamp, slope_factor};
-		if (DynNeedsSet(slot(&GfxDynMemo::depth_bias), bias)) {
-			vk_buffer.setDepthBias(constant_factor, poly_offset.clamp, slope_factor);
-		}
+		dynamic_state.SetDepthBias(constant_factor, poly_offset.clamp, slope_factor);
 	}
 
-	const vk::Bool32 stencil_test_enable = depth.stencil_test_enable ? VK_TRUE : VK_FALSE;
-	if (DynNeedsSet(slot(&GfxDynMemo::stencil_test), stencil_test_enable)) {
-		vk_buffer.setStencilTestEnable(stencil_test_enable);
-	}
+	dynamic_state.SetStencilTestEnabled(depth.stencil_test_enable);
 	if (depth.stencil_test_enable) {
-		const auto set_stencil = [&](vk::StencilFaceFlagBits face, const vk::StencilOpState& state,
-		                             DynSlot<vk::StencilOpState>* face_slot) {
-			if (!DynNeedsSet(face_slot, state)) {
-				return;
-			}
-			vk_buffer.setStencilOp(face, state.failOp, state.passOp, state.depthFailOp, state.compareOp);
-			vk_buffer.setStencilCompareMask(face, state.compareMask);
-			vk_buffer.setStencilWriteMask(face, state.writeMask);
-			vk_buffer.setStencilReference(face, state.reference);
-		};
-		set_stencil(vk::StencilFaceFlagBits::eFront, depth.stencil_front, slot(&GfxDynMemo::stencil_front));
-		set_stencil(vk::StencilFaceFlagBits::eBack, depth.stencil_back, slot(&GfxDynMemo::stencil_back));
+		const auto& front = depth.stencil_front;
+		const auto& back  = depth.stencil_back;
+		dynamic_state.SetStencilOps({front.failOp, front.passOp, front.depthFailOp, front.compareOp},
+		                            {back.failOp, back.passOp, back.depthFailOp, back.compareOp});
+		dynamic_state.SetStencilCompareMasks(front.compareMask, back.compareMask);
+		dynamic_state.SetStencilWriteMasks(front.writeMask, back.writeMask);
+		dynamic_state.SetStencilReferences(front.reference, back.reference);
 	}
 
 #if defined(__APPLE__)
@@ -539,14 +434,7 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 	for (uint32_t slot = 0; slot < rendering.num_color_attachments; slot++) {
 		enable[slot] = rendering.color_attachments[slot].image_view != nullptr;
 	}
-	if (rendering.num_color_attachments != 0) {
-		DynColorWrite write_state {};
-		write_state.count = rendering.num_color_attachments;
-		std::memcpy(write_state.enable, enable, sizeof(enable));
-		if (DynNeedsSet(slot(&GfxDynMemo::color_write), write_state)) {
-			vk_buffer.setColorWriteEnableEXT(rendering.num_color_attachments, enable);
-		}
-	}
+	dynamic_state.SetColorWriteEnables(std::span {enable}.first(rendering.num_color_attachments));
 #endif
 }
 
@@ -1414,8 +1302,63 @@ struct GfxBindState {
 	uint64_t          tick  = 0;
 	uint64_t          epoch = 0;
 	vk::Pipeline      pipeline {};
-	GfxDynMemo        dyn;
 };
+
+bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo& draw,
+                                       const DrawEmitInfo& emit, DrawRenderState& state) {
+	if (!buffer.GetRegisters().GetRenderControl().copy_depth_to_color) {
+		return false;
+	}
+	auto& ucfg = buffer.GetUserConfig();
+	const auto& hw = buffer.GetRegisters();
+	auto& depth = state.depth_info;
+	auto& color = state.color_info[0];
+	EXIT_NOT_IMPLEMENTED(!m_context.GetGraphics().depth_color_copy_enabled ||
+	                     !Prospero::IsRectList(ucfg.GetPrimType()) ||
+	                     draw.IsIndexed() || draw.index_count != 3 || draw.instance_count != 1 ||
+	                     emit.first_vertex != 0 || emit.first_instance != 0 ||
+	                     state.color_count != 1 || color.target_slot != 0 || !depth.image_id ||
+	                     color.desc.info.samples != 1 ||
+	                     depth.desc.info.extent.width != color.Extent().width ||
+	                     depth.desc.info.extent.height != color.Extent().height ||
+	                     depth.desc.view_info.layer_count != 1 ||
+	                     color.desc.view_info.layer_count != 1 ||
+	                     hw.GetBlendControl(0).enable || state.ps_input_info.ps_pixel_kill_enable ||
+	                     state.ps_input_info.ps_depth_export_enable ||
+	                     state.ps_input_info.ps_sample_mask_export_enable);
+	vk::ImageAspectFlags feedback;
+	const auto rendering = AcquireRenderTargets(buffer, &color, 1, depth, feedback);
+	if (depth.depth_load_clear_enable) {
+		m_context.GetCommandScheduler().BeginRendering(rendering);
+	}
+	auto& cache = m_context.GetTextureCache();
+	auto& source = cache.GetImage(depth.image_id);
+	auto& destination = cache.GetImage(color.image_id);
+	EXIT_NOT_IMPLEMENTED((source.backing.format != vk::Format::eD32Sfloat &&
+	                      source.backing.format != vk::Format::eD32SfloatS8Uint) ||
+	                     destination.backing.format != vk::Format::eR32Sfloat);
+	const auto rect = calc_final_scissor(hw.GetScreenViewport(), hw.GetScanModeControl(),
+	                                    {rendering.width, rendering.height}, 0);
+	if (rect.right > rect.left && rect.bottom > rect.top) {
+		const vk::ImageCopy region {
+		    {vk::ImageAspectFlagBits::eDepth, depth.desc.view_info.base_level,
+		     depth.desc.view_info.base_layer, 1}, {rect.left, rect.top, 0},
+		    {vk::ImageAspectFlagBits::eColor, color.desc.view_info.base_level,
+		     color.desc.view_info.base_layer, 1}, {rect.left, rect.top, 0},
+		    {static_cast<uint32_t>(rect.right - rect.left),
+		     static_cast<uint32_t>(rect.bottom - rect.top), 1}};
+		m_context.GetCommandScheduler().EndRendering();
+		const auto command = buffer.Handle();
+		source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
+		               {}, command);
+		destination.Transit(vk::ImageLayout::eTransferDstOptimal,
+		                    vk::AccessFlagBits2::eTransferWrite, {}, command);
+		command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
+		                  destination.backing.image, vk::ImageLayout::eTransferDstOptimal,
+		                  1, &region);
+	}
+	return true;
+}
 
 void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
                                          const DrawCallInfo& draw, DrawRenderState& state,
@@ -1424,6 +1367,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	                                     bool primitive_restart_enable) {
 	BufferCache::PerfTimerScope phase_timer(BufferCache::PerfTimer::DrawExecute);
 	auto& ucfg = buffer.GetUserConfig();
+	if (CopyDepthToColor(buffer, draw, emit, state)) {
+		return;
+	}
 	const auto vertex_stages =
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
 	const bool mesh_active = state.vertex_info[0].stage.program->stage == ShaderType::Mesh;
@@ -1614,10 +1560,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// KYTY_PIPELINE_MEMO. The pipeline bound by this path is remembered together with the recording it was bound
 	// in: (VkCommandBuffer, scheduler tick, graphics epoch). The tick advances on every submit, so a recycled
 	// VkCommandBuffer handle never matches; every other graphics bind in the renderer (blit helper) bumps
-	// g_graphics_pipeline_epoch. While the same pipeline is still the bound one, binding it again is a no-op,
-	// and the dynamic-state values this path set last are still the command buffer's values (nothing else
-	// issues those commands in a recording without bumping the epoch), so identical re-sets can be dropped.
-	// The dynamic-state mirror is cleared whenever it is not used, so it never survives a flag toggle.
+	// g_graphics_pipeline_epoch. While the same pipeline is still the bound one, binding it again is a no-op.
 	static GfxBindState gfx_bound;
 	const bool pipeline_memo = Common::RuntimeFlags::Current().pipeline_memo;
 	const uint64_t gfx_tick  = m_context.GetCommandScheduler().CurrentTick();
@@ -1625,24 +1568,27 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	const bool same_bound = gfx_bound.cmd == vk_buffer && gfx_bound.tick == gfx_tick &&
 	                        gfx_bound.epoch == gfx_epoch && gfx_bound.pipeline == pipeline.pipeline &&
 	                        pipeline.pipeline != vk::Pipeline {};
+	// The blit helper sets viewport and scissor directly and bumps the epoch; the tracked
+	// dynamic state no longer mirrors the command buffer after it.
+	const bool foreign_state = gfx_bound.epoch != gfx_epoch;
 	gfx_bound.cmd      = vk_buffer;
 	gfx_bound.tick     = gfx_tick;
 	gfx_bound.epoch    = gfx_epoch;
 	gfx_bound.pipeline = pipeline.pipeline;
-	if (!(same_bound && pipeline_memo)) {
-		gfx_bound.dyn = GfxDynMemo {};
-	}
 	if (same_bound) {
 		FrameBreakdown::VAdd(FrameBreakdown::g_pl.bind_same);
 	}
 
 	{
 		FrameBreakdown::Timer dyn_timer(FrameBreakdown::g_pl.dyn_ns, FrameBreakdown::Verbose());
-		SetGraphicsDynamicParams(buffer, vk_buffer, vertex_stages.back(), state.depth_info, rendering,
-		                         same_bound && pipeline_memo ? &gfx_bound.dyn : nullptr);
-		if (m_context.GetGraphics().attachment_feedback_loop_enabled) {
-			vk_buffer.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
+		auto& dynamic_state = m_context.GetCommandScheduler().GetDynamicState();
+		if (foreign_state) {
+			dynamic_state.Invalidate();
 		}
+		UpdateGraphicsDynamicState(buffer, dynamic_state, vertex_stages.back(), state.depth_info,
+		                           rendering);
+		dynamic_state.SetAttachmentFeedbackLoopAspects(feedback_aspects);
+		dynamic_state.Commit(m_context.GetGraphics(), vk_buffer);
 	}
 
 	commit_section.Stop();
@@ -1976,10 +1922,10 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	             : ResolveDrawOffsets(ucfg.GetIndexOffset(), state.vertex_info[0]);
 
 	DrawEmitInfo emit {};
-	// Native mesh prologs consume the offsets written to the packet's user SGPRs.
-	const bool mesh_indirect = indirect && state.vertex_info[0].logical_stage == ShaderType::Mesh;
-	emit.vertex_offset  = mesh_indirect ? 0 : vertex_offset + args.base_vertex;
-	emit.first_instance = mesh_indirect ? 0 : instance_offset;
+	// Native fetches consume the patched SGPRs; rewritten fetches need Vulkan offsets.
+	const bool native_indirect = indirect && !state.vertex_info[0].fetch_embedded;
+	emit.vertex_offset  = native_indirect ? 0 : vertex_offset + args.base_vertex;
+	emit.first_instance = native_indirect ? 0 : instance_offset;
 
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
 	                    primitive_restart);
@@ -2069,10 +2015,10 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	    indirect ? std::pair<int32_t, uint32_t> {0, args.first_instance}
 	             : ResolveDrawOffsets(ucfg.GetIndexOffset(), state.vertex_info[0]);
 	DrawEmitInfo emit {};
-	const bool mesh_indirect = indirect && state.vertex_info[0].logical_stage == ShaderType::Mesh;
-	emit.first_vertex = mesh_indirect ? 0 :
+	const bool native_indirect = indirect && !state.vertex_info[0].fetch_embedded;
+	emit.first_vertex = native_indirect ? 0 :
 	    static_cast<uint32_t>(vertex_offset + static_cast<int32_t>(args.first_vertex));
-	emit.first_instance = mesh_indirect ? 0 : instance_offset;
+	emit.first_instance = native_indirect ? 0 : instance_offset;
 
 	DrawIndexBufferSource index_source {};
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source, false);

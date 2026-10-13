@@ -6,7 +6,6 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
-#include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/shader.h"
 
 #include <set>
@@ -241,8 +240,8 @@ void CaptureBindings(const PreparedBindings& b, uint32_t seq, uint64_t ps_hash) 
 		// SRT: the flattened_srt buffer bound at binding NativeBinding(stage, FlattenedSrt) (= 109 for PS).
 		const uint32_t srt_binding = ShaderRecompiler::IR::NativeBinding(
 		    prog.stage, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt);
-		const bool srt_bound = ShaderRecompiler::IR::FindBinding(
-		                           prog.bindings, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) != nullptr;
+		const bool srt_bound = prog.bindings.descriptor_counts[static_cast<size_t>(
+		                           ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt)] != 0;
 		if (!srt_bound) {
 			std::snprintf(line, sizeof(line), "SRT %05u ps=0x%016" PRIx64 " binding=%u not bound\n", seq, ps_hash,
 			              srt_binding);

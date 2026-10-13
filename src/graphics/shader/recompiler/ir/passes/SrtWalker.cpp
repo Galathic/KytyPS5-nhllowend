@@ -1,5 +1,6 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
+#include "common/abi.h"
 #include "common/assert.h"
 #include "common/experiments.h"
 #include "common/runtimeFlags.h"
@@ -8,6 +9,8 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceFixture.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/SrtProf.h"
+
+#include <xbyak/xbyak.h>
 
 #include <algorithm>
 #include <bit>
@@ -26,6 +29,34 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
+SrtRuntime SrtReadCapture::ObservedRuntime() {
+	auto runtime = m_source;
+	runtime.userdata = this;
+	runtime.read_specialization_memory = m_source.read_specialization_memory != nullptr
+	                                         ? ReadStrict : nullptr;
+	runtime.read_memory = ReadOrdinary;
+	return runtime;
+}
+
+bool SrtReadCapture::ReadStrict(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	auto& capture = *static_cast<SrtReadCapture*>(userdata);
+	if (!capture.m_source.read_specialization_memory(capture.m_source.userdata, address, values)) {
+		return false;
+	}
+	capture.m_ranges.emplace_back(address, values.size_bytes());
+	return true;
+}
+
+bool SrtReadCapture::ReadOrdinary(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	auto& capture = *static_cast<SrtReadCapture*>(userdata);
+	if (capture.m_source.read_memory != nullptr) {
+		if (!capture.m_source.read_memory(capture.m_source.userdata, address, values)) return false;
+	} else {
+		std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
+	}
+	capture.m_ranges.emplace_back(address, values.size_bytes());
+	return true;
+}
 SrtRuntime CleanRuntime(SrtRuntime runtime) {
 	runtime.try_read_memory_span = runtime.try_read_specialization_span;
 	runtime.read_memory = runtime.read_specialization_memory != nullptr
@@ -537,7 +568,7 @@ private:
 	bool Validate(Value value, bool require_uniform = true) {
 		value = value.Resolve();
 		// Host floating-point evaluation does not model shader rounding/denormal modes.
-		if (m_type == RuntimeValueType::Integer &&
+		if (m_type != RuntimeValueType::Any &&
 		    TypesOverlap(value.GetType(), Type::F16 | Type::F32 | Type::F32x2)) {
 			return false;
 		}
@@ -575,6 +606,13 @@ private:
 			return valid;
 		};
 		const auto op = inst->GetOpcode();
+		if (m_type == RuntimeValueType::ImmutableInteger &&
+		    (op == ValueOpcode::ReadConst || BufferAccessOf(op) != BufferAccess::None ||
+		     AddressOpcodeInfoOf(op).access != AddressAccess::None ||
+		     ImageOpcodeInfoOf(op).access != ImageAccess::None ||
+		     SharedAccessOf(op) != SharedAccess::None)) {
+			return finish(false);
+		}
 		if (op == ValueOpcode::ReadConst) {
 			const auto slot = inst->NumArgs() == 2 ? inst->Arg(1).Resolve() : Value {};
 			if (inst->NumArgs() != 2 || inst->Arg(0).Resolve().TryInstruction() == nullptr ||
@@ -584,7 +622,7 @@ private:
 			    slot.U32() >= m_program.srt_reads.size()) {
 				return finish(false);
 			}
-			if (m_type == RuntimeValueType::Integer) {
+			if (m_type != RuntimeValueType::Any) {
 				const auto active_mask = m_active_mask;
 				m_active_mask          = {};
 				const bool valid       = Validate(m_program.srt_reads[slot.U32()].value);
@@ -596,7 +634,7 @@ private:
 		if (!m_active_mask.IsEmpty() && IsRuntimeSelect(op) && inst->NumArgs() == 3 &&
 		    inst->Arg(0).Resolve() == m_active_mask) {
 			// Empty EXEC reads lane zero, so ignored operands still require integer types.
-			if (m_type == RuntimeValueType::Integer && !Validate(inst->Arg(2), false)) {
+			if (m_type != RuntimeValueType::Any && !Validate(inst->Arg(2), false)) {
 				return finish(false);
 			}
 			return finish(Validate(inst->Arg(1)));
@@ -624,7 +662,7 @@ private:
 			return finish(true);
 		}
 		if (op == ValueOpcode::Phi) {
-			if (m_type == RuntimeValueType::Integer && !ValidateArguments(*inst, false)) {
+			if (m_type != RuntimeValueType::Any && !ValidateArguments(*inst, false)) {
 				return finish(false);
 			}
 			const auto invariant = ResolveInvariantPhi(m_program, value);
@@ -638,7 +676,7 @@ private:
 			    inst->Arg(1).GetType() != Type::U1) {
 				return finish(false);
 			}
-			if (m_type == RuntimeValueType::Integer && !Validate(inst->Arg(1), false)) {
+			if (m_type != RuntimeValueType::Any && !Validate(inst->Arg(1), false)) {
 				return finish(false);
 			}
 			const auto active_mask = m_active_mask;
@@ -711,6 +749,130 @@ private:
 
 } // namespace
 
+void CompileSrtWalker(ResourcePlan& program) {
+	if (!program.resource_tracking_complete || !program.srt_plan_complete ||
+	    program.capture_specialization_reads || !program.control_flow.empty() ||
+	    program.srt_reads.empty()) return;
+
+	using Reads = std::map<int32_t, const SrtRead*>;
+	std::map<uint32_t, Reads> roots;
+	std::unordered_map<const Inst*, Reads> pointer_uses;
+	std::unordered_map<const Inst*, int32_t> offsets;
+	for (const auto& read: program.srt_reads) {
+		const auto* inst = read.value.Resolve().TryInstruction();
+		if (inst == nullptr || inst->GetOpcode() != ValueOpcode::LoadAddressU32 ||
+		    inst->NumArgs() < 2 || !IsRawRead(program, *inst) ||
+		    read.flat_offset >= program.srt_reads.size()) return;
+		const auto offset = inst->Arg(1).Resolve();
+		if (!offset.IsImmediate() || offset.GetType() != Type::U32) return;
+		const auto& memory = program.memory_info[inst->Flags<MemoryFlags>().index];
+		const auto relative =
+		    (static_cast<int64_t>(static_cast<int32_t>(memory.offset)) & ~int64_t {3}) +
+		    static_cast<int64_t>(offset.U32() & ~3u);
+		if (relative < INT32_MIN || relative > INT32_MAX ||
+		    !offsets.emplace(inst, static_cast<int32_t>(relative)).second) return;
+	}
+	uint32_t user_data_count = 0;
+	for (const auto& read: program.srt_reads) {
+		const auto* inst = read.value.ResolveInstruction();
+		const auto* handle = inst->Arg(0).Resolve().TryInstruction();
+		if (handle == nullptr || handle->GetOpcode() != ValueOpcode::GetAddressResource ||
+		    handle->NumArgs() != 2) return;
+		const auto* low = handle->Arg(0).Resolve().TryInstruction();
+		const auto* high = handle->Arg(1).Resolve().TryInstruction();
+		if (low == nullptr || high == nullptr) return;
+		Reads* uses = nullptr;
+		if (low->GetOpcode() == ValueOpcode::GetUserData &&
+		    high->GetOpcode() == ValueOpcode::GetUserData && low->NumArgs() == 1 &&
+		    high->NumArgs() == 1 && low->Arg(0).GetType() == Type::ScalarReg &&
+		    high->Arg(0).GetType() == Type::ScalarReg) {
+			const auto reg = RegIndex(low->Arg(0).ScalarRegister());
+			if (reg < program.user_data_base ||
+			    RegIndex(high->Arg(0).ScalarRegister()) != reg + 1u) return;
+			const auto base = reg - program.user_data_base;
+			user_data_count = std::max(user_data_count, base + 2u);
+			uses = &roots[base];
+		} else {
+			const auto lo = offsets.find(low);
+			const auto hi = offsets.find(high);
+			if (lo == offsets.end() || hi == offsets.end() ||
+			    static_cast<int64_t>(lo->second) + 4 != hi->second ||
+			    !EquivalentValue(program, low->Arg(0), high->Arg(0))) return;
+			uses = &pointer_uses[low];
+		}
+		if (!uses->emplace(offsets.at(inst), &read).second) return;
+	}
+	std::unordered_set<const Inst*> visited;
+	const auto reachable = [&](auto&& self, const Reads& reads) -> bool {
+		for (const auto& [offset, read]: reads) {
+			const auto* inst = read->value.ResolveInstruction();
+			const auto child = pointer_uses.find(inst);
+			if (child != pointer_uses.end() &&
+			    (!visited.insert(inst).second || !self(self, child->second))) return false;
+		}
+		return true;
+	};
+	for (const auto& [reg, reads]: roots) {
+		if (!reachable(reachable, reads)) return;
+	}
+	if (visited.size() != pointer_uses.size()) return;
+
+	program.srt_code = std::make_unique<Xbyak::CodeGenerator>(4096, Xbyak::AutoGrow);
+	auto& code = *program.srt_code;
+	Xbyak::Label failed, finished;
+	code.push(code.rbp);
+	code.mov(code.rbp, code.rsp);
+	code.cmp(code.r8, user_data_count);
+	code.jb(failed, Xbyak::CodeGenerator::T_NEAR);
+	code.mov(code.r9, AddressMask & ~uint64_t {3});
+	// Follow shadPS4's VisitPointer: copy one table level in offset order, then
+	// descend through its child pointers. Seed the descriptor evaluator's memo.
+	const auto visit = [&](auto&& self, int32_t pointer_offset, const Reads& reads) -> void {
+		code.push(code.rdi);
+		code.mov(code.rdi, code.qword[code.rdi + pointer_offset]);
+		code.and_(code.rdi, code.r9);
+		const auto first = reads.begin()->first;
+		const auto last = reads.rbegin()->first;
+		if (first < 0) {
+			code.mov(code.r10, -static_cast<int64_t>(first));
+			code.cmp(code.rdi, code.r10);
+			code.jb(failed, Xbyak::CodeGenerator::T_NEAR);
+		}
+		if (last > 0) {
+			code.mov(code.r10, AddressMask - last);
+			code.cmp(code.rdi, code.r10);
+			code.ja(failed, Xbyak::CodeGenerator::T_NEAR);
+		}
+		for (const auto& [offset, read]: reads) {
+			const auto index = read->value.ResolveInstruction()->EvaluationIndex(program.evaluation_value_count);
+			using Entry = ResourcePlan::EvaluationContext::Entry;
+			const auto slot = code.rdx + index * sizeof(Entry);
+			code.mov(code.r10d, code.dword[code.rdi + offset]);
+			code.mov(code.dword[code.rsi + read->flat_offset * sizeof(uint32_t)], code.r10d);
+			code.mov(code.qword[slot + offsetof(Entry, value)], code.r10);
+			code.mov(code.qword[slot + offsetof(Entry, generation)], code.rcx);
+		}
+		for (const auto& [offset, read]: reads) {
+			const auto child = pointer_uses.find(read->value.ResolveInstruction());
+			if (child == pointer_uses.end()) continue;
+			self(self, offset, child->second);
+		}
+		code.pop(code.rdi);
+	};
+	for (const auto& [reg, reads]: roots) {
+		visit(visit, reg * sizeof(uint32_t), reads);
+	}
+	code.mov(code.eax, 1);
+	code.jmp(finished, Xbyak::CodeGenerator::T_NEAR);
+	code.L(failed);
+	code.xor_(code.eax, code.eax);
+	code.L(finished);
+	code.mov(code.rsp, code.rbp);
+	code.pop(code.rbp);
+	code.ret();
+	code.readyRE();
+	EXIT_IF(Xbyak::GetError() != 0);
+}
 SrtWalker::SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
                      std::span<const uint8_t> clean_flat_slots, SrtWalker* clean_evaluator,
                      Value active_mask, bool skip_tape)
@@ -2249,6 +2411,20 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 			(kind == 1 ? fc.mat_flat_hit_ns : fc.mat_flat_nocfg_ns).fetch_add(ns, std::memory_order_relaxed);
 		}
 	} call_timer;
+	// Upstream's x64 walker (CompileSrtWalker): plans without control flow or captured reads,
+	// read straight from guest memory. It fills the flat words and seeds the evaluation memo.
+	if (m_program.srt_code && m_runtime.read_memory == nullptr &&
+	    Common::Experiments::Enabled(Common::Experiments::SrtJit)) {
+		flat.resize(m_program.srt_reads.size());
+		m_program.active_sources.clear();
+		m_context.values.resize(m_program.evaluation_value_count);
+		using Walker = bool KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*,
+		    ResourcePlan::EvaluationContext::Entry*, uint64_t, size_t);
+		const bool ok = m_program.srt_code->getCode<Walker>()(m_runtime.user_data.data(), flat.data(),
+		    m_context.values.data(), m_context.generation, m_runtime.user_data.size());
+		m_context.refreshed_flat = ok ? &flat : nullptr;
+		return ok;
+	}
 	if (m_cfg_gather_enabled) {
 		m_cfg_gather_ready_sources.assign(m_program.descriptor_sources.size(), 0u);
 		if (m_clean_evaluator != nullptr)
@@ -2703,7 +2879,10 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		uint32_t condition = 0;
 		auto& predicate = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
 		int predicate_done = -1;
-		if (!block.condition.IsEmpty() && m_runtime.read_specialization_memory != nullptr) {
+		// Immutable predicates (capture_specialization_reads unset) need no strict reader.
+		const bool can_decide = m_runtime.read_specialization_memory != nullptr ||
+		                        !m_program.capture_specialization_reads;
+		if (!block.condition.IsEmpty() && can_decide) {
 			const auto& tape = m_program.cfg_srt_tapes[m_clean_evaluator != nullptr ? 1 : 0];
 			const uint32_t root = tape.state == ResourcePlan::SrtTape::State::Ready
 			                          ? tape.condition_ops[index] : UINT32_MAX;
@@ -2721,7 +2900,7 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 				        .b = predicate_done == 0 ? 2u : condition != 0u ? 1u : 0u});
 			}
 		}
-		if (!block.condition.IsEmpty() && m_runtime.read_specialization_memory != nullptr && predicate_done > 0) {
+		if (!block.condition.IsEmpty() && can_decide && predicate_done > 0) {
 			pending.push_back(block.successors[condition != 0u ? 0u : 1u]);
 		} else {
 			pending.insert(pending.end(), block.successors.begin(), block.successors.end());

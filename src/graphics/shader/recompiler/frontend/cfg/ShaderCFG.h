@@ -120,6 +120,9 @@ struct Graph {
 // Build failures are reported through graph.unsupported (with failure_pc when known); the caller
 // decides whether they are fatal.
 Graph       BuildGraph(const Decoder::Program& program);
+bool MayWriteScalarRegister(const Decoder::Instruction& inst, uint32_t code);
+uint32_t FindScalarDefinition(const Decoder::Program& program, const Graph& graph,
+                              uint32_t before, uint32_t code);
 // Returns structured control flow or failure diagnostics without changing the native graph.
 // On failure, failure_block is an original block ID or UINT32_MAX.
 Graph       Structurize(const Graph& graph);

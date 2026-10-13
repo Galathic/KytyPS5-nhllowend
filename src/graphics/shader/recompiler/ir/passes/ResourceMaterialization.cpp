@@ -17,7 +17,6 @@
 #include <bit>
 #include <chrono>
 #include <cstdio>
-#include <cstring>
 #include <fmt/format.h>
 #include <functional>
 #include <numeric>
@@ -431,20 +430,22 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		} else if (!indirect.selector_first.IsEmpty()) {
 			ShaderBufferResource material;
 			uint32_t             first = 0, count = 0;
-			if (!DecodeBufferDescriptor(material_value, material) || material.Type() != 0u ||
-			    material.SwizzleEnabled() ||
-			    material.AddTid() || material.OutOfBounds() != 0u ||
-			    uint64_t {selector->offset} + 4u > material.Stride() ||
+			if (!DecodeBufferDescriptor(material_value, material) ||
 			    !clean.Evaluate(indirect.selector_first, first) ||
-			    !clean.Evaluate(indirect.key_count, count) || count > MaxIndirectDescriptorProbes ||
-			    uint64_t {first} + count > material.NumRecords())
+			    !clean.Evaluate(indirect.key_count, count) || count > MaxIndirectDescriptorProbes)
 				return false;
-			if (count != 0u && (uint64_t {first} + count - 1u) * material.Stride() +
-			                           selector->offset + 4u >
-			                       uint64_t {UINT32_MAX} + 1u)
+			// SMEM uses its instruction's byte stride; V# stride only supplies its bounds.
+			const auto step = selector->stride != 0u ? selector->stride : material.Stride();
+			if (selector->stride == 0u &&
+			    (material.Type() != 0u || material.SwizzleEnabled() || material.AddTid() ||
+			     material.OutOfBounds() != 0u || uint64_t {selector->offset} + 4u > step ||
+			     uint64_t {first} + count > material.NumRecords())) return false;
+			const auto end = count != 0u
+			    ? (uint64_t {first} + count - 1u) * step + selector->offset + 4u : 0u;
+			if (end > uint64_t {UINT32_MAX} + 1u || end > material.GetSize())
 				return false;
-			if (!read_keys(material, uint64_t {first} * material.Stride() + selector->offset,
-			               material.Stride(), count)) return false;
+			if (!read_keys(material, uint64_t {first} * step + selector->offset, step, count))
+				return false;
 		} else if (!indirect.selector_mask.IsEmpty()) {
 			uint32_t mask = 0;
 			uint32_t count = 0;
@@ -753,6 +754,10 @@ bool BuildSamplerPlan(const ShaderInfo& base, SamplerPlan& plan) {
 			return false;
 		}
 		usage[pair.sampler] |= 1u << static_cast<uint32_t>(ClassifySampler(base.images[pair.image]));
+		for (const auto candidate: base.samplers[pair.sampler].indirect_resources) {
+			if (candidate >= base.samplers.size()) return false;
+			usage[candidate] |= usage[pair.sampler];
+		}
 	}
 	for (uint32_t index = 0; index < base.samplers.size(); index++) {
 		auto& mapping = plan.mapping[index];
@@ -774,30 +779,29 @@ bool BuildSamplerPlan(const ShaderInfo& base, SamplerPlan& plan) {
 template <typename Predicate>
 static std::vector<ResourceBlock> ResourceControlFlow(const Program& program, const Predicate& predicate) {
 	// The renderer checks captured scalar reads against final buffer and image write ranges.
-	if (program.blocks.size() != program.block_info.size() || program.has_address_writes) {
+	if (program.has_address_writes) {
 		return {};
 	}
-	std::unordered_map<uint32_t, uint32_t> indices;
-	for (uint32_t i = 0; i < program.block_info.size(); i++) {
-		if (!indices.emplace(program.block_info[i].id, i).second) {
+	std::unordered_map<const Block*, uint32_t> indices;
+	for (uint32_t i = 0; i < program.blocks.size(); i++) {
+		if (!indices.emplace(program.blocks[i], i).second) {
 			return {};
 		}
 	}
 	std::vector<ResourceBlock> blocks(program.blocks.size());
 	for (uint32_t i = 0; i < blocks.size(); i++) {
 		auto&                 block      = blocks[i];
-		const auto&           info       = program.block_info[i];
+		const auto&             info       = *program.blocks[i];
 		const auto&           terminator = info.terminator;
-		std::vector<uint32_t> successors;
+		const std::array        targets {terminator.true_block, terminator.false_block};
+		std::span<Block* const> successors;
 		switch (terminator.kind) {
-			case CFG::TerminatorKind::Branch: successors.push_back(terminator.true_block); break;
+			case CFG::TerminatorKind::Branch: successors = std::span(targets).first(1); break;
 			case CFG::TerminatorKind::ConditionalBranch:
-				successors = {terminator.true_block, terminator.false_block};
+				successors      = targets;
 				block.condition = info.condition;
 				break;
-			case CFG::TerminatorKind::IndirectBranch:
-				successors = terminator.indirect_targets;
-				break;
+			case CFG::TerminatorKind::IndirectBranch: successors = info.ImmSuccessors(); break;
 			case CFG::TerminatorKind::Return: break;
 			default: return {};
 		}
@@ -922,28 +926,26 @@ static std::optional<std::array<uint64_t, 3>> FillIndex(Value value, uint32_t ax
 // for the whole dispatch, so the copied range follows from the descriptors and dispatch size.
 static UniformCopy AnalyzeUniformCopy(const Program& program) {
 	if (program.stage != ShaderType::Compute || program.blocks.empty() ||
-	    program.blocks.size() != program.block_info.size() || program.info.uses_dma ||
+	    program.info.uses_dma ||
 	    !program.info.samplers.empty() || !program.info.images.empty() ||
 	    program.info.buffers.size() != 2) {
 		return {};
 	}
-	std::unordered_set<uint32_t> visited;
-	uint32_t                     index = 0;
-	const Inst*                  store = nullptr;
+	std::unordered_set<const Block*> visited;
+	const Block*                     block = program.blocks[0];
+	const Inst*                      store = nullptr;
 	for (;;) {
-		if (!visited.insert(index).second) return {};
-		for (const auto& inst: *program.blocks[index]) {
+		if (!visited.insert(block).second) return {};
+		for (const auto& inst: *block) {
 			if (AddressOpcodeInfoOf(inst.GetOpcode()).access != AddressAccess::None) return {};
 			if (!inst.MayHaveSideEffects()) continue;
 			if (store != nullptr || BufferAccessOf(inst.GetOpcode()) != BufferAccess::Write) return {};
 			store = &inst;
 		}
-		const auto& term = program.block_info[index].terminator;
+		const auto& term = block->terminator;
 		if (term.kind == CFG::TerminatorKind::Return) break;
-		if (term.kind != CFG::TerminatorKind::Branch) return {};
-		const auto next = std::ranges::find(program.block_info, term.true_block, &BlockInfo::id);
-		if (next == program.block_info.end()) return {};
-		index = static_cast<uint32_t>(next - program.block_info.begin());
+		if (term.kind != CFG::TerminatorKind::Branch || term.true_block == nullptr) return {};
+		block = term.true_block;
 	}
 	if (store == nullptr || visited.size() != program.blocks.size()) return {};
 	constexpr std::array stores {ValueOpcode::StoreBufferU32, ValueOpcode::StoreBufferU32x2,
@@ -989,17 +991,16 @@ static UniformCopy AnalyzeUniformCopy(const Program& program) {
 }
 
 static UniformFillPlan AnalyzeUniformFill(const Program& program) {
-	if (program.stage != ShaderType::Compute || program.blocks.empty() ||
-	    program.blocks.size() != program.block_info.size() || program.info.uses_dma ||
+	if (program.stage != ShaderType::Compute || program.blocks.empty() || program.info.uses_dma ||
 	    !program.info.samplers.empty()) {
 		return {};
 	}
-	std::unordered_set<uint32_t> visited;
-	uint32_t                     index = 0;
-	const Inst*                  store = nullptr;
+	std::unordered_set<const Block*> visited;
+	const auto*                      block = program.blocks.front();
+	const Inst*                      store = nullptr;
 	for (;;) {
-		if (!visited.insert(index).second) return {};
-		for (const auto& inst: *program.blocks[index]) {
+		if (block == nullptr || !visited.insert(block).second) return {};
+		for (const auto& inst: *block) {
 			if (AddressOpcodeInfoOf(inst.GetOpcode()).access != AddressAccess::None) return {};
 			if (!inst.MayHaveSideEffects()) continue;
 			if (store != nullptr || (BufferAccessOf(inst.GetOpcode()) != BufferAccess::Write &&
@@ -1007,12 +1008,10 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 				return {};
 			store = &inst;
 		}
-		const auto& term = program.block_info[index].terminator;
+		const auto& term = block->terminator;
 		if (term.kind == CFG::TerminatorKind::Return) break;
 		if (term.kind != CFG::TerminatorKind::Branch) return {};
-		const auto next = std::ranges::find(program.block_info, term.true_block, &BlockInfo::id);
-		if (next == program.block_info.end()) return {};
-		index = static_cast<uint32_t>(next - program.block_info.begin());
+		block = term.true_block;
 	}
 	if (store == nullptr || visited.size() != program.blocks.size()) return {};
 	for (const auto& buffer: program.info.buffers) {
@@ -1096,6 +1095,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	plan.user_data_count            = program.user_data_count;
 	plan.info                       = program.info;
 	plan.memory_info                = program.memory_info;
+	plan.source_reads               = program.source_reads;
 	plan.srt_plan_complete          = program.srt_plan_complete;
 	plan.resource_tracking_complete = program.resource_tracking_complete;
 
@@ -1212,6 +1212,8 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	// Predicates share subterms; memoize per instruction so the walk stays linear in DAG size.
 	std::unordered_map<const Inst*, Value> cloned_predicates;
 	std::function<Value(Value)> ClonePredicateImpl;
+	bool capture_control_reads = false;
+	std::unordered_map<const Inst*, Value> predicates;
 	std::function<Value(Value)> ClonePredicate = [&](Value value) -> Value {
 		value = value.Resolve();
 		const auto* key = value.IsEmpty() ? nullptr : value.TryInstruction();
@@ -1225,16 +1227,25 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	};
 	ClonePredicateImpl = [&](Value value) -> Value {
 		if (value.IsEmpty()) return {};
-		if (ValidateRuntimeValue(program, value, RuntimeValueType::Integer)) return Clone(value);
 		const auto* inst = value.TryInstruction();
-		if (inst == nullptr) return {};
+		if (inst == nullptr)
+			return ValidateRuntimeValue(program, value, RuntimeValueType::Integer) ? value : Value {};
+		// Preserve shared EXEC predicates, including subgraphs with no uniform factor.
+		const auto [found, inserted] = predicates.try_emplace(inst);
+		if (!inserted) return found->second;
+		auto& result = found->second;
+		if (ValidateRuntimeValue(program, value, RuntimeValueType::Integer)) {
+			capture_control_reads |=
+			    !ValidateRuntimeValue(program, value, RuntimeValueType::ImmutableInteger);
+			return result = Clone(value);
+		}
 		const auto op = inst->GetOpcode();
 		if (op == ValueOpcode::ConditionRef || op == ValueOpcode::LogicalNot) {
 			const auto operand = ClonePredicate(inst->Arg(0));
-			if (operand.IsEmpty() || op == ValueOpcode::ConditionRef) return operand;
+			if (operand.IsEmpty() || op == ValueOpcode::ConditionRef) return result = operand;
 			auto& node = plan.value_storage.emplace_back(op);
 			node.SetArg(0, operand);
-			return Value(&node);
+			return result = Value(&node);
 		}
 		if (op != ValueOpcode::LogicalAnd && op != ValueOpcode::LogicalOr) return {};
 		auto left = ClonePredicate(inst->Arg(0));
@@ -1248,7 +1259,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		auto& node = plan.value_storage.emplace_back(op);
 		node.SetArg(0, left);
 		node.SetArg(1, right);
-		return Value(&node);
+		return result = Value(&node);
 	};
 	plan.control_flow = ResourceControlFlow(program, ClonePredicate);
 	plan.uniform_fill = AnalyzeUniformFill(program);
@@ -1276,7 +1287,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 			}
 		}
 	}
-	plan.capture_specialization_reads |= capture_indirect_reads || !plan.control_flow.empty();
+	plan.capture_specialization_reads |= capture_indirect_reads || capture_control_reads || !plan.source_reads.empty();
 	if (plan.capture_specialization_reads) {
 		// Clean writable addresses prove that shader writes cannot overlap captured reads.
 		for (const auto& buffer: plan.info.buffers) {
@@ -1286,7 +1297,8 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 			if (image.written) MarkCleanFlatSlots(plan, Source(plan, image.source), plan.clean_flat_slots);
 		}
 	}
-	if (capture_indirect_reads) plan.resource_tracking_complete &= !program.has_address_writes;
+	if (capture_indirect_reads || !plan.source_reads.empty())
+		plan.resource_tracking_complete &= !program.has_address_writes;
 	// Runtime traversal limits these candidates to consecutive reads in a reached block.
 	// Descriptor/offset expressions, reader semantics and bytes must all match.
 	{
@@ -1328,6 +1340,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 			first += count;
 		}
 	}
+	CompileSrtWalker(plan);
 	return plan;
 }
 
@@ -1413,13 +1426,14 @@ static bool MaterializeResourcesCore(const ResourcePlan& program, const SrtRunti
 		}
 	} cache_attempt {cache};
 	if (!program.resource_tracking_complete ||
-	    (program.requires_specialization_memory && runtime.read_specialization_memory == nullptr)) {
+	    ((program.requires_specialization_memory || !program.source_reads.empty()) &&
+	     runtime.read_specialization_memory == nullptr)) {
 		return false;
 	}
 	MaterializationTimer timer(runtime.materialization_timings);
-	const bool capture_reads = program.capture_specialization_reads;
+	const bool capture_reads = program.capture_specialization_reads || !program.source_reads.empty();
 	auto& reads = snapshot.specialization_reads;
-	reads.clear();
+	reads = program.source_reads;
 	ReadCapture capture {runtime, reads, Common::RuntimeFlags::Current().srt_source_reuse};
 	SrtRuntime observed = runtime;
 	if (capture_reads) {
@@ -1592,7 +1606,14 @@ static bool MaterializeResourcesCore(const ResourcePlan& program, const SrtRunti
 	timer.Step(MaterializationTimings::Phase::Samplers);
 	snapshot.samplers.resize(program.info.samplers.size());
 	for (uint32_t i = 0; i < program.info.samplers.size(); ++i) {
-		if (!evaluate(program.info.samplers[i].source, snapshot.samplers[i])) {
+		auto source = program.info.samplers[i].source;
+		if (source >= program.descriptor_sources.size()) return false;
+		const auto& descriptor = program.descriptor_sources[source];
+		if (descriptor.indirect_descriptor) {
+			if (descriptor.indirect_descriptor->sources.empty()) return false;
+			source = descriptor.indirect_descriptor->sources[0];
+		}
+		if (!evaluate(source, snapshot.samplers[i])) {
 			return false;
 		}
 		if (program.info.samplers[i].gather_lod) {
@@ -1822,8 +1843,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
   (std::filesystem::path(directory)/name).string(),MaterializeResourcesImpl);
 }
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {
-	EXIT_IF(!program.resource_tracking_complete || program.shader_info_complete ||
-	        program.binding_layout_complete);
+	EXIT_IF(!program.resource_tracking_complete || program.shader_info_complete);
 	EXIT_IF(program.info.buffers.size() > specialization.buffers.size() ||
 	        program.info.images.size() > specialization.images.size());
 
@@ -1896,11 +1916,20 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		samplers[index].force_point_filtering = binding.type == SamplerClass::PointInteger;
 		samplers[index].integer_border        = binding.type != SamplerClass::Float;
 	}
+	for (uint32_t index = 0; index < sampler_plan.sampler_count; index++) {
+		const auto& binding = sampler_plan.bindings[index];
+		for (auto& candidate: samplers[index].indirect_resources) {
+			candidate = sampler_plan.mapping[candidate][static_cast<uint32_t>(binding.type)];
+			EXIT_IF(candidate == UINT32_MAX);
+		}
+	}
 	for (auto& pair: sampled_pairs) {
 		const auto type = static_cast<uint32_t>(ClassifySampler(images[pair.image]));
 		pair.sampler = sampler_plan.mapping[pair.sampler][type];
 		EXIT_IF(pair.sampler == UINT32_MAX);
 		samplers[pair.sampler].depth_compare |= images[pair.image].depth_compare;
+		for (const auto candidate: samplers[pair.sampler].indirect_resources)
+			samplers[candidate].depth_compare |= images[pair.image].depth_compare;
 	}
 
 	auto& memory_info = program.memory_info;
@@ -1988,7 +2017,9 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 				EXIT_IF(memory.sampler == UINT32_MAX);
 			}
 			EXIT_IF(image.indirect_root == memory.resource &&
-			        inst.GetOpcode() != ValueOpcode::ImageSampleRaw);
+			        inst.GetOpcode() != ValueOpcode::ImageSampleRaw &&
+			        inst.GetOpcode() != ValueOpcode::ImageGatherRaw &&
+			        inst.GetOpcode() != ValueOpcode::ImageRead);
 		}
 	}
 	for (auto& memory: memory_info) {

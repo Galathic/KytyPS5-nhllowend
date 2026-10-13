@@ -47,6 +47,7 @@ uint32_t EnvironmentMask() {
 	// Not part of the recommended set: opt in with 1.
 	set("KYTY_CPU_COPY_FORWARD", CpuCopyForward, false);
 	set("KYTY_FALSE_SHARE_READS", FalseShareReads, false);
+	set("KYTY_SRT_JIT", SrtJit, false);
 	return mask;
 }
 
