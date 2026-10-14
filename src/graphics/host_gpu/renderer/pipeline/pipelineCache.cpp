@@ -688,6 +688,8 @@ struct PipelineCache::ProgramCache {
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
 		lookup_key.stage           = stage;
 		lookup_key.hash            = params.hash;
+		// Diagnostics (KYTY_SPECULATE_DIRTY_READS stats): which shader the following guest reads serve.
+		Libs::LibKernel::Memory::SetReadContext(params.hash);
 		lookup_key.user_data_count = params.user_data_count;
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);

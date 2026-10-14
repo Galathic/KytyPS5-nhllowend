@@ -49,6 +49,8 @@ namespace Libs::Graphics {
 static thread_local CommandProcessor* g_current_processor = nullptr;
 static thread_local Pm4Execution*     g_current_execution = nullptr;
 static thread_local bool              g_gpu_thread        = false;
+// Execution thread: the operation being executed (see GuestGpu::CurrentExecOp).
+static thread_local uint64_t          g_exec_op           = 0;
 // The command processor thread of a pipelined GPU.
 static thread_local bool              g_cp_thread         = false;
 static thread_local GuestGpu*         g_gpu_state         = nullptr;
@@ -577,7 +579,9 @@ void GuestGpu::ExecutionThread() {
 		const bool traced   = Common::EventTrace::g_capturing.load(std::memory_order_relaxed);
 		const auto op_kind  = static_cast<uint64_t>(operation->kind) | (uint64_t {operation->trace_op} << 8u);
 		const auto op_start = traced ? Common::EventTrace::NowNs() : int64_t {0};
+		g_exec_op           = op_kind;
 		operation->processor->Execute(*operation);
+		g_exec_op = 0;
 		if (traced) {
 			const auto op_ns = Common::EventTrace::NowNs() - op_start;
 			if (op_ns >= 20000) {
@@ -1292,17 +1296,53 @@ void GuestGpu::ThreadRun(void* data) {
 			}
 			if (no_work) {
 				gpu->WaitForExecution();
+				bool arrived = false;
 				{
 					Common::LockGuard lock(gpu->m_queue_mutex);
 					epoch = gpu->m_work_epoch.load(std::memory_order_acquire);
 					if (gpu->m_commands.empty() && gpu->m_submission_count == 0) {
 						gpu->m_processing = false;
 						gpu->m_idle.SignalAll();
+					} else {
+						arrived = true;
 					}
 				}
-				// Spin for the next submission; sleep below only when none came.
-				Common::SpinWait spin;
-				while (gpu->m_work_epoch.load(std::memory_order_acquire) == epoch && spin.Spin()) {
+				// Spin for the next submission; sleep below only when none came. Work queued
+				// during WaitForExecution already moved the epoch read above, so spinning for
+				// the epoch to move again would wait out the whole spin budget (2 ms) although
+				// the work is waiting. Experiment CpSkipIdleSpin: start that work at once.
+				const bool skip = arrived && Common::Experiments::Enabled(Common::Experiments::CpSkipIdleSpin);
+				const auto spin_start = arrived ? std::chrono::steady_clock::now()
+				                                : std::chrono::steady_clock::time_point {};
+				if (!skip) {
+					Common::SpinWait spin;
+					while (gpu->m_work_epoch.load(std::memory_order_acquire) == epoch && spin.Spin()) {
+					}
+				}
+				if (arrived && FrameBreakdown::Enabled()) {
+					// NHL27CPSPIN: how often work was already queued after the wait, and the spin
+					// time spent on it (none when the experiment is on).
+					static std::atomic<uint64_t> s_arrived {0};
+					static std::atomic<uint64_t> s_spin_ns {0};
+					static std::atomic<int64_t>  s_last_print {0};
+					s_arrived.fetch_add(1, std::memory_order_relaxed);
+					s_spin_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+					                        std::chrono::steady_clock::now() - spin_start).count()),
+					                    std::memory_order_relaxed);
+					const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+					                        std::chrono::steady_clock::now().time_since_epoch()).count();
+					const auto last = s_last_print.load(std::memory_order_relaxed);
+					if (last == 0) {
+						s_last_print.store(now_ms, std::memory_order_relaxed);
+					} else if (now_ms - last >= 5000) {
+						s_last_print.store(now_ms, std::memory_order_relaxed);
+						std::printf("NHL27CPSPIN: window=%.1fs queued_after_wait=%llu spin_ms=%.1f skip=%d\n",
+						            static_cast<double>(now_ms - last) / 1000.0,
+						            static_cast<unsigned long long>(s_arrived.exchange(0, std::memory_order_relaxed)),
+						            static_cast<double>(s_spin_ns.exchange(0, std::memory_order_relaxed)) / 1e6,
+						            skip ? 1 : 0);
+						std::fflush(stdout);
+					}
 				}
 			}
 		}
@@ -3157,6 +3197,10 @@ void CommandProcessor::SynchronizeGpu() {
 
 bool GuestGpu::IsGpuThread() noexcept {
 	return g_gpu_thread;
+}
+
+uint64_t GuestGpu::CurrentExecOp() noexcept {
+	return g_exec_op;
 }
 
 } // namespace Libs::Graphics

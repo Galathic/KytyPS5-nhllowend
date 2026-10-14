@@ -14,6 +14,8 @@
 #include <array>
 #include <chrono>
 #include <map>
+#include <mutex>
+#include <shared_mutex>
 #include <span>
 #include <unordered_map>
 #include <utility>
@@ -215,6 +217,18 @@ public:
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	// Any thread: HasGpuDirtyBytes under a shared lock (the GPU thread changes the ranges under an
+	// exclusive one). Used by experiment FalseShareAnyThread.
+	[[nodiscard]] bool HasGpuDirtyBytesShared(uint64_t vaddr, uint64_t size) const;
+	// Any thread: how many bytes of the range are GPU-dirty (diagnostics, KYTY_PERF_GPU_FAULT_STACKS).
+	[[nodiscard]] uint64_t GpuDirtyByteCount(uint64_t vaddr, uint64_t size) const;
+	// Experiment SpeculateDirtyReads (GPU thread): a small read of GPU-dirty bytes whose recent
+	// downloads all found the bytes the backing already held is served from the backing without
+	// waiting. A copy of the GPU's bytes is compared once the GPU gets there; a mismatch ends the
+	// guess for that address until its downloads are steady again.
+	[[nodiscard]] bool TrySpeculativeRead(uint64_t vaddr, void* data, uint64_t size);
+	// After a real download for such a read: whether the GPU changed the bytes, and the wait.
+	void NoteDirtyRead(uint64_t vaddr, uint64_t size, bool changed, const void* value, uint64_t wait_ns);
 	// Changes whenever new GPU-dirty bytes are recorded (GPU thread).
 	[[nodiscard]] uint64_t GpuDirtyGeneration() const noexcept { return m_gpu_dirty_generation; }
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
@@ -325,6 +339,8 @@ private:
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
+	// Guards m_gpu_modified_ranges against readers on other threads (HasGpuDirtyBytesShared).
+	mutable std::shared_mutex                         m_gpu_ranges_mutex;
 	uint64_t                                          m_gpu_dirty_generation = 0;
 	RangeSet                                          m_released_ranges;
 	bool                                              m_record_released = false;

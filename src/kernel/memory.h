@@ -126,6 +126,29 @@ bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t
 // GPU thread only: reads the backing when none of the bytes is GPU-dirty, so the CPU view of
 // them is already current. Never synchronizes with the GPU.
 bool                   TryReadCleanBacking(uint64_t vaddr, void* data, uint64_t size);
+// KYTY_PERF_GPU_FAULT_STACKS (diagnostics): how this thread's last TryReadCleanBacking call ended, reset
+// by the call (0 = no call since the last take).
+enum CleanReadResult : int {
+	CleanReadServed      = 1,
+	CleanReadDirty       = 2,
+	CleanReadCapped      = 3,
+	CleanReadFailed      = 4,
+	CleanReadUnavailable = 5,
+};
+int                    TakeCleanReadResult();
+// Any thread: how many bytes of the range are GPU-dirty (diagnostics).
+uint64_t               GpuDirtyByteCount(uint64_t vaddr, uint64_t size);
+// Diagnostics: what this thread is reading guest memory for (the shader being materialized).
+void                   SetReadContext(uint64_t context);
+uint64_t               ReadContext();
+// Diagnostics: this thread's host return addresses, innermost first (Windows only; 0 elsewhere).
+int                    CaptureHostStack(uint64_t* frames, int max_frames);
+// Experiment FalseShareAnyThread: the same for any other thread (command processor, guest): reads the
+// backing when the page holds GPU-dirty bytes but the read does not, a limited number of times per page.
+bool                   TryReadCleanBackingAnyThread(uint64_t vaddr, void* data, uint64_t size);
+// Any thread but the GPU thread: reads the backing when none of the bytes is GPU-dirty (no page
+// condition, no limit). False leaves the caller to its ordinary load.
+bool                   TryReadCleanBackingShared(uint64_t vaddr, void* data, uint64_t size);
 // Optional GPU-thread clean peek: refusal never downloads, faults or changes output.
 bool                   TryReadCleanBufferBacking(uint64_t vaddr, void* data, uint64_t size);
 // GPU-thread clean validation (DRAWPREP prefetch): Equal = the backing bytes are not GPU-dirty and equal `expected`;

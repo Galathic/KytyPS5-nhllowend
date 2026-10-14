@@ -54,6 +54,9 @@ public:
 
 	// The thread that owns the renderer: the execution thread of a pipelined GPU.
 	[[nodiscard]] static bool IsGpuThread() noexcept;
+	// Execution thread: the operation it is executing (GpuOperationKind | GpuOperation::trace_op << 8),
+	// or 0 between operations. Diagnostics only (KYTY_PERF_GPU_FAULT_STACKS).
+	[[nodiscard]] static uint64_t CurrentExecOp() noexcept;
 
 	// A pipelined GPU parses command buffers on its command processor thread and executes the
 	// operations they produce, in order, on its execution thread.
