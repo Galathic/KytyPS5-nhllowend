@@ -63,6 +63,7 @@ uint32_t EnvironmentMask() {
 	set("KYTY_READBACK_TRANSFER", ReadbackTransfer, false);
 	set("KYTY_READBACK_SPIN", ReadbackSpin, false);
 	set("KYTY_FAULT_PAGE_DIRECT", FaultPageDirect, true);
+	set("KYTY_BACKING_LOOKUP_CACHE", BackingLookupCache, false);
 	return mask;
 }
 

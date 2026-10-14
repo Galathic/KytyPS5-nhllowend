@@ -1216,6 +1216,24 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	return clamped_size;
 }
 
+uint64_t ClampRangeSizeOrZero(uint64_t vaddr, uint64_t size) {
+	EXIT_IF(g_virtual_ranges == nullptr);
+	const auto clamped_size = g_virtual_ranges->ClampRangeSize(vaddr, size);
+	if (clamped_size == 0) {
+		static std::atomic<uint32_t> reported {0};
+		if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
+			std::printf("NHL27UNMAPPED: buffer descriptor at unmapped 0x%016" PRIx64 " size 0x%" PRIx64
+			            " bound as null\n",
+			            vaddr, size);
+			std::fflush(stdout);
+		}
+	} else if (clamped_size != size) {
+		LOGF("Memory: clamped buffer range addr=0x%016" PRIx64 " size=0x%016" PRIx64 " to 0x%016" PRIx64 "\n",
+		     vaddr, size, clamped_size);
+	}
+	return clamped_size;
+}
+
 void WriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
 	if (!TryWriteBacking(vaddr, data, size)) {
 		EXIT("Memory: required direct-backing write failed, addr=0x%016" PRIx64

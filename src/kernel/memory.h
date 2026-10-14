@@ -143,6 +143,8 @@ bool                   IsBackingReadable(uint64_t vaddr, uint64_t size);
 // means IsBackingReadable still answers as before.
 [[nodiscard]] uint64_t BackingEpoch() noexcept;
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
+// As ClampRangeSize, but 0 (instead of a fatal error) when no byte of the range is mapped.
+[[nodiscard]] uint64_t ClampRangeSizeOrZero(uint64_t vaddr, uint64_t size);
 // Not noexcept: under a Common::SoftExitScope its failure throws to the scope's owner.
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);

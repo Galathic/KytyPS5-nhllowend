@@ -101,6 +101,32 @@ processor's later reads of register blocks the GPU writes (`SET_SH_REG_INDIRECT`
 `COMPUTE_PGM_LO/HI`), which then read stale bytes and compiled pipelines for garbage states. The
 wait has to stay unless those register loads move to the execution thread.
 
+Render resolution, cross-boot benches of 120 s in a match (`nhl27_scale_0p5.json` sets the
+game's ResolutionScale to 0.5; the game registers 3840x2160 display buffers):
+
+| Run | Native | Scale 0.5 |
+|---|---|---|
+| Pair 1 | 29.1 fps, GPU 3D 72-74% | 29.7 fps |
+| Pair 2 | 29.6 fps, GPU 3D 72-74% | 33.8 fps, GPU 3D 52-53% |
+
+So pixels are not what holds the frame rate: the GPU stays busy at half resolution and the gain is
+small and uneven. `KYTY_OUTPUT_1080P=1` reports a 1080p output to the game (not measured yet).
+
+The resolve and execution threads share one program lock, held for whole resource
+materializations (resolve waited on it 14-17% of its time, execution 4-6%). Releasing it around
+the materialization of compute programs (only the execution thread materializes those) or around
+the resolve thread's read-ahead materialization was much slower in in-match A/Bs (the compute
+variant also compiled new compute permutations nonstop; the read-ahead variant was -39%, 6
+rounds), so the lock stays as it is.
+
+Bit 17 (`KYTY_BACKING_LOOKUP_CACHE`, default off): backing reads of another mapping than the
+thread's last one look the mapping up in a per-thread cache of 64 slots (one per 64 KiB block)
+before the locked map search. It hits 99.7% of the time, yet in-match A/Bs were -34% (6 rounds)
+and -25% (4 rounds), with every read-ahead still valid (`NHL27AHEAD`: resolved ahead per 2 s
+125,000 with it, 185,000 without). The resolve thread reads about 8 million guest dwords per
+second, so a few nanoseconds more per read matter: with the cache, a read that misses the
+single-mapping cache never refills it.
+
 Measured and dropped on the way: per-range write ticks (a download waits for the latest write of
 its bytes instead of its buffer's): fewer than 1% of the downloads would wait for an older
 submission, and the A/B was -14% +- 7.5.

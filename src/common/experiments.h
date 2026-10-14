@@ -16,7 +16,7 @@ namespace Common::Experiments {
 // Features that also have a live runtime flag (common/runtimeFlags.h, flags.ctl) are NOT here:
 // KYTY_GUEST_SYNC, KYTY_LONG_BUFFER_GC_AGE, KYTY_RENDER_TARGET_MEMO (flag KYTY_RT_DECODE_MEMO),
 // KYTY_FAULT_COALESCE, KYTY_SPARSE_BUFFER_GC, KYTY_DIRECT_EOP_INTERRUPTS, KYTY_READBACK_QUEUE.
-// Their bit numbers (13, 14, 16, 17, 19, 20) are retired. Bit 0 (once GuestSync) is
+// Their bit numbers (13, 14, 16, 19, 20) are retired; 17 is BackingLookupCache. Bit 0 (once GuestSync) is
 // EarlySubmitWriters, bit 8 (once GpuThreadPriority) is ReadbackTransfer and bit 9 (once
 // ImageRecycle, unconditional since the GTA port) is ReadbackSpin.
 // KYTY_RESOURCE_MULTI_CACHE (16-state resource memo) is read only by the resource memo itself.
@@ -32,6 +32,7 @@ enum Bit : uint32_t {
 	FalseShareReads    = 1u << 6u, // KYTY_FALSE_SHARE_READS (default off)
 	SrtBatchReads      = 1u << 7u, // KYTY_SRT_BATCH_READS (default on; also read by the program cache)
 	DirectSrtReads     = 1u << 10u, // KYTY_DIRECT_SRT_READS (default on; SRT reads without the IR walk)
+	BackingLookupCache = 1u << 17u, // KYTY_BACKING_LOOKUP_CACHE (default off: -34% in an in-match A/B; backing reads of another mapping than the last use a per-64 KiB lookup cache)
 	TextureDescCache   = 1u << 11u, // KYTY_TEXTURE_DESC_CACHE (default on; superseded by the draw-prep delta, no consumer)
 	ImageLookupHint    = 1u << 12u, // KYTY_IMAGE_LOOKUP_HINT (default on; skip the region scan for known images)
 	AdaptiveResourceMemo = 1u << 15u, // KYTY_ADAPTIVE_RESOURCE_MEMO (default on; superseded by KYTY_RESOURCE_MEMO_BYPASS, no consumer)

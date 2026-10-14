@@ -1857,8 +1857,14 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 	                         (attribute & 0x20000000) != 0;
 	ctx->mutex.Lock();
 	// Primary output reports 4K unless param.json Video-out Info enables resolution detection.
+	// KYTY_OUTPUT_1080P=1 reports a 1080p output to the game whatever it declares (NHL 27 then
+	// picks its own display buffers and render resolution).
+	static const bool output_1080p = [] {
+		const char* value = std::getenv("KYTY_OUTPUT_1080P");
+		return value != nullptr && value[0] == '1';
+	}();
 	status->resolution =
-	    ((attribute3 & 4) != 0 && ctx->width < 3840 && ctx->height < 2160 ? 1u : 2u);
+	    (output_1080p || ((attribute3 & 4) != 0 && ctx->width < 3840 && ctx->height < 2160) ? 1u : 2u);
 	status->dynamicRange = hdr_allowed && DriverState().IsHdrSupported() ? 2u : 1u;
 	status->refreshRate =
 	    (ctx->output_mode == VIDEO_OUT_OUTPUT_MODE_119_88HZ || Config::GetVblankFrequency() >= 119

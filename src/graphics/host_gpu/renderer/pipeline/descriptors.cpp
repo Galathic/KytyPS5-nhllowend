@@ -1289,7 +1289,13 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 				     descriptor.NumRecords(), raw.dwords[0], raw.dwords[1], raw.dwords[2], raw.dwords[3]);
 				std::fflush(stderr);
 			}
-			size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
+			// A descriptor wholly outside guest memory (NHL 27 menus, base 0x11ffffffff once in
+			// ~50 boots) is bound as a null buffer instead of ending the emulator.
+			size = Libs::LibKernel::Memory::ClampRangeSizeOrZero(address, size);
+			if (size == 0) {
+				source = {};
+				continue;
+			}
 			source = {address, size, cache.FindBuffer(address, size)};
 		}
 	}

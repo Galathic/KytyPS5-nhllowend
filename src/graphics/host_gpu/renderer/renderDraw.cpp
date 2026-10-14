@@ -760,6 +760,20 @@ DrawRenderState& RenderExecutor::AcquireDrawRenderState(bool tessellation, bool&
 	auto* resolved = std::exchange(m_resolved_draw, nullptr);
 	shaders_resolved =
 	    resolved != nullptr && !tessellation && resolved->programs.reads.StillValid();
+	// KYTY_DBG_CP_READS=1: how many draws use the resolve thread's read-ahead (NHL27AHEAD, 2 s).
+	if (Libs::Graphics::CpReadDebugEnabled()) {
+		static uint64_t counts[3] {};
+		static auto     last = std::chrono::steady_clock::now();
+		counts[resolved == nullptr ? 0 : shaders_resolved ? 1 : 2]++;
+		if ((counts[0] + counts[1] + counts[2]) % 1024 == 0 && std::chrono::steady_clock::now() - last > std::chrono::seconds(2)) {
+			last = std::chrono::steady_clock::now();
+			std::printf("NHL27AHEAD: draws resolved ahead=%llu stale=%llu not resolved=%llu\n",
+			            static_cast<unsigned long long>(counts[1]), static_cast<unsigned long long>(counts[2]),
+			            static_cast<unsigned long long>(counts[0]));
+			std::fflush(stdout);
+			counts[0] = counts[1] = counts[2] = 0;
+		}
+	}
 	if (shaders_resolved) {
 		return resolved->storage.state;
 	}

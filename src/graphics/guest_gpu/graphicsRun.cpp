@@ -3087,6 +3087,19 @@ void NoteCpRead(const char* kind, uint64_t address, const uint32_t* pairs, uint3
 	std::sort(sorted.begin(), sorted.end(), [](const Stat* a, const Stat* b) { return a->ns > b->ns; });
 	std::printf("NHL27CPREAD: total %.1f ms in 2 s over %zu kinds\n", static_cast<double>(total_ns) / 1e6,
 	            sorted.size());
+	{
+		// Page protection changes and tracking faults in the same 2 s (all threads).
+		static uint64_t previous[5] {};
+		uint64_t        now_stats[5] {};
+		ProtectStats::Read(now_stats[0], now_stats[1], now_stats[2], now_stats[3], now_stats[4]);
+		std::printf("NHL27PROTECT: protect calls=%llu (execution %llu) MiB=%.1f | faults read=%llu write=%llu\n",
+		            static_cast<unsigned long long>(now_stats[0] - previous[0]),
+		            static_cast<unsigned long long>(now_stats[2] - previous[2]),
+		            static_cast<double>(now_stats[1] - previous[1]) / (1024.0 * 1024.0),
+		            static_cast<unsigned long long>(now_stats[3] - previous[3]),
+		            static_cast<unsigned long long>(now_stats[4] - previous[4]));
+		std::copy(std::begin(now_stats), std::end(now_stats), std::begin(previous));
+	}
 	for (size_t i = 0; i < sorted.size() && i < 10; ++i) {
 		const auto& s = *sorted[i];
 		std::printf("NHL27CPREAD: %s ms=%.1f count=%llu slow=%llu last=0x%llx pairs=%u regs=%x,%x,%x,%x\n", s.kind,

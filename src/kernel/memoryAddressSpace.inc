@@ -203,7 +203,7 @@ public:
 			current += bytes;
 		}
 
-		RememberMapping(first->second, end);
+		RememberMapping(first->second, vaddr, end);
 		current = vaddr;
 		for (auto mapping = first; current < end; ++mapping) {
 			const auto& entry  = mapping->second;
@@ -260,6 +260,14 @@ public:
 				std::memcpy(destination, c.host + (vaddr - c.begin), size);
 				std::atomic_thread_fence(std::memory_order_acquire);
 				if (m_map_gen.load(std::memory_order_relaxed) == g0) return true;
+			}
+			// Another mapping than the last one: the per-block lookup cache, before the map
+			// (experiment BackingLookupCache; the resolve thread spent 13% in the map lookup).
+			if (Common::Experiments::Enabled(Common::Experiments::BackingLookupCache) &&
+			    TryCachedTransfer(vaddr, size, [destination](uint8_t* backing, size_t bytes) {
+				    std::memcpy(destination, backing, bytes);
+			    })) {
+				return true;
 			}
 			return TryTransferBacking(
 			    vaddr, size,
@@ -336,7 +344,7 @@ public:
 		    !RangeOk(entry.backing_offset + vaddr - entry.vaddr, size)) {
 			return nullptr;
 		}
-		RememberMapping(entry, end);
+		RememberMapping(entry, vaddr, end);
 		return m_backing_base + entry.backing_offset + (vaddr - entry.vaddr);
 	}
 
@@ -655,7 +663,7 @@ private:
 			    RangeOk(first.backing_offset + vaddr - first.vaddr, size)) {
 				transfer(m_backing_base + first.backing_offset + (vaddr - first.vaddr), 0,
 				         static_cast<size_t>(size));
-				RememberMapping(first, end);
+				RememberMapping(first, vaddr, end);
 				if (fill_cache) {
 					// m_mutex is held, so m_map_gen is stable and describes this entry.
 					const auto ok_len = std::min<uint64_t>(first.size, m_size - first.backing_offset);
@@ -724,12 +732,18 @@ private:
 		}
 	}
 #endif
+	// One mapping per 64 KiB block of guest addresses (direct mapped): resource reads of one draw
+	// touch more mappings than a few recent ones (the resolve thread spent 5% in the map lookup).
+	static constexpr uint32_t LookupSlots     = 64;
+	static constexpr uint32_t LookupSlotShift = 16;
 	struct LookupCache {
-		const GuestBackingStore* owner      = nullptr;
-		uint64_t                 generation = 0;
-		uint32_t                 next       = 0;
-		std::array<MapEntry, 4>  entries {};
+		const GuestBackingStore*          owner      = nullptr;
+		uint64_t                          generation = 0;
+		std::array<MapEntry, LookupSlots> entries {};
 	};
+	static constexpr uint32_t LookupSlot(uint64_t vaddr) noexcept {
+		return static_cast<uint32_t>(vaddr >> LookupSlotShift) % LookupSlots;
+	}
 
 	static LookupCache& ThreadLookupCache() noexcept {
 		thread_local LookupCache cache;
@@ -758,21 +772,19 @@ private:
 		    cached.generation != s_maps_generation.load(std::memory_order_acquire)) {
 			return false;
 		}
-		const auto end = vaddr + size;
-		for (const auto& entry: cached.entries) {
-			if (vaddr >= entry.vaddr && end <= entry.vaddr + entry.size) {
-				transfer(m_backing_base + entry.backing_offset + (vaddr - entry.vaddr),
-				         static_cast<size_t>(size));
-				return true;
-			}
+		const auto  end   = vaddr + size;
+		const auto& entry = cached.entries[LookupSlot(vaddr)];
+		if (vaddr >= entry.vaddr && end <= entry.vaddr + entry.size) {
+			transfer(m_backing_base + entry.backing_offset + (vaddr - entry.vaddr), static_cast<size_t>(size));
+			return true;
 		}
 		return false;
 	}
 
 	// Called under m_mutex (shared or exclusive) after a lookup: remembers a mapping that holds
 	// the whole transfer [entry.vaddr <= vaddr, end].
-	void RememberMapping(const MapEntry& entry, uint64_t end) {
-		if (end > entry.vaddr + entry.size || !RangeOk(entry.backing_offset, entry.size)) {
+	void RememberMapping(const MapEntry& entry, uint64_t vaddr, uint64_t end) {
+		if (vaddr < entry.vaddr || end > entry.vaddr + entry.size || !RangeOk(entry.backing_offset, entry.size)) {
 			return;
 		}
 		auto&      cached     = ThreadLookupCache();
@@ -780,7 +792,7 @@ private:
 		if (cached.owner != this || cached.generation != generation) {
 			cached = {this, generation};
 		}
-		cached.entries[cached.next++ % cached.entries.size()] = entry;
+		cached.entries[LookupSlot(vaddr)] = entry;
 	}
 
 	bool FindContainingUnlocked(uint64_t vaddr, uint64_t size, MapEntry* out) const {
