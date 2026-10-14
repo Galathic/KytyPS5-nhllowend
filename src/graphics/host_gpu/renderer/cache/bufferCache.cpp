@@ -542,9 +542,12 @@ namespace {
 // (0: the write is in it, so it must be submitted first); done = the write had finished on the
 // GPU when the download began; from = who read (gpu = the execution thread itself, cp = the
 // command processor, guest = a guest thread, ? = another path); exact = the bytes read were
-// GPU-written themselves (else they only share a page with such bytes).
+// GPU-written themselves (else they only share a page with such bytes); via = the ReadMemory
+// caller (fault, clear = fast-clear metadata, other = an explicit read such as a strict resource
+// table read).
 thread_local uint32_t g_readback_origin = 3;
 thread_local uint32_t g_readback_exact  = 2;
+thread_local uint32_t g_readback_caller = 3;
 struct ReadbackWaitNote {
 	bool                                  active = false;
 	bool                                  queue  = false;
@@ -556,10 +559,11 @@ struct ReadbackWaitNote {
 		const auto lag  = static_cast<uint32_t>(std::min<uint64_t>(current - std::min(write_tick, current), 3));
 		const bool done = scheduler.GetMasterSemaphore().KnownGpuTick() >= write_tick;
 		active          = true;
-		key             = g_readback_origin * 1000 + g_readback_exact * 100 + lag * 10 + (done ? 1 : 0);
-		start           = std::chrono::steady_clock::now();
+		key = g_readback_caller * 10000 + g_readback_origin * 1000 + g_readback_exact * 100 + lag * 10 + (done ? 1 : 0);
+		start             = std::chrono::steady_clock::now();
 		g_readback_origin = 3;
 		g_readback_exact  = 2;
+		g_readback_caller = 3;
 	}
 	~ReadbackWaitNote() {
 		if (!active) {
@@ -572,7 +576,7 @@ struct ReadbackWaitNote {
 		static std::map<uint32_t, Stat>                   stats;
 		static std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
 		const auto                                        now = std::chrono::steady_clock::now();
-		auto& stat = stats[key + (queue ? 10000u : 0u)];
+		auto& stat = stats[key + (queue ? 100000u : 0u)];
 		stat.count++;
 		stat.ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count());
 		if (now - last < std::chrono::seconds(2)) {
@@ -582,9 +586,11 @@ struct ReadbackWaitNote {
 		for (const auto& [k, s]: stats) {
 			static const char* const origins[] = {"gpu", "cp", "guest", "?"};
 			static const char* const exacts[]  = {"no", "yes", "?"};
-			std::printf("NHL27RBWAIT: %s from=%s exact=%s lag=%u done=%u count=%llu ms=%.1f\n",
-			            k >= 10000 ? "queue " : "inline", origins[(k / 1000) % 10], exacts[(k / 100) % 10],
-			            (k / 10) % 10, k % 10, static_cast<unsigned long long>(s.count), static_cast<double>(s.ns) / 1e6);
+			static const char* const callers[] = {"other", "clear", "fault", "?"};
+			std::printf("NHL27RBWAIT: %s via=%s from=%s exact=%s lag=%u done=%u count=%llu ms=%.1f\n",
+			            k >= 100000 ? "queue " : "inline", callers[(k / 10000) % 10], origins[(k / 1000) % 10],
+			            exacts[(k / 100) % 10], (k / 10) % 10, k % 10, static_cast<unsigned long long>(s.count),
+			            static_cast<double>(s.ns) / 1e6);
 		}
 		std::fflush(stdout);
 		stats.clear();
@@ -1080,6 +1086,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadC
 		if (CpReadDebugEnabled()) {
 			g_readback_origin = origin;
 			g_readback_exact  = is_write ? 2u : HasGpuDirtyBytes(vaddr, size) ? 1u : 0u;
+			g_readback_caller = static_cast<uint32_t>(caller);
 		}
 		const bool downloaded = lazy ? DownloadBufferMemory<true, true>(buffer, vaddr, size)
 		                             : DownloadBufferMemory<false>(buffer, vaddr, size);

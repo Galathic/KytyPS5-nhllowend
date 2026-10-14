@@ -302,11 +302,25 @@ bool GuestReadLog::StillValid() const {
 			    std::memcmp(buffer.data(), recorded, entry.size) != 0) {
 				return false;
 			}
-		} else if (!SameGuestBytes(reinterpret_cast<const void*>(entry.address), recorded,
-		                           entry.size)) {
+		} else {
+			// Experiment FaultPageDirect: on a page that faulted before (the GPU wrote other
+			// bytes of it), clean bytes are compared in the backing instead of faulting again.
+			if (Common::Experiments::Enabled(Common::Experiments::FaultPageDirect) &&
+			    Libs::LibKernel::Memory::IsReadFaultPage(entry.address, entry.size)) {
+				const auto compare =
+				    Libs::LibKernel::Memory::TryValidateCleanBacking(entry.address, recorded, entry.size);
+				if (compare == Libs::LibKernel::Memory::CleanBackingCompare::Equal) {
+					continue;
+				}
+				if (compare == Libs::LibKernel::Memory::CleanBackingCompare::Different) {
+					return false;
+				}
+			}
 			// A plain load, as the execution thread's own resolution reads: GPU-owned pages
 			// fault and read the GPU's bytes back.
-			return false;
+			if (!SameGuestBytes(reinterpret_cast<const void*>(entry.address), recorded, entry.size)) {
+				return false;
+			}
 		}
 	}
 	return true;

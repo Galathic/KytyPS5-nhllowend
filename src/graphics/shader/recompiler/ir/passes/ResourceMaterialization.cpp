@@ -34,6 +34,11 @@ void SetFaultPageReader(FaultPageReader reader) {
 	g_fault_page_reader_slot.store(reader, std::memory_order_relaxed);
 }
 
+bool TryFaultPageRead(uint64_t address, void* data, uint64_t size) {
+	const auto reader = g_fault_page_reader_slot.load(std::memory_order_relaxed);
+	return reader != nullptr && reader(address, data, size);
+}
+
 namespace {
 
 constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;

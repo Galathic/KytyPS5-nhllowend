@@ -2299,7 +2299,10 @@ bool SrtWalker::DirectReadRun(uint32_t slot, uint32_t count, std::vector<uint32_
 	const auto words = std::span(flat).subspan(first, count);
 	if (evaluator.m_runtime.read_memory != nullptr) {
 		if (!evaluator.m_runtime.read_memory(evaluator.m_runtime.userdata, address, words)) return false;
-	} else {
+	} else if (!Common::Experiments::Enabled(Common::Experiments::FaultPageDirect) ||
+	           !TryFaultPageRead(address, words.data(), words.size_bytes())) {
+		// Experiment FaultPageDirect: clean bytes of a page that faulted before (the GPU wrote
+		// others) come from the backing; the plain read would fault and wait for the GPU.
 		std::memcpy(words.data(), reinterpret_cast<const void*>(address), words.size_bytes());
 	}
 	// Descriptor and condition expressions refer back to these reads through the memo.

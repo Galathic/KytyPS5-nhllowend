@@ -62,6 +62,7 @@ uint32_t EnvironmentMask() {
 	set("KYTY_READBACK_COMPUTE", ReadbackCompute, true);
 	set("KYTY_READBACK_TRANSFER", ReadbackTransfer, false);
 	set("KYTY_READBACK_SPIN", ReadbackSpin, false);
+	set("KYTY_FAULT_PAGE_DIRECT", FaultPageDirect, true);
 	return mask;
 }
 

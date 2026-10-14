@@ -28,6 +28,7 @@ enum Bit : uint32_t {
 	ReadbackTransfer   = 1u << 8u, // KYTY_READBACK_TRANSFER (default off; second-queue readbacks on the transfer-only family, before ReadbackCompute)
 	ReadbackSpin       = 1u << 9u, // KYTY_READBACK_SPIN (default off; a second-queue readback polls its fence briefly before sleeping on it)
 	SrtJit             = 1u << 4u, // KYTY_SRT_JIT (default off; upstream x64 flat walker for plans without control flow)
+	FaultPageDirect    = 1u << 5u, // KYTY_FAULT_PAGE_DIRECT (default on; direct SRT reads and read-ahead checks of pages that faulted before use the backing)
 	FalseShareReads    = 1u << 6u, // KYTY_FALSE_SHARE_READS (default off)
 	SrtBatchReads      = 1u << 7u, // KYTY_SRT_BATCH_READS (default on; also read by the program cache)
 	DirectSrtReads     = 1u << 10u, // KYTY_DIRECT_SRT_READS (default on; SRT reads without the IR walk)

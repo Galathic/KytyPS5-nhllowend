@@ -14,6 +14,8 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 // tried first; it returns false to keep the plain read (experiment FaultPageReads).
 using FaultPageReader = bool (*)(uint64_t address, void* data, uint64_t size);
 void SetFaultPageReader(FaultPageReader reader);
+// The reader, when set; false when the plain read must be used.
+[[nodiscard]] bool TryFaultPageRead(uint64_t address, void* data, uint64_t size);
 
 
 // Canonical module-affecting resource state. Runtime addresses and descriptor payloads remain in

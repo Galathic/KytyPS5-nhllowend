@@ -76,6 +76,23 @@ leaves the device as before), and bit 2 copies on the compute family, bit 8
 | Compute family | 28.7 | +13.8% (paired +3.5 +- 1.4, every round faster) |
 | Transfer family | 24.7 | -2% (+-7.5: copies of finished data take 0.1 ms, but some phases are much slower) |
 
+With the compute queue, the remaining download waits of the execution thread in play (per 2 s):
+- 20 to 40 faults on bytes that only share a page with GPU-written ones, each waiting about 6 ms
+  for the previous submission (130 to 230 ms): the plain loads of direct resource-table reads
+  (`SrtWalker::DirectReadRun`) and of read-ahead checks (`GuestReadLog::StillValid`). Bit 5
+  (`KYTY_FAULT_PAGE_DIRECT`, default on) reads such bytes from the backing once their page has
+  faulted on this thread (as `KYTY_FAULT_PAGE_READS` already did for ordinary resource reads);
+  with it these waits are gone from `NHL27RBWAIT`.
+- About 60 reads of bytes the GPU wrote in the command buffer being recorded (strict resource
+  reads): 50 to 300 ms, a real dependency.
+- Bit 9 (`KYTY_READBACK_SPIN`, fence polling) stays off: within noise.
+
+The game asks for its flip rate every frame (`VideoOutSetFlipRate`; `KYTY_DBG_QUEUE_TIME=1`
+prints changes as `NHL27FLIPRATE`): 60 Hz during play (stretches of 60 to 70 s in a match), 30 Hz
+in menus, the pause menu and some stoppages. A paused match is therefore capped at 30 fps and is
+no longer a useful A/B scene; in play the execution thread is the limit (`NHL27QUEUES`: q0 busy
+990 ms/s, about 110,000 operations/s at 9 us each).
+
 Measured and dropped on the way: per-range write ticks (a download waits for the latest write of
 its bytes instead of its buffer's): fewer than 1% of the downloads would wait for an older
 submission, and the A/B was -14% +- 7.5.
