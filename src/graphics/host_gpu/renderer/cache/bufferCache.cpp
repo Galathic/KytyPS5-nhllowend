@@ -18,6 +18,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
@@ -29,6 +30,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -364,7 +366,10 @@ void BufferCache::DiscardGpuModified(uint64_t vaddr, uint64_t size) {
 		return;
 	}
 	DropGpuFills(vaddr, size);
-	m_gpu_modified_ranges.Subtract(vaddr, size);
+	{
+		std::unique_lock ranges_lock(m_gpu_ranges_mutex);
+		m_gpu_modified_ranges.Subtract(vaddr, size);
+	}
 	m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
 }
 
@@ -373,7 +378,10 @@ void BufferCache::ForgetGpuWrite(uint64_t vaddr, uint64_t size) {
 		return;
 	}
 	DropGpuFills(vaddr, size);
-	m_gpu_modified_ranges.Subtract(vaddr, size);
+	{
+		std::unique_lock ranges_lock(m_gpu_ranges_mutex);
+		m_gpu_modified_ranges.Subtract(vaddr, size);
+	}
 	const auto first = vaddr & ~(TRACKER_PAGE_SIZE - 1);
 	const auto last  = (vaddr + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
 	for (auto page = first; page < last; page += TRACKER_PAGE_SIZE) {
@@ -512,6 +520,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 			    // Keep packed ranges on separate cache lines, as in shadPS4.
 			    total_size += Common::AlignUp(end - start, 64);
 		    });
+		    std::unique_lock ranges_lock(m_gpu_ranges_mutex);
 		    m_gpu_modified_ranges.Subtract(address, bytes);
 	    });
 	m_last_download_bytes = 0;
@@ -1372,7 +1381,10 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 			FrameDump::TraceWrite("buffer-write", vaddr, vaddr + size, m_writer_kind, m_writer_hash);
 		}
 		m_gpu_write_generation++;
-		m_gpu_modified_ranges.Add(vaddr, size);
+		{
+			std::unique_lock ranges_lock(m_gpu_ranges_mutex);
+			m_gpu_modified_ranges.Add(vaddr, size);
+		}
 		++m_gpu_dirty_generation;
 	}
 	return {&buffer, buffer.Offset(vaddr)};
@@ -1533,6 +1545,192 @@ bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 	return m_gpu_modified_ranges.Intersects(vaddr, size);
 }
 
+bool BufferCache::HasGpuDirtyBytesShared(uint64_t vaddr, uint64_t size) const {
+	std::shared_lock ranges_lock(m_gpu_ranges_mutex);
+	return m_gpu_modified_ranges.Intersects(vaddr, size);
+}
+
+uint64_t BufferCache::GpuDirtyByteCount(uint64_t vaddr, uint64_t size) const {
+	std::shared_lock ranges_lock(m_gpu_ranges_mutex);
+	uint64_t         dirty = 0;
+	m_gpu_modified_ranges.ForEachInRange(vaddr, size, [&](uint64_t start, uint64_t end) { dirty += end - start; });
+	return dirty;
+}
+
+namespace {
+
+// Experiment SpeculateDirtyReads bookkeeping, keyed by read address and size. Counts are totals
+// since start.
+struct SpecReadEntry {
+	uint64_t vaddr       = 0;
+	uint64_t size        = 0;
+	uint32_t stable      = 0; // consecutive downloads that found the bytes unchanged
+	uint64_t downloads   = 0;
+	uint64_t changed     = 0;
+	uint64_t speculated  = 0;
+	uint64_t confirmed   = 0;
+	uint64_t mispredicts = 0;
+	uint64_t wait_ns     = 0;
+	uint64_t context     = 0; // shader being materialized
+	uint64_t exec_op     = 0;
+	uint8_t  value[16] {};
+	uint64_t stack[10] {};
+	int      depth = 0;
+};
+std::mutex                                  g_spec_mutex;
+std::unordered_map<uint64_t, SpecReadEntry> g_spec_reads;
+std::chrono::steady_clock::time_point       g_spec_last_print {};
+uint64_t                                    g_spec_miss_lines = 0;
+constexpr uint32_t                          SpecStableNeeded  = 4;
+constexpr uint64_t                          SpecMaxBytes      = 16;
+
+uint64_t SpecKey(uint64_t vaddr, uint64_t size) {
+	return vaddr ^ (size << 56u);
+}
+
+std::string SpecHex(const uint8_t* bytes, uint64_t size) {
+	std::string text;
+	char        digits[3] {};
+	for (uint64_t i = 0; i < size; ++i) {
+		std::snprintf(digits, sizeof(digits), "%02x", bytes[i]);
+		text += digits;
+	}
+	return text;
+}
+
+// Caller holds g_spec_mutex. KYTY_PERF_STATS: the most-read addresses every 5 s (NHL27SPECREAD).
+void SpecMaybePrint() {
+	if (!PerfStatsEnabled()) {
+		return;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (now - g_spec_last_print < std::chrono::seconds(5)) {
+		return;
+	}
+	g_spec_last_print = now;
+	std::vector<const SpecReadEntry*> top;
+	top.reserve(g_spec_reads.size());
+	for (const auto& entry: g_spec_reads) {
+		top.push_back(&entry.second);
+	}
+	std::sort(top.begin(), top.end(), [](const SpecReadEntry* a, const SpecReadEntry* b) {
+		return a->downloads + a->speculated > b->downloads + b->speculated;
+	});
+	for (size_t i = 0; i < top.size() && i < 6; ++i) {
+		const auto& e = *top[i];
+		std::string stack;
+		for (int f = 0; f < e.depth; ++f) {
+			char frame[24] {};
+			std::snprintf(frame, sizeof(frame), "%s0x%" PRIx64, f == 0 ? "" : ",", e.stack[f]);
+			stack += frame;
+		}
+		std::printf("NHL27SPECREAD: vaddr=0x%" PRIx64 " size=%" PRIu64 " value=%s downloads=%" PRIu64
+		            " changed=%" PRIu64 " speculated=%" PRIu64 " confirmed=%" PRIu64 " mispredicts=%" PRIu64
+		            " stable=%u wait_ms=%.1f shader=0x%016" PRIx64 " op=0x%" PRIx64 " stack=%s\n",
+		            e.vaddr, e.size, SpecHex(e.value, e.size).c_str(), e.downloads, e.changed, e.speculated,
+		            e.confirmed, e.mispredicts, e.stable, static_cast<double>(e.wait_ns) / 1e6, e.context,
+		            e.exec_op, stack.c_str());
+	}
+	std::fflush(stdout);
+}
+
+} // namespace
+
+void BufferCache::NoteDirtyRead(uint64_t vaddr, uint64_t size, bool changed, const void* value,
+                                uint64_t wait_ns) {
+	if (size == 0 || size > SpecMaxBytes || value == nullptr) {
+		return;
+	}
+	std::scoped_lock lock(g_spec_mutex);
+	auto&            e = g_spec_reads[SpecKey(vaddr, size)];
+	if (e.downloads == 0 && e.speculated == 0) {
+		e.vaddr = vaddr;
+		e.size  = size;
+		e.depth = Libs::LibKernel::Memory::CaptureHostStack(e.stack, 10);
+	}
+	e.downloads++;
+	e.wait_ns += wait_ns;
+	e.changed += changed ? 1 : 0;
+	e.stable = changed ? 0 : e.stable + 1;
+	std::memcpy(e.value, value, size);
+	e.context = Libs::LibKernel::Memory::ReadContext();
+	e.exec_op = GuestGpu::CurrentExecOp();
+	SpecMaybePrint();
+}
+
+bool BufferCache::TrySpeculativeRead(uint64_t vaddr, void* data, uint64_t size) {
+	if (size == 0 || size > SpecMaxBytes || data == nullptr || !GuestGpu::IsGpuThread()) {
+		return false;
+	}
+	const auto key = SpecKey(vaddr, size);
+	{
+		std::scoped_lock lock(g_spec_mutex);
+		const auto       it = g_spec_reads.find(key);
+		if (it == g_spec_reads.end() || it->second.stable < SpecStableNeeded) {
+			return false;
+		}
+	}
+	auto& command = m_scheduler.Current();
+	if (command.IsInvalid() || !Libs::LibKernel::Memory::TryReadBacking(vaddr, data, size)) {
+		return false;
+	}
+	auto [mapped, offset] = m_download_buffer.Map(SpecMaxBytes, 64);
+	if (mapped == nullptr) {
+		return false;
+	}
+	m_download_buffer.Commit();
+	// Copy the GPU's bytes back after the work recorded so far, without changing what is tracked
+	// as GPU-dirty: later reads and faults still download as before.
+	auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+	command.EndRendering();
+	const auto              native = command.Handle();
+	vk::BufferMemoryBarrier before {};
+	before.srcAccessMask       = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	before.dstAccessMask       = vk::AccessFlagBits::eTransferRead;
+	before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before.buffer              = buffer.Handle();
+	before.offset              = 0;
+	before.size                = buffer.Size();
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer, {}, 0,
+	                       nullptr, 1, &before, 0, nullptr);
+	const vk::BufferCopy copy {buffer.Offset(vaddr), offset, size};
+	native.copyBuffer(buffer.Handle(), m_download_buffer.Handle(), 1, &copy);
+	auto after          = before;
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eHostRead;
+	after.buffer        = m_download_buffer.Handle();
+	after.offset        = offset;
+	after.size          = size;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                       vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost, {}, 0,
+	                       nullptr, 1, &after, 0, nullptr);
+	std::array<uint8_t, SpecMaxBytes> expected {};
+	std::memcpy(expected.data(), data, size);
+	m_scheduler.DeferHostOperation([this, mapped, offset, size, key, expected] {
+		m_download_buffer.Invalidate(offset, size);
+		const bool       same = std::memcmp(mapped, expected.data(), size) == 0;
+		std::scoped_lock lock(g_spec_mutex);
+		auto&            e = g_spec_reads[key];
+		if (same) {
+			e.confirmed++;
+			return;
+		}
+		e.mispredicts++;
+		e.stable = 0;
+		if (g_spec_miss_lines++ < 64) {
+			std::printf("NHL27SPECMISS: vaddr=0x%" PRIx64 " size=%" PRIu64 " guessed=%s gpu=%s shader=0x%016" PRIx64 "\n",
+			            e.vaddr, size, SpecHex(expected.data(), size).c_str(), SpecHex(mapped, size).c_str(),
+			            e.context);
+			std::fflush(stdout);
+		}
+	});
+	std::scoped_lock lock(g_spec_mutex);
+	g_spec_reads[key].speculated++;
+	SpecMaybePrint();
+	return true;
+}
+
 bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionCpuModified(vaddr, size);
 }
@@ -1638,6 +1836,7 @@ void BufferCache::NoteGpuWrites(uint64_t vaddr, uint64_t size) {
 		    start, finish - start, [&](uint64_t page, uint64_t bytes) {
 			    const auto first = std::max(page, start);
 			    const auto last  = std::min(page + bytes, finish);
+			    std::unique_lock ranges_lock(m_gpu_ranges_mutex);
 			    m_gpu_modified_ranges.Add(first, last - first);
 		    });
 	}

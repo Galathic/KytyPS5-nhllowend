@@ -1,5 +1,6 @@
 #include "common/runtimeFlags.h"
 #include "common/assert.h"
+#include "common/experiments.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -1966,6 +1967,18 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 	return 3;
 }
 
+// The register table of an indirect register packet. On the GPU thread TryReadBufferBacking reads
+// it from the backing (downloading actual GPU writes first). Experiment CpCleanRegReads: the
+// command processor thread of a pipelined GPU reads a table without GPU-dirty bytes from the
+// backing too. Otherwise each load of a table on a page protected for other GPU-written bytes
+// faults, which costs tens of microseconds per register in a match.
+static bool ReadRegisterTable(uint64_t address, std::vector<uint32_t>& table) {
+	const uint64_t bytes = table.size() * sizeof(uint32_t);
+	return LibKernel::Memory::TryReadBufferBacking(address, table.data(), bytes) ||
+	       (Common::Experiments::Enabled(Common::Experiments::CpCleanRegReads) &&
+	        LibKernel::Memory::TryReadCleanBackingShared(address, table.data(), bytes));
+}
+
 KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -1988,9 +2001,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	// Reused per packet (GPU thread only): one allocation instead of one per packet.
 	static thread_local std::vector<uint32_t> backing_registers;
 	backing_registers.resize(indirect_num_dw * 2u);
-	if (LibKernel::Memory::TryReadBufferBacking(reinterpret_cast<uint64_t>(indirect_buffer),
-	                                          backing_registers.data(),
-	                                          backing_registers.size() * sizeof(uint32_t))) {
+	if (ReadRegisterTable(reinterpret_cast<uint64_t>(indirect_buffer), backing_registers)) {
 		indirect_buffer = backing_registers.data();
 		static std::atomic_flag reported = ATOMIC_FLAG_INIT;
 		if (!reported.test_and_set(std::memory_order_relaxed)) {
@@ -2075,9 +2086,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 	// Reused per packet (GPU thread only): one allocation instead of one per packet.
 	static thread_local std::vector<uint32_t> backing_registers;
 	backing_registers.resize(indirect_num_dw * 2u);
-	if (LibKernel::Memory::TryReadBufferBacking(reinterpret_cast<uint64_t>(indirect_buffer),
-	                                          backing_registers.data(),
-	                                          backing_registers.size() * sizeof(uint32_t))) {
+	if (ReadRegisterTable(reinterpret_cast<uint64_t>(indirect_buffer), backing_registers)) {
 		indirect_buffer = backing_registers.data();
 		static std::atomic_flag reported = ATOMIC_FLAG_INIT;
 		if (!reported.test_and_set(std::memory_order_relaxed)) {
@@ -2151,9 +2160,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	// Reused per packet (GPU thread only): one allocation instead of one per packet.
 	static thread_local std::vector<uint32_t> backing_registers;
 	backing_registers.resize(indirect_num_dw * 2u);
-	if (LibKernel::Memory::TryReadBufferBacking(reinterpret_cast<uint64_t>(indirect_buffer),
-	                                          backing_registers.data(),
-	                                          backing_registers.size() * sizeof(uint32_t))) {
+	if (ReadRegisterTable(reinterpret_cast<uint64_t>(indirect_buffer), backing_registers)) {
 		indirect_buffer = backing_registers.data();
 		static std::atomic_flag reported = ATOMIC_FLAG_INIT;
 		if (!reported.test_and_set(std::memory_order_relaxed)) {

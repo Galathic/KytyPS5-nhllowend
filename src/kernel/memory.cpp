@@ -1159,7 +1159,14 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 		}
 		auto& buffers = GetGpuResources().GetBufferCache();
 		if (buffers.HasGpuDirtyBytes(vaddr, size)) {
-			if (!BackingReadStatsEnabled()) {
+			// Experiment SpeculateDirtyReads: bytes the GPU keeps rewriting with the values the
+			// backing already holds are read from the backing without waiting; the GPU's bytes are
+			// checked when it gets there.
+			const bool speculate = Common::Experiments::Enabled(Common::Experiments::SpeculateDirtyReads);
+			if (speculate && buffers.TrySpeculativeRead(vaddr, data, size)) {
+				return true;
+			}
+			if (!BackingReadStatsEnabled() && !speculate) {
 				buffers.ReadMemory(vaddr, size);
 			} else {
 				auto&                 stats = g_backing_read_stats;
@@ -1175,7 +1182,13 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 					std::array<uint8_t, 256> after {};
 					if (TryReadBacking(vaddr, after.data(), size)) {
 						stats.compared++;
-						stats.unchanged += std::memcmp(before.data(), after.data(), size) == 0 ? 1 : 0;
+						const bool unchanged = std::memcmp(before.data(), after.data(), size) == 0;
+						stats.unchanged += unchanged ? 1 : 0;
+						if (speculate) {
+							buffers.NoteDirtyRead(vaddr, size, !unchanged, after.data(),
+							                      static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+							                          now - start).count()));
+						}
 					}
 				}
 				if (now - stats.last_print >= std::chrono::seconds(5)) {
@@ -1192,9 +1205,98 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
+bool TryReadCleanBackingAnyThread(uint64_t vaddr, void* data, uint64_t size) {
+	if (g_gpu_resources == nullptr || data == nullptr || size == 0 || Graphics::GuestGpu::IsGpuThread()) {
+		return false;
+	}
+	auto&          buffers = GetGpuResources().GetBufferCache();
+	const uint64_t page    = vaddr & ~uint64_t {0xfff};
+	// Only a page protected for other bytes the GPU wrote; the read itself must be clean. Those bytes
+	// are current in the backing, whereas the fault would download the page and wait for all
+	// queued GPU work.
+	if (!buffers.HasGpuDirtyBytesShared(page, 0x1000) || buffers.HasGpuDirtyBytesShared(vaddr, size)) {
+		return false;
+	}
+	// Each served read costs a fault and leaves the page protected. A page read over and over is
+	// cheaper to download once, so cap the reads per page per thread in each 10 ms window.
+	struct PageReads {
+		uint64_t page   = 0;
+		int64_t  window = 0;
+		uint32_t count  = 0;
+	};
+	thread_local std::array<PageReads, 64> recent {};
+	const auto window = std::chrono::duration_cast<std::chrono::milliseconds>(
+	                        std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+	auto& slot = recent[(page >> 12u) & (recent.size() - 1u)];
+	if (slot.page != page || slot.window != window) {
+		slot = {page, window, 0};
+	}
+	if (++slot.count > 256u) {
+		return false;
+	}
+	return TryReadBacking(vaddr, data, size);
+}
+
+bool TryReadCleanBackingShared(uint64_t vaddr, void* data, uint64_t size) {
+	if (g_gpu_resources == nullptr || data == nullptr || size == 0 || Graphics::GuestGpu::IsGpuThread() ||
+	    !Graphics::GuestRange {vaddr, size}.Valid() ||
+	    GetGpuResources().GetBufferCache().HasGpuDirtyBytesShared(vaddr, size)) {
+		return false;
+	}
+	return TryReadBacking(vaddr, data, size);
+}
+
+// KYTY_PERF_GPU_FAULT_STACKS: how this thread's last TryReadCleanBacking call ended (CleanReadResult).
+static thread_local int t_clean_read_result = 0;
+
+int TakeCleanReadResult() {
+	const int result    = t_clean_read_result;
+	t_clean_read_result = 0;
+	return result;
+}
+
+uint64_t GpuDirtyByteCount(uint64_t vaddr, uint64_t size) {
+	if (g_gpu_resources == nullptr || size == 0) {
+		return 0;
+	}
+	return GetGpuResources().GetBufferCache().GpuDirtyByteCount(vaddr, size);
+}
+
+static thread_local uint64_t t_read_context = 0;
+
+void SetReadContext(uint64_t context) {
+	t_read_context = context;
+}
+
+uint64_t ReadContext() {
+	return t_read_context;
+}
+
+int CaptureHostStack(uint64_t* frames, int max_frames) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (frames == nullptr || max_frames <= 0) {
+		return 0;
+	}
+	void* raw[32] {};
+	const auto count = RtlCaptureStackBackTrace(1, static_cast<DWORD>(std::min(max_frames, 32)), raw, nullptr);
+	for (USHORT i = 0; i < count; ++i) {
+		frames[i] = reinterpret_cast<uint64_t>(raw[i]);
+	}
+	return static_cast<int>(count);
+#else
+	(void)frames;
+	(void)max_frames;
+	return 0;
+#endif
+}
+
 bool TryReadCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
-	if (g_gpu_resources == nullptr || !Graphics::GuestGpu::IsGpuThread() ||
-	    GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size)) {
+	if (g_gpu_resources == nullptr || !Graphics::GuestGpu::IsGpuThread()) {
+		t_clean_read_result = CleanReadUnavailable;
+		return false;
+	}
+	if (GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size)) {
+		t_clean_read_result = CleanReadDirty;
 		return false;
 	}
 	// Each served read costs a fault. A page read over and over (a command stream, a table walk)
@@ -1213,9 +1315,12 @@ bool TryReadCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 		slot = {page, epoch, 0};
 	}
 	if (++slot.count > 64u) {
+		t_clean_read_result = CleanReadCapped;
 		return false;
 	}
-	return TryReadBacking(vaddr, data, size);
+	const bool read     = TryReadBacking(vaddr, data, size);
+	t_clean_read_result = read ? CleanReadServed : CleanReadFailed;
+	return read;
 }
 
 bool TryReadCleanBufferBacking(uint64_t vaddr, void* data, uint64_t size) {

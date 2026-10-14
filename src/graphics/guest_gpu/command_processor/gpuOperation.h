@@ -97,6 +97,9 @@ struct GpuOperation {
 	// The command processor processed a WAIT_REG_MEM since the previous operation: the guest may
 	// have written memory the operations before it read.
 	bool after_wait = false;
+	// KYTY_IDLE_TRACE: the PM4 packet that produced the operation (opcode | IT_NOP R code << 8,
+	// 0x4000 = the KYTY_BDA_BATCH boundary after the packet, 0 = outside a packet).
+	uint16_t trace_op = 0;
 	union {
 		DrawIndexArgs       draw_index;
 		DrawAutoArgs        draw_auto;

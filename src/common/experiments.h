@@ -29,6 +29,12 @@ enum Bit : uint32_t {
 	AdaptiveResourceMemo = 1u << 15u, // KYTY_ADAPTIVE_RESOURCE_MEMO (default on; superseded by KYTY_RESOURCE_MEMO_BYPASS, no consumer)
 	CleanFromDirect      = 1u << 18u, // KYTY_CLEAN_FROM_DIRECT (default on; strict evaluator reuses direct SRT words)
 	LazySharedWrites     = 1u << 22u, // KYTY_LAZY_SHARED_WRITES (default off; CPU stores next to few GPU-written bytes do not wait)
+	ProtectSharedLock    = 1u << 23u, // KYTY_PROTECT_SHARED_LOCK (default off; page-tracking protections of different pages run in parallel)
+	ClockWaitPredict     = 1u << 24u, // KYTY_CLOCK_WAIT_PREDICT (default off; WAIT_REG_MEM on a pending clock write need not wait for it)
+	FalseShareAnyThread  = 1u << 29u, // KYTY_FALSE_SHARE_ANY_THREAD (default off; CP and guest reads of clean bytes on GPU-dirty pages use the backing)
+	CpCleanRegReads      = 1u << 25u, // KYTY_CP_CLEAN_REG_READS (default off; the command processor reads clean indirect register tables from the backing)
+	CpSkipIdleSpin       = 1u << 26u, // KYTY_CP_SKIP_IDLE_SPIN (default off; work queued while the command processor waited for the execution thread starts at once, not after a 2 ms spin)
+	SpeculateDirtyReads  = 1u << 30u, // KYTY_SPECULATE_DIRTY_READS (default off; shader-table reads of GPU-written bytes the GPU keeps rewriting unchanged use the backing, checked later)
 	// A/B only (no environment variable): selects the code a pending change replaces.
 	AbLegacy = 1u << 31u,
 };
