@@ -897,8 +897,8 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 			}
 			return;
 		}
-		if (dw_num <= 2) {
-			std::array<uint32_t, 2> values{};
+		if (dw_num <= 64) {
+			std::array<uint32_t, 64> values{};
 			std::memcpy(values.data(), src, static_cast<size_t>(dw_num) * sizeof(uint32_t));
 			if (cache.TryWriteLabel(reinterpret_cast<uint64_t>(dst), values.data(),
 			                        static_cast<uint64_t>(dw_num) * sizeof(uint32_t))) {
@@ -2479,12 +2479,26 @@ void CommandProcessor::ExecuteWriteAtEndOfPipe(uint64_t submit_id, uint32_t eop_
 		const char* setting = std::getenv("KYTY_EOP_DIRECT_LABELS");
 		return setting != nullptr && setting[0] == '1';
 	}();
+	// KYTY_EOP_LABEL_NO_PREPARE=1 (experiment, off by default): prepare the guest page only when the
+	// label falls back to a plain write. Preparing a protected page downloads its GPU-dirty bytes, which
+	// waits for all queued GPU work (about 17 ms per label in the NHL 27 menus). A direct label write
+	// (KYTY_EOP_DIRECT_LABELS) updates the backing and the GPU copy without touching the guest view.
+	static const bool label_no_prepare = [] {
+		const char* setting = std::getenv("KYTY_EOP_LABEL_NO_PREPARE");
+		return setting != nullptr && setting[0] == '1';
+	}();
 	auto write_label = [&](void* destination, const void* data, uint64_t bytes) {
 		Common::EventTrace::Record(Common::EventTrace::LABEL_WRITE,
 		                           reinterpret_cast<uint64_t>(destination) & 0xffffffffu,
 		                           m_renderer.GetCommandScheduler().CurrentTick());
+		if (!label_no_prepare) {
+			m_renderer.PrepareGpuWrite(destination, bytes);
+		}
 		if (!direct_labels || !m_renderer.GetBufferCache().TryWriteLabel(
 		        reinterpret_cast<uint64_t>(destination), data, bytes)) {
+			if (label_no_prepare) {
+				m_renderer.PrepareGpuWrite(destination, bytes);
+			}
 			std::memcpy(destination, data, static_cast<size_t>(bytes));
 		} else {
 			static std::atomic_flag reported = ATOMIC_FLAG_INIT;
@@ -2500,7 +2514,6 @@ void CommandProcessor::ExecuteWriteAtEndOfPipe(uint64_t submit_id, uint32_t eop_
 		auto  data = static_cast<uint32_t>(value);
 		EXIT_IF(dst == nullptr);
 		(void)command.Handle();
-		m_renderer.PrepareGpuWrite(dst, sizeof(data));
 		write_label(dst, &data, sizeof(data));
 
 		if (with_interrupt) {
@@ -2544,7 +2557,6 @@ void CommandProcessor::ExecuteWriteAtEndOfPipe(uint64_t submit_id, uint32_t eop_
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
 					EXIT_IF(dst == nullptr);
 					(void)command.Handle();
-					m_renderer.PrepareGpuWrite(dst, sizeof(value));
 					write_label(dst, &value, sizeof(value));
 
 					if (with_interrupt) {

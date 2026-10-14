@@ -729,16 +729,99 @@ BufferCache::~BufferCache() {
 	m_buffers.clear();
 }
 
+// NHL27LABEL (KYTY_PERF_STATS=1): how direct label writes resolve. A failed label write falls back to
+// PrepareGpuWrite, which downloads GPU-dirty bytes on the page and waits for queued GPU work. Every 5 s.
+namespace {
+enum LabelOutcome : size_t {
+	LabelOk,
+	LabelUncached,
+	LabelBadSize,
+	LabelNoBuffer,
+	LabelNotCovered,
+	LabelOwnerCovers,
+	LabelBacking,
+	LabelCount
+};
+std::atomic<uint64_t> g_label_outcomes[LabelCount] {};
+void NoteLabel(LabelOutcome outcome, uint64_t vaddr) {
+	if (!PerfStatsEnabled()) {
+		return;
+	}
+	g_label_outcomes[outcome].fetch_add(1, std::memory_order_relaxed);
+	static std::atomic<int64_t>  last_ns {0};
+	static std::atomic<uint64_t> last_vaddr {0};
+	if (outcome != LabelOk && outcome != LabelUncached) {
+		last_vaddr.store(vaddr, std::memory_order_relaxed);
+	}
+	const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                        std::chrono::steady_clock::now().time_since_epoch())
+	                        .count();
+	int64_t prev = last_ns.load(std::memory_order_relaxed);
+	if (now - prev < 5'000'000'000 || !last_ns.compare_exchange_strong(prev, now)) {
+		return;
+	}
+	uint64_t n[LabelCount] {};
+	for (size_t i = 0; i < LabelCount; i++) {
+		n[i] = g_label_outcomes[i].exchange(0, std::memory_order_relaxed);
+	}
+	std::printf("NHL27LABEL: ok=%llu uncached_ok=%llu bad_size=%llu no_buffer=%llu not_covered=%llu "
+	            "(page_owner_covers=%llu) backing_fail=%llu last_fail_vaddr=0x%016llx\n",
+	            static_cast<unsigned long long>(n[LabelOk]), static_cast<unsigned long long>(n[LabelUncached]),
+	            static_cast<unsigned long long>(n[LabelBadSize]), static_cast<unsigned long long>(n[LabelNoBuffer]),
+	            static_cast<unsigned long long>(n[LabelNotCovered]),
+	            static_cast<unsigned long long>(n[LabelOwnerCovers]), static_cast<unsigned long long>(n[LabelBacking]),
+	            static_cast<unsigned long long>(last_vaddr.load(std::memory_order_relaxed)));
+	std::fflush(stdout);
+}
+} // namespace
+
 bool BufferCache::TryWriteLabel(uint64_t vaddr, const void* data, uint64_t size) {
-	if ((size != 4 && size != 8) || (vaddr & (size - 1)) != 0 || data == nullptr ||
-	    !GuestRange {vaddr, size}.Valid()) return false;
+	if (size == 0 || size > 256 || (size & 3u) != 0 || (vaddr & 3u) != 0 || data == nullptr ||
+	    !GuestRange {vaddr, size}.Valid()) {
+		NoteLabel(LabelBadSize, vaddr);
+		return false;
+	}
+	// KYTY_LABEL_UNCACHED_DIRECT=1 (experiment, off by default): a label no buffer covers has no GPU copy
+	// to keep coherent, so write the backing directly. Its page can still be protected for other
+	// GPU-written bytes; preparing it would download those and wait for queued GPU work (about 19 ms per
+	// label in the NHL 27 menus). Labels inside an image, or on GPU-dirty bytes, keep the old path.
+	static const bool uncached_direct = [] {
+		const char* value = std::getenv("KYTY_LABEL_UNCACHED_DIRECT");
+		return value != nullptr && value[0] == '1';
+	}();
+	const auto write_uncached = [&] {
+		if (!uncached_direct || HasGpuDirtyBytes(vaddr, size) || m_texture_cache.HasImagesInRegion(vaddr, size) ||
+		    !Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size)) {
+			return false;
+		}
+		DropGpuFills(vaddr, size);
+		return true;
+	};
 	// Labels fit within one cache page. Do not create a buffer or change page ownership.
 	const auto found = m_buffers.upper_bound(vaddr);
-	if (found == m_buffers.begin()) return false;
+	if (found == m_buffers.begin()) {
+		const bool written = write_uncached();
+		NoteLabel(written ? LabelUncached : LabelNoBuffer, vaddr);
+		return written;
+	}
 	auto& buffer = m_slot_buffers[std::prev(found)->second];
 	if (vaddr < buffer.CpuAddress() || vaddr - buffer.CpuAddress() > buffer.Size() ||
-	    size > buffer.Size() - (vaddr - buffer.CpuAddress())) return false;
-	if (!Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size)) return false;
+	    size > buffer.Size() - (vaddr - buffer.CpuAddress())) {
+		const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+		const bool owner_covers = owner != nullptr && *owner && m_slot_buffers[*owner].IsInBounds(vaddr, size);
+		if (owner_covers) {
+			NoteLabel(LabelOwnerCovers, vaddr);
+			return false;
+		}
+		const bool written = write_uncached();
+		NoteLabel(written ? LabelUncached : LabelNotCovered, vaddr);
+		return written;
+	}
+	if (!Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size)) {
+		NoteLabel(LabelBacking, vaddr);
+		return false;
+	}
+	NoteLabel(LabelOk, vaddr);
 	DropGpuFills(vaddr, size);
 	// Keep the GPU copy coherent so a later download cannot restore an old label.
 	// Other GPU-owned bytes on the page are untouched and remain tracked as dirty.
@@ -762,21 +845,35 @@ void BufferCache::NoteFaultRip(uint64_t rip) {
 	g_fault_rip = rip;
 }
 
-// NHL27WRITEBACK: CPU-write readbacks (a guest write to a GPU-written page) by faulting guest
-// instruction, cumulative, the top entries by wait time every 5 s.
+// NHL27WRITEBACK: CPU-write readbacks (a write to a GPU-written page) by faulting guest instruction,
+// cumulative, the top entries by wait time every 5 s. Writes with no faulting guest instruction (rip=0:
+// GPU-thread writes such as CP labels, unmaps, metadata and fills) are split by thread and invalidation
+// size, so their sources can be told apart: a CP label write invalidates 1 byte, an unmap its whole range.
 struct WriteBackStat {
-	uint64_t count = 0;
-	uint64_t ns    = 0;
-	uint64_t vaddr = 0;
+	uint64_t rip    = 0;
+	uint64_t count  = 0;
+	uint64_t ns     = 0;
+	uint64_t vaddr  = 0;
+	uint64_t size   = 0;
+	uint64_t bytes  = 0;
+	bool     on_gpu = false;
 };
 static std::mutex                                g_writeback_mutex;
 static std::unordered_map<uint64_t, WriteBackStat> g_writeback;
 
-static void WriteBackRecord(uint64_t rip, uint64_t vaddr, uint64_t ns) {
+static void WriteBackRecord(uint64_t rip, bool on_gpu, uint64_t vaddr, uint64_t size, uint64_t bytes,
+                            uint64_t ns) {
 	std::scoped_lock lock {g_writeback_mutex};
-	auto&            stat = g_writeback[rip];
+	const uint64_t   key = rip != 0 ? rip
+	                                : (uint64_t {1} << 63u) | (on_gpu ? uint64_t {1} << 62u : 0u) |
+	                                      (size & ((uint64_t {1} << 62u) - 1u));
+	auto& stat = g_writeback[key];
+	stat.rip    = rip;
+	stat.on_gpu = on_gpu;
+	stat.size   = size;
 	stat.count++;
 	stat.ns += ns;
+	stat.bytes += bytes;
 	stat.vaddr = vaddr;
 	static auto last = std::chrono::steady_clock::now();
 	const auto  now  = std::chrono::steady_clock::now();
@@ -787,9 +884,11 @@ static void WriteBackRecord(uint64_t rip, uint64_t vaddr, uint64_t ns) {
 	std::vector<std::pair<uint64_t, WriteBackStat>> top(g_writeback.begin(), g_writeback.end());
 	std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
 	for (size_t i = 0; i < top.size() && i < 12; i++) {
-		std::printf("NHL27WRITEBACK: rip=0x%016" PRIx64 " count=%" PRIu64 " ms=%.1f last_vaddr=0x%016" PRIx64 "\n",
-		            top[i].first, top[i].second.count, static_cast<double>(top[i].second.ns) / 1e6,
-		            top[i].second.vaddr);
+		const auto& stat = top[i].second;
+		std::printf("NHL27WRITEBACK: rip=0x%016" PRIx64 " thread=%s size=0x%" PRIx64 " count=%" PRIu64
+		            " ms=%.1f downloaded_KiB=%.1f last_vaddr=0x%016" PRIx64 "\n",
+		            stat.rip, stat.on_gpu ? "gpu" : "guest", stat.size, stat.count,
+		            static_cast<double>(stat.ns) / 1e6, static_cast<double>(stat.bytes) / 1024.0, stat.vaddr);
 	}
 	std::fflush(stdout);
 }
@@ -854,7 +953,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadC
 				                    .count();
 				FrameBreakdown::AddReadback(static_cast<uint64_t>(ns));
 				if (is_write) {
-					WriteBackRecord(fault_rip, vaddr, static_cast<uint64_t>(ns));
+										WriteBackRecord(fault_rip, on_gpu, vaddr, size, m_last_download_bytes, static_cast<uint64_t>(ns));
 				}
 				g_perf.waits[bucket].fetch_add(1, std::memory_order_relaxed);
 				g_perf.wait_ns[bucket].fetch_add(static_cast<uint64_t>(ns),
