@@ -54,6 +54,8 @@ static thread_local bool              g_gpu_thread        = false;
 // The command processor thread of a pipelined GPU.
 static thread_local bool              g_cp_thread         = false;
 static thread_local GuestGpu*         g_gpu_state         = nullptr;
+// The GuestGpu whose execution thread this is (ServiceUrgentCommands).
+static thread_local GuestGpu*         g_execution_gpu     = nullptr;
 
 struct Pm4FaultScope {
 	uint64_t packet_addr = 0;
@@ -433,7 +435,8 @@ void GuestGpu::ExecuteSync(Common::UniqueFunction<void>&& command) {
 void GuestGpu::ExecutionThread() {
 	KYTY_PROFILER_THREAD("Thread_GpuExecute");
 	Config::ConfigureGpuStageThread(Config::GpuStageThread::Execution);
-	g_gpu_thread = true;
+	g_gpu_thread    = true;
+	g_execution_gpu = this;
 	// Waking the command processor costs a fence: publish every operation, but only look for a
 	// waiter now and then and before sleeping.
 	constexpr uint32_t NotifyInterval = 16;
@@ -2564,6 +2567,11 @@ void CommandProcessor::ExecuteWriteAtEndOfPipe(uint64_t submit_id, uint32_t eop_
 		                           m_renderer.GetCommandScheduler().CurrentTick());
 		if (!direct_labels || !m_renderer.GetBufferCache().TryWriteLabel(
 		        reinterpret_cast<uint64_t>(destination), data, bytes)) {
+			// A store into a watched page would fault: download its GPU-written bytes first. A
+			// direct label write goes through the backing and the label's GPU copy instead, so the
+			// other GPU-written bytes of the page stay where they are and nothing waits for the
+			// GPU (15% of the execution thread in a match, before this).
+			m_renderer.PrepareGpuWrite(destination, bytes);
 			std::memcpy(destination, data, static_cast<size_t>(bytes));
 		} else {
 			static std::atomic_flag reported = ATOMIC_FLAG_INIT;
@@ -2579,7 +2587,6 @@ void CommandProcessor::ExecuteWriteAtEndOfPipe(uint64_t submit_id, uint32_t eop_
 		auto  data = static_cast<uint32_t>(value);
 		EXIT_IF(dst == nullptr);
 		(void)command.Handle();
-		m_renderer.PrepareGpuWrite(dst, sizeof(data));
 		write_label(dst, &data, sizeof(data));
 
 		if (with_interrupt) {
@@ -2623,7 +2630,6 @@ void CommandProcessor::ExecuteWriteAtEndOfPipe(uint64_t submit_id, uint32_t eop_
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
 					EXIT_IF(dst == nullptr);
 					(void)command.Handle();
-					m_renderer.PrepareGpuWrite(dst, sizeof(value));
 					write_label(dst, &value, sizeof(value));
 
 					if (with_interrupt) {
@@ -3008,6 +3014,13 @@ bool GuestGpu::IsGpuThread() noexcept {
 
 bool GuestGpu::IsCommandProcessorThread() noexcept {
 	return g_cp_thread;
+}
+
+void GuestGpu::ServiceUrgentCommands() {
+	if (g_execution_gpu != nullptr &&
+	    g_execution_gpu->m_urgent_pending.load(std::memory_order_acquire) != 0) {
+		g_execution_gpu->RunUrgentCommands();
+	}
 }
 
 } // namespace Libs::Graphics

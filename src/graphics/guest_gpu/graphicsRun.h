@@ -58,6 +58,10 @@ public:
 	[[nodiscard]] static bool IsCommandProcessorThread() noexcept;
 	// The guest queue the GPU thread is processing (0 = graphics ring, 1.. = compute rings).
 	[[nodiscard]] static uint32_t CurrentQueue() noexcept;
+	// Execution thread, while it waits inside an operation (a shader compile worker): runs the
+	// urgent commands other threads queued, such as the readback of a page a compile worker
+	// faulted on, which would otherwise wait for this thread forever. No-op elsewhere.
+	static void ServiceUrgentCommands();
 
 	// A pipelined GPU parses command buffers on its command processor thread and executes the
 	// operations they produce, in order, on its execution thread.

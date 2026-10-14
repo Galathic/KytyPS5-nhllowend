@@ -1219,6 +1219,9 @@ struct PipelineCache::ProgramCache {
 		const auto key = lookup_key;
 		do {
 			UnlockPrograms();
+			// A worker that faults on a GPU-written page of the shader code waits for this
+			// thread to read the page back (a menu deadlock on NHL 27).
+			GuestGpu::ServiceUrgentCommands();
 			std::this_thread::yield();
 			LockPrograms();
 		} while (in_flight.contains(key));
