@@ -72,7 +72,9 @@ public:
 	uint64_t               EmitOperation(GpuOperation&& operation);
 	// The guest memory an emitted operation writes, and the value it writes when that is known
 	// when the operation is emitted (`value` null otherwise, or larger than 8 bytes).
-	void NoteGuestWrite(uint64_t sequence, uint64_t address, uint64_t size, const void* value);
+	// `kind` names the writer for KYTY_DBG_CP_READS (a static string).
+	void NoteGuestWrite(uint64_t sequence, uint64_t address, uint64_t size, const void* value,
+	                    const char* kind = "write");
 	// Reads guest memory the command processor decides on as a serial GPU would at this point
 	// of the stream: from the value of a pending write when it is known, otherwise from memory
 	// once the operations that write it executed.
@@ -146,8 +148,9 @@ private:
 		uint64_t sequence = 0;
 		uint64_t address  = 0;
 		uint64_t size     = 0;
-		bool     known    = false;
-		uint8_t  value[8] = {};
+		bool        known    = false;
+		uint8_t     value[8] = {};
+		const char* kind     = nullptr;
 	};
 
 	const bool                      m_pipelined;

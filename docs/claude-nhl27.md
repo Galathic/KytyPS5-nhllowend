@@ -93,6 +93,14 @@ in menus, the pause menu and some stoppages. A paused match is therefore capped 
 no longer a useful A/B scene; in play the execution thread is the limit (`NHL27QUEUES`: q0 busy
 990 ms/s, about 110,000 operations/s at 9 us each).
 
+The command processor waits about 23% of its time in `WAIT_REG_MEM`: NHL 27 writes the GPU clock
+at end of pipe (`RELEASE_MEM`, 64-bit clock source) and waits for it to be nonzero (`NHL27CPREAD:
+wait-eop-clock`, 5 to 35 ms each). Letting such a wait pass on the command processor (any later
+clock value passes the test) stalled the game for good: the wait also orders the command
+processor's later reads of register blocks the GPU writes (`SET_SH_REG_INDIRECT` of
+`COMPUTE_PGM_LO/HI`), which then read stale bytes and compiled pipelines for garbage states. The
+wait has to stay unless those register loads move to the execution thread.
+
 Measured and dropped on the way: per-range write ticks (a download waits for the latest write of
 its bytes instead of its buffer's): fewer than 1% of the downloads would wait for an older
 submission, and the A/B was -14% +- 7.5.

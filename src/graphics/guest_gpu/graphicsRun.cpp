@@ -389,7 +389,7 @@ void GuestGpu::ForgetExecutedWrites() {
 }
 
 void GuestGpu::NoteGuestWrite(uint64_t sequence, uint64_t address, uint64_t size,
-                              const void* value) {
+                              const void* value, const char* kind) {
 	ForgetExecutedWrites();
 	if (sequence <= m_executed.Load()) {
 		return;
@@ -399,7 +399,7 @@ void GuestGpu::NoteGuestWrite(uint64_t sequence, uint64_t address, uint64_t size
 		ForgetExecutedWrites();
 	}
 	auto& write = m_pending_writes[(m_pending_first + m_pending_count) % PendingWriteCapacity];
-	write       = {.sequence = sequence, .address = address, .size = size};
+	write       = {.sequence = sequence, .address = address, .size = size, .kind = kind};
 	if (value != nullptr && size <= sizeof(write.value)) {
 		write.known = true;
 		std::memcpy(write.value, value, size);
@@ -422,6 +422,15 @@ void GuestGpu::ReadDecisionMemory(const volatile void* address, void* value, siz
 			return;
 		}
 		// The value is only known once the write executed; waiting acquires it.
+		if (CpReadDebugEnabled()) {
+			const auto start = std::chrono::steady_clock::now();
+			WaitForExecution(write->sequence);
+			NoteCpRead(write->kind, begin, nullptr, 0,
+			           static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+			                                     std::chrono::steady_clock::now() - start)
+			                                     .count()));
+			break;
+		}
 		WaitForExecution(write->sequence);
 		break;
 	}
@@ -627,9 +636,9 @@ uint64_t CommandProcessor::Emit(GpuOperation&& operation) {
 }
 
 void CommandProcessor::NoteGuestWrite(uint64_t sequence, uint64_t address, uint64_t size,
-                                      const void* value) {
+                                      const void* value, const char* kind) {
 	if (m_pipeline != nullptr && size != 0) {
-		m_pipeline->NoteGuestWrite(sequence, address, size, value);
+		m_pipeline->NoteGuestWrite(sequence, address, size, value, kind);
 	}
 }
 
@@ -966,7 +975,7 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 			     dst_address, value, num_bytes);
 		}
 	});
-	NoteGuestWrite(sequence, dst_address, num_bytes);
+	NoteGuestWrite(sequence, dst_address, num_bytes, nullptr, "wait-clock-copy");
 }
 
 void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cache_policy,
@@ -1020,7 +1029,7 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 		               src_address_or_offset_or_immediate, num_bytes);
 	});
 	if (!dst_gds) {
-		NoteGuestWrite(sequence, dst_address_or_offset, num_bytes);
+		NoteGuestWrite(sequence, dst_address_or_offset, num_bytes, nullptr, "wait-dma-data");
 	}
 }
 
@@ -2525,13 +2534,14 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 	}
 	if constexpr (sizeof(T) == sizeof(uint32_t)) {
 		if (event_write_source == 0x01) {
-			NoteGuestWrite(sequence, address, uint64_t {value >> 16u} * sizeof(uint32_t));
+			NoteGuestWrite(sequence, address, uint64_t {value >> 16u} * sizeof(uint32_t), nullptr,
+			               "wait-eop-gds");
 			return;
 		}
 		NoteGuestWrite(sequence, address, sizeof(value), &value);
 	} else {
 		if (event_write_source == 0x04) {
-			NoteGuestWrite(sequence, address, sizeof(value));
+			NoteGuestWrite(sequence, address, sizeof(value), nullptr, "wait-eop-clock");
 			return;
 		}
 		const auto low = static_cast<uint32_t>(value);
@@ -2830,7 +2840,7 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 	});
 	if (event_type == 0x00000039) {
 		// Occlusion counter pairs of 16 DBs.
-		NoteGuestWrite(sequence, event_address, 16u * 2u * sizeof(uint64_t));
+		NoteGuestWrite(sequence, event_address, 16u * 2u * sizeof(uint64_t), nullptr, "wait-occlusion");
 	}
 }
 
@@ -2914,7 +2924,7 @@ void CommandProcessor::WriteLodStats(void* dst, uint32_t size) {
 			*label      = 1;
 		}
 	});
-	NoteGuestWrite(sequence, reinterpret_cast<uint64_t>(dst), size);
+	NoteGuestWrite(sequence, reinterpret_cast<uint64_t>(dst), size, nullptr, "wait-lod-stats");
 }
 
 void CommandProcessor::Flip() {
