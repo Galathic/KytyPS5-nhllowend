@@ -63,6 +63,9 @@ DispatchArgsGuard::~DispatchArgsGuard() {
 std::pair<vk::Buffer, uint64_t> DispatchArgsGuard::Record(CommandBuffer& buffer, const Buffer& args,
                                                           uint64_t offset, uint64_t guest_address) {
  const auto command = buffer.Handle();
+ // The trip counter is only reported: look every 64 dispatches (it lives in video memory the
+ // CPU reads uncached, about 1% of the execution thread when read every time).
+ if ((m_next & 63u) == 0) {
  if (!m_trips->IsCoherent()) m_trips->Invalidate(0, m_trips->Size());
  const auto* trips = reinterpret_cast<const volatile uint32_t*>(m_trips->Mapped().data());
  if (const uint32_t count = trips[0]; count != m_reported_trips) {
@@ -76,6 +79,7 @@ std::pair<vk::Buffer, uint64_t> DispatchArgsGuard::Record(CommandBuffer& buffer,
               backing[2], readable ? "" : " (unreadable)");
   std::fflush(stdout);
   m_reported_trips = count;
+ }
  }
  const uint64_t slot = (m_next++ % SlotCount) * SlotBytes;
  vk::MemoryBarrier written {};

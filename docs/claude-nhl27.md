@@ -95,11 +95,9 @@ no longer a useful A/B scene; in play the execution thread is the limit (`NHL27Q
 
 The command processor waits about 23% of its time in `WAIT_REG_MEM`: NHL 27 writes the GPU clock
 at end of pipe (`RELEASE_MEM`, 64-bit clock source) and waits for it to be nonzero (`NHL27CPREAD:
-wait-eop-clock`, 5 to 35 ms each). Letting such a wait pass on the command processor (any later
-clock value passes the test) stalled the game for good: the wait also orders the command
-processor's later reads of register blocks the GPU writes (`SET_SH_REG_INDIRECT` of
-`COMPUTE_PGM_LO/HI`), which then read stale bytes and compiled pipelines for garbage states. The
-wait has to stay unless those register loads move to the execution thread.
+wait-eop-clock`, 5 to 35 ms each). Bit 13 (`KYTY_CLOCK_WAIT_AHEAD`, default off) lets such a wait
+pass on the command processor when the pending clock write is the same queue's and the test holds
+for any later clock value. In-match A/B (8 rounds): -8.4% +- 4.8, within noise, so it stays off; in its phases the game kept running normally.
 
 Render resolution, cross-boot benches of 120 s in a match (`nhl27_scale_0p5.json` sets the
 game's ResolutionScale to 0.5; the game registers 3840x2160 display buffers):
@@ -113,19 +111,34 @@ So pixels are not what holds the frame rate: the GPU stays busy at half resoluti
 small and uneven. `KYTY_OUTPUT_1080P=1` reports a 1080p output to the game (not measured yet).
 
 The resolve and execution threads share one program lock, held for whole resource
-materializations (resolve waited on it 14-17% of its time, execution 4-6%). Releasing it around
-the materialization of compute programs (only the execution thread materializes those) or around
-the resolve thread's read-ahead materialization was much slower in in-match A/Bs (the compute
-variant also compiled new compute permutations nonstop; the read-ahead variant was -39%, 6
-rounds), so the lock stays as it is.
+materializations (resolve waited on it 14-17% of its time, execution 4-6%). Bit 14
+(`KYTY_COMPUTE_UNLOCKED`) releases it while the execution thread materializes a compute program,
+bit 16 (`KYTY_AHEAD_UNLOCKED`) while the resolve thread materializes ahead (a per-entry busy flag
+keeps the other thread off that program), and bit 17 (`KYTY_BACKING_READ_MRU`) makes backing
+reads remember the thread's last two mappings instead of one. Bit 19 (`KYTY_DISPATCH_AHEAD`)
+resolves direct dispatches on the resolve thread as draws are. All default off: in-match A/Bs,
+-5% for the dispatch read-ahead (6 rounds, +-7.0) and +0.3% for 14+16+17 together (10 rounds,
++-5.4), within the scene-to-scene noise.
 
-Bit 17 (`KYTY_BACKING_LOOKUP_CACHE`, default off): backing reads of another mapping than the
+Bit 20 (`KYTY_BACKING_LOOKUP_CACHE`, default off): backing reads of another mapping than the
 thread's last one look the mapping up in a per-thread cache of 64 slots (one per 64 KiB block)
-before the locked map search. It hits 99.7% of the time, yet in-match A/Bs were -34% (6 rounds)
-and -25% (4 rounds), with every read-ahead still valid (`NHL27AHEAD`: resolved ahead per 2 s
-125,000 with it, 185,000 without). The resolve thread reads about 8 million guest dwords per
-second, so a few nanoseconds more per read matter: with the cache, a read that misses the
-single-mapping cache never refills it.
+before the locked map search; it hits 99.7% of the time. In-match A/B (8 rounds): +6.7% +- 4.3, within noise.
+
+Unconditional execution-thread trims (profile-checked, each 1-2% of the thread before):
+- The dispatch-args guard reads its trip counter (in video memory the CPU reads uncached) every
+  64 indirect dispatches instead of every one.
+- Buffer range clamps remember the last 16 committed-run answers per thread while no page
+  changed (a 256 MiB range is a thousand bitmap words).
+- The CPU fast-clear check compares color metadata eight bytes at a time.
+
+In-match fps varies by 5 to 7 fps between adjacent 20 s phases (scene changes), so A/Bs of 6 to 10
+rounds only resolve effects of about 10% or more.
+
+Earlier A/Bs of bits 13, 14, 16 and 17 that reported stalls or -25 to -39% were wrong: their base
+mask (1979710566) had the retired bits 13 to 20 set, so adding a bit carried into bits up to 25
+(NativeFp16, ExecSelects, FaultPageReads off: shader recompiles at 0 fps). Masks are now built by
+OR-ing bits into the default mask the boot prints (`Experiments: mask <default> -> ...`,
+1977916646 with play-nhl defaults).
 
 Measured and dropped on the way: per-range write ticks (a download waits for the latest write of
 its bytes instead of its buffer's): fewer than 1% of the downloads would wait for an older

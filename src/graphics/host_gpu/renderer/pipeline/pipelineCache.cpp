@@ -487,6 +487,10 @@ struct PipelineCache::ProgramCache {
 		size_t                                     last_permutation = std::numeric_limits<size_t>::max();
 		bool                                       native_plan_checked = false;
 		bool                                       native_plan_allowed = false;
+		// Experiments AheadUnlocked / ComputeUnlocked: a thread materializes this entry's plan
+		// without the program lock (the plan's scratch is the entry's own); set and cleared
+		// under the lock. The resolve thread skips a busy entry, the execution thread waits.
+		std::atomic<bool>                          busy {false};
 		uint64_t                                   refresh_ns = 0;
 		uint64_t                                   refresh_calls = 0;
 		uint64_t                                   refresh_hits = 0;
@@ -618,8 +622,11 @@ struct PipelineCache::ProgramCache {
 	ShaderProgram GetAhead(const ShaderParams& params, InputInfo& input_info,
 	                       uint32_t& push_data_cursor, ProgramResolution& ahead) {
 		ShaderType stage;
+		constexpr bool compute = std::is_same_v<InputInfo, ShaderComputeInputInfo>;
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			stage = input_info.logical_stage;
+		} else if constexpr (compute) {
+			stage = ShaderType::Compute;
 		} else {
 			static_assert(std::is_same_v<InputInfo, ShaderPixelInputInfo>);
 			stage = ShaderType::Pixel;
@@ -630,28 +637,54 @@ struct PipelineCache::ProgramCache {
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
 		const auto entry = programs.find(lookup_key);
-		if (entry == programs.end() && ahead.stages != ProgramResolution::MaxStages) {
-			QueueCompile(stage, params, input_info, push_data_cursor, nullptr);
+		// Compute programs are compiled by the execution thread itself.
+		if constexpr (!compute) {
+			if (entry == programs.end() && ahead.stages != ProgramResolution::MaxStages) {
+				QueueCompile(stage, params, input_info, push_data_cursor, nullptr);
+			}
 		}
 		// SWAPPC programs link the functions they call from guest memory: the execution thread
 		// resolves them.
 		if (entry == programs.end() || ahead.stages == ProgramResolution::MaxStages ||
-		    entry->second.call_source) {
+		    entry->second.call_source || entry->second.busy.load(std::memory_order_acquire)) {
 			ahead.reads.Fail();
 			return {};
 		}
 		const auto                             stage_index    = ahead.stages++;
 		auto&                                  resources      = ahead.resources[stage_index];
 		auto&                                  specialization = ahead.specializations[stage_index];
-		const ShaderRecompiler::IR::SrtRuntime runtime {
+		ShaderRecompiler::IR::SrtRuntime runtime {
 		    .user_data                  = std::span(params.user_data).first(params.user_data_count),
 		    .shader_base                = params.Base(),
 		    .read_memory                = ReadAheadPlain,
 		    .userdata                   = &ahead.reads,
 		    .read_specialization_memory = ReadAheadStrict,
 		};
-		if (!ShaderRecompiler::IR::MaterializeResources(entry->second.resource_plan, runtime,
-		                                                resources, specialization)) {
+		if constexpr (compute) {
+			runtime.workgroup_counts = input_info.workgroup_counts;
+		}
+		auto& source = entry->second;
+		bool  materialized = false;
+		// Experiment AheadUnlocked: the execution thread may take the lock meanwhile; it keeps
+		// off this entry until the materialization is done.
+		if (program_lock != nullptr && Common::Experiments::Enabled(Common::Experiments::AheadUnlocked)) {
+			source.busy.store(true, std::memory_order_release);
+			UnlockPrograms();
+			materialized =
+			    ShaderRecompiler::IR::MaterializeResources(source.resource_plan, runtime, resources, specialization);
+			LockPrograms();
+			source.busy.store(false, std::memory_order_release);
+			// The other thread may have used the shared lookup key meanwhile.
+			lookup_key.stage           = stage;
+			lookup_key.hash            = params.hash;
+			lookup_key.user_data_count = params.user_data_count;
+			lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
+			BuildStageStaticKey(input_info, lookup_key.static_state);
+		} else {
+			materialized =
+			    ShaderRecompiler::IR::MaterializeResources(source.resource_plan, runtime, resources, specialization);
+		}
+		if (!materialized) {
 			ahead.reads.Fail();
 			return {};
 		}
@@ -664,7 +697,9 @@ struct PipelineCache::ProgramCache {
 			           candidate.specialization == specialization;
 		    });
 		if (permutation == entry->second.permutations.end()) {
-			QueueCompile(stage, params, input_info, push_data_cursor, &specialization);
+			if constexpr (!compute) {
+				QueueCompile(stage, params, input_info, push_data_cursor, &specialization);
+			}
 			ahead.reads.Fail();
 			return {};
 		}
@@ -718,6 +753,16 @@ struct PipelineCache::ProgramCache {
 		} else if (auto found = programs.find(lookup_key); found != programs.end()) {
 			entry = &found->second;
 			last = {&found->first, entry};
+		}
+		// Experiments AheadUnlocked / ComputeUnlocked: another thread materializes this entry
+		// without the lock; wait without it, then look up again.
+		if (entry != nullptr && entry->busy.load(std::memory_order_acquire)) {
+			UnlockPrograms();
+			while (entry->busy.load(std::memory_order_acquire)) {
+				Common::SpinPause();
+			}
+			LockPrograms();
+			return Get(params, input_info, push_data_cursor);
 		}
 		const auto runtime_flags = Common::RuntimeFlags::Current();
 		ShaderRecompiler::IR::SrtRuntime             runtime {
@@ -826,8 +871,26 @@ struct PipelineCache::ProgramCache {
 		}
 		if (entry != nullptr && !source_changed) {
 			if (!check_native_plan(*entry)) return {};
-			bool reused = false;
-			if (!refresh(*entry, reused)) return {};
+			bool reused    = false;
+			bool refreshed = false;
+			// Experiment ComputeUnlocked: the resolve thread may look up graphics programs while
+			// the execution thread materializes a compute program (the entry is marked busy).
+			if (std::is_same_v<InputInfo, ShaderComputeInputInfo> && program_lock != nullptr &&
+			    replaying == nullptr && Common::Experiments::Enabled(Common::Experiments::ComputeUnlocked)) {
+				entry->busy.store(true, std::memory_order_release);
+				UnlockPrograms();
+				refreshed = refresh(*entry, reused);
+				LockPrograms();
+				entry->busy.store(false, std::memory_order_release);
+				lookup_key.stage           = stage;
+				lookup_key.hash            = params.hash;
+				lookup_key.user_data_count = params.user_data_count;
+				lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
+				BuildStageStaticKey(input_info, lookup_key.static_state);
+			} else {
+				refreshed = refresh(*entry, reused);
+			}
+			if (!refreshed) return {};
 			resource_hits += reused;
 			materializations += !reused;
 			if (memo_enabled && !reused) ++resource_misses[static_cast<size_t>(entry->resource_memo.LastMiss())];
@@ -1984,6 +2047,23 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 	uint32_t          push_data_cursor = 0;
 	const ProgramLockGuard lock(m_program_lock);
 	return m_program_cache->Get(params, input_info, push_data_cursor);
+}
+
+ShaderProgram PipelineCache::GetComputeProgramAhead(const HW::ComputeShaderInfo& regs,
+                                                    const HW::ShaderRegisters& sh,
+                                                    ShaderComputeInputInfo& input_info, ProgramResolution& ahead) {
+	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
+	const ShaderGuestReaderScope reader(ReadAheadShaderState, &ahead.reads);
+	const auto params = PrepareProgram(regs, sh, input_info);
+	if (ahead.reads.Failed()) {
+		return {};
+	}
+	input_info.lds_storage = input_info.lds_size_dwords * 4u >
+	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
+	uint32_t               push_data_cursor = 0;
+	const ProgramLockGuard lock(m_program_lock);
+	auto program = m_program_cache->GetAhead(params, input_info, push_data_cursor, ahead);
+	return ahead.reads.Failed() ? ShaderProgram {} : program;
 }
 
 bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other) const noexcept {

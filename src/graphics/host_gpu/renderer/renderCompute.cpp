@@ -384,6 +384,83 @@ static bool ShouldBindComputePipeline(RenderContext& context, const CommandRecor
 	return !same;
 }
 
+struct RenderExecutor::ResolvedDispatch {
+	ProgramResolution      programs;
+	ShaderComputeInputInfo input_info;
+	ShaderProgram          program;
+	std::atomic_bool       busy {false};
+};
+
+// As for draws: more resolutions than operations can wait between the two threads.
+struct RenderExecutor::ResolvedDispatchRing {
+	static constexpr size_t Size = 320;
+
+	std::array<ResolvedDispatch, Size> dispatches;
+	size_t                             next = 0;
+};
+
+void RenderExecutor::ReleaseResolvedDispatch(ResolvedDispatch* resolved) noexcept {
+	resolved->busy.store(false, std::memory_order_release);
+}
+
+void RenderExecutor::PrepareComputeInputInfo(const HW::Shader& shaders, uint32_t thread_group_x,
+                                             uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
+                                             bool async_compute, ShaderComputeInputInfo& input_info) {
+	constexpr uint32_t DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS = 1u << 5u;
+	const auto&        cs_regs                                  = shaders.GetCs();
+	input_info.async_compute                                    = async_compute;
+	const bool use_thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
+	input_info.dispatch_thread_dimensions = use_thread_dimensions;
+	input_info.workgroup_counts[0] = thread_group_x;
+	input_info.workgroup_counts[1] = thread_group_y;
+	input_info.workgroup_counts[2] = thread_group_z;
+	if (use_thread_dimensions) {
+		const uint32_t group_sizes[] = {cs_regs.cs_regs.num_thread_x, cs_regs.cs_regs.num_thread_y,
+		                                cs_regs.cs_regs.num_thread_z};
+		for (uint32_t axis = 0; axis < 3u; ++axis) {
+			const auto size = std::max(group_sizes[axis], 1u);
+			const auto threads = input_info.workgroup_counts[axis];
+			input_info.workgroup_counts[axis] = threads / size + (threads % size != 0u);
+		}
+	}
+}
+
+RenderExecutor::ResolvedDispatch* RenderExecutor::ResolveDispatchAhead(const HW::Context& context,
+                                                                       const HW::Shader& shaders,
+                                                                       uint32_t thread_group_x,
+                                                                       uint32_t thread_group_y,
+                                                                       uint32_t thread_group_z, uint32_t mode,
+                                                                       bool async_compute) {
+	if (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0 ||
+	    shaders.GetCs().cs_regs.data_addr == 0) {
+		return nullptr;
+	}
+	if (m_resolved_dispatch_ring == nullptr) {
+		m_resolved_dispatch_ring = {new ResolvedDispatchRing {}, [](ResolvedDispatchRing* ring) { delete ring; }};
+	}
+	auto& ring     = *m_resolved_dispatch_ring;
+	auto& dispatch = ring.dispatches[ring.next];
+	// The execution thread releases resolutions in order.
+	for (Common::SpinWait wait; dispatch.busy.load(std::memory_order_acquire);) {
+		if (!wait.Spin()) {
+			std::this_thread::yield();
+		}
+	}
+	ring.next = (ring.next + 1) % ResolvedDispatchRing::Size;
+	dispatch.programs.Reset();
+	dispatch.input_info = {};
+	PrepareComputeInputInfo(shaders, thread_group_x, thread_group_y, thread_group_z, mode, async_compute,
+	                        dispatch.input_info);
+	dispatch.program = m_context.GetPipelineCache().GetComputeProgramAhead(
+	    shaders.GetCs(), context.GetShaderRegisters(), dispatch.input_info, dispatch.programs);
+	if (!dispatch.program || dispatch.programs.reads.Failed()) {
+		return nullptr;
+	}
+	// Published to the execution thread with the operation that carries it.
+	dispatch.busy.store(true, std::memory_order_relaxed);
+	return &dispatch;
+}
+
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode, bool async_compute) {
@@ -443,23 +520,17 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	const auto& sh_regs = ctx.GetShaderRegisters();
 
 	ShaderComputeInputInfo input_info {};
-	input_info.async_compute = async_compute;
-	const bool use_thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
-	input_info.dispatch_thread_dimensions = use_thread_dimensions;
-	input_info.workgroup_counts[0] = thread_group_x;
-	input_info.workgroup_counts[1] = thread_group_y;
-	input_info.workgroup_counts[2] = thread_group_z;
-	if (use_thread_dimensions) {
-		const uint32_t group_sizes[] = {cs_regs.cs_regs.num_thread_x, cs_regs.cs_regs.num_thread_y,
-		                                cs_regs.cs_regs.num_thread_z};
-		for (uint32_t axis = 0; axis < 3u; ++axis) {
-			const auto size = std::max(group_sizes[axis], 1u);
-			const auto threads = input_info.workgroup_counts[axis];
-			input_info.workgroup_counts[axis] = threads / size + (threads % size != 0u);
-		}
-	}
+	PrepareComputeInputInfo(sh_ctx, thread_group_x, thread_group_y, thread_group_z, mode, async_compute, input_info);
+	const bool use_thread_dimensions = input_info.dispatch_thread_dimensions;
 	BufferCache::PerfTimerScope program_timer(BufferCache::PerfTimer::DispatchProgram);
+	// Experiment DispatchAhead: the resolve thread may have resolved the program already; it
+	// holds when the guest memory it read still has the same bytes.
+	auto* resolved = std::exchange(m_resolved_dispatch, nullptr);
 	const auto compute_program = [&] {
+		if (resolved != nullptr && resolved->programs.reads.StillValid()) {
+			input_info = resolved->input_info;
+			return resolved->program;
+		}
 		FrameBreakdown::Timer materialize_timer(FrameBreakdown::g_counters.dc_materialize_ns);
 		return m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
 	}();

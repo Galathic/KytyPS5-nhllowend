@@ -293,6 +293,14 @@ public:
 	void UseResolvedDraw(ResolvedDraw* resolved) noexcept { m_resolved_draw = resolved; }
 	// Execution thread: the operation that carried `resolved` executed.
 	static void ReleaseResolvedDraw(ResolvedDraw* resolved) noexcept;
+	// The same for direct dispatches (experiment DispatchAhead): the compute program and its
+	// resources, resolved by the resolve thread with the dispatch's registers and group counts.
+	struct ResolvedDispatch;
+	[[nodiscard]] ResolvedDispatch* ResolveDispatchAhead(const HW::Context& context, const HW::Shader& shaders,
+	                                                     uint32_t thread_group_x, uint32_t thread_group_y,
+	                                                     uint32_t thread_group_z, uint32_t mode, bool async_compute);
+	void UseResolvedDispatch(ResolvedDispatch* resolved) noexcept { m_resolved_dispatch = resolved; }
+	static void ReleaseResolvedDispatch(ResolvedDispatch* resolved) noexcept;
 	// Execution thread: the context register snapshot of the operation about to execute (0 for
 	// live registers); operations with the same id see the same context registers.
 	void UseContextId(uint64_t context_id) noexcept { m_context_id = context_id; }
@@ -412,6 +420,11 @@ private:
 	struct DepthTargetMemo;
 	struct RenderTargetMemo;
 	struct ResolvedDrawRing;
+	struct ResolvedDispatchRing;
+	// The input info DispatchDirect builds for a dispatch (group counts from thread counts).
+	static void PrepareComputeInputInfo(const HW::Shader& shaders, uint32_t thread_group_x, uint32_t thread_group_y,
+	                                    uint32_t thread_group_z, uint32_t mode, bool async_compute,
+	                                    ShaderComputeInputInfo& input_info);
 	// See RenderTargetMemo.
 	void               CaptureRenderTargetKey(const HW::Context& registers, uint32_t mrt_mask,
 	                                          uint32_t slice_offset);
@@ -521,6 +534,9 @@ private:
 	std::unique_ptr<ResolvedDrawRing, void (*)(ResolvedDrawRing*)> m_resolved_ring {nullptr,
 	                                                                                nullptr};
 	ResolvedDraw*                                                  m_resolved_draw = nullptr;
+	std::unique_ptr<ResolvedDispatchRing, void (*)(ResolvedDispatchRing*)> m_resolved_dispatch_ring {nullptr,
+	                                                                                                nullptr};
+	ResolvedDispatch* m_resolved_dispatch = nullptr;
 	uint64_t                                                       m_context_id    = 0;
 	// The context snapshot whose registers hw_check() last accepted.
 	uint64_t m_checked_context_id = 0;

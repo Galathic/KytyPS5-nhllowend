@@ -16,7 +16,8 @@ namespace Common::Experiments {
 // Features that also have a live runtime flag (common/runtimeFlags.h, flags.ctl) are NOT here:
 // KYTY_GUEST_SYNC, KYTY_LONG_BUFFER_GC_AGE, KYTY_RENDER_TARGET_MEMO (flag KYTY_RT_DECODE_MEMO),
 // KYTY_FAULT_COALESCE, KYTY_SPARSE_BUFFER_GC, KYTY_DIRECT_EOP_INTERRUPTS, KYTY_READBACK_QUEUE.
-// Their bit numbers (13, 14, 16, 19, 20) are retired; 17 is BackingLookupCache. Bit 0 (once GuestSync) is
+// Their bit numbers are reused: 13 ClockWaitAhead, 14 ComputeUnlocked, 16 AheadUnlocked, 17 BackingReadMru, 19
+// DispatchAhead, 20 BackingLookupCache. Bit 0 (once GuestSync) is
 // EarlySubmitWriters, bit 8 (once GpuThreadPriority) is ReadbackTransfer and bit 9 (once
 // ImageRecycle, unconditional since the GTA port) is ReadbackSpin.
 // KYTY_RESOURCE_MULTI_CACHE (16-state resource memo) is read only by the resource memo itself.
@@ -32,7 +33,12 @@ enum Bit : uint32_t {
 	FalseShareReads    = 1u << 6u, // KYTY_FALSE_SHARE_READS (default off)
 	SrtBatchReads      = 1u << 7u, // KYTY_SRT_BATCH_READS (default on; also read by the program cache)
 	DirectSrtReads     = 1u << 10u, // KYTY_DIRECT_SRT_READS (default on; SRT reads without the IR walk)
-	BackingLookupCache = 1u << 17u, // KYTY_BACKING_LOOKUP_CACHE (default off: -34% in an in-match A/B; backing reads of another mapping than the last use a per-64 KiB lookup cache)
+	ClockWaitAhead     = 1u << 13u, // KYTY_CLOCK_WAIT_AHEAD (default off; a WAIT_REG_MEM on this queue's pending end-of-pipe clock write that any later clock satisfies does not wait)
+	ComputeUnlocked    = 1u << 14u, // KYTY_COMPUTE_UNLOCKED (default off; the execution thread materializes compute resources without the program lock)
+	AheadUnlocked      = 1u << 16u, // KYTY_AHEAD_UNLOCKED (default off; the resolve thread materializes resources ahead without the program lock)
+	BackingLookupCache = 1u << 20u, // KYTY_BACKING_LOOKUP_CACHE (default off; backing reads of another mapping use a per-64 KiB lookup cache)
+	DispatchAhead      = 1u << 19u, // KYTY_DISPATCH_AHEAD (default off; the resolve thread resolves direct dispatches' programs ahead, as for draws)
+	BackingReadMru     = 1u << 17u, // KYTY_BACKING_READ_MRU (default off; backing reads remember the thread's last two mappings, not one)
 	TextureDescCache   = 1u << 11u, // KYTY_TEXTURE_DESC_CACHE (default on; superseded by the draw-prep delta, no consumer)
 	ImageLookupHint    = 1u << 12u, // KYTY_IMAGE_LOOKUP_HINT (default on; skip the region scan for known images)
 	AdaptiveResourceMemo = 1u << 15u, // KYTY_ADAPTIVE_RESOURCE_MEMO (default on; superseded by KYTY_RESOURCE_MEMO_BYPASS, no consumer)

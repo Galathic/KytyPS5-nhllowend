@@ -399,12 +399,28 @@ void GuestGpu::NoteGuestWrite(uint64_t sequence, uint64_t address, uint64_t size
 		ForgetExecutedWrites();
 	}
 	auto& write = m_pending_writes[(m_pending_first + m_pending_count) % PendingWriteCapacity];
-	write       = {.sequence = sequence, .address = address, .size = size, .kind = kind};
+	write       = {.sequence = sequence, .address = address, .size = size, .kind = kind, .queue = CurrentQueue()};
 	if (value != nullptr && size <= sizeof(write.value)) {
 		write.known = true;
 		std::memcpy(write.value, value, size);
 	}
 	m_pending_count++;
+}
+
+const char kEopClockWrite[] = "wait-eop-clock";
+
+bool GuestGpu::PendingClockWrite(uint64_t address, uint64_t size) {
+	ForgetExecutedWrites();
+	const auto end = address + size;
+	for (size_t i = m_pending_count; i-- > 0;) {
+		const auto* write = &m_pending_writes[(m_pending_first + i) % PendingWriteCapacity];
+		if (write->address >= end || write->address + write->size <= address) {
+			continue;
+		}
+		return write->kind == kEopClockWrite && write->address <= address && end <= write->address + write->size &&
+		       write->queue == CurrentQueue();
+	}
+	return false;
 }
 
 void GuestGpu::ReadDecisionMemory(const volatile void* address, void* value, size_t size) {
@@ -506,6 +522,13 @@ void GuestGpu::ResolveThread() {
 			operation->resolved =
 			    executor.ResolveDrawAhead(*operation->state.context, *operation->state.user_config,
 			                              *operation->state.shaders);
+		} else if (operation->kind == GpuOperationKind::DispatchDirect &&
+		           Common::Experiments::Enabled(Common::Experiments::DispatchAhead)) {
+			const auto& dispatch = operation->dispatch;
+			operation->resolved_dispatch = executor.ResolveDispatchAhead(
+			    *operation->state.context, *operation->state.shaders, dispatch.thread_group_x,
+			    dispatch.thread_group_y, dispatch.thread_group_z, dispatch.mode,
+			    operation->processor->IsAsyncComputeQueue());
 		}
 		m_resolved.Push(std::move(*operation));
 	}
@@ -708,8 +731,13 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 		case GpuOperationKind::DrawIndirect: ExecuteDrawIndirect(operation); break;
 		case GpuOperationKind::DispatchDirect: {
 			const auto& dispatch = operation.dispatch;
+			executor.UseResolvedDispatch(operation.resolved_dispatch);
 			ExecuteDispatchDirect(operation, dispatch.thread_group_x, dispatch.thread_group_y,
 			                      dispatch.thread_group_z, dispatch.mode);
+			executor.UseResolvedDispatch(nullptr);
+			if (operation.resolved_dispatch != nullptr) {
+				RenderExecutor::ReleaseResolvedDispatch(operation.resolved_dispatch);
+			}
 			break;
 		}
 		case GpuOperationKind::DispatchIndirect: ExecuteDispatchIndirect(operation); break;
@@ -875,6 +903,21 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 
 	(void)poll;
 	m_wait_since_operation = true;
+	// Experiment ClockWaitAhead: NHL 27 writes the GPU clock at end of pipe and waits for it to
+	// be written. The value written is the reference clock when the write executes, so at least
+	// the clock now; a test that holds for the clock now and for every later value (nonzero, or
+	// at least / more than the reference) needs no wait for the execution.
+	if constexpr (sizeof(T) == sizeof(uint64_t)) {
+		const bool monotone = mask == ~T {0} && (func == 5 || func == 6 || (func == 4 && ref == 0));
+		if (m_pipeline != nullptr && monotone && Common::Experiments::Enabled(Common::Experiments::ClockWaitAhead) &&
+		    m_pipeline->PendingClockWrite(reinterpret_cast<uint64_t>(addr), sizeof(T)) &&
+		    TestWaitRegMemValue(Sync::ReadReferenceClock(), ref, mask, func)) {
+			if (BufferCache::GuestSyncOnly()) {
+				EmitGlobalBarrier();
+			}
+			return;
+		}
+	}
 	if (!TestWaitRegMemValue(ReadDecisionValue<T>(addr), ref, mask, func)) {
 		SuspendPm4();
 	}
@@ -2541,7 +2584,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 		NoteGuestWrite(sequence, address, sizeof(value), &value);
 	} else {
 		if (event_write_source == 0x04) {
-			NoteGuestWrite(sequence, address, sizeof(value), nullptr, "wait-eop-clock");
+			NoteGuestWrite(sequence, address, sizeof(value), nullptr, kEopClockWrite);
 			return;
 		}
 		const auto low = static_cast<uint32_t>(value);

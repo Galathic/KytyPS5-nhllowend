@@ -1495,8 +1495,20 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			if (!LibKernel::Memory::TryReadBacking(address, bytes.data(), bytes.size())) {
 				EXIT("TextureCache: failed to read color metadata slice\n");
 			}
-			if (!std::all_of(bytes.begin(), bytes.end(),
-			                 [code](uint8_t byte) { return byte == code; })) {
+			// Eight bytes at a time: metadata slices are tens of KiB (1.5% of the execution thread
+			// when compared bytewise).
+			const uint64_t pattern = uint64_t {code} * 0x0101010101010101ull;
+			size_t         at      = 0;
+			bool           uniform = true;
+			for (; uniform && at + sizeof(uint64_t) <= bytes.size(); at += sizeof(uint64_t)) {
+				uint64_t word = 0;
+				std::memcpy(&word, bytes.data() + at, sizeof(word));
+				uniform = word == pattern;
+			}
+			for (; uniform && at < bytes.size(); ++at) {
+				uniform = bytes[at] == code;
+			}
+			if (!uniform) {
 				continue;
 			}
 		}

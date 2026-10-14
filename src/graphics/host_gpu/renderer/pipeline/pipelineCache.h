@@ -187,6 +187,10 @@ public:
 	ShaderProgram GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                const HW::ShaderRegisters&   sh,
 	                                ShaderComputeInputInfo&      input_info);
+	// Resolve thread: the program of a dispatch ahead of its execution, reading guest memory
+	// through `ahead`'s log; empty when it is not compiled yet or cannot be resolved ahead.
+	ShaderProgram GetComputeProgramAhead(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
+	                                     ShaderComputeInputInfo& input_info, ProgramResolution& ahead);
 
 	Pipeline& GetGraphicsPipeline(std::span<const RenderColorInfo>       colors,
 	                              const RenderDepthInfo&                 depth,

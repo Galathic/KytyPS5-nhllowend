@@ -79,6 +79,10 @@ public:
 	// of the stream: from the value of a pending write when it is known, otherwise from memory
 	// once the operations that write it executed.
 	void ReadDecisionMemory(const volatile void* address, void* value, size_t size);
+	// True when the newest pending write over [address, address + size) is an end-of-pipe clock
+	// write of the current guest queue covering it (its value is the reference clock when it
+	// executes).
+	[[nodiscard]] bool PendingClockWrite(uint64_t address, uint64_t size);
 	void                   WaitForExecution(uint64_t sequence) { m_executed.WaitFor(sequence); }
 	// Waits until every operation emitted so far executed.
 	void WaitForExecution() { m_executed.WaitFor(m_emitted); }
@@ -151,6 +155,7 @@ private:
 		bool        known    = false;
 		uint8_t     value[8] = {};
 		const char* kind     = nullptr;
+		uint32_t    queue    = 0; // the guest queue that wrote it
 	};
 
 	const bool                      m_pipelined;
@@ -187,6 +192,9 @@ private:
 
 	friend class CommandProcessor;
 };
+
+// The kind of pending guest writes of end-of-pipe clock values (GuestGpu::PendingClockWrite).
+extern const char kEopClockWrite[];
 
 // KYTY_DBG_CP_READS=1: guest memory reads of the command processor (indirect register pairs,
 // WAIT_REG_MEM values), timed so the ones that fault and wait for the GPU show up. Printed as

@@ -249,6 +249,7 @@ public:
 			// Not page aligned, or outside the windows: such queries take the slow path.
 			if (((start | size) & PageMask) != 0) {
 				m_imprecise.store(true, std::memory_order_relaxed);
+				m_generation.fetch_add(1, std::memory_order_release);
 			}
 			return;
 		}
@@ -270,6 +271,28 @@ public:
 			}
 			page = leaf_end;
 		}
+		m_generation.fetch_add(1, std::memory_order_release);
+	}
+
+	// Advances after every change of the pages (CommittedRunCached).
+	[[nodiscard]] uint64_t Generation() const { return m_generation.load(std::memory_order_acquire); }
+
+	// CommittedRun, remembered per thread while no page changed: the GPU threads clamp the same
+	// large buffer ranges (up to 256 MiB, a thousand bitmap words each) for every binding.
+	[[nodiscard]] uint64_t CommittedRunCached(uint64_t address, uint64_t size) const {
+		struct Entry {
+			uint64_t address, size, generation, run;
+		};
+		static thread_local Entry entries[16];
+		const auto generation = Generation();
+		auto&      entry      = entries[((address >> 12u) ^ (size >> 12u)) % 16u];
+		if (entry.address == address && entry.size == size && entry.generation == generation &&
+		    generation != 0) {
+			return entry.run;
+		}
+		const auto run = CommittedRun(address, size);
+		entry          = {address, size, generation, run};
+		return run;
 	}
 
 	// How many bytes from `address` (at most `size`) lie in contiguous committed pages, or
@@ -308,6 +331,8 @@ private:
 	static constexpr uint64_t PageMask       = (uint64_t {1} << PageBits) - 1u;
 	static constexpr uint64_t LowerSize      = uint64_t {1} << 40u;
 	static constexpr uint64_t LeafPages      = uint64_t {1} << 19u; // 2 GiB, 64 KiB of bits
+	// Starts at 1 so that a zeroed cache entry never matches.
+	std::atomic<uint64_t>     m_generation {1};
 	static constexpr uint64_t LowerLeaves    = (LowerSize >> PageBits) / LeafPages;
 	static constexpr uint64_t ExtendedLeaves = (kExtendedMemorySize >> PageBits) / LeafPages;
 
@@ -563,7 +588,7 @@ public:
 		}
 		// The GPU threads clamp every buffer they bind: answer from the page map, without the
 		// lock, whenever it covers the range.
-		if (const auto run = m_committed.CommittedRun(virtual_addr, size);
+		if (const auto run = m_committed.CommittedRunCached(virtual_addr, size);
 		    run != CommittedPageMap::Unknown) {
 			return run;
 		}

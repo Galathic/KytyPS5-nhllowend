@@ -261,8 +261,22 @@ public:
 				std::atomic_thread_fence(std::memory_order_acquire);
 				if (m_map_gen.load(std::memory_order_relaxed) == g0) return true;
 			}
-			// Another mapping than the last one: the per-block lookup cache, before the map
-			// (experiment BackingLookupCache; the resolve thread spent 13% in the map lookup).
+			// Experiment BackingReadMru: resource reads alternate between a few mappings (tables
+			// and the buffers they point to); the one before the last also skips the map search
+			// (5% of the resolve thread), and becomes the last again.
+			if (Common::Experiments::Enabled(Common::Experiments::BackingReadMru)) {
+				auto& p = t_read_cache_previous;
+				if (p.owner == this && p.gen == g0 && size != 0 && vaddr >= p.begin && vaddr - p.begin < p.length &&
+				    size <= p.length - (vaddr - p.begin)) {
+					std::memcpy(destination, p.host + (vaddr - p.begin), size);
+					std::atomic_thread_fence(std::memory_order_acquire);
+					if (m_map_gen.load(std::memory_order_relaxed) == g0) {
+						std::swap(c, p);
+						return true;
+					}
+				}
+			}
+			// Experiment BackingLookupCache: the per-block lookup cache before the map search.
 			if (Common::Experiments::Enabled(Common::Experiments::BackingLookupCache) &&
 			    TryCachedTransfer(vaddr, size, [destination](uint8_t* backing, size_t bytes) {
 				    std::memcpy(destination, backing, bytes);
@@ -636,6 +650,8 @@ private:
 		uint8_t*    host;
 	};
 	static inline thread_local ReadCache t_read_cache;
+	// The mapping t_read_cache held before (experiment BackingReadMru).
+	static inline thread_local ReadCache t_read_cache_previous;
 	static inline std::atomic<uint64_t> s_gen_epoch {0};
 	std::atomic<uint64_t>               m_map_gen {s_gen_epoch.fetch_add(uint64_t {1} << 32) + 1};
 	// Called with m_mutex held, after mutating m_maps.
@@ -667,6 +683,7 @@ private:
 				if (fill_cache) {
 					// m_mutex is held, so m_map_gen is stable and describes this entry.
 					const auto ok_len = std::min<uint64_t>(first.size, m_size - first.backing_offset);
+					t_read_cache_previous = t_read_cache;
 					t_read_cache = {this, m_map_gen.load(std::memory_order_relaxed), first.vaddr, ok_len,
 					                m_backing_base + first.backing_offset};
 				}
