@@ -40,7 +40,7 @@ uint32_t EnvironmentMask() {
 	set("KYTY_SKIP_REDUNDANT_BINDS", SkipRedundantBinds, true);
 	set("KYTY_SRT_BATCH_READS", SrtBatchReads, true);
 	set("KYTY_DIRECT_SRT_READS", DirectSrtReads, true);
-	set("KYTY_TEXTURE_DESC_CACHE", TextureDescCache, true);
+	set("KYTY_NATIVE_MINMAX", NativeMinMax, true);
 	set("KYTY_IMAGE_LOOKUP_HINT", ImageLookupHint, true);
 	set("KYTY_WIDE_FAULT_WINDOWS", WideFaultWindows, true);
 	set("KYTY_CLEAN_FROM_DIRECT", CleanFromDirect, true);

@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
+#include "graphics/shader/shader.h"
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
@@ -167,6 +168,12 @@ uint32_t EmitClassMaskF16(EmitterState& state, uint32_t bits, uint32_t mask) {
 }
 
 uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value) {
+	if (ShaderNativeMinMax()) {
+		const auto ret = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpExtInst, TypeF32(state), ret, GlslStd450(state),
+		                          max_value ? GLSLstd450NMax : GLSLstd450NMin, lhs, rhs);
+		return ret;
+	}
 	const auto lhs_class = EmitClassifyF32(state, lhs);
 	const auto rhs_class = EmitClassifyF32(state, rhs);
 

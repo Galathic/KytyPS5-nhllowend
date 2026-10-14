@@ -46,6 +46,16 @@ inline std::atomic<uint32_t> g_shader_native_fp16_modes {0};
 [[nodiscard]] inline bool ShaderLdsLaneSlots() {
 	return Common::Experiments::Enabled(Common::Experiments::LdsLaneSlots);
 }
+// Codegen option: experiment NativeMinMax. V_MIN/V_MAX/V_MIN3/V_MAX3/V_MED3_F32 (and the f32
+// math of the f16 forms) use GLSL NMin/NMax, which an AMD host compiles to the same v_min/v_max
+// as the guest, instead of exact NaN and signed-zero emulation (about ten instructions each). Folded
+// into the NativeFp16 key word so keys are unchanged while it is off.
+[[nodiscard]] inline bool ShaderNativeMinMax() {
+	return Common::Experiments::Enabled(Common::Experiments::NativeMinMax);
+}
+[[nodiscard]] inline uint32_t ShaderFloatCodegenKey() {
+	return static_cast<uint32_t>(ShaderNativeFp16()) | (ShaderNativeMinMax() ? 2u : 0u);
+}
 [[nodiscard]] inline uint32_t ShaderNativeFp16Modes() {
 	return g_shader_native_fp16_modes.load(std::memory_order_relaxed);
 }

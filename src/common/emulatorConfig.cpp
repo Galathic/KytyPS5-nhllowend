@@ -94,7 +94,13 @@ bool AmdCpuEnabled() {
 }
 
 uint32_t GetVblankFrequency() {
-	return std::clamp(g_config->vblank_frequency, 30u, 360u);
+	// Benchmarking: KYTY_VBLANK_HZ overrides the configured rate (a paused NHL 27 match renders every
+	// second vblank, so 100 lifts its 30 fps cap above what the emulator reaches).
+	static const uint32_t forced = [] {
+		const char* value = std::getenv("KYTY_VBLANK_HZ");
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+	}();
+	return std::clamp(forced != 0 ? forced : g_config->vblank_frequency, 30u, 360u);
 }
 
 uint32_t GetConsoleLanguage() {

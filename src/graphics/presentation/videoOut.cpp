@@ -1411,6 +1411,15 @@ KYTY_SYSV_ABI int VideoOutSetFlipRate(int handle, int rate) {
 	if (rate < 0 || rate > 2) {
 		return VIDEO_OUT_ERROR_INVALID_VALUE;
 	}
+	// Benchmarking: KYTY_FORCE_FLIP_RATE=0 keeps 60 Hz flips in menus and the pause menu (where
+	// NHL 27 asks for 30 Hz), so a paused match is an uncapped, steady A/B scene.
+	static const int forced_rate = [] {
+		const char* value = std::getenv("KYTY_FORCE_FLIP_RATE");
+		return value != nullptr && value[0] >= '0' && value[0] <= '2' ? value[0] - '0' : -1;
+	}();
+	if (forced_rate >= 0) {
+		rate = forced_rate;
+	}
 
 	Common::LockGuard lock(ctx->mutex);
 	if (ctx->flip_rate != rate) {

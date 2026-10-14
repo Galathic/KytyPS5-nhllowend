@@ -141,6 +141,40 @@ steadiest stretch (rounds 5 to 10) 0.6 to 1 fps slower every round, with write f
 In-match fps varies by 5 to 7 fps between adjacent 20 s phases (scene changes), so A/Bs of 6 to 10
 rounds only resolve effects of about 10% or more.
 
+### Native min/max (bit 11, `KYTY_NATIVE_MINMAX`, default on)
+
+`V_MIN/V_MAX/V_MIN3/V_MAX3/V_MED3_F32` (and the f32 math of the f16 forms) were emulated exactly:
+NaN and signed-zero classification of both operands and four selects, about ten host instructions
+each, and the bulk of the `v_cndmask` in NHL 27's heavy shaders. With bit 11 they are GLSL
+`NMin`/`NMax`, which an AMD host compiles to the same `v_min`/`v_max` the guest ran (differences
+only for signalling NaNs and the sign of equal zeros). The option is folded into the NativeFp16
+stage-key word, so keys stay as before while it is off; the first boot with it on translates every
+shader again. Bit 11 was the unused `KYTY_TEXTURE_DESC_CACHE`, so the play-nhl default mask is
+still 1977916646 (with bit 11 off: 1977914598).
+
+Measured in one boot, paused match, GPU timeline captures A (off), B (on), A again (drift +0.2%):
+GPU busy per frame 20.9 -> 18.8 ms (-10%), the top 30 draws/dispatches -13% (CS a36f0b4f -30%,
+db7e537e -56%, 4c9b2981 -25%, 9380d724 -13%, PS 9eaaf80c -12%, 136eed67 -7%), 34-38 -> 40 fps.
+In-match screenshots look the same.
+
+Tools for shader-codegen A/Bs: `gpu-ab.sh <prefix> <maskA> <maskB>` (`PAUSE=1` pauses first)
+captures A, switches the mask (new variants compile), captures B, switches back, captures A2, and
+compares per-shader GPU time with `gpu-compare.py`; GPU time per draw is far steadier than fps.
+
+### Where the pipeline threads wait (`KYTY_DBG_STAGE_STATS=1`)
+
+`NHL27STALLS` (every 5 s): execution-thread busy, idle and program-lock ms/s, and the resolve
+thread's lock and full-queue waits; `ab-stalls.py <console>` groups them by mask. In a match the
+execution thread is busy about 900 ms/s, idle 90 to 130 (the command processor waits for its
+results), and 33 to 60 ms/s of the busy time is spinning for the program lock while the resolve
+thread materializes; the resolve thread waits 90 to 300 ms/s for the lock and about 220 ms/s for
+room in the execution queue. With bits 14 and 16 together both lock waits drop to about 0, but
+in-match fps (8 rounds) and the paused fps did not move beyond noise, so they stay off.
+
+`KYTY_FORCE_FLIP_RATE=0` keeps 60 Hz flips where the game asks for 30 (menus reach 40+ fps) and
+`KYTY_VBLANK_HZ` overrides the vblank rate; the paused match still ran at about 30 fps with both,
+because that is what it costs (GPU busy 70%, the execution thread 93%).
+
 Earlier A/Bs of bits 13, 14, 16 and 17 that reported stalls or -25 to -39% were wrong: their base
 mask (1979710566) had the retired bits 13 to 20 set, so adding a bit carried into bits up to 25
 (NativeFp16, ExecSelects, FaultPageReads off: shader recompiles at 0 fps). Masks are now built by

@@ -1,3 +1,4 @@
+#include "graphics/guest_gpu/stageStats.h"
 #include "common/eventTrace.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/bindEpoch.h"
@@ -462,6 +463,37 @@ void GuestGpu::ReadDecisionMemory(const volatile void* address, void* value, siz
 	CopyFromGuest(value, address, size);
 }
 
+// KYTY_DBG_STAGE_STATS: every 5 s (checked when the execution thread runs out of operations).
+static void PrintStageStats() {
+	static auto     last       = std::chrono::steady_clock::now();
+	static uint64_t last_items = 0;
+	static uint64_t last_ns[StageStats::CounterCount] {};
+	const auto      now        = std::chrono::steady_clock::now();
+	if (now - last < std::chrono::seconds(5)) {
+		return;
+	}
+	const double seconds = std::chrono::duration<double>(now - last).count();
+	last                 = now;
+	double ms[StageStats::CounterCount];
+	for (uint32_t i = 0; i < StageStats::CounterCount; i++) {
+		const auto value = StageStats::g_ns[i].load(std::memory_order_relaxed);
+		ms[i]            = static_cast<double>(value - last_ns[i]) / 1e6 / seconds;
+		last_ns[i]       = value;
+	}
+	const uint64_t ops   = StageStats::g_ops.load(std::memory_order_relaxed);
+	const uint64_t items = ops - last_items;
+	last_items           = ops;
+	const double   busy  = 1000.0 - ms[StageStats::ExecIdle];
+	std::printf("NHL27STALLS mask=%u ops/s=%.0f exec busy=%.1f idle=%.1f lock=%.1f ms/s busy/op=%.2f us"
+	            " (%.2f us without lock waits) | resolve lock=%.1f queue-full=%.1f ms/s\n",
+	            static_cast<unsigned>(Common::Experiments::Mask()), static_cast<double>(items) / seconds, busy,
+	            ms[StageStats::ExecIdle], ms[StageStats::ExecProgramLock],
+	            items != 0 ? busy * 1e3 * seconds / static_cast<double>(items) : 0.0,
+	            items != 0 ? (busy - ms[StageStats::ExecProgramLock]) * 1e3 * seconds / static_cast<double>(items) : 0.0,
+	            ms[StageStats::ResolveProgramLock], ms[StageStats::ResolveQueueFull]);
+	std::fflush(stdout);
+}
+
 void GuestGpu::ExecuteSync(Common::UniqueFunction<void>&& command) {
 	m_gfx_cp->EmitHostCommand(std::move(command));
 	WaitForExecution();
@@ -470,6 +502,7 @@ void GuestGpu::ExecuteSync(Common::UniqueFunction<void>&& command) {
 void GuestGpu::ExecutionThread() {
 	KYTY_PROFILER_THREAD("Thread_GpuExecute");
 	Config::ConfigureGpuStageThread(Config::GpuStageThread::Execution);
+	StageStats::t_role = StageStats::Role::Execution;
 	g_gpu_thread    = true;
 	g_execution_gpu = this;
 	// Waking the command processor costs a fence: publish every operation, but only look for a
@@ -485,12 +518,22 @@ void GuestGpu::ExecutionThread() {
 		if (!operation) {
 			m_executed.Notify();
 			unnotified = 0;
-			operation  = operations.Pop();
+			if (StageStats::Enabled()) {
+				const auto start = std::chrono::steady_clock::now();
+				operation        = operations.Pop();
+				StageStats::Add(StageStats::ExecIdle, start);
+				PrintStageStats();
+			} else {
+				operation = operations.Pop();
+			}
 			if (!operation) {
 				break;
 			}
 		}
 		operation->processor->Execute(*operation);
+		if (StageStats::Enabled()) {
+			StageStats::g_ops.store(StageStats::g_ops.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+		}
 		const auto sequence = operation->sequence;
 		// Destroy the callback before the command processor may reuse what it references.
 		operation.reset();
@@ -507,6 +550,7 @@ void GuestGpu::ExecutionThread() {
 void GuestGpu::ResolveThread() {
 	KYTY_PROFILER_THREAD("Thread_GpuResolve");
 	Config::ConfigureGpuStageThread(Config::GpuStageThread::Resolve);
+	StageStats::t_role = StageStats::Role::Resolve;
 	auto& executor = m_renderer.GetRenderExecutor();
 	for (;;) {
 		auto operation = m_operations.TryPop();
@@ -530,7 +574,13 @@ void GuestGpu::ResolveThread() {
 			    dispatch.thread_group_y, dispatch.thread_group_z, dispatch.mode,
 			    operation->processor->IsAsyncComputeQueue());
 		}
-		m_resolved.Push(std::move(*operation));
+		if (StageStats::Enabled() && !m_resolved.TryPush(*operation)) {
+			const auto start = std::chrono::steady_clock::now();
+			m_resolved.Push(std::move(*operation));
+			StageStats::Add(StageStats::ResolveQueueFull, start);
+		} else if (!StageStats::Enabled()) {
+			m_resolved.Push(std::move(*operation));
+		}
 	}
 	m_resolved.Stop();
 }

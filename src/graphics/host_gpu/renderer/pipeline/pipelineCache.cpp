@@ -1,3 +1,4 @@
+#include "graphics/guest_gpu/stageStats.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 
 #include "common/assert.h"
@@ -331,10 +332,18 @@ namespace {
 class ProgramLockGuard {
 public:
 	explicit ProgramLockGuard(std::atomic_flag& flag): m_flag(flag) {
-		while (m_flag.test_and_set(std::memory_order_acquire)) {
+		if (!m_flag.test_and_set(std::memory_order_acquire)) {
+			return;
+		}
+		const bool stats = StageStats::Enabled();
+		const auto start = stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+		do {
 			while (m_flag.test(std::memory_order_relaxed)) {
 				Common::SpinPause();
 			}
+		} while (m_flag.test_and_set(std::memory_order_acquire));
+		if (stats && StageStats::ProgramLockCounter() != StageStats::CounterCount) {
+			StageStats::Add(StageStats::ProgramLockCounter(), start);
 		}
 	}
 	~ProgramLockGuard() { m_flag.clear(std::memory_order_release); }
@@ -689,14 +698,14 @@ struct PipelineCache::ProgramCache {
 			return {};
 		}
 		const auto permutation =
-		    std::ranges::find_if(entry->second.permutations, [&](const Permutation& candidate) {
+		    std::ranges::find_if(source.permutations, [&](const Permutation& candidate) {
 			    const auto& layout = candidate.program.bindings;
 			    return layout.push_data_start_dword ==
 			               ShaderRecompiler::IR::PushData::StartFor(push_data_cursor,
 			                                                        layout.ShaderDataDwords()) &&
 			           candidate.specialization == specialization;
 		    });
-		if (permutation == entry->second.permutations.end()) {
+		if (permutation == source.permutations.end()) {
 			if constexpr (!compute) {
 				QueueCompile(stage, params, input_info, push_data_cursor, &specialization);
 			}
@@ -1250,10 +1259,18 @@ struct PipelineCache::ProgramCache {
 	std::vector<std::jthread>                      workers;
 
 	void LockPrograms() {
-		while (program_lock->test_and_set(std::memory_order_acquire)) {
+		if (!program_lock->test_and_set(std::memory_order_acquire)) {
+			return;
+		}
+		const bool stats = StageStats::Enabled();
+		const auto start = stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+		do {
 			while (program_lock->test(std::memory_order_relaxed)) {
 				Common::SpinPause();
 			}
+		} while (program_lock->test_and_set(std::memory_order_acquire));
+		if (stats && StageStats::ProgramLockCounter() != StageStats::CounterCount) {
+			StageStats::Add(StageStats::ProgramLockCounter(), start);
 		}
 	}
 	void UnlockPrograms() { program_lock->clear(std::memory_order_release); }
