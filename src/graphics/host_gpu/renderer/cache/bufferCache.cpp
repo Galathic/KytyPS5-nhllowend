@@ -750,7 +750,12 @@ bool BufferCache::ReadbackOnSecondQueue(const Buffer& source, const Buffer& dest
 	// Experiments ReadbackTransfer / ReadbackCompute: a queue of another family copies beside the
 	// graphics work instead of after the work running on the graphics engine.
 	uint32_t kind = 0;
-	if (Common::Experiments::Enabled(Common::Experiments::ReadbackTransfer) && graphics.readback_queues[2] != nullptr) {
+	// KYTY_READBACK_TRANSFER=1 (env only; -2% +- 7.5 as experiment bit 8): the transfer-only family.
+	static const bool readback_transfer = [] {
+		const char* value = std::getenv("KYTY_READBACK_TRANSFER");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (readback_transfer && graphics.readback_queues[2] != nullptr) {
 		kind = 2;
 	} else if (Common::Experiments::Enabled(Common::Experiments::ReadbackCompute) &&
 	           graphics.readback_queues[1] != nullptr) {
@@ -831,9 +836,13 @@ bool BufferCache::ReadbackOnSecondQueue(const Buffer& source, const Buffer& dest
 		return false;
 	}
 	Common::Timeline::Mark("readback-queue", wait_tick);
-	// Experiment ReadbackSpin: most copies of finished data take tens of microseconds, less than
-	// waking a thread that sleeps on the fence.
-	if (Common::Experiments::Enabled(Common::Experiments::ReadbackSpin)) {
+	// KYTY_READBACK_SPIN=1: most copies of finished data take tens of microseconds, less than
+	// waking a thread that sleeps on the fence (measured within noise as experiment bit 9).
+	static const bool readback_spin = [] {
+		const char* value = std::getenv("KYTY_READBACK_SPIN");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (readback_spin) {
 		const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(150);
 		while (graphics.device.getFenceStatus(readback_fence) == vk::Result::eNotReady &&
 		       std::chrono::steady_clock::now() < deadline) {

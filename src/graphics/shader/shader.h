@@ -53,8 +53,32 @@ inline std::atomic<uint32_t> g_shader_native_fp16_modes {0};
 [[nodiscard]] inline bool ShaderNativeMinMax() {
 	return Common::Experiments::Enabled(Common::Experiments::NativeMinMax);
 }
+// Codegen option: experiment FusedMad. V_MAD_F32/V_MAC_F32 (a separately rounded multiply and
+// add on the guest) as one fused multiply-add instead of a NoContraction multiply and add.
+[[nodiscard]] inline bool ShaderFusedMad() {
+	return Common::Experiments::Enabled(Common::Experiments::FusedMad);
+}
+// Codegen option: experiment RobustLoads, on devices with robustBufferAccess2 (out-of-range
+// storage-buffer reads return zero, as the guest's do). Raw storage-buffer loads then skip their
+// EXEC branch and per-dword bounds branch, so the host compiler can batch them.
+inline std::atomic<bool> g_shader_robust_buffer_access2 {false};
+[[nodiscard]] inline bool ShaderRobustLoads() {
+	return g_shader_robust_buffer_access2.load(std::memory_order_relaxed) &&
+	       Common::Experiments::Enabled(Common::Experiments::RobustLoads);
+}
+// KYTY_ROBUST_LOADS_KEEP_EXEC=1: robust loads still branch on EXEC (skipping waves with no active
+// lane), dropping only the bounds branches.
+[[nodiscard]] inline bool ShaderRobustLoadsKeepExec() {
+	static const bool keep = [] {
+		const char* value = std::getenv("KYTY_ROBUST_LOADS_KEEP_EXEC");
+		return value != nullptr && value[0] == '1';
+	}();
+	return keep;
+}
 [[nodiscard]] inline uint32_t ShaderFloatCodegenKey() {
-	return static_cast<uint32_t>(ShaderNativeFp16()) | (ShaderNativeMinMax() ? 2u : 0u);
+	return static_cast<uint32_t>(ShaderNativeFp16()) | (ShaderNativeMinMax() ? 2u : 0u) |
+	       (ShaderFusedMad() ? 4u : 0u) |
+	       (ShaderRobustLoads() ? (ShaderRobustLoadsKeepExec() ? 24u : 8u) : 0u);
 }
 [[nodiscard]] inline uint32_t ShaderNativeFp16Modes() {
 	return g_shader_native_fp16_modes.load(std::memory_order_relaxed);

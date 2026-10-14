@@ -60,8 +60,8 @@ uint32_t EnvironmentMask() {
 	set("KYTY_SRT_JIT", SrtJit, false);
 	set("KYTY_EARLY_SUBMIT_WRITERS", EarlySubmitWriters, false);
 	set("KYTY_READBACK_COMPUTE", ReadbackCompute, true);
-	set("KYTY_READBACK_TRANSFER", ReadbackTransfer, false);
-	set("KYTY_READBACK_SPIN", ReadbackSpin, false);
+	set("KYTY_ROBUST_LOADS", RobustLoads, true);
+	set("KYTY_FUSED_MAD", FusedMad, false);
 	set("KYTY_FAULT_PAGE_DIRECT", FaultPageDirect, true);
 	set("KYTY_BACKING_READ_MRU", BackingReadMru, false);
 	set("KYTY_DISPATCH_AHEAD", DispatchAhead, false);

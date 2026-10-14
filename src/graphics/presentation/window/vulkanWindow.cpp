@@ -744,6 +744,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 #endif
 	if (robustness2_ext_enabled) {
 		robustness2.robustBufferAccess2 = supported_robustness2.robustBufferAccess2;
+		g_shader_robust_buffer_access2.store(supported_robustness2.robustBufferAccess2 == VK_TRUE,
+		                                     std::memory_order_relaxed);
 		robustness2.robustImageAccess2  = supported_robustness2.robustImageAccess2;
 		robustness2.nullDescriptor      = supported_robustness2.nullDescriptor;
 	}

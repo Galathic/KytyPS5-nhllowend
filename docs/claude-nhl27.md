@@ -157,6 +157,24 @@ GPU busy per frame 20.9 -> 18.8 ms (-10%), the top 30 draws/dispatches -13% (CS 
 db7e537e -56%, 4c9b2981 -25%, 9380d724 -13%, PS 9eaaf80c -12%, 136eed67 -7%), 34-38 -> 40 fps.
 In-match screenshots look the same.
 
+### Robust buffer loads (bit 8, `KYTY_ROBUST_LOADS`, default on)
+
+Every raw storage-buffer load was wrapped in a branch on EXEC and, per dword, a branch on the
+bounds (a `buffer_load_dwordx4` became five branches), so the host compiler could neither batch
+loads nor hoist them. The device has robustBufferAccess2 (out-of-range reads return zero, as the
+guest's do, against the same bound range the explicit check used), so with bit 8 those loads are
+plain loads in every lane. Formatted loads keep their checks (their out-of-range value need not be
+zero). Shaders that spill guest VGPRs (LDS lane slots or scratch) keep the branches too: the one
+such heavy pixel shader (33037c60) got 16-27% slower without them, as more values stayed live.
+`KYTY_ROBUST_LOADS_KEEP_EXEC=1` keeps the EXEC branch and drops only the bounds branches.
+
+A/B/A in a paused match (drift -0.2%): top 30 commands -5.0%, GPU busy per frame 16.9 -> 16.1
+ms; PS 136eed67 -13%, 9eaaf80c -10%, 90706b3b -18%, 2b39f281 -18%, f4e33d7e -20%, 33037c60 level;
+in-match screenshots unchanged. Bit 8 was `KYTY_READBACK_TRANSFER`, which is now env-only (=1);
+likewise `KYTY_READBACK_SPIN` (was bit 9). Bit 9 is now `KYTY_FUSED_MAD` (default off): V_MAD/V_MAC_F32
+as one fused multiply-add measured -1% (A/B/A), within noise, so the separately rounded multiply
+and add stay. Default mask with play-nhl: 1977916902.
+
 Tools for shader-codegen A/Bs: `gpu-ab.sh <prefix> <maskA> <maskB>` (`PAUSE=1` pauses first)
 captures A, switches the mask (new variants compile), captures B, switches back, captures A2, and
 compares per-shader GPU time with `gpu-compare.py`; GPU time per draw is far steadier than fps.
