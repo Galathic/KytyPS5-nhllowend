@@ -23,7 +23,7 @@ A private working fork of [KytyPS5](https://github.com/KytyPS5/KytyPS5) focused 
 FPS ranges in normal play mode (no profiler or debug logging), measured after the lighting fix.
 
 | Scene | RX 6800 XT, Ryzen 5 5600 32 GB DDR4-3200|
-|---|---|---|
+|---|---|
 | Main menu (game caps at 30) | 26-30| 
 | Franchise menus (game caps at 30) | 30 |
 | Team select | 18-26 |
