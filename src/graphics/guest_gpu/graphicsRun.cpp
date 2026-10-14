@@ -384,7 +384,7 @@ void GuestGpu::ForgetExecutedWrites() {
 }
 
 void GuestGpu::NoteGuestWrite(uint64_t sequence, uint64_t address, uint64_t size,
-                              const void* value) {
+                              const void* value, uint8_t origin) {
 	ForgetExecutedWrites();
 	if (sequence <= m_executed.Load()) {
 		return;
@@ -394,7 +394,7 @@ void GuestGpu::NoteGuestWrite(uint64_t sequence, uint64_t address, uint64_t size
 		ForgetExecutedWrites();
 	}
 	auto& write = m_pending_writes[(m_pending_first + m_pending_count) % PendingWriteCapacity];
-	write       = {.sequence = sequence, .address = address, .size = size};
+	write       = {.sequence = sequence, .address = address, .size = size, .origin = origin};
 	if (value != nullptr && size <= sizeof(write.value)) {
 		write.known = true;
 		std::memcpy(write.value, value, size);
@@ -402,7 +402,81 @@ void GuestGpu::NoteGuestWrite(uint64_t sequence, uint64_t address, uint64_t size
 	m_pending_count++;
 }
 
+// NHL27DECISION (KYTY_PERF_STATS=1): what the command processor waits for when it decides on guest
+// memory (WAIT_REG_MEM, COND_EXEC, predication): pending writes whose value is only known once the
+// execution thread ran them (by write size), direct reads, and the WAIT_REG_MEM handler itself.
+namespace {
+struct DecisionStats {
+	std::atomic<uint64_t> reads {0};
+	std::atomic<uint64_t> known {0};
+	std::atomic<uint64_t> waits[3] {}; // by the pending write's origin: other, clock, DMA
+	std::atomic<uint64_t> wait_ns[3] {};
+	std::atomic<uint64_t> predicted {0};
+	std::atomic<uint32_t> slow_logged {0};
+	std::atomic<uint64_t> copies {0};
+	std::atomic<uint64_t> copy_ns {0};
+	std::atomic<uint64_t> wrm_calls {0};
+	std::atomic<uint64_t> wrm_suspends {0};
+	std::atomic<uint64_t> wrm_ns {0};
+	std::atomic<uint64_t> wrm_read_ns {0};
+	std::atomic<uint64_t> wrm_barrier_ns {0};
+	std::atomic<int64_t>  last_print {0};
+};
+DecisionStats g_decision;
+
+uint64_t DecisionNowNs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
+void DecisionMaybePrint() {
+	const auto now  = static_cast<int64_t>(DecisionNowNs() / 1000000u);
+	auto       last = g_decision.last_print.load(std::memory_order_relaxed);
+	if (last == 0) {
+		g_decision.last_print.compare_exchange_strong(last, now, std::memory_order_relaxed);
+		return;
+	}
+	if (now - last < 5000 || !g_decision.last_print.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+		return;
+	}
+	const auto take = [](std::atomic<uint64_t>& v) { return v.exchange(0, std::memory_order_relaxed); };
+	const auto ms   = [](uint64_t ns) { return static_cast<double>(ns) / 1e6; };
+	const auto reads = take(g_decision.reads);
+	const auto known = take(g_decision.known);
+	uint64_t   w[3];
+	uint64_t   wn[3];
+	for (int i = 0; i < 3; i++) {
+		w[i]  = take(g_decision.waits[i]);
+		wn[i] = take(g_decision.wait_ns[i]);
+	}
+	const auto predicted = take(g_decision.predicted);
+	const auto copies    = take(g_decision.copies);
+	const auto copy_ns   = take(g_decision.copy_ns);
+	const auto calls     = take(g_decision.wrm_calls);
+	const auto suspends  = take(g_decision.wrm_suspends);
+	const auto wrm_ns    = take(g_decision.wrm_ns);
+	const auto read_ns   = take(g_decision.wrm_read_ns);
+	const auto barrier_ns = take(g_decision.wrm_barrier_ns);
+	std::printf("NHL27DECISION: window=%.1fs reads=%llu known=%llu wait_other=%llu/%.1fms wait_clock=%llu/%.1fms "
+	            "wait_dma=%llu/%.1fms copies=%llu/%.1fms predicted=%llu | wait_reg_mem calls=%llu suspends=%llu "
+	            "total=%.1fms read=%.1fms barrier=%.1fms\n",
+	            static_cast<double>(now - last) / 1000.0, static_cast<unsigned long long>(reads),
+	            static_cast<unsigned long long>(known), static_cast<unsigned long long>(w[0]), ms(wn[0]),
+	            static_cast<unsigned long long>(w[1]), ms(wn[1]), static_cast<unsigned long long>(w[2]),
+	            ms(wn[2]), static_cast<unsigned long long>(copies), ms(copy_ns),
+	            static_cast<unsigned long long>(predicted),
+	            static_cast<unsigned long long>(calls), static_cast<unsigned long long>(suspends), ms(wrm_ns),
+	            ms(read_ns), ms(barrier_ns));
+	std::fflush(stdout);
+}
+} // namespace
+
 void GuestGpu::ReadDecisionMemory(const volatile void* address, void* value, size_t size) {
+	const bool timed = FrameBreakdown::Enabled();
+	if (timed) {
+		g_decision.reads.fetch_add(1, std::memory_order_relaxed);
+	}
 	ForgetExecutedWrites();
 	const auto begin = reinterpret_cast<uint64_t>(address);
 	const auto end   = begin + size;
@@ -413,14 +487,59 @@ void GuestGpu::ReadDecisionMemory(const volatile void* address, void* value, siz
 			continue;
 		}
 		if (write->known && write->address <= begin && end <= write->address + write->size) {
+			if (timed) {
+				g_decision.known.fetch_add(1, std::memory_order_relaxed);
+			}
 			std::memcpy(value, write->value + (begin - write->address), size);
 			return;
 		}
 		// The value is only known once the write executed; waiting acquires it.
+		const auto write_size    = write->size;
+		const auto write_address = write->address;
+		const auto write_origin  = write->origin;
+		const auto wait_start    = timed ? DecisionNowNs() : 0;
 		WaitForExecution(write->sequence);
+		if (timed) {
+			const auto waited = DecisionNowNs() - wait_start;
+			const int  bucket = write_origin < 3 ? write_origin : 0;
+			g_decision.waits[bucket].fetch_add(1, std::memory_order_relaxed);
+			g_decision.wait_ns[bucket].fetch_add(waited, std::memory_order_relaxed);
+			if (waited > 1000000u && g_decision.slow_logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+				std::printf("NHL27DECISION: slow wait %.2fms read=0x%016llx+%zu pending write=0x%016llx+%llu origin=%u\n",
+				            static_cast<double>(waited) / 1e6, static_cast<unsigned long long>(begin), size,
+				            static_cast<unsigned long long>(write_address),
+				            static_cast<unsigned long long>(write_size), static_cast<unsigned>(write_origin));
+				std::fflush(stdout);
+			}
+		}
 		break;
 	}
+	const auto copy_start = timed ? DecisionNowNs() : 0;
 	CopyFromGuest(value, address, size);
+	if (timed) {
+		g_decision.copies.fetch_add(1, std::memory_order_relaxed);
+		g_decision.copy_ns.fetch_add(DecisionNowNs() - copy_start, std::memory_order_relaxed);
+	}
+}
+
+bool GuestGpu::TryPredictClockWrite(const volatile void* address, size_t size, uint64_t& lower_bound) {
+	ForgetExecutedWrites();
+	const auto begin = reinterpret_cast<uint64_t>(address);
+	const auto end   = begin + size;
+	for (size_t i = m_pending_count; i-- > 0;) {
+		const auto* write = &m_pending_writes[(m_pending_first + i) % PendingWriteCapacity];
+		if (write->address >= end || write->address + write->size <= begin) {
+			continue;
+		}
+		if (write->origin != WriteOriginClock || write->known || write->address != begin || write->size != size) {
+			return false;
+		}
+		const auto sequence = write->sequence;
+		lower_bound         = Sync::ReadReferenceClock();
+		// The write reads the clock after this only while it is still pending.
+		return m_executed.Load() < sequence;
+	}
+	return false;
 }
 
 void GuestGpu::ExecuteSync(Common::UniqueFunction<void>&& command) {
@@ -445,12 +564,26 @@ void GuestGpu::ExecutionThread() {
 		if (!operation) {
 			m_executed.Notify();
 			unnotified = 0;
+			// KYTY_IDLE_TRACE: the execution thread waits for the command processor (a = 0).
+			Common::EventTrace::Record(Common::EventTrace::EXEC_WAIT_BEGIN);
 			operation  = operations.Pop();
+			Common::EventTrace::Record(Common::EventTrace::EXEC_WAIT_END);
 			if (!operation) {
 				break;
 			}
 		}
+		// KYTY_IDLE_TRACE: operations taking 20 us or more, recorded when they end
+		// (a = GpuOperationKind | GpuOperation::trace_op << 8, b = microseconds).
+		const bool traced   = Common::EventTrace::g_capturing.load(std::memory_order_relaxed);
+		const auto op_kind  = static_cast<uint64_t>(operation->kind) | (uint64_t {operation->trace_op} << 8u);
+		const auto op_start = traced ? Common::EventTrace::NowNs() : int64_t {0};
 		operation->processor->Execute(*operation);
+		if (traced) {
+			const auto op_ns = Common::EventTrace::NowNs() - op_start;
+			if (op_ns >= 20000) {
+				Common::EventTrace::Record(Common::EventTrace::EXEC_OP, op_kind, static_cast<uint64_t>(op_ns / 1000));
+			}
+		}
 		const auto sequence = operation->sequence;
 		// Destroy the callback before the command processor may reuse what it references.
 		operation.reset();
@@ -547,9 +680,13 @@ void CommandProcessor::ApplyContextStateOperation(ContextStateOperation operatio
 	}
 }
 
+// KYTY_IDLE_TRACE: the PM4 packet the command processor thread is handling (GpuOperation::trace_op).
+static thread_local uint16_t g_trace_op = 0;
+
 GpuOperation CommandProcessor::MakeOperation(GpuOperationKind kind) {
 	GpuOperation operation;
 	operation.kind          = kind;
+	operation.trace_op      = g_trace_op;
 	operation.processor     = this;
 	operation.submit_id     = m_submit_id;
 	operation.num_instances = m_num_instances;
@@ -612,11 +749,11 @@ uint64_t CommandProcessor::Emit(GpuOperation&& operation) {
 }
 
 void CommandProcessor::NoteGuestWrite(uint64_t sequence, uint64_t address, uint64_t size,
-                                      const void* value) {
+                                      const void* value, uint8_t origin) {
 	LibKernel::Memory::NoteHostWrite(address, size, LibKernel::Memory::HostWriteSource::CommandProcessor,
 	                                 value);
 	if (m_pipeline != nullptr && size != 0) {
-		m_pipeline->NoteGuestWrite(sequence, address, size, value);
+		m_pipeline->NoteGuestWrite(sequence, address, size, value, origin);
 	}
 }
 
@@ -641,7 +778,10 @@ void CommandProcessor::BdaBoundary(RenderContext::BdaBoundary kind) {
 		return;
 	}
 	// KYTY_BDA_BATCH orders boundaries with the draws and dispatches that execute around them.
+	const auto saved_trace_op = g_trace_op;
+	g_trace_op                = static_cast<uint16_t>(g_trace_op | 0x4000u);
 	EmitCallback([this, kind] { m_renderer.BdaBatchBoundary(kind); });
+	g_trace_op = saved_trace_op;
 }
 
 uint64_t CommandProcessor::EmitCallback(GpuCallback&& callback) {
@@ -847,13 +987,43 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 
 	(void)poll;
 	m_wait_since_operation = true;
-	if (!TestWaitRegMemValue(ReadDecisionValue<T>(addr), ref, mask, func)) {
+	const bool timed       = FrameBreakdown::Enabled();
+	const auto start       = timed ? DecisionNowNs() : 0;
+	// Experiment ClockWaitPredict: a wait on a 64-bit reference-clock write that is still pending
+	// (EOP timestamp) would stop the command processor until the execution thread catches up. The
+	// clock only grows, so when the clock now already satisfies a wait for "at least" / "above" /
+	// "not equal", the value written later satisfies it too.
+	bool predicted = false;
+	if constexpr (sizeof(T) == sizeof(uint64_t)) {
+		uint64_t lower = 0;
+		if (m_pipeline != nullptr && mask == ~T {0} &&
+		    Common::Experiments::Enabled(Common::Experiments::ClockWaitPredict) &&
+		    m_pipeline->TryPredictClockWrite(addr, sizeof(T), lower)) {
+			predicted = func == 0 || (func == 5 && lower >= ref) || ((func == 6 || func == 4) && lower > ref);
+		}
+	}
+	if (predicted && timed) {
+		g_decision.predicted.fetch_add(1, std::memory_order_relaxed);
+	}
+	const auto value       = predicted ? T {0} : ReadDecisionValue<T>(addr);
+	const auto read_done   = timed ? DecisionNowNs() : 0;
+	const bool satisfied   = predicted || TestWaitRegMemValue(value, ref, mask, func);
+	if (!satisfied) {
 		SuspendPm4();
 	}
 	// KYTY_GUEST_SYNC: labels are written at CP time, so a guest RELEASE_MEM + WAIT_REG_MEM pair
 	// no longer orders GPU work by itself. Without the automatic dispatch barriers the wait must.
 	if (BufferCache::GuestSyncOnly()) {
 		EmitGlobalBarrier();
+	}
+	if (timed) {
+		const auto done = DecisionNowNs();
+		g_decision.wrm_calls.fetch_add(1, std::memory_order_relaxed);
+		g_decision.wrm_suspends.fetch_add(satisfied ? 0 : 1, std::memory_order_relaxed);
+		g_decision.wrm_ns.fetch_add(done - start, std::memory_order_relaxed);
+		g_decision.wrm_read_ns.fetch_add(read_done - start, std::memory_order_relaxed);
+		g_decision.wrm_barrier_ns.fetch_add(done - read_done, std::memory_order_relaxed);
+		DecisionMaybePrint();
 	}
 }
 
@@ -948,7 +1118,8 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 			     dst_address, value, num_bytes);
 		}
 	});
-	NoteGuestWrite(sequence, dst_address, num_bytes);
+	NoteGuestWrite(sequence, dst_address, num_bytes, nullptr,
+	               num_bytes == sizeof(uint64_t) ? GuestGpu::WriteOriginClock : GuestGpu::WriteOriginOther);
 }
 
 void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cache_policy,
@@ -1002,7 +1173,7 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 		               src_address_or_offset_or_immediate, num_bytes);
 	});
 	if (!dst_gds) {
-		NoteGuestWrite(sequence, dst_address_or_offset, num_bytes);
+		NoteGuestWrite(sequence, dst_address_or_offset, num_bytes, nullptr, GuestGpu::WriteOriginDma);
 	}
 }
 
@@ -1384,6 +1555,63 @@ static FrameBreakdown::GpuBucket PacketBusyBucket(uint32_t op) {
 	}
 }
 
+// NHL27PM4OPS (KYTY_PERF_STATS=1): time spent inside each PM4 packet handler, by opcode (IT_NOP by
+// its custom R code), so the sync_pkt bucket of NHL27GPUBUSY can be broken down. Totals per 5 s.
+namespace {
+struct Pm4OpStat {
+	std::atomic<uint64_t> ns {0};
+	std::atomic<uint64_t> count {0};
+};
+constexpr size_t kPm4OpStatSlots = 256 + Pm4::R_NUM; // opcodes, then IT_NOP custom R codes
+Pm4OpStat        g_pm4_op_stats[kPm4OpStatSlots];
+std::atomic<int64_t> g_pm4_op_last_print {0};
+
+void Pm4OpStatsAdd(uint32_t opcode, uint32_t header, uint64_t ns) {
+	const size_t slot = opcode == Pm4::IT_NOP ? 256u + KYTY_PM4_R(header) : opcode;
+	g_pm4_op_stats[slot].ns.fetch_add(ns, std::memory_order_relaxed);
+	g_pm4_op_stats[slot].count.fetch_add(1, std::memory_order_relaxed);
+	const auto now  = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now().time_since_epoch()).count();
+	auto       last = g_pm4_op_last_print.load(std::memory_order_relaxed);
+	if (last == 0) {
+		g_pm4_op_last_print.compare_exchange_strong(last, now, std::memory_order_relaxed);
+		return;
+	}
+	if (now - last < 5000 || !g_pm4_op_last_print.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+		return;
+	}
+	struct Entry {
+		uint64_t ns;
+		uint64_t count;
+		size_t   slot;
+	};
+	std::vector<Entry> top;
+	for (size_t i = 0; i < kPm4OpStatSlots; i++) {
+		const auto t = g_pm4_op_stats[i].ns.exchange(0, std::memory_order_relaxed);
+		const auto c = g_pm4_op_stats[i].count.exchange(0, std::memory_order_relaxed);
+		if (c != 0) {
+			top.push_back({t, c, i});
+		}
+	}
+	std::sort(top.begin(), top.end(), [](const Entry& a, const Entry& b) { return a.ns > b.ns; });
+	std::printf("NHL27PM4OPS: window=%.1fs", static_cast<double>(now - last) / 1000.0);
+	for (size_t i = 0; i < top.size() && i < 12; i++) {
+		const auto t    = top[i].ns;
+		const auto c    = top[i].count;
+		const auto slot = top[i].slot;
+		if (slot >= 256) {
+			std::printf(" | nop_r=0x%02zx n=%llu ms=%.1f", slot - 256, static_cast<unsigned long long>(c),
+			            static_cast<double>(t) / 1e6);
+		} else {
+			std::printf(" | op=0x%02zx n=%llu ms=%.1f", slot, static_cast<unsigned long long>(c),
+			            static_cast<double>(t) / 1e6);
+		}
+	}
+	std::printf("\n");
+	std::fflush(stdout);
+}
+} // namespace
+
 static void SubmitSplitMaybePrint() {
 	static const bool stats = [] {
 		const char* s = std::getenv("KYTY_PERF_STATS");
@@ -1731,15 +1959,23 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		}
 
 		BufferCache::PerfSetPm4Op(opcode);
+		g_trace_op = static_cast<uint16_t>(opcode | (opcode == Pm4::IT_NOP ? KYTY_PM4_R(packet_header) << 8u : 0u));
 		uint32_t packet_dw;
 		{
 			FrameBreakdown::GpuBusyScope busy_scope(PacketBusyBucket(opcode));
+			const bool op_timed = FrameBreakdown::Enabled();
+			const auto op_start = op_timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 			packet_dw = handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+			if (op_timed) {
+				Pm4OpStatsAdd(opcode, packet_header, static_cast<uint64_t>(
+				    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - op_start).count()));
+			}
 		}
 		EXIT_IF(packet_dw > remaining_dw);
 		if (RenderContext::BdaBoundary bda_kind; BdaBoundaryKind(opcode, packet_header, bda_kind)) {
 			BdaBoundary(bda_kind);  // after the handler, also when the packet suspended on a wait
 		}
+		g_trace_op = 0;
 		if (execution.m_suspended) {
 			return;
 		}
@@ -2442,7 +2678,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 		NoteGuestWrite(sequence, address, sizeof(value), &value);
 	} else {
 		if (event_write_source == 0x04) {
-			NoteGuestWrite(sequence, address, sizeof(value));
+			NoteGuestWrite(sequence, address, sizeof(value), nullptr, GuestGpu::WriteOriginClock);
 			return;
 		}
 		const auto low = static_cast<uint32_t>(value);

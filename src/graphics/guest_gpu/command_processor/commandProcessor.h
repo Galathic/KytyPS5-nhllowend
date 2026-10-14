@@ -228,7 +228,7 @@ private:
 	uint64_t                   Emit(GpuOperation&& operation);
 	uint64_t                   EmitCallback(GpuCallback&& callback);
 	void NoteGuestWrite(uint64_t sequence, uint64_t address, uint64_t size,
-	                    const void* value = nullptr);
+	                    const void* value = nullptr, uint8_t origin = 0);
 
 	// Execution side, in operation order. Only these touch the renderer.
 	void BindState(const GpuRegisterState& state);

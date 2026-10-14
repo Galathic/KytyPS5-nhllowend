@@ -62,9 +62,18 @@ public:
 	[[nodiscard]] uint64_t NextSequence() const noexcept { return m_emitted + 1; }
 	// Returns the sequence of the operation.
 	uint64_t               EmitOperation(GpuOperation&& operation);
+	// What a pending write stores when its value is not known at emit time (NHL27DECISION).
+	static constexpr uint8_t WriteOriginOther = 0;
+	static constexpr uint8_t WriteOriginClock = 1; // the 64-bit reference clock, read when it executes
+	static constexpr uint8_t WriteOriginDma   = 2;
 	// The guest memory an emitted operation writes, and the value it writes when that is known
 	// when the operation is emitted (`value` null otherwise, or larger than 8 bytes).
-	void NoteGuestWrite(uint64_t sequence, uint64_t address, uint64_t size, const void* value);
+	void NoteGuestWrite(uint64_t sequence, uint64_t address, uint64_t size, const void* value,
+	                    uint8_t origin = WriteOriginOther);
+	// Experiment ClockWaitPredict: when the newest pending write of exactly [address, address + size)
+	// stores the 64-bit reference clock, returns true with a value the write will not be below (the
+	// clock read now, while the write is still pending). The clock only grows.
+	[[nodiscard]] bool TryPredictClockWrite(const volatile void* address, size_t size, uint64_t& lower_bound);
 	// Reads guest memory the command processor decides on as a serial GPU would at this point
 	// of the stream: from the value of a pending write when it is known, otherwise from memory
 	// once the operations that write it executed.
@@ -139,6 +148,7 @@ private:
 		uint64_t address  = 0;
 		uint64_t size     = 0;
 		bool     known    = false;
+		uint8_t  origin   = 0;
 		uint8_t  value[8] = {};
 	};
 

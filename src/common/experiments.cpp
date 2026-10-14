@@ -49,6 +49,8 @@ uint32_t EnvironmentMask() {
 	set("KYTY_FALSE_SHARE_READS", FalseShareReads, false);
 	set("KYTY_SRT_JIT", SrtJit, false);
 	set("KYTY_LAZY_SHARED_WRITES", LazySharedWrites, false);
+	set("KYTY_PROTECT_SHARED_LOCK", ProtectSharedLock, false);
+	set("KYTY_CLOCK_WAIT_PREDICT", ClockWaitPredict, false);
 	return mask;
 }
 

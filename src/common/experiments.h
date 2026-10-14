@@ -29,6 +29,8 @@ enum Bit : uint32_t {
 	AdaptiveResourceMemo = 1u << 15u, // KYTY_ADAPTIVE_RESOURCE_MEMO (default on; superseded by KYTY_RESOURCE_MEMO_BYPASS, no consumer)
 	CleanFromDirect      = 1u << 18u, // KYTY_CLEAN_FROM_DIRECT (default on; strict evaluator reuses direct SRT words)
 	LazySharedWrites     = 1u << 22u, // KYTY_LAZY_SHARED_WRITES (default off; CPU stores next to few GPU-written bytes do not wait)
+	ProtectSharedLock    = 1u << 23u, // KYTY_PROTECT_SHARED_LOCK (default off; page-tracking protections of different pages run in parallel)
+	ClockWaitPredict     = 1u << 24u, // KYTY_CLOCK_WAIT_PREDICT (default off; WAIT_REG_MEM on a pending clock write need not wait for it)
 	// A/B only (no environment variable): selects the code a pending change replaces.
 	AbLegacy = 1u << 31u,
 };
