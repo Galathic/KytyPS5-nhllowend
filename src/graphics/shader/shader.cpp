@@ -672,6 +672,8 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 	words.push_back(info.wave_size);
 	words.push_back(info.scratch_size_dwords);
 	words.push_back(static_cast<uint32_t>(ShaderNativeFp16()));
+	if (ShaderFastMinMax()) words.push_back(0x464d4d31u);
+	if (ShaderSkipBoundsChecks()) words.push_back(0x53424331u);
 	words.push_back(info.pa_cl_vs_out_cntl);
 	words.push_back(static_cast<uint32_t>(info.clip_space.enabled));
 	if (info.clip_space.enabled) {
@@ -753,6 +755,8 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 	words.insert(std::begin(info.interpolator_settings),
 	             std::begin(info.interpolator_settings) + info.input_num);
 	words.push_back(static_cast<uint32_t>(ShaderNativeFp16()));
+	if (ShaderFastMinMax()) words.push_back(0x464d4d31u);
+	if (ShaderSkipBoundsChecks()) words.push_back(0x53424331u);
 	words.CopyTo(key);
 }
 
@@ -772,6 +776,8 @@ void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_
 	}
 	words.push_back(static_cast<uint32_t>(info.tg_size_en));
 	words.push_back(static_cast<uint32_t>(ShaderNativeFp16()));
+	if (ShaderFastMinMax()) words.push_back(0x464d4d31u);
+	if (ShaderSkipBoundsChecks()) words.push_back(0x53424331u);
 	words.CopyTo(key);
 }
 
