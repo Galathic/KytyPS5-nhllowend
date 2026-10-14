@@ -11,6 +11,46 @@ There are two kinds of switches, and a key name belongs to exactly one of them.
   `KYTY_EXPERIMENT_FILE` names a file holding a decimal mask (bit numbers below); while the file
   exists its mask replaces the environment values.
 
+## Threaded GPU pipeline (merge of pengui07/nhl27-gta-eadb, 2026-10-14)
+
+pengui07's `nhl27-gta-eadb` (upstream main, TheCruZ's GTA V work and its NHL 27 port) runs the
+emulated GPU as a pipeline of threads: command processor, resolve (program selection and SRT
+materialization ahead of execution), execution (owns the renderer and caches) and recording
+(replays the recorded commands into Vulkan command buffers and submits them).
+`KYTY_GPU_PIPELINE=0` (or `--gpu-pipeline 0`) runs everything inline; stage threads are pinned
+(`KYTY_GPU_THREAD_CPUS`, default 4,6,8) and run at high priority (`KYTY_GPU_THREAD_PRIORITY=0`
+keeps normal priority).
+
+Measured on this merge (cross-boot, 120 s of a match then 60 s paused, play-nhl defaults):
+
+| Build | Match fps | Paused fps |
+|---|---|---|
+| Merge, pipeline on (PGO profile v4) | 18.0 / 22.9 / 18.4 | 20.7 / 22.7 / 19.5 |
+| Merge, pipeline on (stale PGO), 6 boots | 17-22, mean 20.0 | 20.6-26.3, mean 23.6 |
+| Merge, `KYTY_GPU_PIPELINE=0` | 14.7 / 14.2 | 16.0 / 18.6 |
+| pengui07/nhl27-gta-eadb alone (no PGO) | 15.0 | 15.6 |
+| claude/nhl27-perf before the merge, 8 boots the same day | 19-24, mean 20.9 | 19-28, mean 23.2 |
+
+So the pipeline is worth about +40% on the merged code, but the merged code inline is slower than
+the pre-merge branch was, and the two cancel out in a match: the merge is about level with the
+pre-merge build (the game also switches between 60 and 30 Hz flips on its own, which quantizes the
+frame rate). Per-boot spread is several fps; these are not in-match A/Bs.
+
+Changes made in the merge:
+- `KYTY_READBACK_QUEUE` with the pipeline lost the device in 3 of 5 boots: a second-queue readback
+  waited for a timeline tick the recording thread had not submitted yet. It now waits until the
+  tick is submitted (`CommandScheduler::WaitSubmitted`); 3 of 3 boots clean, and a failed
+  second-queue submission falls back to the ordinary readback.
+- Retired experiment bits: 8 (`KYTY_GPU_THREAD_PRIORITY` as an experiment: the stage threads set
+  their own priority, and the env key now belongs to the pipeline), 9 (`KYTY_IMAGE_RECYCLE`:
+  image recycling is TheCruZ's, unconditional, 768 MiB kept for NHL 27's aliased targets) and 21
+  (`KYTY_ASYNC_SUBMIT` has no consumer: the recording thread submits).
+- Bit 0 is now `KYTY_EARLY_SUBMIT_WRITERS` (default off): a draw or dispatch that writes bytes a
+  strict resource read had to download ends the host command buffer, so the next such read waits
+  only for that work on the second queue.
+- The first boot after shader-emitter changes recompiles every shader (minutes at 0 fps while
+  loading); later boots use the pipeline cache.
+
 ## Merged defaults (nhl27 + claude/nhl27-perf)
 
 Where both branches implemented the same feature, only one implementation is left and it is a
