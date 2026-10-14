@@ -1572,6 +1572,10 @@ bool TextureCache::MaterializeColorClearOnGpu(ImageId id, const ImageDesc& desc,
 	command.EndRendering();
 	const bool expand        = desc.type != BindingType::VideoOut;
 	const auto [buffer, offset] = m_buffer_cache.ObtainBuffer(address, slice_size * count, expand, false);
+	if (!buffer->HasDeviceAddress()) {
+		note("stream-buffer");
+		return false;
+	}
 	if (m_color_clear_check == nullptr) {
 		m_color_clear_check = std::make_shared<ColorClearCheck>(m_graphics, m_scheduler);
 	}

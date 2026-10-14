@@ -57,6 +57,14 @@ struct GraphicContext {
 	// Second queue of the same family (null when the family has one): GPU-to-CPU readbacks that
 	// only need to wait for an earlier submission instead of all recorded work.
 	vk::Queue                          readback_queue = nullptr;
+	// Readback queues by kind: 0 = readback_queue, 1 = a compute-only family, 2 = a transfer-only
+	// family (experiments ReadbackCompute / ReadbackTransfer). A second queue of the graphics
+	// family waits for the graphics work running on the same engine; the others run beside it.
+	// Null when the device has no such family, or with KYTY_READBACK_FAMILIES=0.
+	vk::Queue                          readback_queues[3] {};
+	uint32_t                           readback_families[3] {};
+	// Queue families every buffer is shared with (concurrent sharing) when there are several.
+	std::vector<uint32_t>              buffer_families;
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;

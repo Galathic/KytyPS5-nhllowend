@@ -66,6 +66,12 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	vk::BufferCreateInfo buffer_info {};
 	buffer_info.size        = size;
 	buffer_info.usage       = flags;
+	// Readbacks may copy from or into it on another queue family.
+	if (graphics.buffer_families.size() > 1) {
+		buffer_info.sharingMode           = vk::SharingMode::eConcurrent;
+		buffer_info.queueFamilyIndexCount = static_cast<uint32_t>(graphics.buffer_families.size());
+		buffer_info.pQueueFamilyIndices   = graphics.buffer_families.data();
+	}
 
 	const bool with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
 	// Experiment PooledBdaBuffers: small device-address buffers come from VMA's shared blocks. The

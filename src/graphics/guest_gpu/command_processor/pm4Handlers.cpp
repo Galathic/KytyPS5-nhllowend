@@ -21,6 +21,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1998,6 +1999,16 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 			std::fflush(stdout);
 		}
 	}
+	if (CpReadDebugEnabled()) {
+		const auto               start = std::chrono::steady_clock::now();
+		const volatile uint32_t* touch = indirect_buffer;
+		(void)touch[0];
+		(void)touch[indirect_num_dw * 2u - 1u];
+		NoteCpRead("CpOpIndirectCxRegs", reinterpret_cast<uint64_t>(indirect_buffer), indirect_buffer, indirect_num_dw,
+		           static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                                     std::chrono::steady_clock::now() - start)
+		                                     .count()));
+	}
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		// Keep the encoded offset for packet control values, and use the normalized offset
 		// only for register dispatch.
@@ -2084,6 +2095,16 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 			std::printf("NHL26MENU: indirect register backing read active\n");
 			std::fflush(stdout);
 		}
+	}
+	if (CpReadDebugEnabled()) {
+		const auto               start = std::chrono::steady_clock::now();
+		const volatile uint32_t* touch = indirect_buffer;
+		(void)touch[0];
+		(void)touch[indirect_num_dw * 2u - 1u];
+		NoteCpRead("CpOpIndirectShRegs", reinterpret_cast<uint64_t>(indirect_buffer), indirect_buffer, indirect_num_dw,
+		           static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                                     std::chrono::steady_clock::now() - start)
+		                                     .count()));
 	}
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];

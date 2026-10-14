@@ -47,9 +47,38 @@ Changes made in the merge:
   (`KYTY_ASYNC_SUBMIT` has no consumer: the recording thread submits).
 - Bit 0 is now `KYTY_EARLY_SUBMIT_WRITERS` (default off): a draw or dispatch that writes bytes a
   strict resource read had to download ends the host command buffer, so the next such read waits
-  only for that work on the second queue.
+  only for that work on the second queue. In-match A/B, 4 rounds: 27.0 fps off, 20.8 fps on
+  (every round slower), so it stays off: the extra submissions cost more than the shorter waits.
+- A dispatch whose arguments the CPU wrote gets them from the stream buffer, which has no device
+  address; the dispatch-args guard (and the GPU color-clear check) skip it instead of failing
+  (`streamBuffer.cpp:121`, once during a match load).
 - The first boot after shader-emitter changes recompiles every shader (minutes at 0 fps while
   loading); later boots use the pipeline cache.
+
+### Readbacks on a compute queue (bit 2, `KYTY_READBACK_COMPUTE`, default on)
+
+`KYTY_DBG_CP_READS=1` prints what the synchronous downloads wait for (`NHL27RBWAIT`, every 2 s:
+who read, whether the bytes read were GPU-written themselves, how many submissions back the
+buffer's last write is, and whether it had finished) and which command-processor reads of guest
+memory are slow (`NHL27CPREAD`: indirect register loads and `WAIT_REG_MEM` values, by time).
+
+In a match, about 300 to 4000 downloads per 2 s copy data whose writer had already finished, yet
+each took 0.2 to 0.8 ms (up to a third of the execution thread): the second queue of the graphics
+family runs on the same engine as the frame's work and waits behind it. The device also has a
+compute-only family (async compute, 8 queues on the RX 9070 XT) and a transfer-only family
+(SDMA). Every buffer is now shared with them (concurrent sharing; `KYTY_READBACK_FAMILIES=0`
+leaves the device as before), and bit 2 copies on the compute family, bit 8
+(`KYTY_READBACK_TRANSFER`) on the transfer family. In-match A/B, 6 rounds of 20 s:
+
+| Readback queue | fps | vs graphics |
+|---|---|---|
+| Graphics family (before) | 25.3 | |
+| Compute family | 28.7 | +13.8% (paired +3.5 +- 1.4, every round faster) |
+| Transfer family | 24.7 | -2% (+-7.5: copies of finished data take 0.1 ms, but some phases are much slower) |
+
+Measured and dropped on the way: per-range write ticks (a download waits for the latest write of
+its bytes instead of its buffer's): fewer than 1% of the downloads would wait for an older
+submission, and the A/B was -14% +- 7.5.
 
 ## Merged defaults (nhl27 + claude/nhl27-perf)
 

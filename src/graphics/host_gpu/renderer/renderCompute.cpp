@@ -883,7 +883,9 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
 	// KYTY_DISPATCH_ARGS_GUARD (runtime flag, default on; =0 disables) is the GPU-side check of the group counts.
-	const bool guard_args = Common::RuntimeFlags::Current().dispatch_args_guard;
+	// Arguments the CPU wrote come from the stream buffer, which has no device address: the guard
+	// is for counts the GPU wrote (a fatal error during an NHL 27 match load).
+	const bool guard_args = Common::RuntimeFlags::Current().dispatch_args_guard && args_buffer->HasDeviceAddress();
 	vk::Buffer indirect_buffer = args_buffer->Handle();
 	uint64_t   indirect_offset = args_offset;
 	if (guard_args) {

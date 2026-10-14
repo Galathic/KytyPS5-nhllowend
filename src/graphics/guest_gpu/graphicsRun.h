@@ -184,6 +184,13 @@ private:
 
 	friend class CommandProcessor;
 };
+
+// KYTY_DBG_CP_READS=1: guest memory reads of the command processor (indirect register pairs,
+// WAIT_REG_MEM values), timed so the ones that fault and wait for the GPU show up. Printed as
+// NHL27CPREAD every 2 s, by time spent. One thread at a time (the command processor).
+[[nodiscard]] bool CpReadDebugEnabled() noexcept;
+void               NoteCpRead(const char* kind, uint64_t address, const uint32_t* pairs, uint32_t pair_count,
+                              uint64_t ns);
 } // namespace Libs::Graphics
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_GRAPHICSRUN_H_ */

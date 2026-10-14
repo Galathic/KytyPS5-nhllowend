@@ -43,6 +43,7 @@
 #include <string>
 #include <thread>
 #include <type_traits>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -423,6 +424,15 @@ void GuestGpu::ReadDecisionMemory(const volatile void* address, void* value, siz
 		// The value is only known once the write executed; waiting acquires it.
 		WaitForExecution(write->sequence);
 		break;
+	}
+	if (CpReadDebugEnabled()) {
+		const auto start = std::chrono::steady_clock::now();
+		CopyFromGuest(value, address, size);
+		NoteCpRead("wait-reg-mem", begin, nullptr, 0,
+		           static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                                     std::chrono::steady_clock::now() - start)
+		                                     .count()));
+		return;
 	}
 	CopyFromGuest(value, address, size);
 }
@@ -3014,6 +3024,68 @@ bool GuestGpu::IsGpuThread() noexcept {
 
 bool GuestGpu::IsCommandProcessorThread() noexcept {
 	return g_cp_thread;
+}
+
+bool CpReadDebugEnabled() noexcept {
+	static const bool enabled = std::getenv("KYTY_DBG_CP_READS") != nullptr;
+	return enabled;
+}
+
+void NoteCpRead(const char* kind, uint64_t address, const uint32_t* pairs, uint32_t pair_count, uint64_t ns) {
+	struct Stat {
+		const char*             kind    = nullptr;
+		uint64_t                address = 0;
+		uint32_t                pairs   = 0;
+		std::array<uint32_t, 4> regs {};
+		uint64_t                count = 0;
+		uint64_t                slow  = 0;
+		uint64_t                ns    = 0;
+	};
+	static std::unordered_map<uint64_t, Stat>      stats;
+	static std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+	// Register loads are keyed by their register offsets (the address changes per draw), waits by
+	// their address.
+	uint64_t                key = std::hash<const char*> {}(kind);
+	std::array<uint32_t, 4> regs {};
+	for (uint32_t i = 0; i < pair_count && i < regs.size(); ++i) {
+		regs[i] = pairs[i * 2];
+		key     = key * 0x9e3779b97f4a7c15ull + regs[i];
+	}
+	key = pairs != nullptr ? key * 31u + pair_count : key ^ address;
+	auto& stat = stats[key];
+	if (stat.count == 0) {
+		stat.kind  = kind;
+		stat.pairs = pair_count;
+		stat.regs  = regs;
+	}
+	stat.address = address;
+	stat.count++;
+	stat.slow += ns > 20000 ? 1u : 0u;
+	stat.ns += ns;
+	const auto now = std::chrono::steady_clock::now();
+	if (now - last < std::chrono::seconds(2)) {
+		return;
+	}
+	last = now;
+	std::vector<const Stat*> sorted;
+	sorted.reserve(stats.size());
+	uint64_t total_ns = 0;
+	for (const auto& [k, s]: stats) {
+		sorted.push_back(&s);
+		total_ns += s.ns;
+	}
+	std::sort(sorted.begin(), sorted.end(), [](const Stat* a, const Stat* b) { return a->ns > b->ns; });
+	std::printf("NHL27CPREAD: total %.1f ms in 2 s over %zu kinds\n", static_cast<double>(total_ns) / 1e6,
+	            sorted.size());
+	for (size_t i = 0; i < sorted.size() && i < 10; ++i) {
+		const auto& s = *sorted[i];
+		std::printf("NHL27CPREAD: %s ms=%.1f count=%llu slow=%llu last=0x%llx pairs=%u regs=%x,%x,%x,%x\n", s.kind,
+		            static_cast<double>(s.ns) / 1e6, static_cast<unsigned long long>(s.count),
+		            static_cast<unsigned long long>(s.slow), static_cast<unsigned long long>(s.address), s.pairs,
+		            s.regs[0], s.regs[1], s.regs[2], s.regs[3]);
+	}
+	std::fflush(stdout);
+	stats.clear();
 }
 
 void GuestGpu::ServiceUrgentCommands() {

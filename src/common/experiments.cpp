@@ -59,6 +59,9 @@ uint32_t EnvironmentMask() {
 	set("KYTY_BDA_DIRTY_REGIONS", BdaDirtyRegions, false);
 	set("KYTY_SRT_JIT", SrtJit, false);
 	set("KYTY_EARLY_SUBMIT_WRITERS", EarlySubmitWriters, false);
+	set("KYTY_READBACK_COMPUTE", ReadbackCompute, true);
+	set("KYTY_READBACK_TRANSFER", ReadbackTransfer, false);
+	set("KYTY_READBACK_SPIN", ReadbackSpin, false);
 	return mask;
 }
 

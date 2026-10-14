@@ -2500,7 +2500,8 @@ bool RenderExecutor::DrawAutoIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	     state.ps_input_info.input_num != 0)) { ResetBindings(); return false; }
 	auto& scheduler = m_context.GetCommandScheduler();
 	source.snapshot = std::make_shared<Buffer>(m_context.GetGraphics(), scheduler,
-	    MemoryUsage::Download, 0, AllFlags | (source.indexed || state.vertex_info[0].native_draw.Enabled()
+	    MemoryUsage::Download, 0, AllFlags | (source.indexed || state.vertex_info[0].native_draw.Enabled() ||
+	                                          state.vertex_info[0].stage.program->info.native_draw
 	        ? vk::BufferUsageFlagBits::eShaderDeviceAddress : vk::BufferUsageFlags {}),
 	    source.ArgsSize() + sizeof(uint32_t));
 	// The scheduler retains ownership even if SET_NUM_INSTANCES discards the CPU snapshot early.

@@ -340,9 +340,9 @@ private:
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;
 	// KYTY_READBACK_QUEUE: copies downloads on GraphicContext::readback_queue.
-	vk::CommandPool                                   m_readback_pool   = nullptr;
-	vk::CommandBuffer                                 m_readback_buffer = nullptr;
-	vk::Fence                                         m_readback_fence  = nullptr;
+	vk::CommandPool                                   m_readback_pool[3] {};
+	vk::CommandBuffer                                 m_readback_buffer[3] {};
+	vk::Fence                                         m_readback_fence[3] {};
 	bool ReadbackOnSecondQueue(const Buffer& source, const Buffer& destination,
 	                           std::span<const vk::BufferCopy> copies, uint64_t wait_tick);
 	StreamBuffer                                      m_device_buffer;

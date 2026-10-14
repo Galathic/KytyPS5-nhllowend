@@ -478,11 +478,46 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	queue_create_info.queueFamilyIndex = queue_family;
 	queue_create_info.queueCount       = 1;
 	queue_create_info.pQueuePriorities = queue_priority;
+	std::vector<vk::DeviceQueueCreateInfo> queue_create_infos;
 	{
 		const auto families = physical_device.getQueueFamilyProperties();
 		if (queue_family < families.size() && families[queue_family].queueCount >= 2) {
 			queue_create_info.queueCount = 2;
 		}
+		queue_create_infos.push_back(queue_create_info);
+		graphics.buffer_families = {queue_family};
+		// Readback queues beside the graphics engine (experiments ReadbackCompute/Transfer).
+		const char* extra = std::getenv("KYTY_READBACK_FAMILIES");
+		if (extra == nullptr || extra[0] != '0') {
+			const auto find = [&](vk::QueueFlags want, vk::QueueFlags reject) {
+				for (uint32_t i = 0; i < families.size(); i++) {
+					if (i != queue_family && families[i].queueCount != 0 && (families[i].queueFlags & want) == want &&
+					    !(families[i].queueFlags & reject)) {
+						return i;
+					}
+				}
+				return static_cast<uint32_t>(-1);
+			};
+			const uint32_t compute  = find(vk::QueueFlagBits::eCompute, vk::QueueFlagBits::eGraphics);
+			const uint32_t transfer = find(vk::QueueFlagBits::eTransfer,
+			                               vk::QueueFlagBits::eGraphics | vk::QueueFlagBits::eCompute);
+			for (const auto family: {compute, transfer}) {
+				if (family == static_cast<uint32_t>(-1)) {
+					continue;
+				}
+				vk::DeviceQueueCreateInfo info {};
+				info.queueFamilyIndex = family;
+				info.queueCount       = 1;
+				info.pQueuePriorities = queue_priority;
+				queue_create_infos.push_back(info);
+				graphics.buffer_families.push_back(family);
+			}
+			graphics.readback_families[1] = compute;
+			graphics.readback_families[2] = transfer;
+		} else {
+			graphics.readback_families[1] = graphics.readback_families[2] = static_cast<uint32_t>(-1);
+		}
+		graphics.readback_families[0] = queue_family;
 	}
 
 	vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write_ext {};
@@ -807,8 +842,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		maintenance8.pNext = const_cast<void*>(create_info.pNext);
 		create_info.pNext = &maintenance8;
 	}
-	create_info.pQueueCreateInfos       = &queue_create_info;
-	create_info.queueCreateInfoCount    = 1;
+	create_info.pQueueCreateInfos       = queue_create_infos.data();
+	create_info.queueCreateInfoCount    = static_cast<uint32_t>(queue_create_infos.size());
 	create_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
 	create_info.ppEnabledExtensionNames = device_extensions.data();
 	create_info.pEnabledFeatures        = &device_features;
@@ -1276,6 +1311,15 @@ void WindowContext::CreateVulkan() {
 		    families[graphic_ctx.queue_family].queueCount >= 2) {
 			graphic_ctx.device.getQueue(graphic_ctx.queue_family, 1, &graphic_ctx.readback_queue);
 		}
+		graphic_ctx.readback_queues[0] = graphic_ctx.readback_queue;
+		for (uint32_t kind = 1; kind < 3; kind++) {
+			if (graphic_ctx.readback_families[kind] != static_cast<uint32_t>(-1)) {
+				graphic_ctx.device.getQueue(graphic_ctx.readback_families[kind], 0,
+				                            &graphic_ctx.readback_queues[kind]);
+			}
+		}
+		std::printf("NHL27READBACK: queue families graphics=%u compute=%d transfer=%d\n", graphic_ctx.queue_family,
+		            static_cast<int>(graphic_ctx.readback_families[1]), static_cast<int>(graphic_ctx.readback_families[2]));
 	}
 
 	if (!graphic_ctx.CreateAllocator()) {

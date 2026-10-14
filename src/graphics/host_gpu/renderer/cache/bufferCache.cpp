@@ -536,6 +536,62 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	}
 }
 
+namespace {
+// KYTY_DBG_CP_READS=1: what the synchronous downloads wait for, printed as NHL27RBWAIT every 2 s.
+// lag = submissions between the last write of the buffer and the command buffer being recorded
+// (0: the write is in it, so it must be submitted first); done = the write had finished on the
+// GPU when the download began; from = who read (gpu = the execution thread itself, cp = the
+// command processor, guest = a guest thread, ? = another path); exact = the bytes read were
+// GPU-written themselves (else they only share a page with such bytes).
+thread_local uint32_t g_readback_origin = 3;
+thread_local uint32_t g_readback_exact  = 2;
+struct ReadbackWaitNote {
+	bool                                  active = false;
+	bool                                  queue  = false;
+	uint32_t                              key    = 0;
+	std::chrono::steady_clock::time_point start;
+
+	void Begin(CommandScheduler& scheduler, uint64_t write_tick) {
+		const auto current = scheduler.CurrentTick();
+		const auto lag  = static_cast<uint32_t>(std::min<uint64_t>(current - std::min(write_tick, current), 3));
+		const bool done = scheduler.GetMasterSemaphore().KnownGpuTick() >= write_tick;
+		active          = true;
+		key             = g_readback_origin * 1000 + g_readback_exact * 100 + lag * 10 + (done ? 1 : 0);
+		start           = std::chrono::steady_clock::now();
+		g_readback_origin = 3;
+		g_readback_exact  = 2;
+	}
+	~ReadbackWaitNote() {
+		if (!active) {
+			return;
+		}
+		struct Stat {
+			uint64_t count = 0;
+			uint64_t ns    = 0;
+		};
+		static std::map<uint32_t, Stat>                   stats;
+		static std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+		const auto                                        now = std::chrono::steady_clock::now();
+		auto& stat = stats[key + (queue ? 10000u : 0u)];
+		stat.count++;
+		stat.ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count());
+		if (now - last < std::chrono::seconds(2)) {
+			return;
+		}
+		last = now;
+		for (const auto& [k, s]: stats) {
+			static const char* const origins[] = {"gpu", "cp", "guest", "?"};
+			static const char* const exacts[]  = {"no", "yes", "?"};
+			std::printf("NHL27RBWAIT: %s from=%s exact=%s lag=%u done=%u count=%llu ms=%.1f\n",
+			            k >= 10000 ? "queue " : "inline", origins[(k / 1000) % 10], exacts[(k / 100) % 10],
+			            (k / 10) % 10, k % 10, static_cast<unsigned long long>(s.count), static_cast<double>(s.ns) / 1e6);
+		}
+		std::fflush(stdout);
+		stats.clear();
+	}
+};
+} // namespace
+
 template <bool async, bool merge>
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
 	static_assert(async || !merge);
@@ -607,13 +663,18 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 			at += copy.size;
 		}
 	};
+	ReadbackWaitNote wait_note;
 	if constexpr (!async) {
+		const uint64_t wait_tick = buffer.last_write_tick;
+		if (CpReadDebugEnabled()) {
+			wait_note.Begin(m_scheduler, wait_tick);
+		}
 		// KYTY_READBACK_QUEUE: a buffer last written by an already submitted command buffer is
 		// copied on the second queue once that submission finishes, not after everything queued.
-		if (buffer.last_write_tick < m_scheduler.CurrentTick() &&
+		if (wait_tick < m_scheduler.CurrentTick() &&
 		    Common::RuntimeFlags::Current().readback_queue) {
 			const auto rb_start = std::chrono::steady_clock::now();
-			const bool ok = ReadbackOnSecondQueue(buffer, download, copies, buffer.last_write_tick);
+			const bool ok = ReadbackOnSecondQueue(buffer, download, copies, wait_tick);
 			if (FrameBreakdown::Enabled()) {
 				FrameBreakdown::Add(ok ? FrameBreakdown::g_counters.port_rbq_used
 				                       : FrameBreakdown::g_counters.port_rbq_fallback);
@@ -623,8 +684,9 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 			}
 			if (ok) {
 				// Older asynchronous downloads of these bytes publish first, as on the normal path.
-				m_scheduler.WaitPriorityOperations(buffer.last_write_tick);
+				m_scheduler.WaitPriorityOperations(wait_tick);
 				publish();
+				wait_note.queue = true;
 				return true;
 			}
 		}
@@ -679,42 +741,54 @@ bool BufferCache::ReadbackOnSecondQueue(const Buffer& source, const Buffer& dest
                                         std::span<const vk::BufferCopy> copies,
                                         uint64_t                        wait_tick) {
 	auto& graphics = m_graphics;
-	if (graphics.readback_queue == nullptr || copies.empty()) {
+	// Experiments ReadbackTransfer / ReadbackCompute: a queue of another family copies beside the
+	// graphics work instead of after the work running on the graphics engine.
+	uint32_t kind = 0;
+	if (Common::Experiments::Enabled(Common::Experiments::ReadbackTransfer) && graphics.readback_queues[2] != nullptr) {
+		kind = 2;
+	} else if (Common::Experiments::Enabled(Common::Experiments::ReadbackCompute) &&
+	           graphics.readback_queues[1] != nullptr) {
+		kind = 1;
+	}
+	const auto queue = graphics.readback_queues[kind];
+	if (queue == nullptr || copies.empty()) {
 		return false;
 	}
-	if (m_readback_buffer == nullptr) {
+	auto& readback_buffer = m_readback_buffer[kind];
+	auto& readback_fence  = m_readback_fence[kind];
+	if (readback_buffer == nullptr) {
 		vk::CommandPoolCreateInfo pool_info {};
 		pool_info.flags            = vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
-		pool_info.queueFamilyIndex = graphics.queue_family;
-		if (graphics.device.createCommandPool(&pool_info, nullptr, &m_readback_pool) !=
+		pool_info.queueFamilyIndex = graphics.readback_families[kind];
+		if (graphics.device.createCommandPool(&pool_info, nullptr, &m_readback_pool[kind]) !=
 		    vk::Result::eSuccess) {
 			return false;
 		}
 		vk::CommandBufferAllocateInfo alloc {};
-		alloc.commandPool        = m_readback_pool;
+		alloc.commandPool        = m_readback_pool[kind];
 		alloc.level              = vk::CommandBufferLevel::ePrimary;
 		alloc.commandBufferCount = 1;
 		vk::FenceCreateInfo fence_info {};
-		if (graphics.device.allocateCommandBuffers(&alloc, &m_readback_buffer) != vk::Result::eSuccess ||
-		    graphics.device.createFence(&fence_info, nullptr, &m_readback_fence) != vk::Result::eSuccess) {
-			m_readback_buffer = nullptr;
+		if (graphics.device.allocateCommandBuffers(&alloc, &readback_buffer) != vk::Result::eSuccess ||
+		    graphics.device.createFence(&fence_info, nullptr, &readback_fence) != vk::Result::eSuccess) {
+			readback_buffer = nullptr;
 			return false;
 		}
 	}
 	vk::CommandBufferBeginInfo begin {};
 	begin.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
-	if (m_readback_buffer.begin(&begin) != vk::Result::eSuccess) {
+	if (readback_buffer.begin(&begin) != vk::Result::eSuccess) {
 		return false;
 	}
-	m_readback_buffer.copyBuffer(source.Handle(), destination.Handle(),
+	readback_buffer.copyBuffer(source.Handle(), destination.Handle(),
 	                             static_cast<uint32_t>(copies.size()), copies.data());
 	vk::MemoryBarrier host {};
 	host.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
 	host.dstAccessMask = vk::AccessFlagBits::eHostRead;
-	m_readback_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	readback_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
 	                                  vk::PipelineStageFlagBits::eHost, {}, 1, &host, 0, nullptr, 0,
 	                                  nullptr);
-	if (m_readback_buffer.end() != vk::Result::eSuccess) {
+	if (readback_buffer.end() != vk::Result::eSuccess) {
 		return false;
 	}
 	const auto                      semaphore = m_scheduler.GetMasterSemaphore().Handle();
@@ -728,14 +802,14 @@ bool BufferCache::ReadbackOnSecondQueue(const Buffer& source, const Buffer& dest
 	submit.pWaitSemaphores    = &semaphore;
 	submit.pWaitDstStageMask  = &stage;
 	submit.commandBufferCount = 1;
-	submit.pCommandBuffers    = &m_readback_buffer;
+	submit.pCommandBuffers    = &readback_buffer;
 	// A wait for a tick the recording thread has not submitted yet (wait before signal) lost the
 	// device on NHL 27 with the threaded GPU pipeline.
 	m_scheduler.WaitSubmitted(wait_tick);
 	vk::Result result;
 	{
 		Common::LockGuard lock(graphics.queue_mutex);
-		result = graphics.readback_queue.submit(1, &submit, m_readback_fence);
+		result = queue.submit(1, &submit, readback_fence);
 	}
 	if (result != vk::Result::eSuccess) {
 		// The ordinary path (record into the current command buffer, wait for it) still works.
@@ -747,15 +821,24 @@ bool BufferCache::ReadbackOnSecondQueue(const Buffer& source, const Buffer& dest
 			            GuestGpu::IsGpuThread() ? 1 : 0);
 			std::fflush(stdout);
 		}
-		(void)m_readback_buffer.reset({});
+		(void)readback_buffer.reset({});
 		return false;
 	}
 	Common::Timeline::Mark("readback-queue", wait_tick);
-	EXIT_NOT_IMPLEMENTED(graphics.device.waitForFences(1, &m_readback_fence, VK_TRUE, UINT64_MAX) !=
+	// Experiment ReadbackSpin: most copies of finished data take tens of microseconds, less than
+	// waking a thread that sleeps on the fence.
+	if (Common::Experiments::Enabled(Common::Experiments::ReadbackSpin)) {
+		const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(150);
+		while (graphics.device.getFenceStatus(readback_fence) == vk::Result::eNotReady &&
+		       std::chrono::steady_clock::now() < deadline) {
+			std::this_thread::yield();
+		}
+	}
+	EXIT_NOT_IMPLEMENTED(graphics.device.waitForFences(1, &readback_fence, VK_TRUE, UINT64_MAX) !=
 	                     vk::Result::eSuccess);
 	Common::Timeline::Mark("readback-done", wait_tick);
-	(void)graphics.device.resetFences(1, &m_readback_fence);
-	(void)m_readback_buffer.reset({});
+	(void)graphics.device.resetFences(1, &readback_fence);
+	(void)readback_buffer.reset({});
 	return true;
 }
 
@@ -953,14 +1036,15 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadC
 	// only for the writer's submission (KYTY_READBACK_QUEUE). The asynchronous guest-read path
 	// below would wait for every queued GPU operation instead: 34% of its time in a match, and
 	// -10% fps in an in-match A/B (8 rounds).
-	const bool     on_gpu = GuestGpu::IsGpuThread() || GuestGpu::IsCommandProcessorThread();
+	const bool     on_gpu  = GuestGpu::IsGpuThread() || GuestGpu::IsCommandProcessorThread();
+	const uint32_t origin  = GuestGpu::IsGpuThread() ? 0u : GuestGpu::IsCommandProcessorThread() ? 1u : 2u;
 	const uint64_t tid   = static_cast<uint64_t>(std::hash<std::thread::id> {}(std::this_thread::get_id()));
 	// Experiment AsyncGuestReads: a guest thread's read is queued and submitted by the GPU
 	// thread, which then goes on recording; the guest thread waits for the copy itself.
 	uint64_t       async_tick = 0;
 	const uint64_t fault_rip  = on_gpu ? 0 : g_fault_rip;
 	m_scheduler.Context().GetGpu().SendUrgentCommandSync([this, vaddr, size, is_write, caller, on_gpu, tid,
-	                                                      fault_rip, &async_tick] {
+	                                                      fault_rip, origin, &async_tick] {
 		if (!m_pending_guest_reads.empty()) {
 			FinishPendingGuestReads(vaddr, size);
 		}
@@ -993,6 +1077,10 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadC
 		const bool lazy = is_write && !on_gpu &&
 		                  Common::Experiments::Enabled(Common::Experiments::LazySharedWrites) &&
 		                  LazySharedWriteEligible(vaddr, size);
+		if (CpReadDebugEnabled()) {
+			g_readback_origin = origin;
+			g_readback_exact  = is_write ? 2u : HasGpuDirtyBytes(vaddr, size) ? 1u : 0u;
+		}
 		const bool downloaded = lazy ? DownloadBufferMemory<true, true>(buffer, vaddr, size)
 		                             : DownloadBufferMemory<false>(buffer, vaddr, size);
 		if (lazy) {

@@ -16,14 +16,17 @@ namespace Common::Experiments {
 // Features that also have a live runtime flag (common/runtimeFlags.h, flags.ctl) are NOT here:
 // KYTY_GUEST_SYNC, KYTY_LONG_BUFFER_GC_AGE, KYTY_RENDER_TARGET_MEMO (flag KYTY_RT_DECODE_MEMO),
 // KYTY_FAULT_COALESCE, KYTY_SPARSE_BUFFER_GC, KYTY_DIRECT_EOP_INTERRUPTS, KYTY_READBACK_QUEUE.
-// Their bit numbers (13, 14, 16, 17, 19, 20) and the unused one (2) are retired, as are 8
-// (GpuThreadPriority: the GPU pipeline stages set their own priority) and 9 (ImageRecycle: image
-// recycling is unconditional since the GTA port). Bit 0 (once GuestSync) is EarlySubmitWriters.
+// Their bit numbers (13, 14, 16, 17, 19, 20) are retired. Bit 0 (once GuestSync) is
+// EarlySubmitWriters, bit 8 (once GpuThreadPriority) is ReadbackTransfer and bit 9 (once
+// ImageRecycle, unconditional since the GTA port) is ReadbackSpin.
 // KYTY_RESOURCE_MULTI_CACHE (16-state resource memo) is read only by the resource memo itself.
 enum Bit : uint32_t {
 	EarlySubmitWriters = 1u << 0u, // KYTY_EARLY_SUBMIT_WRITERS (default off; a draw/dispatch writing bytes resource reads waited for is submitted at once)
 	SkipRedundantBinds = 1u << 1u, // KYTY_SKIP_REDUNDANT_BINDS (default on)
+	ReadbackCompute    = 1u << 2u, // KYTY_READBACK_COMPUTE (default on; second-queue readbacks on a compute-only queue family)
 	CpuCopyForward     = 1u << 3u, // KYTY_CPU_COPY_FORWARD (default off)
+	ReadbackTransfer   = 1u << 8u, // KYTY_READBACK_TRANSFER (default off; second-queue readbacks on the transfer-only family, before ReadbackCompute)
+	ReadbackSpin       = 1u << 9u, // KYTY_READBACK_SPIN (default off; a second-queue readback polls its fence briefly before sleeping on it)
 	SrtJit             = 1u << 4u, // KYTY_SRT_JIT (default off; upstream x64 flat walker for plans without control flow)
 	FalseShareReads    = 1u << 6u, // KYTY_FALSE_SHARE_READS (default off)
 	SrtBatchReads      = 1u << 7u, // KYTY_SRT_BATCH_READS (default on; also read by the program cache)
