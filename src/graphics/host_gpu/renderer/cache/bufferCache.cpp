@@ -729,6 +729,9 @@ bool BufferCache::ReadbackOnSecondQueue(const Buffer& source, const Buffer& dest
 	submit.pWaitDstStageMask  = &stage;
 	submit.commandBufferCount = 1;
 	submit.pCommandBuffers    = &m_readback_buffer;
+	// A wait for a tick the recording thread has not submitted yet (wait before signal) lost the
+	// device on NHL 27 with the threaded GPU pipeline.
+	m_scheduler.WaitSubmitted(wait_tick);
 	vk::Result result;
 	{
 		Common::LockGuard lock(graphics.queue_mutex);

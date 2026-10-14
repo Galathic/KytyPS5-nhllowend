@@ -85,6 +85,10 @@ public:
 	CommandBuffer&                 Current();
 	[[nodiscard]] uint64_t         CurrentTick() const noexcept { return m_master.CurrentTick(); }
 	[[nodiscard]] bool             IsFree(uint64_t tick);
+	// Returns once the submission that signals `tick` was handed to the queue: with deferred
+	// recording the recording thread submits after the tick was allocated. Work on another queue
+	// that waits for the tick must not be submitted before (KYTY_READBACK_QUEUE).
+	void                           WaitSubmitted(uint64_t tick);
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
 	[[nodiscard]] DynamicState&    GetDynamicState() noexcept { return m_dynamic_state; }
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
@@ -171,6 +175,8 @@ private:
 	// The tick of the oldest pending operation (UINT64_MAX without any), written under
 	// m_operation_mutex: draws check it without the lock.
 	std::atomic<uint64_t>        m_pending_front_tick {UINT64_MAX};
+	// Last tick whose submission reached vkQueueSubmit (submissions are made in tick order).
+	std::atomic<uint64_t>        m_submitted_tick {0};
 	// Calls since draws last queried the GPU timeline for pending operations.
 	std::atomic<uint32_t>        m_pending_skips {0};
 	std::queue<PendingOperation> m_priority_operations;

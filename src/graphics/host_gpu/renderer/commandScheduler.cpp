@@ -1359,6 +1359,12 @@ void CommandScheduler::RunOperation(Common::UniqueFunction<void>&& operation) {
 	g_deferred_callback_scheduler = previous;
 }
 
+void CommandScheduler::WaitSubmitted(uint64_t tick) {
+	while (m_submitted_tick.load(std::memory_order_acquire) < tick) {
+		std::this_thread::yield();
+	}
+}
+
 bool CommandScheduler::IsFree(uint64_t tick) {
 	if (m_master.IsFree(tick)) {
 		return true;
@@ -1487,6 +1493,7 @@ void CommandScheduler::QueueSubmit(vk::CommandBuffer buffer, SubmitInfo& submit,
 		FrameBreakdown::GpuBusyScope queue_scope(FrameBreakdown::GB_QUEUE_SUBMIT);
 		result = graphics.queue.submit(1, &submit_info, nullptr);
 	}
+	m_submitted_tick.store(tick, std::memory_order_release);
 
 	if (result == vk::Result::eErrorDeviceLost) {
 		DumpDeviceFault(graphics.device);
