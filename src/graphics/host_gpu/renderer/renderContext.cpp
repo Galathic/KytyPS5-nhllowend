@@ -138,11 +138,16 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		// are GPU-modified or already CPU-dirty are skipped; marking an unwritten page CPU-dirty
 		// only costs an upload.
 		if (Common::RuntimeFlags::Current().fault_coalesce) {
-			static const uint64_t window = [] {
+			static const uint64_t wide_window = [] {
 				const char* value = std::getenv("KYTY_FAULT_COALESCE_PAGES");
 				const auto  pages = value != nullptr ? std::strtoull(value, nullptr, 10) : 16ull;
 				return std::bit_ceil(std::clamp<uint64_t>(pages, 1, 256)) * TRACKER_PAGE_SIZE;
 			}();
+			// Experiment WideFaultWindows off: 4-page windows. NHL 27 faults ~200 times per frame and
+			// the 16-page windows upload ~11 MB per frame, mostly unwritten neighbors.
+			const uint64_t window = Common::Experiments::Enabled(Common::Experiments::WideFaultWindows)
+			                            ? wide_window
+			                            : std::min<uint64_t>(wide_window, 4 * TRACKER_PAGE_SIZE);
 			const uint64_t begin = fault_vaddr & ~(window - 1);
 			if (window > TRACKER_PAGE_SIZE && IsMapped(begin, window)) {
 				const uint64_t marked = m_buffer_cache.MarkCpuDirtyAhead(begin, window);

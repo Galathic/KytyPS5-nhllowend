@@ -41,7 +41,7 @@ enum Bit : uint32_t {
 	BackingReadMru     = 1u << 17u, // KYTY_BACKING_READ_MRU (default off; backing reads remember the thread's last two mappings, not one)
 	TextureDescCache   = 1u << 11u, // KYTY_TEXTURE_DESC_CACHE (default on; superseded by the draw-prep delta, no consumer)
 	ImageLookupHint    = 1u << 12u, // KYTY_IMAGE_LOOKUP_HINT (default on; skip the region scan for known images)
-	AdaptiveResourceMemo = 1u << 15u, // KYTY_ADAPTIVE_RESOURCE_MEMO (default on; superseded by KYTY_RESOURCE_MEMO_BYPASS, no consumer)
+	WideFaultWindows     = 1u << 15u, // KYTY_WIDE_FAULT_WINDOWS (default on; a CPU write fault releases KYTY_FAULT_COALESCE_PAGES pages, else 4; was AdaptiveResourceMemo)
 	CleanFromDirect      = 1u << 18u, // KYTY_CLEAN_FROM_DIRECT (default on; strict evaluator reuses direct SRT words)
 	AsyncSubmit          = 1u << 21u, // KYTY_ASYNC_SUBMIT (no consumer: the GPU pipeline's recording thread submits)
 	LazySharedWrites     = 1u << 22u, // KYTY_LAZY_SHARED_WRITES (default off; CPU stores next to few GPU-written bytes do not wait)

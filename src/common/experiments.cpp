@@ -42,7 +42,7 @@ uint32_t EnvironmentMask() {
 	set("KYTY_DIRECT_SRT_READS", DirectSrtReads, true);
 	set("KYTY_TEXTURE_DESC_CACHE", TextureDescCache, true);
 	set("KYTY_IMAGE_LOOKUP_HINT", ImageLookupHint, true);
-	set("KYTY_ADAPTIVE_RESOURCE_MEMO", AdaptiveResourceMemo, true);
+	set("KYTY_WIDE_FAULT_WINDOWS", WideFaultWindows, true);
 	set("KYTY_CLEAN_FROM_DIRECT", CleanFromDirect, true);
 	set("KYTY_LDS_LANE_SLOTS", LdsLaneSlots, true);
 	// Not part of the recommended set: opt in with 1.

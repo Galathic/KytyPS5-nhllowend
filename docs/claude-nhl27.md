@@ -131,6 +131,13 @@ Unconditional execution-thread trims (profile-checked, each 1-2% of the thread b
   changed (a 256 MiB range is a thousand bitmap words).
 - The CPU fast-clear check compares color metadata eight bytes at a time.
 
+Bit 15 (`KYTY_WIDE_FAULT_WINDOWS`, default on, was the unused `KYTY_ADAPTIVE_RESOURCE_MEMO`): a
+CPU write fault releases `KYTY_FAULT_COALESCE_PAGES` pages (16); off, 4 pages. In play the game
+takes about 200 write faults per frame and the 16-page windows upload about 11 MB per frame,
+mostly unwritten neighbors. In-match A/B (10 rounds), 4-page windows: +2.1% +- 3.4, and in the
+steadiest stretch (rounds 5 to 10) 0.6 to 1 fps slower every round, with write faults 14,500 to
+33,000 per 2 s. So the wide windows stay.
+
 In-match fps varies by 5 to 7 fps between adjacent 20 s phases (scene changes), so A/Bs of 6 to 10
 rounds only resolve effects of about 10% or more.
 
