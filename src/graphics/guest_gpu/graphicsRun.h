@@ -54,6 +54,8 @@ public:
 
 	// The thread that owns the renderer: the execution thread of a pipelined GPU.
 	[[nodiscard]] static bool IsGpuThread() noexcept;
+	// The pipelined command processor's thread (it parses PM4; the execution thread owns caches).
+	[[nodiscard]] static bool IsCommandProcessorThread() noexcept;
 	// The guest queue the GPU thread is processing (0 = graphics ring, 1.. = compute rings).
 	[[nodiscard]] static uint32_t CurrentQueue() noexcept;
 

@@ -948,7 +948,12 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadC
 		     vaddr, size);
 	}
 	FrameBreakdown::FaultTimer fault_readmem_timer(FrameBreakdown::g_fault_cost.readmem_ns);
-	const bool     on_gpu = GuestGpu::IsGpuThread();
+	// The pipelined command processor counts as the GPU: its faults (PM4 and register data next to
+	// GPU-written bytes) are served after the operations it emitted, and the sync download waits
+	// only for the writer's submission (KYTY_READBACK_QUEUE). The asynchronous guest-read path
+	// below would wait for every queued GPU operation instead: 34% of its time in a match, and
+	// -10% fps in an in-match A/B (8 rounds).
+	const bool     on_gpu = GuestGpu::IsGpuThread() || GuestGpu::IsCommandProcessorThread();
 	const uint64_t tid   = static_cast<uint64_t>(std::hash<std::thread::id> {}(std::this_thread::get_id()));
 	// Experiment AsyncGuestReads: a guest thread's read is queued and submitted by the GPU
 	// thread, which then goes on recording; the guest thread waits for the copy itself.

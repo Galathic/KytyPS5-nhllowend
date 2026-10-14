@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cstdlib>
 #include <memory>
 #include <string_view>
@@ -231,6 +232,13 @@ void ConfigureGpuStageThread(GpuStageThread stage) {
 		Common::Thread::RaiseCurrentPriority();
 	}
 	Common::Thread::PinCurrent(cpus[static_cast<uint32_t>(stage)]);
+	// For profilers that sample one thread (KytyPS5-tools/prof-stage.sh): which OS thread runs
+	// which stage.
+	static constexpr const char* Names[] = {"command-processor", "execution", "recording", "resolve",
+	                                        "host-copy"};
+	std::printf("NHL27STAGE: %s tid=%s cpu=%d\n", Names[static_cast<uint32_t>(stage)],
+	            Common::Thread::GetThreadId().c_str(), cpus[static_cast<uint32_t>(stage)]);
+	std::fflush(stdout);
 }
 
 uint32_t GpuPipelineStages() {
