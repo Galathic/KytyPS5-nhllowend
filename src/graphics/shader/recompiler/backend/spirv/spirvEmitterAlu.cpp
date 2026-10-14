@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
+#include "graphics/shader/shader.h"
 
 #include <array>
 
@@ -113,6 +114,11 @@ uint32_t BitcastToF16x2(EmitterState& state, uint32_t bits) {
 uint32_t BitcastF16x2ToU32(EmitterState& state, uint32_t value) {
 	return Unary(state, spv::OpBitcast, TypeU32(state), value);
 }
+
+// KYTY_FAST_MINMAX: one GLSL NMin/NMax instead of the exact guest min/max emulation.
+uint32_t EmitFastMinMaxF32(EmitterState& state, uint32_t a, uint32_t b, bool max_value) {
+	return EmitExt(state, TypeF32(state), max_value ? GLSLstd450NMax : GLSLstd450NMin, {a, b});
+}
 } // namespace
 
 // Native packed f16 (KYTY_NATIVE_FP16): u32 -> f16vec2, vector op, f16vec2 -> u32. The FMA is a
@@ -169,6 +175,12 @@ uint32_t EmitFPMad32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 }
 
 uint32_t EmitFPMedTri32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
+	if (ShaderFastMinMax()) {
+		// max(min(a, b), min(max(a, b), c)); the driver can fold this into v_med3_f32.
+		const auto lo = EmitFastMinMaxF32(state, a, b, false);
+		const auto hi = EmitFastMinMaxF32(state, a, b, true);
+		return EmitFastMinMaxF32(state, lo, EmitFastMinMaxF32(state, hi, c, false), true);
+	}
 	const auto min_ab   = EmitMinMaxF32Value(state, a, b, false);
 	const auto min3     = EmitMinMaxF32Value(state, min_ab, c, false);
 	const auto max_ab   = EmitMinMaxF32Value(state, a, b, true);
@@ -310,10 +322,16 @@ uint32_t EmitUMedTri32(EmitterState& state, uint32_t arg0, uint32_t arg1, uint32
 }
 
 uint32_t EmitFPMin32(EmitterState& state, uint32_t arg0, uint32_t arg1) {
+	if (ShaderFastMinMax()) {
+		return EmitFastMinMaxF32(state, arg0, arg1, false);
+	}
 	return EmitMinMaxF32Value(state, arg0, arg1, false);
 }
 
 uint32_t EmitFPMax32(EmitterState& state, uint32_t arg0, uint32_t arg1) {
+	if (ShaderFastMinMax()) {
+		return EmitFastMinMaxF32(state, arg0, arg1, true);
+	}
 	return EmitMinMaxF32Value(state, arg0, arg1, true);
 }
 
@@ -326,10 +344,16 @@ uint32_t EmitFPMax64(EmitterState& state, uint32_t arg0, uint32_t arg1) {
 }
 
 uint32_t EmitFPMinTri32(EmitterState& state, uint32_t arg0, uint32_t arg1, uint32_t arg2) {
+	if (ShaderFastMinMax()) {
+		return EmitFastMinMaxF32(state, EmitFastMinMaxF32(state, arg0, arg1, false), arg2, false);
+	}
 	return EmitFMinMax3(state, arg0, arg1, arg2, false);
 }
 
 uint32_t EmitFPMaxTri32(EmitterState& state, uint32_t arg0, uint32_t arg1, uint32_t arg2) {
+	if (ShaderFastMinMax()) {
+		return EmitFastMinMaxF32(state, EmitFastMinMaxF32(state, arg0, arg1, true), arg2, true);
+	}
 	return EmitFMinMax3(state, arg0, arg1, arg2, true);
 }
 

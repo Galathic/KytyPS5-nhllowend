@@ -899,8 +899,8 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 			}
 			return;
 		}
-		if (dw_num <= 2) {
-			std::array<uint32_t, 2> values{};
+		if (dw_num <= 64) {
+			std::array<uint32_t, 64> values{};
 			std::memcpy(values.data(), src, static_cast<size_t>(dw_num) * sizeof(uint32_t));
 			if (cache.TryWriteLabel(reinterpret_cast<uint64_t>(dst), values.data(),
 			                        static_cast<uint64_t>(dw_num) * sizeof(uint32_t))) {
