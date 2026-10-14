@@ -14,6 +14,7 @@
 #include <array>
 #include <chrono>
 #include <map>
+#include <atomic>
 #include <mutex>
 #include <shared_mutex>
 #include <span>
@@ -362,7 +363,11 @@ private:
 		uint64_t end;
 		uint32_t value;
 	};
+	// The GPU thread records fills while guest write faults drop them, so the list is locked;
+	// m_gpu_fill_count lets the common no-fill case skip the lock.
 	std::vector<GpuFill>                              m_gpu_fills;
+	mutable std::mutex                                m_gpu_fills_mutex;
+	std::atomic<size_t>                               m_gpu_fill_count {0};
 	struct WriterRecord {
 		uint64_t    begin;
 		uint64_t    end;

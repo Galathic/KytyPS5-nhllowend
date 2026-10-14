@@ -325,11 +325,13 @@ void BufferCache::LogGpuWrite(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::DropGpuFills(uint64_t vaddr, uint64_t size) {
-	if (m_gpu_fills.empty()) {
+	if (m_gpu_fill_count.load(std::memory_order_acquire) == 0) {
 		return;
 	}
-	const auto end = vaddr + size;
+	const auto       end = vaddr + size;
+	std::scoped_lock lock(m_gpu_fills_mutex);
 	std::erase_if(m_gpu_fills, [&](const GpuFill& fill) { return fill.begin < end && vaddr < fill.end; });
+	m_gpu_fill_count.store(m_gpu_fills.size(), std::memory_order_release);
 }
 
 void BufferCache::RecordGpuFill(uint64_t vaddr, uint64_t size, uint32_t value) {
@@ -337,18 +339,25 @@ void BufferCache::RecordGpuFill(uint64_t vaddr, uint64_t size, uint32_t value) {
 	    size > UINT64_MAX - vaddr) {
 		return;
 	}
-	DropGpuFills(vaddr, size);
+	const auto       end = vaddr + size;
+	std::scoped_lock lock(m_gpu_fills_mutex);
+	std::erase_if(m_gpu_fills, [&](const GpuFill& fill) { return fill.begin < end && vaddr < fill.end; });
 	constexpr size_t MaxFills = 64;
 	if (m_gpu_fills.size() >= MaxFills) {
 		m_gpu_fills.erase(m_gpu_fills.begin());
 	}
-	m_gpu_fills.push_back({vaddr, vaddr + size, value});
+	m_gpu_fills.push_back({vaddr, end, value});
+	m_gpu_fill_count.store(m_gpu_fills.size(), std::memory_order_release);
 }
 
 bool BufferCache::TryGetGpuFill(uint64_t vaddr, uint64_t size, uint32_t& value) const {
 	if (size == 0 || size > UINT64_MAX - vaddr) {
 		return false;
 	}
+	if (m_gpu_fill_count.load(std::memory_order_acquire) == 0) {
+		return false;
+	}
+	std::scoped_lock lock(m_gpu_fills_mutex);
 	for (const auto& fill: m_gpu_fills) {
 		if (vaddr >= fill.begin && vaddr + size <= fill.end && ((vaddr - fill.begin) & 3u) == 0) {
 			value = fill.value;

@@ -1470,6 +1470,8 @@ struct PipelineCache::ProgramCache {
 PipelineCache::PipelineCache(GraphicContext& graphics)
     : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	// LoadStore takes the program lock, so it must be set before the store is read.
+	m_program_cache->program_lock = &m_program_lock;
 	InitializeDriverCache();
 	InitializeShaderRecord();
 	const char* pregen = std::getenv("KYTY_SHADER_PREGEN");
