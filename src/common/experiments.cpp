@@ -58,6 +58,7 @@ uint32_t EnvironmentMask() {
 	set("KYTY_ASYNC_GUEST_READS", AsyncGuestReads, false);
 	set("KYTY_BDA_DIRTY_REGIONS", BdaDirtyRegions, false);
 	set("KYTY_SRT_JIT", SrtJit, false);
+	set("KYTY_EARLY_SUBMIT_WRITERS", EarlySubmitWriters, false);
 	return mask;
 }
 
@@ -124,7 +125,7 @@ struct Event {
 };
 
 struct Recorder {
-	static constexpr size_t Capacity = 1u << 16u;
+	static constexpr size_t Capacity = 1u << 19u;
 	std::unique_ptr<Event[]> events = std::make_unique<Event[]>(Capacity);
 	std::atomic<size_t>      next {0};
 	std::atomic<bool>        recording {false};
@@ -153,7 +154,9 @@ struct Recorder {
 			}
 			origin = std::chrono::steady_clock::now();
 			recording.store(true, std::memory_order_release);
-			std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+			// KYTY_DBG_TIMELINE_MS: capture length (default 1500 ms).
+			const char* length = std::getenv("KYTY_DBG_TIMELINE_MS");
+			std::this_thread::sleep_for(std::chrono::milliseconds(length != nullptr ? std::atoi(length) : 1500));
 			recording.store(false, std::memory_order_release);
 			std::this_thread::sleep_for(std::chrono::milliseconds(50));
 			const auto count = std::min(next.load(), Capacity);
@@ -189,6 +192,18 @@ uint32_t ThreadTag() {
 
 bool Enabled() noexcept {
 	return GetRecorder().enabled;
+}
+
+void MarkStack() noexcept {
+	auto& recorder = GetRecorder();
+	if (!recorder.enabled || !recorder.recording.load(std::memory_order_acquire)) return;
+#if defined(_WIN32)
+	void*      frames[10] {};
+	const auto count = RtlCaptureStackBackTrace(1, 10, frames, nullptr);
+	for (USHORT i = 0; i < count; i++) {
+		Mark("ra", reinterpret_cast<uint64_t>(frames[i]));
+	}
+#endif
 }
 
 void Mark(const char* what, uint64_t value) noexcept {

@@ -923,6 +923,24 @@ static void WriteBackRecord(uint64_t rip, uint64_t vaddr, uint64_t ns) {
 	std::fflush(stdout);
 }
 
+void BufferCache::NoteDirtyRead(uint64_t vaddr, uint64_t size) {
+	if (!Common::Experiments::Enabled(Common::Experiments::EarlySubmitWriters)) {
+		return;
+	}
+	constexpr size_t MaxWatched = 64;
+	for (const auto& [address, bytes]: m_watched_writes) {
+		if (address <= vaddr && vaddr + size <= address + bytes) {
+			return;
+		}
+	}
+	if (m_watched_writes.size() < MaxWatched) {
+		m_watched_writes.emplace_back(vaddr, size);
+	} else {
+		m_watched_writes[m_watched_next] = {vaddr, size};
+		m_watched_next                   = (m_watched_next + 1) % MaxWatched;
+	}
+}
+
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadCaller caller) {
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
@@ -1388,6 +1406,15 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		m_gpu_write_generation++;
 		m_gpu_modified_ranges.Add(vaddr, size);
 		++m_gpu_dirty_generation;
+		if (!m_watched_writes.empty() && !m_submit_requested &&
+		    Common::Experiments::Enabled(Common::Experiments::EarlySubmitWriters)) {
+			for (const auto& [address, bytes]: m_watched_writes) {
+				if (address < vaddr + size && vaddr < address + bytes) {
+					m_submit_requested = true;
+					break;
+				}
+			}
+		}
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }

@@ -701,6 +701,12 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 	if (auto* copies = GetScheduler().HostCopies(); copies != nullptr) {
 		(void)copies->Flush();
 	}
+	if (m_renderer.GetBufferCache().TakeSubmitRequest()) {
+		// Experiment EarlySubmitWriters: this operation wrote bytes a later resource read will
+		// download; submitting now lets that read wait for this work only (second queue).
+		GetScheduler().Flush();
+		Common::Timeline::Mark("early-submit", static_cast<uint64_t>(operation.kind));
+	}
 }
 
 void CommandProcessor::BindState(const GpuRegisterState& state) {

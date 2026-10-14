@@ -16,11 +16,12 @@ namespace Common::Experiments {
 // Features that also have a live runtime flag (common/runtimeFlags.h, flags.ctl) are NOT here:
 // KYTY_GUEST_SYNC, KYTY_LONG_BUFFER_GC_AGE, KYTY_RENDER_TARGET_MEMO (flag KYTY_RT_DECODE_MEMO),
 // KYTY_FAULT_COALESCE, KYTY_SPARSE_BUFFER_GC, KYTY_DIRECT_EOP_INTERRUPTS, KYTY_READBACK_QUEUE.
-// Their bit numbers (0, 13, 14, 16, 17, 19, 20) and the unused one (2) are retired, as are 8
+// Their bit numbers (13, 14, 16, 17, 19, 20) and the unused one (2) are retired, as are 8
 // (GpuThreadPriority: the GPU pipeline stages set their own priority) and 9 (ImageRecycle: image
-// recycling is unconditional since the GTA port).
+// recycling is unconditional since the GTA port). Bit 0 (once GuestSync) is EarlySubmitWriters.
 // KYTY_RESOURCE_MULTI_CACHE (16-state resource memo) is read only by the resource memo itself.
 enum Bit : uint32_t {
+	EarlySubmitWriters = 1u << 0u, // KYTY_EARLY_SUBMIT_WRITERS (default off; a draw/dispatch writing bytes resource reads waited for is submitted at once)
 	SkipRedundantBinds = 1u << 1u, // KYTY_SKIP_REDUNDANT_BINDS (default on)
 	CpuCopyForward     = 1u << 3u, // KYTY_CPU_COPY_FORWARD (default off)
 	SrtJit             = 1u << 4u, // KYTY_SRT_JIT (default off; upstream x64 flat walker for plans without control flow)
@@ -69,10 +70,14 @@ extern std::atomic<uint64_t> g_mask;
 
 namespace Common::Timeline {
 
-// Debugging: KYTY_DBG_TIMELINE=<seconds> records marks from every thread for 1.5 s after that
-// delay, then prints them once in time order (NHL27TL lines): who waits on whom in a frame.
+// Debugging: KYTY_DBG_TIMELINE=<seconds> records marks from every thread for 1.5 s
+// (KYTY_DBG_TIMELINE_MS) after that delay, then prints them once in time order (NHL27TL lines):
+// who waits on whom in a frame.
 [[nodiscard]] bool Enabled() noexcept;
 void Mark(const char* what, uint64_t value = 0) noexcept;
+// While recording: one "ra" mark per return address of the calling stack (up to 10 frames, the
+// caller first), so a wait can be traced to its call site (symbolize with the image base).
+void MarkStack() noexcept;
 
 } // namespace Common::Timeline
 

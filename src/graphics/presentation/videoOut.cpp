@@ -1,4 +1,5 @@
 #include "common/eventTrace.h"
+#include "common/experiments.h"
 #include "graphics/presentation/videoOut.h"
 
 #include "common/abi.h"
@@ -885,6 +886,7 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 		}
 
 		VblankBegin();
+		Common::Timeline::Mark("vblank", 0);
 		bool presented = m_flip_queue.Flip(0);
 		if (!presented && m_presenter.NeedsSystemOverlayRefresh()) {
 			if (m_presenter.PresentLastFrame()) {
@@ -1161,6 +1163,7 @@ void FlipQueue::Complete(uint64_t request_id) {
 			EXIT("completed GPU flip has no prepared recording, id=%" PRIu64 "\n", request_id);
 		}
 		request->state = RequestState::Ready;
+		Common::Timeline::Mark("flip-ready", static_cast<uint64_t>(request->index));
 		Common::EventTrace::Record(Common::EventTrace::FLIP_READY, request_id, static_cast<uint64_t>(request->index));
 		m_submit_cond_var.Signal();
 		m_mutex.Unlock();
@@ -1202,8 +1205,12 @@ void FlipQueue::Wait(VideoOutConfig& cfg, int index) {
 		return std::any_of(m_requests.begin(), m_requests.end(), matches) ||
 		       std::any_of(m_cpu_requests.begin(), m_cpu_requests.end(), matches);
 	};
-	while (has_request()) {
-		m_done_cond_var.Wait(&m_mutex);
+	if (has_request()) {
+		Common::Timeline::Mark("flip-wait", static_cast<uint64_t>(index));
+		while (has_request()) {
+			m_done_cond_var.Wait(&m_mutex);
+		}
+		Common::Timeline::Mark("flip-wait-done", static_cast<uint64_t>(index));
 	}
 }
 
@@ -1274,7 +1281,9 @@ bool FlipQueue::Flip(uint32_t micros) {
 	}
 	if (due) {
 		unlock_ports();
+		Common::Timeline::Mark("flip-present", static_cast<uint64_t>(requests[0].index));
 		m_presenter.Present(std::span(layers.data(), count));
+		Common::Timeline::Mark("flip-presented", static_cast<uint64_t>(requests[0].index));
 		due = lock_ports();
 	}
 
@@ -1404,6 +1413,15 @@ KYTY_SYSV_ABI int VideoOutSetFlipRate(int handle, int rate) {
 	}
 
 	Common::LockGuard lock(ctx->mutex);
+	if (ctx->flip_rate != rate) {
+		Common::Timeline::Mark("flip-rate", static_cast<uint64_t>(rate));
+		if (std::getenv("KYTY_DBG_QUEUE_TIME") != nullptr) {
+			// With the queue-time diagnostic: the game picks its frame rate (0 = 60, 1 = 30, 2 = 20 Hz).
+			std::printf("NHL27FLIPRATE: handle=%d rate=%d -> %d at %.1f s\n", handle, ctx->flip_rate, rate,
+			            static_cast<double>(LibKernel::KernelGetProcessTime()) / 1e6);
+			std::fflush(stdout);
+		}
+	}
 	ctx->flip_rate = rate;
 
 	return OK;

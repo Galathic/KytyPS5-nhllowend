@@ -202,6 +202,16 @@ public:
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	// Experiment EarlySubmitWriters (GPU execution thread): a strict resource read had to download
+	// these GPU-written bytes; later writes to them ask for an early submit (TakeSubmitRequest).
+	void NoteDirtyRead(uint64_t vaddr, uint64_t size);
+	// True once after a draw or dispatch wrote bytes a strict resource read downloaded before: the
+	// caller ends the host command buffer, so the next read waits for that work only.
+	[[nodiscard]] bool TakeSubmitRequest() {
+		const bool requested = m_submit_requested;
+		m_submit_requested   = false;
+		return requested;
+	}
 	// Changes whenever new GPU-dirty bytes are recorded (GPU thread).
 	[[nodiscard]] uint64_t GpuDirtyGeneration() const noexcept { return m_gpu_dirty_generation; }
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
@@ -306,6 +316,11 @@ private:
 	void FinishPendingGuestReads(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool OverlapsPendingGuestRead(uint64_t vaddr, uint64_t size) const;
 
+	// Experiment EarlySubmitWriters: GPU-written ranges strict resource reads downloaded (oldest
+	// replaced first), and whether a write to one of them asks for a submit.
+	std::vector<std::pair<uint64_t, uint64_t>>        m_watched_writes;
+	size_t                                            m_watched_next     = 0;
+	bool                                              m_submit_requested = false;
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
 	FaultManager                                      m_fault_manager;
