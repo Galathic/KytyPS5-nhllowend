@@ -273,10 +273,19 @@ public:
 	explicit RenderExecutor(RenderContext& context): m_context(context) {}
 	KYTY_CLASS_NO_COPY(RenderExecutor);
 
+	struct ResolvedDispatch;
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
-	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode, bool async_compute);
+	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode, bool async_compute,
+	                    ResolvedDispatch* resolved = nullptr);
 	void DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
-	                      uint32_t mode, bool async_compute);
+	                      uint32_t mode, bool async_compute, ResolvedDispatch* resolved = nullptr);
+	// Resolve only shader programs/resources. Indirect argument memory stays on the execution path.
+	[[nodiscard]] ResolvedDispatch* ResolveDispatchAhead(const HW::Context& context,
+	                                                     const HW::Shader& shaders,
+	                                                     uint32_t x, uint32_t y, uint32_t z,
+	                                                     uint32_t mode, bool async_compute,
+	                                                     bool indirect);
+	static void ReleaseResolvedDispatch(ResolvedDispatch* resolved) noexcept;
 
 	// Shader programs and resources of a draw resolved ahead of its execution.
 	struct ResolvedDraw;
@@ -520,6 +529,8 @@ private:
 	std::unique_ptr<ResolvedDrawRing, void (*)(ResolvedDrawRing*)> m_resolved_ring {nullptr,
 	                                                                                nullptr};
 	ResolvedDraw*                                                  m_resolved_draw = nullptr;
+	struct ResolvedDispatchRing;
+	std::unique_ptr<ResolvedDispatchRing, void (*)(ResolvedDispatchRing*)> m_dispatch_ring {nullptr, nullptr};
 	uint64_t                                                       m_context_id    = 0;
 	// The context snapshot whose registers hw_check() last accepted.
 	uint64_t m_checked_context_id = 0;

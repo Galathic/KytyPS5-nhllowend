@@ -482,6 +482,15 @@ void GuestGpu::ResolveThread() {
 			operation->resolved =
 			    executor.ResolveDrawAhead(*operation->state.context, *operation->state.user_config,
 			                              *operation->state.shaders);
+		} else if (Common::RuntimeFlags::Current().compute_resolve_ahead &&
+		           (operation->kind == GpuOperationKind::DispatchDirect ||
+		            operation->kind == GpuOperationKind::DispatchIndirect)) {
+			const auto& args = operation->dispatch;
+			operation->resolved_dispatch = executor.ResolveDispatchAhead(
+			    *operation->state.context, *operation->state.shaders,
+			    args.thread_group_x, args.thread_group_y, args.thread_group_z, args.mode,
+			    operation->processor->IsAsyncComputeQueue(),
+			    operation->kind == GpuOperationKind::DispatchIndirect);
 		}
 		m_resolved.Push(std::move(*operation));
 	}
@@ -696,6 +705,9 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 				operation.callback();
 			}
 			break;
+	}
+	if (operation.resolved_dispatch != nullptr) {
+		RenderExecutor::ReleaseResolvedDispatch(operation.resolved_dispatch);
 	}
 	// Starts the copies of the operation while the next ones are prepared.
 	if (auto* copies = GetScheduler().HostCopies(); copies != nullptr) {
@@ -2339,7 +2351,7 @@ void CommandProcessor::ExecuteDispatchDirect(const GpuOperation& operation, uint
 
 	m_renderer.GetRenderExecutor().DispatchDirect(operation.submit_id, CurrentBuffer(),
 	                                              thread_group_x, thread_group_y, thread_group_z,
-	                                              mode, IsAsyncComputeQueue());
+	                                              mode, IsAsyncComputeQueue(), operation.resolved_dispatch);
 }
 
 void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
@@ -2361,7 +2373,7 @@ void CommandProcessor::ExecuteDispatchIndirect(const GpuOperation& operation) {
 	}
 	m_renderer.GetRenderExecutor().DispatchIndirect(operation.submit_id, CurrentBuffer(),
 	                                                dispatch.args_addr, dispatch.mode,
-	                                                IsAsyncComputeQueue());
+	                                                IsAsyncComputeQueue(), operation.resolved_dispatch);
 }
 
 void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {

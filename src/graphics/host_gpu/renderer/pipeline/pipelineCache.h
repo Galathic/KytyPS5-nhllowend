@@ -185,7 +185,8 @@ public:
 	                    ShaderPixelInputInfo& pixel_info, const NativeDrawShaderInfo& native_draw = {}, ProgramResolution* ahead = nullptr);
 	ShaderProgram GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                const HW::ShaderRegisters&   sh,
-	                                ShaderComputeInputInfo&      input_info);
+	                                ShaderComputeInputInfo&      input_info,
+	                                ProgramResolution*          ahead = nullptr);
 
 	Pipeline& GetGraphicsPipeline(std::span<const RenderColorInfo>       colors,
 	                              const RenderDepthInfo&                 depth,

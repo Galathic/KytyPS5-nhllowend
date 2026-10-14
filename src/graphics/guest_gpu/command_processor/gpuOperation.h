@@ -93,6 +93,7 @@ struct GpuOperation {
 	GpuNumInstances   num_instances;
 	// Draws: the shader programs the resolve thread resolved ahead, if any.
 	RenderExecutor::ResolvedDraw* resolved = nullptr;
+	RenderExecutor::ResolvedDispatch* resolved_dispatch = nullptr;
 	// The command processor processed a WAIT_REG_MEM since the previous operation: the guest may
 	// have written memory the operations before it read.
 	bool after_wait = false;

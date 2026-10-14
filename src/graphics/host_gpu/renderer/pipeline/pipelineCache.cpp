@@ -606,9 +606,11 @@ struct PipelineCache::ProgramCache {
 		ShaderType stage;
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			stage = input_info.logical_stage;
-		} else {
-			static_assert(std::is_same_v<InputInfo, ShaderPixelInputInfo>);
+		} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
 			stage = ShaderType::Pixel;
+		} else {
+			static_assert(std::is_same_v<InputInfo, ShaderComputeInputInfo>);
+			stage = ShaderType::Compute;
 		}
 		lookup_key.stage           = stage;
 		lookup_key.hash            = params.hash;
@@ -617,7 +619,11 @@ struct PipelineCache::ProgramCache {
 		BuildStageStaticKey(input_info, lookup_key.static_state);
 		const auto entry = programs.find(lookup_key);
 		if (entry == programs.end() && ahead.stages != ProgramResolution::MaxStages) {
-			QueueCompile(stage, params, input_info, push_data_cursor, nullptr);
+			// Compute compilation remains on the execution path; the async compiler owns
+			// graphics-only input storage. This experiment resolves existing permutations.
+			if constexpr (!std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+				QueueCompile(stage, params, input_info, push_data_cursor, nullptr);
+			}
 		}
 		// SWAPPC programs link the functions they call from guest memory: the execution thread
 		// resolves them.
@@ -650,7 +656,9 @@ struct PipelineCache::ProgramCache {
 			           candidate.specialization == specialization;
 		    });
 		if (permutation == entry->second.permutations.end()) {
-			QueueCompile(stage, params, input_info, push_data_cursor, &specialization);
+			if constexpr (!std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+				QueueCompile(stage, params, input_info, push_data_cursor, &specialization);
+			}
 			ahead.reads.Fail();
 			return {};
 		}
@@ -1957,15 +1965,24 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                const HW::ShaderRegisters&   sh,
-                                               ShaderComputeInputInfo&      input_info) {
+                                               ShaderComputeInputInfo&      input_info,
+                                               ProgramResolution*          ahead) {
 	FrameBreakdown::Timer prep_timer(FrameBreakdown::g_counters.prep_compute_program_ns,
 	                                 FrameBreakdown::DetailEnabled());
+	const ShaderGuestReaderScope reader(ahead != nullptr ? ReadAheadShaderState : nullptr,
+	                                    ahead != nullptr ? &ahead->reads : nullptr);
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	const auto        params      = PrepareProgram(regs, sh, input_info);
+	if (ahead != nullptr && ahead->reads.Failed()) {
+		return {};
+	}
 	input_info.lds_storage = input_info.lds_size_dwords * 4u >
 	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
 	uint32_t          push_data_cursor = 0;
 	const ProgramLockGuard lock(m_program_lock);
+	if (ahead != nullptr) {
+		return m_program_cache->GetAhead(params, input_info, push_data_cursor, *ahead);
+	}
 	return m_program_cache->Get(params, input_info, push_data_cursor);
 }
 
