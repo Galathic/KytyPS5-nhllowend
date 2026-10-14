@@ -16,14 +16,14 @@ namespace Common::Experiments {
 // Features that also have a live runtime flag (common/runtimeFlags.h, flags.ctl) are NOT here:
 // KYTY_GUEST_SYNC, KYTY_LONG_BUFFER_GC_AGE, KYTY_RENDER_TARGET_MEMO (flag KYTY_RT_DECODE_MEMO),
 // KYTY_FAULT_COALESCE, KYTY_SPARSE_BUFFER_GC, KYTY_DIRECT_EOP_INTERRUPTS, KYTY_READBACK_QUEUE.
-// Their bit numbers (0, 13, 14, 16, 17, 19, 20) and the unused one (2) are retired; 8 is GpuThreadPriority,
-// 9 ImageRecycle.
+// Their bit numbers (0, 13, 14, 16, 17, 19, 20) and the unused one (2) are retired, as are 8
+// (GpuThreadPriority: the GPU pipeline stages set their own priority) and 9 (ImageRecycle: image
+// recycling is unconditional since the GTA port).
 // KYTY_RESOURCE_MULTI_CACHE (16-state resource memo) is read only by the resource memo itself.
 enum Bit : uint32_t {
 	SkipRedundantBinds = 1u << 1u, // KYTY_SKIP_REDUNDANT_BINDS (default on)
 	CpuCopyForward     = 1u << 3u, // KYTY_CPU_COPY_FORWARD (default off)
-	GpuThreadPriority  = 1u << 8u, // KYTY_GPU_THREAD_PRIORITY (default off; the GPU thread runs at highest priority)
-	ImageRecycle       = 1u << 9u, // KYTY_IMAGE_RECYCLE (default on; freed device images are reused by later images with the same parameters)
+	SrtJit             = 1u << 4u, // KYTY_SRT_JIT (default off; upstream x64 flat walker for plans without control flow)
 	FalseShareReads    = 1u << 6u, // KYTY_FALSE_SHARE_READS (default off)
 	SrtBatchReads      = 1u << 7u, // KYTY_SRT_BATCH_READS (default on; also read by the program cache)
 	DirectSrtReads     = 1u << 10u, // KYTY_DIRECT_SRT_READS (default on; SRT reads without the IR walk)
@@ -31,7 +31,7 @@ enum Bit : uint32_t {
 	ImageLookupHint    = 1u << 12u, // KYTY_IMAGE_LOOKUP_HINT (default on; skip the region scan for known images)
 	AdaptiveResourceMemo = 1u << 15u, // KYTY_ADAPTIVE_RESOURCE_MEMO (default on; superseded by KYTY_RESOURCE_MEMO_BYPASS, no consumer)
 	CleanFromDirect      = 1u << 18u, // KYTY_CLEAN_FROM_DIRECT (default on; strict evaluator reuses direct SRT words)
-	AsyncSubmit          = 1u << 21u, // KYTY_ASYNC_SUBMIT (default off; vkQueueSubmit on a worker thread, in tick order)
+	AsyncSubmit          = 1u << 21u, // KYTY_ASYNC_SUBMIT (no consumer: the GPU pipeline's recording thread submits)
 	LazySharedWrites     = 1u << 22u, // KYTY_LAZY_SHARED_WRITES (default off; CPU stores next to few GPU-written bytes do not wait)
 	NativeFp16           = 1u << 23u, // KYTY_NATIVE_FP16 (default off; f16vec2 math for packed f16 ops, needs shaderFloat16)
 	FaultPageReads       = 1u << 24u, // KYTY_FAULT_PAGE_READS (default off; SRT reads of pages that faulted before use the backing)

@@ -34,8 +34,10 @@ public:
 	static void SleepMicro(uint32_t micros);
 	static void SleepNano(uint64_t nanos);
 	static bool IsMainThread();
-	// Raises (or restores) the calling thread's scheduling priority (Windows; no-op elsewhere).
-	static void SetCurrentHighPriority(bool high);
+	// Current thread: raises its priority to "highest", and restricts it to one logical
+	// processor (when `logical_cpu` is not negative). No-ops where unsupported.
+	static void RaiseCurrentPriority();
+	static void PinCurrent(int logical_cpu);
 
 	// Get current thread id
 	// Once a thread has finished, the id may be reused by another thread.

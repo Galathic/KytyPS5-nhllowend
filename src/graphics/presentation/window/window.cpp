@@ -293,7 +293,14 @@ static void GameEventFinger([[maybe_unused]] const EventFinger& f) {
 }
 
 static void GameEventController([[maybe_unused]] const EventController& f) {
-	EXIT_NOT_IMPLEMENTED(f.remapped);
+	// A new mapping changes how SDL translates the device. SDL sends no release or neutral axis
+	// events for the old mapping, so input held on the active controller would stay stuck.
+	if (f.remapped) {
+		if (Controller::GetActiveControllerId() == f.id) {
+			Controller::ResetInputState();
+		}
+		return;
+	}
 
 #ifdef KYTY_DBG_INPUT
 	if (f.added || f.removed) {
@@ -332,6 +339,19 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 		const auto button = ControllerButtonToPadButton(f.button);
 		if (button != 0) {
 			Controller::SetButton(f.id, button, f.down);
+		} else if (f.button == SDL_GAMEPAD_BUTTON_BACK) {
+			// Pads without a touchpad (Switch, Xbox, ...) have no way to click it, which
+			// blocks games that require it. Use their Back/Select button as a centered click.
+			auto* pad = SDL_GetGamepadFromID(f.id);
+			if (pad != nullptr && SDL_GetNumGamepadTouchpads(pad) == 0) {
+				if (f.down) {
+					Controller::SetTouchPad(f.id, 0, true, 0.5f, 0.5f);
+				}
+				Controller::SetButton(f.id, Controller::PAD_BUTTON_TOUCH_PAD, f.down);
+				if (f.up) {
+					Controller::SetTouchPad(f.id, 0, false, 0.5f, 0.5f);
+				}
+			}
 		}
 	}
 
@@ -774,6 +794,13 @@ static void WindowCreate(WindowContext& context) {
 	if (Config::RenderDocEnabled()) {
 		SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "x11,wayland");
 	}
+#endif
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// With GameInput 3+ installed, SDL hands Xbox (GIP) pads to GameInput and XInput/RawInput
+	// skip them; where GameInput enumerates nothing, the pad never appears. Prefer XInput.
+	// SDL_SetHint keeps an environment override.
+	SDL_SetHint(SDL_HINT_JOYSTICK_GAMEINPUT, "0");
+	SDL_SetHint(SDL_HINT_JOYSTICK_GAMEINPUT_RAW, "0");
 #endif
 	if (!SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
 		EXIT("%s\n", SDL_GetError());

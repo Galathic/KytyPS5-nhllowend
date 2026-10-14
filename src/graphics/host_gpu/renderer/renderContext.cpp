@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/experiments.h"
 #include "common/hostException.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/runtimeFlags.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -21,13 +22,14 @@
 namespace Libs::Graphics {
 
 RenderContext::RenderContext(GraphicContext& graphics)
-    : m_graphics(graphics), m_render_executor(*this), m_command_scheduler(*this, graphics),
+    : m_graphics(graphics), m_render_executor(*this),
+      m_command_scheduler(*this, graphics,
+                          (Config::GpuPipelineStages() & Config::GPU_PIPELINE_RECORDING) != 0),
       m_descriptor_heap(graphics, m_command_scheduler.GetMasterSemaphore()),
       m_pipeline_cache(graphics), m_sampler_cache(graphics),
       m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache),
       m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
-	m_command_scheduler.AllowAsyncSubmit();
 	// Experiment FaultPageReads: resource-table reads of a page the GPU thread took a read fault on
 	// (the GPU wrote other bytes of it) read clean bytes through the backing instead of faulting
 	// again; GPU-written bytes still fault and download.
@@ -78,7 +80,11 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.
 	constexpr uint64_t fault_size = 1;
 	if (!IsMapped(fault_vaddr, fault_size)) {
-		return false;
+		// Cache tracking may still protect a page whose range left the GPU-mapped set; that
+		// fault is ours to resolve, not a guest access violation.
+		if (!GuestRange {fault_vaddr, fault_size}.Valid() || !m_page_manager.IsWatched(fault_vaddr)) {
+			return false;
+		}
 	}
 	ProtectStats::CountFault(access == PageFaultAccess::Write);
 	Common::Timeline::Mark(access == PageFaultAccess::Write ? "fault-write" : "fault-read", fault_vaddr);
@@ -166,6 +172,20 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	return true;
 }
 
+void RenderContext::PrepareGpuWrite(const void* destination, uint64_t size) noexcept {
+	const auto vaddr     = reinterpret_cast<uint64_t>(destination);
+	const auto page_size = m_page_manager.GetPageSize();
+	if (size == 0 || !GuestRange {vaddr, size}.Valid()) {
+		return;
+	}
+	// A watched page is protected: the write would fault into HandleFault().
+	for (auto page = vaddr & ~(page_size - 1); page < vaddr + size; page += page_size) {
+		if (m_page_manager.IsWatched(page)) {
+			(void)HandleFault(PageFaultAccess::Write, std::max(page, vaddr));
+		}
+	}
+}
+
 bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!IsMapped(vaddr, size)) {
 		return false;
@@ -183,11 +203,17 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 	return m_mapped_ranges.Contains(vaddr, size);
 }
 
+uint64_t RenderContext::MappedRangesVersion() const noexcept {
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	return m_mapped_ranges_version;
+}
+
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	Common::Timeline::Mark("map", size);
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
 	++m_mapping_generation;
+	m_mapped_ranges_version++;
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -198,12 +224,19 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		     vaddr, size);
 	}
 	const auto unmap = [this, vaddr, size] {
-		// Check cache ownership on the GPU thread. Guest-memory callbacks can still
-		// access a range with no cached data, so they must finish before it is unmapped.
-		if (m_command_scheduler.Active() &&
-		    (m_buffer_cache.IsRegionRegistered(vaddr, size) ||
-		     m_texture_cache.IsRegionRegistered(vaddr, size) ||
-		     m_command_scheduler.HasPendingPriorityOperations())) {
+		// Finishing the GPU protects GPU writes to the range and completions that may write guest
+		// memory there (downloads, write scans). Queued GPU work only reads cached copies and
+		// host-only completions (cache bookkeeping, flips, interrupts) never touch the range, so
+		// without GPU-owned pages, images or pending guest completions writing the range the
+		// unmap needs no drain.
+		if (m_command_scheduler.Active()) {
+			m_command_scheduler.PopPendingOperations();
+		}
+		const bool drain = m_command_scheduler.Active() &&
+		                   (m_buffer_cache.IsRegionGpuModified(vaddr, size) ||
+		                    m_texture_cache.HasImagesInRegion(vaddr, size) ||
+		                    m_command_scheduler.HasPendingGuestOperations(vaddr, size));
+		if (drain) {
 			const auto tick = m_command_scheduler.CurrentTick();
 			m_command_scheduler.Finish();
 			m_command_scheduler.WaitPriorityOperations(tick);
@@ -213,6 +246,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
 		++m_mapping_generation;
+		m_mapped_ranges_version++;
 	};
 	// Shutdown still owns the GPU while queued rendering drains, but its command lane no
 	// longer accepts external work. Use the guest GPU's state for the teardown route.
@@ -220,12 +254,36 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		unmap();
 		return;
 	}
-	m_gpu->SendCommandSync(unmap);
+	// The guest unmaps memory once the GPU work that used it executed: it waits on labels the
+	// execution thread writes after the operations before them. The operations queued since do not
+	// use the range, so the unmap runs before them instead of making the guest wait for them;
+	// streaming games unmap many times per frame, holding their own locks.
+	m_gpu->SendUrgentCommandSync(unmap);
 }
 
-// Pages of TRACKER_PAGE_SIZE covering [start, end). Used only by the NHL27BDA counters.
-static uint64_t PagesIn(uint64_t start, uint64_t end) {
-	return (end - start + TRACKER_PAGE_SIZE - 1) / TRACKER_PAGE_SIZE;
+void RenderContext::CacheDmaBases(const ShaderStageRuntime& runtime) {
+	const auto&      program   = *runtime.program;
+	const auto&      user_data = runtime.resources->user_data;
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	for (const auto reg: program.info.dma_base_registers) {
+		const auto index = static_cast<uint64_t>(reg) - program.user_data_base;
+		if (reg < program.user_data_base || index + 1u >= user_data.size()) {
+			continue;
+		}
+		const auto base = user_data[index] | (static_cast<uint64_t>(user_data[index + 1u]) << 32u);
+		// The registers of an access that never runs may hold stale data. Mapped memory never
+		// reaches the top of the address space, so a window that would overflow is skipped.
+		if (base > UINT64_MAX - BufferCache::CACHING_PAGESIZE) {
+			continue;
+		}
+		// DMA reaches only memory with a cached buffer; any other access records a fault and
+		// reads zero, and the buffer arrives after the shader has run. That loses data the guest
+		// writes for a single dispatch, such as the glyph bitmaps GTA V copies into its font atlas.
+		m_mapped_ranges.ForEachInRange(base, BufferCache::CACHING_PAGESIZE,
+		                               [this](uint64_t start, uint64_t end) {
+			                               (void)m_buffer_cache.FindBuffer(start, end - start);
+		                               });
+	}
 }
 
 void RenderContext::PrepareBda() {
@@ -233,6 +291,7 @@ void RenderContext::PrepareBda() {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		m_bda_logged = true;
 	}
+	m_buffer_cache.PrepareFaultBuffer();
 	static const bool cache_enabled = [] {
 		const char* value = std::getenv("KYTY_BDA_DIRTY_CACHE");
 		return value != nullptr && value[0] == '1' && value[1] == '\0';
@@ -295,16 +354,24 @@ void RenderContext::PrepareBda() {
 				drained = m_buffer_cache.SynchronizeBuffersInRanges(m_mapped_ranges, full);
 			}
 		} else {
-			++m_bda_stats.full_scans;
-			FrameBreakdown::Add(FrameBreakdown::g_counters.bda_scans);
-			FrameBreakdown::Timer sync_timer(FrameBreakdown::g_counters.bda_sync_ns);
-			FrameBreakdown::BufScope buf_scope(2);
-			FrameBreakdown::VAdd(FrameBreakdown::g_buf.bda_syncs);
-			m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
-				FrameBreakdown::Add(FrameBreakdown::g_counters.bda_ranges);
-				FrameBreakdown::Add(FrameBreakdown::g_counters.bda_pages, PagesIn(start, end));
-				m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
-			});
+			// Nothing to upload when no page became CPU dirty, no buffer was registered and no
+			// range was mapped since the last synchronization started. Otherwise only the tracking
+			// regions whose pages became CPU dirty since are visited, unless a new buffer or mapped
+			// range may cover CPU-dirty pages that earlier passes skipped.
+			const std::array<uint64_t, 3> epochs {RegionManager::CpuDirtyEpoch(), registrations,
+			                                      m_mapping_generation};
+			if (epochs != m_bda_sync_epochs) {
+				const bool all = epochs[1] != m_bda_sync_epochs[1] || epochs[2] != m_bda_sync_epochs[2];
+				m_bda_stats.full_scans += all;
+				FrameBreakdown::Add(FrameBreakdown::g_counters.bda_scans);
+				FrameBreakdown::Timer sync_timer(FrameBreakdown::g_counters.bda_sync_ns);
+				FrameBreakdown::BufScope buf_scope(2);
+				FrameBreakdown::VAdd(FrameBreakdown::g_buf.bda_syncs);
+				m_buffer_cache.SynchronizeDirtyRegionsInRanges(m_mapped_ranges, all);
+				m_bda_sync_epochs = epochs;
+			} else {
+				FrameBreakdown::Add(FrameBreakdown::g_counters.bda_skips);
+			}
 		}
 		// Save the pre-scan stamps: a CPU write concurrent with the scan must force
 		// another scan, even if it targets a range we already visited.
@@ -432,6 +499,11 @@ void RenderContext::RunGarbageCollector() {
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;
 		m_buffer_cache.ProcessFaultBuffer();
+	}
+	if (m_indirect_write_tables.TakePendingWrites()) {
+		m_buffer_cache.ProcessWriteBuffer([this](std::span<const uint64_t> pages) {
+			m_indirect_write_tables.NoteWrites(pages);
+		});
 	}
 	m_texture_cache.ProcessDownloadImages();
 	m_texture_cache.RunGarbageCollector();

@@ -63,13 +63,16 @@ static void PrintUsage() {
 	::printf(
 	    "  --gpu <index>                        Vulkan physical device index. Default: auto.\n");
 	::printf("  --fullscreen                         Run in borderless desktop fullscreen.\n");
+	::printf("  --hdr                                Enable HDR10 output when supported.\n");
 	::printf(
 	    "  --hide-cursor                        Hide the cursor after 2 s idle. Default: off.\n");
+	::printf("  --no-splash                          Disable the startup splash screen.\n");
 	::printf("  --vr                                 Enable the virtual VR headset.\n");
 	::printf("  --amd-cpu                            Apply AMD CPU instruction patches.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
 	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
 	::printf("  --vulkan-validation <true|false>     Enable Vulkan validation.\n");
+	::printf("  --network-connected <true|false>     Use the host local network (default: false).\n");
 	::printf("  --gpu-assisted-validation <t|f>      Bounds-check shader accesses on the GPU.\n"
 	         "                                       Implies --vulkan-validation; very slow.\n");
 	::printf("  --shader-validation <true|false>     Enable shader validation.\n");
@@ -95,8 +98,12 @@ static void PrintUsage() {
 	::printf(
 	    "  --skip-notice-screen <true|false>    Skip startup logos and notices in supported games.\n"
 	    "                                      Default: false.\n");
+	::printf("  --gpu-pipeline <0|1|mask>            Emulated GPU stages on their own threads.\n"
+	         "                                       0: all inline, 1: all (default). The\n"
+	         "                                       KYTY_GPU_PIPELINE variable overrides it.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	::printf("  --redzone                            Protect the guest SysV red zone.\n");
+	::printf("  --redzone                            Protect the guest SysV red zone (default).\n");
+	::printf("  --no-redzone                         Do not protect the guest SysV red zone.\n");
 #endif
 	::printf("  --keymap <Control=Input>             DualSense mapping; may be repeated.\n");
 	::printf("  --rd                                 Enable RenderDoc capture.\n");
@@ -217,8 +224,18 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			continue;
 		}
 
+		if (arg == "--hdr") {
+			options.config.hdr_enabled = true;
+			continue;
+		}
+
 		if (arg == "--hide-cursor") {
 			options.config.hide_cursor_enabled = true;
+			continue;
+		}
+
+		if (arg == "--no-splash") {
+			options.config.splash_enabled = false;
 			continue;
 		}
 
@@ -252,6 +269,10 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			options.config.red_zone_protection_enabled = true;
 			continue;
 		}
+		if (arg == "--no-redzone") {
+			options.config.red_zone_protection_enabled = false;
+			continue;
+		}
 #endif
 
 		if (!arg.starts_with("--")) {
@@ -262,6 +283,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		if (!NextArg(argc, argv, i, value)) {
 			::printf("missing value for %s\n", arg.c_str());
 			return false;
+		}
+
+		if (arg == "--gpu-pipeline") {
+			options.config.gpu_pipeline_stages = Config::ParseGpuPipelineStages(value.c_str());
+			continue;
 		}
 
 		if (arg == "--game") {
@@ -297,6 +323,10 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				         value.c_str());
 				return false;
 			}
+		} else if (arg == "--guest-exec") {
+			options.elf = Common::PathFromUtf8(Common::FixFilenameSlash(value));
+			options.config.guest_arguments.assign(argv + i + 1, argv + argc);
+			break;
 		} else if (arg == "--game-patch") {
 			if (!options.game_patch.empty()) {
 				::printf("--game-patch can only be specified once\n");
@@ -373,6 +403,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		} else if (arg == "--console-language") {
 			if (!ParseConsoleLanguage(value, options.config.console_language)) {
 				::printf("invalid console language: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--network-connected") {
+			if (!ParseBool(value, options.config.network_connected)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
 		} else if (arg == "--vulkan-validation") {

@@ -15,6 +15,7 @@
 #include <chrono>
 #include <map>
 #include <span>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -34,6 +35,12 @@ public:
 	static constexpr uint64_t CACHING_NUMPAGES  = (LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize) >> CACHING_PAGEBITS;
 	static constexpr uint64_t BDA_PAGETABLE_SIZE =
 	    CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
+	// The fault buffer holds two bitmaps of CACHING_NUMPAGES bits: pages that device-address
+	// accesses found without a cached buffer, then pages that V#-table stores wrote.
+	static constexpr uint64_t WRITE_BITMAP_OFFSET = CACHING_NUMPAGES / 8;
+	static constexpr uint64_t FAULT_BUFFER_SIZE   = 2 * WRITE_BITMAP_OFFSET;
+	// Word index of the fault-parse gate's dirty word, which follows both bitmaps.
+	static constexpr uint64_t FAULT_DIRTY_WORD    = FAULT_BUFFER_SIZE / sizeof(uint32_t);
 
 	static constexpr uint64_t PageIndex(uint64_t address) {
 		return (address < LOWER_ADDRESS_SIZE
@@ -89,6 +96,9 @@ public:
 	// KYTY_PERF_NO_SYNC_READBACK=1 enables the readback-avoidance paths (default: off).
 	[[nodiscard]] static bool PerfNoSyncReadback();
 	static void               PerfCount(PerfEvent event);
+	// KYTY_PERF_STATS=1: the faulting guest instruction of the calling thread, so CPU-write
+	// readbacks can be attributed to the code that caused them (NHL27WRITEBACK).
+	static void               NoteFaultRip(uint64_t rip);
 	[[nodiscard]] static uint64_t PerfFlipCount();
 	// KYTY_PERF_STATS: device memory use the texture/buffer collectors last saw.
 	static void PerfSetMemoryUsage(uint64_t used, uint64_t texture_trigger, uint64_t buffer_trigger);
@@ -183,6 +193,9 @@ public:
 	                                                              bool is_written, bool is_texel_buffer,
 	                                                              BufferId id = {});
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
+	// Copies guest memory into the mapped stream buffer, possibly on the host copy thread (see
+	// CommandScheduler::HostCopies()).
+	void StreamGuestData(uint8_t* destination, uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
 	                bool src_gds);
@@ -193,13 +206,57 @@ public:
 	[[nodiscard]] uint64_t GpuDirtyGeneration() const noexcept { return m_gpu_dirty_generation; }
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	void               PrepareFaultBuffer() { m_fault_manager.PrepareFaultBuffer(); }
 	void               ProcessFaultBuffer();
+	void ProcessWriteBuffer(FaultManager::PagesHandler&& handler) {
+		m_fault_manager.ProcessWriteBuffer(std::move(handler));
+	}
+	// Records stores that a shader made through device addresses, known once it completed: the
+	// bytes of [vaddr, vaddr + size) that a cached buffer holds become GPU modified, except on
+	// pages the CPU dirtied since, whose upload replaces them.
+	void NoteGpuWrites(uint64_t vaddr, uint64_t size);
+	// Calls func(address, size) for the runs of [vaddr, vaddr + size) the CPU may have written
+	// since the previous call over them (see MemoryTracker::ConsumeCpuWrites).
+	template <typename Func>
+	void ConsumeCpuWrites(uint64_t vaddr, uint64_t size, Func&& func) {
+		m_memory_tracker.ConsumeCpuWrites(vaddr, size, std::forward<Func>(func));
+	}
+	// Calls func(address, size) for the ranges whose buffers the garbage collector released since
+	// the previous call, and forgets them; the first call starts recording them. Merging buffers
+	// keeps every address cached.
+	template <typename Func>
+	void ConsumeReleasedRanges(Func&& func) {
+		m_released_ranges.ForEach(func);
+		m_released_ranges.Clear();
+		m_record_released = true;
+	}
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	uint64_t           SynchronizeBuffersInRanges(const RangeSet& ranges, bool full);
 	[[nodiscard]] uint64_t CpuModificationGeneration() const noexcept {
 		return m_memory_tracker.CpuModificationGeneration();
 	}
 	[[nodiscard]] uint64_t RegistrationGeneration() const noexcept { return m_registration_generation; }
+	// Uploads the pending CPU writes of the buffers within `ranges`. Unless `all`, visits only the
+	// tracking regions whose pages became CPU dirty since the previous call: that call left no
+	// pending write under a buffer anywhere else in `ranges`, provided no buffer was registered
+	// and `ranges` did not change since. Callers pass `all` otherwise.
+	void SynchronizeDirtyRegionsInRanges(const RangeSet& ranges, bool all);
+	// Advances whenever a buffer is registered: a new buffer may cover CPU-dirty pages that no
+	// earlier synchronization uploaded.
+	[[nodiscard]] uint64_t RegisterEpoch() const { return m_registration_generation; }
+	// Advances whenever recorded work may write cached buffers (written bindings, fills, copies,
+	// device-address stores).
+	[[nodiscard]] uint64_t GpuWriteGeneration() const noexcept { return m_gpu_write_generation; }
+	// Advances whenever a page of the range becomes CPU dirty (see
+	// MemoryTracker::RegionCpuDirtyEpoch); pages that stay CPU dirty do not advance it.
+	[[nodiscard]] uint64_t CpuDirtyEpoch(uint64_t vaddr, uint64_t size) const {
+		uint64_t epoch = 0;
+		for (auto index = vaddr / TRACKER_REGION_SIZE; index * TRACKER_REGION_SIZE < vaddr + size;
+		     index++) {
+			epoch += m_memory_tracker.RegionCpuDirtyEpoch(index);
+		}
+		return epoch;
+	}
 	void               RunGarbageCollector();
 
 private:
@@ -260,7 +317,10 @@ private:
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
 	uint64_t                                          m_gpu_dirty_generation = 0;
+	RangeSet                                          m_released_ranges;
+	bool                                              m_record_released = false;
 	MemoryTracker                                     m_memory_tracker;
+	uint64_t                                           m_gpu_write_generation = 0;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;
@@ -302,6 +362,33 @@ private:
 	uint64_t                                          m_writer_hash       = 0;
 	uint64_t                                          m_last_download_bytes = 0;
 	uint64_t                                          m_total_used_memory  = 0;
+	// Advances whenever a buffer is registered or unregistered.
+	uint64_t m_buffer_set_epoch = 0;
+	// The buffer a read-only binding of a range found, while no buffer was registered or
+	// unregistered and no page of the range became CPU dirty since (see ObtainBuffer()).
+	struct ObtainMemo {
+		uint64_t vaddr        = 0;
+		uint64_t size         = 0;
+		uint64_t buffer_epoch = 0;
+		uint64_t cpu_epoch    = 0;
+		uint64_t offset       = 0;
+		BufferId id;
+	};
+	// The stream copy a range got within the current draw window (see ObtainBuffer()).
+	struct StreamMemo {
+		uint64_t vaddr            = 0;
+		uint64_t size             = 0;
+		uint64_t window           = UINT64_MAX;
+		uint64_t lap              = 0;
+		uint64_t write_generation = 0;
+		uint64_t offset           = 0;
+	};
+	static constexpr size_t                                  StreamMemoSlots = 1024;
+	std::unique_ptr<std::array<StreamMemo, StreamMemoSlots>> m_stream_memo =
+	    std::make_unique<std::array<StreamMemo, StreamMemoSlots>>();
+	static constexpr size_t                                  ObtainMemoSlots = 4096;
+	std::unique_ptr<std::array<ObtainMemo, ObtainMemoSlots>> m_obtain_memo =
+	    std::make_unique<std::array<ObtainMemo, ObtainMemoSlots>>();
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
@@ -317,6 +404,9 @@ private:
 	};
 	static constexpr size_t kObtainCacheSize = 512;
 	std::array<ObtainCacheEntry, kObtainCacheSize> m_obtain_cache {};
+	// CPU-dirty epoch of each tracking region as SynchronizeBuffersInRanges last visited it.
+	std::unordered_map<uint64_t, uint64_t>     m_synced_region_epochs;
+	std::vector<std::pair<uint64_t, uint64_t>> m_sync_regions;
 };
 
 } // namespace Libs::Graphics

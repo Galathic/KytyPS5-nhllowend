@@ -11,10 +11,12 @@
 #include "graphics/host_gpu/renderer/cache/samplerCache.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/indirectWriteTables.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "kernel/eventQueue.h"
 
+#include <array>
 #include <memory>
 #include <shared_mutex>
 #include <vector>
@@ -46,13 +48,20 @@ public:
 	SamplerCache&       GetSamplerCache() { return m_sampler_cache; }
 	BufferCache&        GetBufferCache() { return m_buffer_cache; }
 	TextureCache&       GetTextureCache() { return m_texture_cache; }
+	IndirectWriteTables& GetIndirectWriteTables() { return m_indirect_write_tables; }
 	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+	// Before the emulated GPU writes guest memory (labels, WRITE_DATA): resolves a tracked page
+	// as its write fault would, without raising the exception.
+	void PrepareGpuWrite(const void* destination, uint64_t size) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
+	// Advances whenever a range is mapped or unmapped.
+	[[nodiscard]] uint64_t MappedRangesVersion() const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
+	void               CacheDmaBases(const ShaderStageRuntime& runtime);
 	void               PrepareBda();
 	// KYTY_BDA_BATCH: a point where guest memory can become ordered for the GPU or CPU. The next PrepareBda
 	// syncs again. GPU command thread only.
@@ -86,8 +95,13 @@ private:
 	PageManager               m_page_manager;
 	BufferCache               m_buffer_cache;
 	TextureCache              m_texture_cache;
+	IndirectWriteTables       m_indirect_write_tables {*this};
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
+	uint64_t                  m_mapped_ranges_version = 0;
+	// Epochs (CPU dirty, buffer registrations, mapped ranges) read before the last full BDA
+	// synchronization.
+	std::array<uint64_t, 3> m_bda_sync_epochs {UINT64_MAX, UINT64_MAX, UINT64_MAX};
 	std::unique_ptr<GuestGpu> m_gpu;
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	bool                      m_fault_process_pending = false;

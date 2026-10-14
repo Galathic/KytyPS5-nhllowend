@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -23,6 +24,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <bit>
 #include <cstring>
 #include <fmt/format.h>
 #include <string>
@@ -187,18 +189,43 @@ static vk::BlendOp GetBlendOp(uint32_t op) {
 static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>& descriptor_bindings,
                               const ShaderRecompiler::IR::CompiledShaderInfo& program,
                               vk::ShaderStageFlagBits              stage) {
-	for (const auto& binding: program.bindings.descriptors) {
+	for (auto mask = program.bindings.descriptor_mask; mask != 0; mask &= mask - 1) {
+		const auto index = std::countr_zero(mask);
+		const auto kind = static_cast<ShaderRecompiler::IR::DescriptorBindingKind>(index);
 		descriptor_bindings.push_back(
-		    {ShaderRecompiler::IR::NativeBinding(program.stage, binding.kind),
-		     NativeDescriptorType(binding.kind), NativeDescriptorCount(binding), stage, nullptr});
+		    {ShaderRecompiler::IR::NativeBinding(program.stage, kind), NativeDescriptorType(kind),
+		     program.bindings.descriptor_counts[index], stage, nullptr});
 	}
 }
 
 static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                                    std::span<const vk::DescriptorSetLayoutBinding> bindings) {
 	uint32_t descriptor_count = 0;
+	uint32_t sampled_images   = 0;
+	uint32_t stage_count      = 0;
 	for (const auto& binding: bindings) {
 		descriptor_count += binding.descriptorCount;
+		if (binding.descriptorType != vk::DescriptorType::eSampledImage) continue;
+		sampled_images += binding.descriptorCount;
+		uint32_t stage = 0;
+		for (const auto& other: bindings) {
+			if (other.descriptorType == vk::DescriptorType::eSampledImage &&
+			    other.stageFlags == binding.stageFlags) {
+				stage += other.descriptorCount;
+			}
+		}
+		stage_count = std::max(stage_count, stage);
+	}
+	// Bindless image tables can need more sampled images than the device or a descriptor pool
+	// provides: fail clearly instead of creating an invalid layout.
+	const auto& limits = graphics.GetPhysicalDeviceProperties().limits;
+	if (sampled_images > limits.maxDescriptorSetSampledImages ||
+	    stage_count > limits.maxPerStageDescriptorSampledImages ||
+	    sampled_images > DescriptorHeap::MaxSampledImages) {
+		EXIT("pipeline needs %u sampled images (%u in one stage); the device allows %u per set "
+		     "and %u per stage, a descriptor pool holds %u\n",
+		     sampled_images, stage_count, limits.maxDescriptorSetSampledImages,
+		     limits.maxPerStageDescriptorSampledImages, DescriptorHeap::MaxSampledImages);
 	}
 	pipeline.uses_push_descriptors = descriptor_count <= graphics.max_push_descriptors;
 

@@ -40,6 +40,11 @@ if (NOT (WIN32 OR LINUX OR APPLE))
     message(FATAL_ERROR "only Windows, Linux, and macOS builds are supported")
 endif()
 
+if(WIN32)
+	# Prevent Windows headers from defining min/max macros in all targets.
+	add_compile_definitions(NOMINMAX)
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -245,7 +250,7 @@ file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
 	"${KYTY_SOURCE_DIR}/loader/*.h"
 )
 
-find_program(KYTY_GLSLANG_VALIDATOR glslangValidator REQUIRED)
+find_program(KYTY_GLSLANG_VALIDATOR NAMES glslangValidator glslang REQUIRED)
 set(gpu_tiler_shader_dir "${KYTY_SOURCE_DIR}/graphics/host_gpu/shaders")
 set(gpu_tiler_generated_dir "${PROJECT_BINARY_DIR}/gpu_tiler_shaders")
 set(gpu_tiler_shader_names
@@ -291,7 +296,7 @@ add_custom_command(
 	OUTPUT "${fault_buffer_shader_header}"
 	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
 	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
-	        -DCACHING_PAGEBITS=14 -DMAX_PAGE_FAULTS=1024
+	        -DCACHING_PAGEBITS=14
 	        -o "${fault_buffer_shader_spv}" "${fault_buffer_shader_source}"
 	COMMAND ${CMAKE_COMMAND} -DINPUT=${fault_buffer_shader_spv} -DOUTPUT=${fault_buffer_shader_header}
 	        -DSYMBOL=FAULT_BUFFER_PROCESS_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
@@ -317,28 +322,27 @@ list(APPEND kyty_emulator_src "${fault_buffer_gate_header}")
 list(APPEND kyty_emulator_src ${gpu_tiler_shader_headers})
 
 set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")
-set(gpu_blit_shader_sources
-	"${gpu_tiler_shader_dir}/gpu_blit_fs_triangle.vert"
-	"${gpu_tiler_shader_dir}/gpu_blit_color_to_ms_depth.frag"
-	"${gpu_tiler_shader_dir}/gpu_video_out_overlay.frag"
-)
-foreach(shader_source IN LISTS gpu_blit_shader_sources)
-	get_filename_component(shader_name "${shader_source}" NAME_WE)
+function(add_gpu_blit_shader shader_name shader_file)
+	set(shader_source "${gpu_tiler_shader_dir}/${shader_file}")
 	set(shader_spv "${gpu_blit_generated_dir}/${shader_name}.spv")
 	set(shader_header "${gpu_blit_generated_dir}/${shader_name}_spv.h")
 	string(TOUPPER "${shader_name}_SPV" shader_symbol)
 	add_custom_command(
 		OUTPUT "${shader_header}"
 		COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_blit_generated_dir}"
-		COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+		COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os ${ARGN}
 		        "-I${gpu_tiler_shader_dir}" -o "${shader_spv}" "${shader_source}"
 		COMMAND ${CMAKE_COMMAND} -DINPUT=${shader_spv} -DOUTPUT=${shader_header}
 		        -DSYMBOL=${shader_symbol} -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
 		DEPENDS "${shader_source}"
 		VERBATIM
 	)
-	list(APPEND gpu_blit_shader_headers "${shader_header}")
-endforeach()
+	set(gpu_blit_shader_headers ${gpu_blit_shader_headers} "${shader_header}" PARENT_SCOPE)
+endfunction()
+add_gpu_blit_shader(gpu_blit_fs_triangle gpu_blit_fs_triangle.vert)
+add_gpu_blit_shader(gpu_blit_color_to_ms_depth gpu_blit_color_to_ms_depth.frag)
+add_gpu_blit_shader(gpu_video_out_overlay gpu_video_out_overlay.frag)
+add_gpu_blit_shader(gpu_imgui_hdr gpu_video_out_overlay.frag -DIMGUI_HDR=1)
 list(APPEND kyty_emulator_src ${gpu_blit_shader_headers})
 
 list(APPEND kyty_emulator_src
@@ -412,12 +416,15 @@ add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.c
 
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ReadLaneElimination.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/PartialWaveReduction.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
+	"${KYTY_SOURCE_DIR}/common/experiments.cpp"
 )
-target_link_libraries(scalar_provenance_tests fmt::fmt)
+target_link_libraries(scalar_provenance_tests fmt::fmt xbyak::xbyak)
 target_include_directories(scalar_provenance_tests PRIVATE ${inc_headers})
 
 add_executable(page_manager_tests EXCLUDE_FROM_ALL
@@ -471,6 +478,13 @@ add_executable(memory_tracker_tests EXCLUDE_FROM_ALL
 target_link_libraries(memory_tracker_tests fmt::fmt common)
 target_include_directories(memory_tracker_tests PRIVATE ${inc_headers})
 
+add_executable(gpu_pipeline_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/GpuPipelineTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/commandRecorder.cpp"
+)
+target_link_libraries(gpu_pipeline_tests fmt::fmt common Vulkan::Headers xxhash)
+target_include_directories(gpu_pipeline_tests PRIVATE ${inc_headers})
+
 add_executable(shader_vertex_metadata_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ShaderVertexMetadataTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
@@ -486,7 +500,7 @@ add_executable(resource_materialization_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
 )
-target_link_libraries(resource_materialization_tests fmt::fmt)
+target_link_libraries(resource_materialization_tests fmt::fmt xbyak::xbyak)
 if(KYTY_SRT_PROFILE)
 	# Offline TSC accumulators (SrtProf.h); never enabled for the emulator.
 	target_compile_definitions(resource_materialization_tests PRIVATE KYTY_SRT_PROFILE=1)
@@ -506,9 +520,9 @@ add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceTracking.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ShaderInfoCollection.cpp"
-	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/BindingLayout.cpp"
+	"${KYTY_SOURCE_DIR}/common/experiments.cpp"
 )
-target_link_libraries(resource_tracking_tests fmt::fmt)
+target_link_libraries(resource_tracking_tests fmt::fmt xbyak::xbyak)
 target_include_directories(resource_tracking_tests PRIVATE ${inc_headers})
 
 add_executable(audio_out2_port_tests EXCLUDE_FROM_ALL
@@ -618,6 +632,22 @@ add_kyty_full_emulator_test(virtual_memory_allocation_tests "${KYTY_TESTS_DIR}/V
 target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 	KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1)
 
+# Common::SoftExitScope turns a fatal error of the current thread into a C++ exception: its
+# thrower and the renderer code that catches it need exceptions where they are off by default.
+if(NOT KYTY_CLANG_CL)
+	target_compile_options(common PRIVATE -fexceptions)
+	set_source_files_properties(
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/descriptors.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp"
+		PROPERTIES COMPILE_OPTIONS -fexceptions)
+else()
+	target_compile_options(common PRIVATE /EHsc)
+	set_source_files_properties(
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/descriptors.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp"
+		PROPERTIES COMPILE_OPTIONS /EHsc)
+endif()
+
 # These tests use exceptions.
 if(NOT KYTY_CLANG_CL)
 	foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests
@@ -625,7 +655,10 @@ if(NOT KYTY_CLANG_CL)
 		target_compile_options(${kyty_exception_test} PRIVATE -fexceptions)
 	endforeach()
 else()
-	target_compile_options(scalar_provenance_tests PRIVATE /EHsc)
+	foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests
+			virtual_memory_allocation_tests)
+		target_compile_options(${kyty_exception_test} PRIVATE /EHsc)
+	endforeach()
 endif()
 
 if(BUILD_TESTING)
@@ -688,6 +721,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --context-state-only)
 	add_test(NAME gpu_tiler
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-tiler-only)
+	add_test(NAME image_transfer_layout
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-layout-only)
 
 	add_test(NAME texture_cache_layered_image
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --layered-image-only)
@@ -703,6 +738,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --compute-meta-clear-only)
 	add_test(NAME buffer_cache_dirty_gc
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-gc-only)
+	add_test(NAME indirect_write_tables
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --indirect-write-tables-only)
 	add_test(NAME color_render_target_1d
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --rt1d-only)
 

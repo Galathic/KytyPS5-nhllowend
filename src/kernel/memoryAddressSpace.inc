@@ -105,6 +105,7 @@ public:
 		}
 		m_maps.clear();
 		BumpMapGeneration();
+		MapsChangedUnlocked();
 		if (m_backing_base != nullptr) {
 			UnmapViewOfFile(m_backing_base);
 		}
@@ -118,6 +119,7 @@ public:
 		}
 		m_maps.clear();
 		BumpMapGeneration();
+		MapsChangedUnlocked();
 		if (m_backing_base != nullptr) {
 			munmap(m_backing_base, m_size);
 		}
@@ -163,19 +165,54 @@ public:
 		if (!IsAvailable() || !RangeOk(backing_offset, size)) {
 			return false;
 		}
+		std::lock_guard lock(m_mutex);
 		std::memset(m_backing_base + backing_offset, 0, size);
 		return true;
 	}
 
 	bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
-		if (data == nullptr) {
+		if (!IsAvailable() || data == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
+
 		const auto* source = static_cast<const uint8_t*>(data);
-		return TryTransferBacking(vaddr, size,
-		                          [source](uint8_t* backing, uint64_t data_offset, size_t bytes) {
-			                          std::memcpy(backing, source + data_offset, bytes);
-		                          });
+		if (TryCachedTransfer(vaddr, size, [source](uint8_t* backing, size_t bytes) {
+			    std::memcpy(backing, source, bytes);
+		    })) {
+			return true;
+		}
+
+		std::lock_guard lock(m_mutex);
+		const auto      end   = vaddr + size;
+		auto            first = m_maps.upper_bound(vaddr);
+		if (first == m_maps.begin()) {
+			return false;
+		}
+		--first;
+		auto current = vaddr;
+		for (auto mapping = first; current < end; ++mapping) {
+			if (mapping == m_maps.end() || current < mapping->second.vaddr ||
+			    current >= mapping->second.vaddr + mapping->second.size) {
+				return false;
+			}
+			const auto& entry = mapping->second;
+			const auto  bytes = std::min(end, entry.vaddr + entry.size) - current;
+			if (!RangeOk(entry.backing_offset + current - entry.vaddr, bytes)) {
+				return false;
+			}
+			current += bytes;
+		}
+
+		RememberMapping(first->second, end);
+		current = vaddr;
+		for (auto mapping = first; current < end; ++mapping) {
+			const auto& entry  = mapping->second;
+			const auto  bytes  = std::min(end, entry.vaddr + entry.size) - current;
+			const auto  offset = entry.backing_offset + current - entry.vaddr;
+			std::memcpy(m_backing_base + offset, source + (current - vaddr), bytes);
+			current += bytes;
+		}
+		return true;
 	}
 
 	// Writes each byte of `data` whose backing byte still equals `expected` (aligned dwords with one
@@ -231,6 +268,11 @@ public:
 			    },
 			    true);
 		}
+		if (TryCachedTransfer(vaddr, size, [destination](uint8_t* backing, size_t bytes) {
+			    std::memcpy(destination, backing, bytes);
+		    })) {
+			return true;
+		}
 		return TryTransferBacking(
 		    vaddr, size, [destination](uint8_t* backing, uint64_t data_offset, size_t bytes) {
 			    std::memcpy(destination + data_offset, backing, bytes);
@@ -272,34 +314,55 @@ public:
 		return ok;
 	}
 
+	// The backing alias of a range that one mapping holds, or null. The alias stays mapped for
+	// the store's lifetime, so the pointer can be read later, even after the guest range changed.
+	const uint8_t* FindBackingPointer(uint64_t vaddr, uint64_t size) {
+		if (!IsAvailable() || size == 0 || UINT64_MAX - vaddr < size) {
+			return nullptr;
+		}
+		const uint8_t* result = nullptr;
+		if (TryCachedTransfer(vaddr, size, [&](uint8_t* backing, size_t) { result = backing; })) {
+			return result;
+		}
+
+		std::shared_lock lock(m_mutex);
+		const auto       end     = vaddr + size;
+		auto             mapping = m_maps.upper_bound(vaddr);
+		if (mapping == m_maps.begin()) {
+			return nullptr;
+		}
+		const auto& entry = std::prev(mapping)->second;
+		if (vaddr < entry.vaddr || end > entry.vaddr + entry.size ||
+		    !RangeOk(entry.backing_offset + vaddr - entry.vaddr, size)) {
+			return nullptr;
+		}
+		RememberMapping(entry, end);
+		return m_backing_base + entry.backing_offset + (vaddr - entry.vaddr);
+	}
+
 	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
 		if (!IsAvailable() || data == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
 
-		std::lock_guard lock(m_mutex);
-		const auto      end   = vaddr + size;
-		auto            first = m_maps.lower_bound(vaddr);
-		if (first != m_maps.begin()) {
-			auto previous = std::prev(first);
-			if (previous->second.vaddr + previous->second.size > vaddr) {
-				first = previous;
-			}
+		std::shared_lock lock(m_mutex);
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+		if (g_test_backing_read != nullptr) {
+			g_test_backing_read(vaddr, size);
 		}
-		for (auto mapping = first; mapping != m_maps.end() && mapping->second.vaddr < end;
-		     ++mapping) {
-			const auto& entry = mapping->second;
-			const auto  start = std::max(vaddr, entry.vaddr);
-			const auto  bytes = std::min(end, entry.vaddr + entry.size) - start;
-			if (!RangeOk(entry.backing_offset + start - entry.vaddr, bytes)) {
-				return false;
+#endif
+		const auto end     = vaddr + size;
+		auto       mapping = m_maps.lower_bound(vaddr);
+		if (mapping != m_maps.begin()) {
+			auto previous = std::prev(mapping);
+			if (previous->second.vaddr + previous->second.size > vaddr) {
+				mapping = previous;
 			}
 		}
 
 		auto* destination = static_cast<uint8_t*>(data);
 		auto  cursor      = vaddr;
-		for (auto mapping = first; mapping != m_maps.end() && mapping->second.vaddr < end;
-		     ++mapping) {
+		for (; mapping != m_maps.end() && mapping->second.vaddr < end; ++mapping) {
 			const auto& entry  = mapping->second;
 			const auto  start  = std::max(vaddr, entry.vaddr);
 			const auto  bytes  = std::min(end, entry.vaddr + entry.size) - start;
@@ -338,7 +401,9 @@ public:
 			std::lock_guard lock(m_mutex);
 			EXIT_IF(!m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
 			BumpMapGeneration();
+			MapsChangedUnlocked();
 		}
+		BumpBackingEpoch();
 		SetFailure(failure_reason, FailureReason::None);
 		return true;
 #else
@@ -350,6 +415,8 @@ public:
 		RemoveMappingsUnlocked(vaddr, size);
 		EXIT_IF(!m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
 		BumpMapGeneration();
+		MapsChangedUnlocked();
+		BumpBackingEpoch();
 		SetFailure(failure_reason, FailureReason::None);
 		return true;
 #endif
@@ -359,6 +426,7 @@ public:
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
+		BumpBackingEpoch();
 
 		if (placeholder_preserved != nullptr) {
 			*placeholder_preserved = false;
@@ -438,6 +506,7 @@ public:
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 					m_maps.erase(entry);
 					BumpMapGeneration();
+					MapsChangedUnlocked();
 #endif
 				}
 			}
@@ -459,6 +528,7 @@ public:
 				std::lock_guard lock(m_mutex);
 				m_maps.emplace(old.vaddr, old);
 				BumpMapGeneration();
+				MapsChangedUnlocked();
 				return false;
 			}
 			if (placeholder_preserved != nullptr) {
@@ -504,6 +574,7 @@ public:
 		std::lock_guard lock(m_mutex);
 		m_maps.emplace(old.vaddr, old);
 		BumpMapGeneration();
+		MapsChangedUnlocked();
 		return false;
 #else
 		// Replace only the requested range so concurrent accesses and GPU watch
@@ -514,6 +585,7 @@ public:
 
 		std::lock_guard lock(m_mutex);
 		RemoveMappingsUnlocked(vaddr, size);
+		MapsChangedUnlocked();
 
 		if (placeholder_preserved != nullptr) {
 			*placeholder_preserved = true;
@@ -527,7 +599,7 @@ public:
 			return false;
 		}
 
-		std::lock_guard lock(m_mutex);
+		std::shared_lock lock(m_mutex);
 		const auto      end     = vaddr + size;
 		auto            current = vaddr;
 
@@ -567,8 +639,14 @@ private:
 			return false;
 		}
 
-		std::lock_guard lock(m_mutex);
-		const auto      end     = vaddr + size;
+		// Copies out and compares only: concurrent readers share the lock.
+		std::shared_lock lock(m_mutex);
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+		if (g_test_backing_read != nullptr) {
+			g_test_backing_read(vaddr, size);
+		}
+#endif
+		const auto end = vaddr + size;
 		{
 			// Single-mapping fast path (the common one-word SRT read): one lookup instead of
 			// a validation pass plus a transfer pass. Same checks, same result, same lock.
@@ -577,6 +655,7 @@ private:
 			    RangeOk(first.backing_offset + vaddr - first.vaddr, size)) {
 				transfer(m_backing_base + first.backing_offset + (vaddr - first.vaddr), 0,
 				         static_cast<size_t>(size));
+				RememberMapping(first, end);
 				if (fill_cache) {
 					// m_mutex is held, so m_map_gen is stable and describes this entry.
 					const auto ok_len = std::min<uint64_t>(first.size, m_size - first.backing_offset);
@@ -645,6 +724,64 @@ private:
 		}
 	}
 #endif
+	struct LookupCache {
+		const GuestBackingStore* owner      = nullptr;
+		uint64_t                 generation = 0;
+		uint32_t                 next       = 0;
+		std::array<MapEntry, 4>  entries {};
+	};
+
+	static LookupCache& ThreadLookupCache() noexcept {
+		thread_local LookupCache cache;
+		return cache;
+	}
+
+	// Called after every change of m_maps, under m_mutex. The generation is shared by all stores,
+	// so a store recreated at the address of a destroyed one never matches a stale lookup.
+	static void MapsChangedUnlocked() noexcept {
+		s_maps_generation.fetch_add(1, std::memory_order_release);
+	}
+
+	inline static std::atomic<uint64_t> s_maps_generation {0};
+
+	// The GPU thread streams thousands of small buffers per frame from a few mappings: reuse the
+	// lookups it made last, without the lock, while no mapping changed. The entries and the
+	// generation were read together under m_mutex, and every change of m_maps advances the
+	// generation under m_mutex, so observing it unchanged (acquire) means no change completed
+	// since. A change racing with this transfer orders as if it followed it: the backing alias
+	// stays mapped for the store's lifetime, and host views are never unmapped under m_mutex
+	// either.
+	template <typename Transfer>
+	bool TryCachedTransfer(uint64_t vaddr, uint64_t size, Transfer transfer) {
+		const auto& cached = ThreadLookupCache();
+		if (cached.owner != this ||
+		    cached.generation != s_maps_generation.load(std::memory_order_acquire)) {
+			return false;
+		}
+		const auto end = vaddr + size;
+		for (const auto& entry: cached.entries) {
+			if (vaddr >= entry.vaddr && end <= entry.vaddr + entry.size) {
+				transfer(m_backing_base + entry.backing_offset + (vaddr - entry.vaddr),
+				         static_cast<size_t>(size));
+				return true;
+			}
+		}
+		return false;
+	}
+
+	// Called under m_mutex (shared or exclusive) after a lookup: remembers a mapping that holds
+	// the whole transfer [entry.vaddr <= vaddr, end].
+	void RememberMapping(const MapEntry& entry, uint64_t end) {
+		if (end > entry.vaddr + entry.size || !RangeOk(entry.backing_offset, entry.size)) {
+			return;
+		}
+		auto&      cached     = ThreadLookupCache();
+		const auto generation = s_maps_generation.load(std::memory_order_relaxed);
+		if (cached.owner != this || cached.generation != generation) {
+			cached = {this, generation};
+		}
+		cached.entries[cached.next++ % cached.entries.size()] = entry;
+	}
 
 	bool FindContainingUnlocked(uint64_t vaddr, uint64_t size, MapEntry* out) const {
 		EXIT_IF(out == nullptr);
@@ -719,7 +856,7 @@ private:
 			return nullptr;
 		}
 
-		if (!ApplyProtection(ptr, size, mode)) {
+		if (mode == VirtualMemory::Mode::NoAccess && !ApplyProtection(ptr, size, mode)) {
 			UnmapViewOfFile2(GetCurrentProcess(), ptr, MEM_PRESERVE_PLACEHOLDER);
 			SetFailure(failure_reason, FailureReason::ProtectFailed);
 			return nullptr;
@@ -778,7 +915,7 @@ private:
 
 	uint8_t*                     m_backing_base = nullptr;
 	uint64_t                     m_size         = 0;
-	std::mutex                   m_mutex;
+	std::shared_mutex            m_mutex;
 	std::map<uint64_t, MapEntry> m_maps;
 };
 
@@ -849,7 +986,7 @@ public:
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
-		std::lock_guard lock(m_mutex);
+		std::shared_lock lock(m_mutex);
 		return std::any_of(m_owned.begin(), m_owned.end(), [vaddr, size](const auto& range) {
 			return vaddr >= range.first && vaddr + size <= range.first + range.second;
 		});
@@ -881,11 +1018,15 @@ public:
 		return m_backing->TryCompareBacking(vaddr, expected, size, equal);
 	}
 
+	const uint8_t* FindBackingPointer(uint64_t vaddr, uint64_t size) {
+		return m_backing->FindBackingPointer(vaddr, size);
+	}
+
 	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
 		if (!Owns(vaddr, size)) {
 			return false;
 		}
-		std::lock_guard lock(m_mutex);
+		std::shared_lock lock(m_mutex);
 		auto            mapping = m_mapped.upper_bound(vaddr);
 		if (mapping != m_mapped.begin()) {
 			--mapping;
@@ -1511,7 +1652,7 @@ private:
 #endif
 	}
 
-	std::mutex                                 m_mutex;
+	std::shared_mutex                          m_mutex;
 	std::map<uint64_t, uint64_t>               m_free;
 	std::map<uint64_t, MappedRegion>            m_mapped;
 	std::vector<std::pair<uint64_t, uint64_t>> m_owned;

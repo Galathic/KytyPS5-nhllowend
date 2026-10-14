@@ -18,9 +18,12 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <cstdio>
+#include <cstring>
+#include <initializer_list>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -337,6 +340,29 @@ static void ShaderDetectBuffers(ShaderVertexInputInfo& info) {
 	}
 }
 
+thread_local ShaderGuestReader t_guest_reader          = nullptr;
+thread_local void*             t_guest_reader_userdata = nullptr;
+
+ShaderGuestReaderScope::ShaderGuestReaderScope(ShaderGuestReader reader, void* userdata)
+    : m_previous_reader(t_guest_reader), m_previous_userdata(t_guest_reader_userdata) {
+	t_guest_reader          = reader;
+	t_guest_reader_userdata = userdata;
+}
+
+ShaderGuestReaderScope::~ShaderGuestReaderScope() {
+	t_guest_reader          = m_previous_reader;
+	t_guest_reader_userdata = m_previous_userdata;
+}
+
+static void ReadShaderGuest(const void* address, void* data, size_t size) {
+	if (t_guest_reader == nullptr) {
+		std::memcpy(data, address, size);
+	} else if (!t_guest_reader(t_guest_reader_userdata, reinterpret_cast<uint64_t>(address), data,
+	                           size)) {
+		std::memset(data, 0, size);
+	}
+}
+
 static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
                                        std::span<const ShaderSemantic> input_semantics,
                                        const uint32_t* attrib, const uint32_t* buffer) {
@@ -354,20 +380,21 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 		uint32_t reg  = in.hardware_mapping;
 		uint32_t size = in.size_in_elements;
 
+		uint32_t attribute = 0;
+		ReadShaderGuest(&attrib[in.semantic], &attribute, sizeof(attribute));
 		if (debug_dump) {
-			LOGF("reg = %u, size = %u, va[%u] = 0x%08" PRIx32 "\n", reg, size, i,
-			     attrib[in.semantic]);
+			LOGF("reg = %u, size = %u, va[%u] = 0x%08" PRIx32 "\n", reg, size, i, attribute);
 		}
 
-		size_t index = attrib[in.semantic] & 0x1fu;
-		auto   format =
-		    static_cast<Prospero::VertexAttribFormat>((attrib[in.semantic] >> 5u) & 0x1ffu);
-		uint32_t offset      = (attrib[in.semantic] >> 14u) & 0xfffu;
-		uint32_t fetch_index = (attrib[in.semantic] >> 26u) & 0x1u;
+		size_t   index  = attribute & 0x1fu;
+		auto     format = static_cast<Prospero::VertexAttribFormat>((attribute >> 5u) & 0x1ffu);
+		uint32_t offset = (attribute >> 14u) & 0xfffu;
+		uint32_t fetch_index = (attribute >> 26u) & 0x1u;
 
 		EXIT_NOT_IMPLEMENTED(index >= ShaderVertexInputInfo::RES_MAX);
 
-		const auto* sharp = &buffer[index * 4];
+		uint32_t sharp[4] {};
+		ReadShaderGuest(&buffer[index * 4], sharp, sizeof(sharp));
 
 		EXIT_NOT_IMPLEMENTED(info.resources_num >= ShaderVertexInputInfo::RES_MAX);
 
@@ -464,7 +491,8 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
                                            ShaderVertexInputInfo&  info) {
 	KYTY_PROFILER_FUNCTION();
 
-	info = {};
+	// In place: assigning a temporary zeroes and then copies the 10 KiB structure.
+	std::construct_at(&info);
 
 	info.pa_cl_vs_out_cntl = sh.m_paClVsOutCntl;
 
@@ -575,10 +603,12 @@ static void ShaderGetStaticInputInfoPS(
 static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
                                        const HW::ShaderRegisters& /*sh*/,
                                        const ShaderMappedData& data, ShaderComputeInputInfo& info) {
+	const bool async_compute             = info.async_compute;
 	const bool dispatch_thread_dimensions = info.dispatch_thread_dimensions;
 	const auto host_subgroup_size         = info.host_subgroup_size;
 	const auto workgroup_counts           = std::to_array(info.workgroup_counts);
 	info                                  = {};
+	info.async_compute                    = async_compute;
 	info.dispatch_thread_dimensions       = dispatch_thread_dimensions;
 	info.host_subgroup_size               = host_subgroup_size;
 	std::ranges::copy(workgroup_counts, info.workgroup_counts);
@@ -598,119 +628,156 @@ static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
 	info.workgroup_register = regs.cs_regs.user_sgpr;
 }
 
+namespace {
+
+// Static keys are assembled in a local buffer and copied once: pushing into the vector
+// reloads and stores its end pointer for every word.
+class StaticKeyBuilder {
+public:
+	void push_back(uint32_t word) {
+		EXIT_IF(m_size == m_words.size());
+		m_words[m_size++] = word;
+	}
+	void insert(std::initializer_list<uint32_t> words) {
+		for (const auto word: words) {
+			push_back(word);
+		}
+	}
+	template <typename Iterator>
+	void insert(Iterator first, Iterator last) {
+		for (; first != last; ++first) {
+			push_back(static_cast<uint32_t>(*first));
+		}
+	}
+	void CopyTo(std::vector<uint32_t>& key) const {
+		key.assign(m_words.begin(), m_words.begin() + m_size);
+	}
+
+private:
+	std::array<uint32_t, 512> m_words;
+	uint32_t                  m_size = 0;
+};
+
+} // namespace
+
 void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t>& key) {
 	EXIT_IF(info.resources_num < 0 || info.resources_num > ShaderVertexInputInfo::RES_MAX);
-	key.clear();
-	key.insert(key.end(), info.native_draw.registers.begin(), info.native_draw.registers.end());
-	key.push_back(static_cast<uint32_t>(info.native_draw.indexed));
-	key.push_back(static_cast<uint32_t>(info.fetch_embedded));
-	key.push_back(static_cast<uint32_t>(info.fetch_attrib_reg));
-	key.push_back(static_cast<uint32_t>(info.fetch_buffer_reg));
-	key.push_back(info.resources_num);
-	key.push_back(info.wave_size);
-	key.push_back(info.scratch_size_dwords);
-	key.push_back(static_cast<uint32_t>(ShaderNativeFp16()));
-	key.push_back(static_cast<uint32_t>(ShaderExecSelects()));
-	key.push_back(static_cast<uint32_t>(ShaderLdsLaneSlots()));
-	key.push_back(info.pa_cl_vs_out_cntl);
-	key.push_back(static_cast<uint32_t>(info.clip_space.enabled));
+	StaticKeyBuilder words;
+	words.insert(info.native_draw.registers.begin(), info.native_draw.registers.end());
+	words.push_back(static_cast<uint32_t>(info.native_draw.indexed));
+	words.push_back(static_cast<uint32_t>(info.fetch_embedded));
+	words.push_back(static_cast<uint32_t>(info.fetch_attrib_reg));
+	words.push_back(static_cast<uint32_t>(info.fetch_buffer_reg));
+	words.push_back(info.resources_num);
+	words.push_back(info.wave_size);
+	words.push_back(info.scratch_size_dwords);
+	words.push_back(static_cast<uint32_t>(ShaderNativeFp16()));
+	words.push_back(static_cast<uint32_t>(ShaderExecSelects()));
+	words.push_back(static_cast<uint32_t>(ShaderLdsLaneSlots()));
+	words.push_back(info.pa_cl_vs_out_cntl);
+	words.push_back(static_cast<uint32_t>(info.clip_space.enabled));
 	if (info.clip_space.enabled) {
 		for (const float value: info.clip_space.scale) {
-			key.push_back(std::bit_cast<uint32_t>(value));
+			words.push_back(std::bit_cast<uint32_t>(value));
 		}
 		for (const float value: info.clip_space.offset) {
-			key.push_back(std::bit_cast<uint32_t>(value));
+			words.push_back(std::bit_cast<uint32_t>(value));
 		}
 		for (const float value: info.clip_space.half_extent) {
-			key.push_back(std::bit_cast<uint32_t>(value));
+			words.push_back(std::bit_cast<uint32_t>(value));
 		}
 	}
 
-	key.push_back(info.mesh.threads_num[0]);
+	words.push_back(info.mesh.threads_num[0]);
 	if (info.mesh.threads_num[0] != 0) {
 		const auto& mesh = info.mesh;
-		key.insert(key.end(), {mesh.wave_size, mesh.host_subgroup_size, mesh.lds_size_dwords,
-		                       mesh.scratch_size_dwords, mesh.input_primitive,
-		                       mesh.primitives_per_group, mesh.vertices_per_group,
-		                       mesh.max_vertices, mesh.max_primitives, mesh.provoking_vertex,
-		                       static_cast<uint32_t>(mesh.fast_launch)});
+		words.insert({mesh.wave_size, mesh.host_subgroup_size, mesh.lds_size_dwords,
+		              mesh.scratch_size_dwords, mesh.input_primitive,
+		              mesh.primitives_per_group, mesh.vertices_per_group,
+		              mesh.max_vertices, mesh.max_primitives, mesh.provoking_vertex,
+		              static_cast<uint32_t>(mesh.fast_launch)});
 	}
-	key.push_back(info.tess.input_control_points);
+	words.push_back(info.tess.input_control_points);
 	if (info.tess.input_control_points != 0) {
 		const auto& tess = info.tess;
-		key.insert(key.end(), {tess.output_control_points, tess.ls_stride, tess.hs_stride,
-		                       tess.domain, tess.partitioning, tess.output_topology});
+		words.insert({tess.output_control_points, tess.ls_stride, tess.hs_stride,
+		              tess.domain, tess.partitioning, tess.output_topology});
 	}
 
 	for (int i = 0; i < info.resources_num; i++) {
 		const auto& resource    = info.resources[i];
 		const auto& destination = info.resources_dst[i];
-		key.push_back(destination.registers_num);
-		key.push_back(static_cast<uint32_t>(destination.attr_id));
-		key.push_back(resource.fields[3] & 0x7ffffu); // Channels and format used by embedded fetch.
+		words.push_back(destination.registers_num);
+		words.push_back(static_cast<uint32_t>(destination.attr_id));
+		words.push_back(resource.fields[3] & 0x7ffffu); // Channels and format used by embedded fetch.
 	}
+	words.CopyTo(key);
 }
 
 void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>& key) {
 	EXIT_IF(info.input_num > std::size(info.interpolator_settings));
-	key.clear();
-	key.push_back(info.pixel_quad_correct);
-	key.push_back(info.scratch_size_dwords);
-	key.push_back(info.input_num);
-	key.push_back(info.wave_size);
-	key.push_back(info.ps_system_input_base);
-	key.push_back(info.custom_interpolation_mask);
-	key.push_back(info.ps_perspective_center_vgpr);
-	key.push_back(info.ps_perspective_sample_vgpr);
-	key.push_back(info.ps_perspective_centroid_vgpr);
-	key.push_back(static_cast<uint32_t>(info.ps_pos_x));
-	key.push_back(static_cast<uint32_t>(info.ps_pos_y));
-	key.push_back(static_cast<uint32_t>(info.ps_pos_z));
-	key.push_back(static_cast<uint32_t>(info.ps_pos_w));
-	key.push_back(static_cast<uint32_t>(info.ps_front_face));
-	key.push_back(static_cast<uint32_t>(info.ps_front_face_all_bits));
-	key.push_back(static_cast<uint32_t>(info.ps_ancillary));
-	key.push_back(static_cast<uint32_t>(info.ps_no_perspective));
-	key.push_back(static_cast<uint32_t>(info.ps_pixel_kill_enable));
-	key.push_back(static_cast<uint32_t>(info.ps_depth_export_enable));
-	key.push_back(static_cast<uint32_t>(info.ps_sample_mask_export_enable));
-	key.push_back(static_cast<uint32_t>(info.ps_early_z));
-	key.push_back(static_cast<uint32_t>(info.dual_source_blending));
-	key.push_back(static_cast<uint32_t>(info.alpha_blend_source));
-	key.insert(key.end(), std::begin(info.target_output_mode), std::end(info.target_output_mode));
+	StaticKeyBuilder words;
+	words.push_back(info.pixel_quad_correct);
+	words.push_back(info.scratch_size_dwords);
+	words.push_back(info.input_num);
+	words.push_back(info.wave_size);
+	words.push_back(info.ps_system_input_base);
+	words.push_back(info.custom_interpolation_mask);
+	words.push_back(info.ps_perspective_center_vgpr);
+	words.push_back(info.ps_perspective_sample_vgpr);
+	words.push_back(info.ps_perspective_centroid_vgpr);
+	words.push_back(static_cast<uint32_t>(info.ps_pos_x));
+	words.push_back(static_cast<uint32_t>(info.ps_pos_y));
+	words.push_back(static_cast<uint32_t>(info.ps_pos_z));
+	words.push_back(static_cast<uint32_t>(info.ps_pos_w));
+	words.push_back(static_cast<uint32_t>(info.ps_front_face));
+	words.push_back(static_cast<uint32_t>(info.ps_front_face_all_bits));
+	words.push_back(static_cast<uint32_t>(info.ps_ancillary));
+	words.push_back(static_cast<uint32_t>(info.ps_no_perspective));
+	words.push_back(static_cast<uint32_t>(info.parameter_mode));
+	words.push_back(static_cast<uint32_t>(info.ps_pixel_kill_enable));
+	words.push_back(static_cast<uint32_t>(info.ps_depth_export_enable));
+	words.push_back(static_cast<uint32_t>(info.ps_sample_mask_export_enable));
+	words.push_back(static_cast<uint32_t>(info.ps_early_z));
+	words.push_back(static_cast<uint32_t>(info.dual_source_blending));
+	words.push_back(static_cast<uint32_t>(info.alpha_blend_source));
+	words.insert(std::begin(info.target_output_mode), std::end(info.target_output_mode));
 	const auto mask = info.target_shader_mask;
-	key.push_back((mask | (mask >> 1u) | (mask >> 2u) | (mask >> 3u)) & 0x11111111u);
+	words.push_back((mask | (mask >> 1u) | (mask >> 2u) | (mask >> 3u)) & 0x11111111u);
 	for (uint32_t base = 0; base < info.target_export_mapping.size(); base += 4u) {
 		uint32_t packed = 0;
 		for (uint32_t i = 0; i < 4u; i++) {
 			packed |= static_cast<uint32_t>(info.target_export_mapping[base + i].packed)
 			          << (i * 8u);
 		}
-		key.push_back(packed);
+		words.push_back(packed);
 	}
-	key.insert(key.end(), std::begin(info.interpolator_settings),
-	           std::begin(info.interpolator_settings) + info.input_num);
-	key.push_back(static_cast<uint32_t>(ShaderNativeFp16()));
-	key.push_back(static_cast<uint32_t>(ShaderExecSelects()));
-	key.push_back(static_cast<uint32_t>(ShaderLdsLaneSlots()));
+	words.insert(std::begin(info.interpolator_settings),
+	             std::begin(info.interpolator_settings) + info.input_num);
+	words.push_back(static_cast<uint32_t>(ShaderNativeFp16()));
+	words.push_back(static_cast<uint32_t>(ShaderExecSelects()));
+	words.push_back(static_cast<uint32_t>(ShaderLdsLaneSlots()));
+	words.CopyTo(key);
 }
 
 void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_t>& key) {
-	key.clear();
-	key.push_back(info.workgroup_register);
-	key.push_back(info.wave_size | (static_cast<uint32_t>(info.float_mode) << 8u));
-	key.push_back(info.host_subgroup_size);
-	key.push_back(info.thread_ids_num);
-	key.push_back(info.lds_size_dwords);
-	key.push_back(info.scratch_size_dwords);
-	key.push_back(static_cast<uint32_t>(info.dispatch_thread_dimensions));
+	StaticKeyBuilder words;
+	words.push_back(info.workgroup_register);
+	words.push_back(info.wave_size | (static_cast<uint32_t>(info.float_mode) << 8u));
+	words.push_back(info.host_subgroup_size);
+	words.push_back(info.thread_ids_num);
+	words.push_back(info.lds_size_dwords);
+	words.push_back(info.scratch_size_dwords);
+	words.push_back(static_cast<uint32_t>(info.dispatch_thread_dimensions) |
+	                (static_cast<uint32_t>(info.async_compute) << 1u));
 	for (int i = 0; i < 3; i++) {
-		key.push_back(info.threads_num[i]);
-		key.push_back(static_cast<uint32_t>(info.group_id[i]));
+		words.push_back(info.threads_num[i]);
+		words.push_back(static_cast<uint32_t>(info.group_id[i]));
 	}
-	key.push_back(static_cast<uint32_t>(info.tg_size_en));
-	key.push_back(static_cast<uint32_t>(ShaderNativeFp16()));
-	key.push_back(static_cast<uint32_t>(ShaderExecSelects()));
+	words.push_back(static_cast<uint32_t>(info.tg_size_en));
+	words.push_back(static_cast<uint32_t>(ShaderNativeFp16()));
+	words.push_back(static_cast<uint32_t>(ShaderExecSelects()));
+	words.CopyTo(key);
 }
 
 ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context& context,
@@ -735,7 +802,7 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	}
 	// NGG user SGPRs start at s8; a separately compiled GS back half also receives
 	// its user-data pointer in s0:s1.
-	info                     = {};
+	std::construct_at(&info);
 	info.logical_stage       = ShaderType::Mesh;
 	info.pa_cl_vs_out_cntl   = sh.m_paClVsOutCntl;
 	auto& mesh               = info.mesh;
@@ -828,7 +895,7 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	params[1].user_data[0] = static_cast<uint32_t>(regs.hs_regs.user_data_addr);
 	params[1].user_data[1] = static_cast<uint32_t>(regs.hs_regs.user_data_addr >> 32u);
 
-	input_info = {};
+	std::construct_at(&input_info);
 	if (!ShaderGetStaticVertexInputInfo(regs.ls_regs.data_addr, regs.hs_user_sgpr,
 	                                    regs.hs_regs.rsrc2.user_sgpr, sh, local, input_info[0])) {
 		EXIT("failed to prepare local shader program\n");

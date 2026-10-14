@@ -6,9 +6,9 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
-#include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/shader.h"
 
+#include <cerrno>
 #include <set>
 #include <algorithm>
 #include <bit>
@@ -241,8 +241,8 @@ void CaptureBindings(const PreparedBindings& b, uint32_t seq, uint64_t ps_hash) 
 		// SRT: the flattened_srt buffer bound at binding NativeBinding(stage, FlattenedSrt) (= 109 for PS).
 		const uint32_t srt_binding = ShaderRecompiler::IR::NativeBinding(
 		    prog.stage, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt);
-		const bool srt_bound = ShaderRecompiler::IR::FindBinding(
-		                           prog.bindings, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) != nullptr;
+		const bool srt_bound = prog.bindings.descriptor_counts[static_cast<size_t>(
+		                           ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt)] != 0;
 		if (!srt_bound) {
 			std::snprintf(line, sizeof(line), "SRT %05u ps=0x%016" PRIx64 " binding=%u not bound\n", seq, ps_hash,
 			              srt_binding);
@@ -289,11 +289,11 @@ void CaptureBindings(const PreparedBindings& b, uint32_t seq, uint64_t ps_hash) 
 	}
 }
 
-void RecordReadback(GraphicContext& gfx, vk::CommandBuffer cmd, const Target& t, const char* label,
+void RecordReadback(GraphicContext& gfx, const CommandRecorder& cmd, const Target& t, const char* label,
                     uint32_t seq);
 
 // Records the GPU->host copies of the queued buffers and volumes. cmd must be outside a render pass.
-void FlushRequests(GraphicContext& gfx, vk::CommandBuffer cmd) {
+void FlushRequests(GraphicContext& gfx, const CommandRecorder& cmd) {
 	if (g_bufreq.empty() && g_volreq.empty()) return;
 	using S = vk::PipelineStageFlagBits2;
 	using A = vk::AccessFlagBits2;
@@ -912,7 +912,7 @@ void ProcessOne(Pending& p) {
 	g_log += line;
 }
 
-void BarrierImage(vk::CommandBuffer cmd, const Target& t, vk::ImageLayout from, vk::ImageLayout to,
+void BarrierImage(const CommandRecorder& cmd, const Target& t, vk::ImageLayout from, vk::ImageLayout to,
                   vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access,
                   vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access) {
 	vk::ImageMemoryBarrier2 b {};
@@ -937,7 +937,7 @@ void BarrierImage(vk::CommandBuffer cmd, const Target& t, vk::ImageLayout from, 
 }
 
 // Must be called with g_mutex held. Records the copy into cmd.
-void RecordReadback(GraphicContext& gfx, vk::CommandBuffer cmd, const Target& t, const char* label,
+void RecordReadback(GraphicContext& gfx, const CommandRecorder& cmd, const Target& t, const char* label,
                     uint32_t seq) {
 	char line[256];
 	if (t.w < kMinSize || (t.h < kMinSize && !t.img3d)) return;
@@ -1064,6 +1064,10 @@ void BeginCapture(CommandBuffer& buffer) {
 		}
 	}
 	std::filesystem::create_directories(g_dir, ec);
+	if (ec || !std::filesystem::is_directory(g_dir)) {
+		std::printf("NHL27FRAMEDUMP: cannot create %s: %s (%d)\n", g_dir.c_str(), ec.message().c_str(),
+		            ec.value());
+	}
 	g_targets.clear();
 	g_pending.clear();
 	g_log.clear();
@@ -1116,6 +1120,8 @@ void FinishCapture(CommandBuffer& buffer) {
 	if (FILE* f = std::fopen((g_dir + "/frame.txt").c_str(), "wb")) {
 		std::fwrite(out.data(), 1, out.size(), f);
 		std::fclose(f);
+	} else {
+		std::printf("NHL27FRAMEDUMP: cannot write %s/frame.txt: errno %d\n", g_dir.c_str(), errno);
 	}
 	std::printf("NHL27FRAMEDUMP: done, %u draws/dispatches, %u images -> %s\n", g_seq, n, g_dir.c_str());
 	std::fflush(stdout);

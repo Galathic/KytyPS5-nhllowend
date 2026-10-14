@@ -41,7 +41,7 @@ inline std::atomic<uint32_t> g_shader_native_fp16_modes {0};
 	}();
 	return 0x100u | mode;
 }
-// Codegen option: experiment LdsLaneSlots (SpirvRequirements::function_lds_lane_slots). Part of the
+// Codegen option: experiment LdsLaneSlots (ShaderInfo::function_lds_lane_slots). Part of the
 // vertex and pixel stage keys.
 [[nodiscard]] inline bool ShaderLdsLaneSlots() {
 	return Common::Experiments::Enabled(Common::Experiments::LdsLaneSlots);
@@ -190,6 +190,7 @@ struct ShaderVertexInputInfo {
 };
 
 struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
+	bool               async_compute              = false;
 	uint8_t            float_mode                 = 0xc0;
 	uint32_t           dispatch_threads_num[3]    = {0, 0, 0};
 	uint32_t           workgroup_counts[3]        = {0, 0, 0};
@@ -203,6 +204,7 @@ struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 };
 
 enum class ShaderAlphaBlendSource : uint8_t { None, SourceAlpha, SourceAlphaOne, SourceAlphaZero };
+enum class ShaderPixelParameterMode : uint8_t { FirstVertex, LastVertex, Rectangle };
 
 struct ShaderPixelInputInfo {
 	bool pixel_quad_correct = false;
@@ -226,6 +228,7 @@ struct ShaderPixelInputInfo {
 	bool                                           ps_front_face_all_bits       = false;
 	bool                                           ps_ancillary                 = false;
 	bool                                           ps_no_perspective            = false;
+	ShaderPixelParameterMode                       parameter_mode = ShaderPixelParameterMode::FirstVertex;
 	bool                                           ps_pixel_kill_enable         = false;
 	bool                                           ps_depth_export_enable       = false;
 	bool                                           ps_sample_mask_export_enable = false;

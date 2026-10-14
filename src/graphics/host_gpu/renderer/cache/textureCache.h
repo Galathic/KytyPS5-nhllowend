@@ -13,9 +13,11 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
 #include <atomic>
+#include <array>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <memory>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -31,7 +33,14 @@ class BufferCache;
 class CommandBuffer;
 class CommandScheduler;
 class RenderExecutor;
+class TextureCache;
 struct TextureCacheTestAccess;
+
+namespace BcAlias {
+[[nodiscard]] bool Matches(const ImageInfo& requested, const ImageInfo& cached);
+[[nodiscard]] bool Publish(TextureCache& cache, Image& image);
+void Resolve(TextureCache& cache, ImageId cached, ImageId merged);
+} // namespace BcAlias
 
 class TextureCache {
 public:
@@ -66,12 +75,18 @@ public:
 	[[nodiscard]] GenCheck CheckGenerationLog(uint64_t memo_gen, uint64_t begin, uint64_t end, uint64_t& current) const;
 	// The per-call bookkeeping FindImage does on a hit (last-access tick, LRU touch).
 	void                        NoteImageUse(ImageId id);
+	// Lookup for bindings the shader may never read (bindless table candidates). It resolves
+	// like FindImage but returns an empty id instead of converting a depth image to color or
+	// back: those conversions replace the image other passes use, which then convert it again.
+	[[nodiscard]] ImageId FindImageSpeculative(ImageDesc& desc, bool exact_format = false);
 	void                        UpdateImage(ImageId id);
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
 	[[nodiscard]] vk::ImageView FindTexture(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] vk::ImageView FindRenderTarget(ImageId id, const ImageDesc& desc);
-	[[nodiscard]] vk::ImageView FindDepthTarget(ImageId id, const ImageDesc& desc);
+	// stencil (optional) receives the stencil association the target refreshed, if any.
+	[[nodiscard]] vk::ImageView FindDepthTarget(ImageId id, const ImageDesc& desc,
+	                                            ImageId* stencil = nullptr);
 	[[nodiscard]] Image&        GetImage(ImageId id) {
 		auto& image = m_slot_images[id];
 		TouchImage(image);
@@ -87,6 +102,8 @@ public:
 	void               InvalidateMemory(uint64_t address, uint64_t size);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
 	[[nodiscard]] bool IsRegionRegistered(uint64_t address, uint64_t size);
+	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
+	[[nodiscard]] bool HasImagesInRegion(uint64_t address, uint64_t size);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
@@ -95,13 +112,14 @@ public:
 
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
+	// Advances whenever an image is registered or unregistered.
+	[[nodiscard]] uint64_t ImageSetEpoch() const { return m_image_set_epoch; }
+	// The ImageSetEpoch of the last registration or unregistration of an image overlapping the
+	// range's pages: while it is unchanged, a lookup in the range finds the same images.
+	[[nodiscard]] uint64_t ImageEpochInRegion(uint64_t address, uint64_t size);
 	void RunGarbageCollector();
 
 private:
-	enum class TransferDirection { Upload, Download };
-	struct TextureTransfer;
-	struct ImageDownload;
-
 	struct MetaDataInfo {
 		enum class Type : uint8_t { CMask, FMask, HTile };
 
@@ -113,6 +131,8 @@ private:
 		ImageId image;
 		int32_t mip   = -1;
 		int32_t layer = -1;
+		// Speculative lookups only: resolving the overlap would replace an owned image.
+		bool rejected = false;
 	};
 
 	using ImageIds       = InlinePageOwnerList<ImageId, 16>;
@@ -158,7 +178,11 @@ private:
 	[[nodiscard]] ImageIds      FindImagesInRegion(uint64_t address, uint64_t size,
 	                                               bool page_overlap) const;
 	[[nodiscard]] OverlapResult ResolveOverlap(const ImageInfo& requested, BindingType binding,
-	                                           ImageId cached, ImageId merged);
+	                                           ImageId cached, ImageId merged,
+	                                           bool speculative = false);
+	[[nodiscard]] ImageId       FindImageImpl(ImageDesc& desc, bool exact_format, bool speculative);
+	[[nodiscard]] static bool   DepthOverlapNeedsRecreate(const ImageInfo& requested,
+	                                                      BindingType binding, const Image& cached);
 	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
 	                                                ImageId cached);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
@@ -171,12 +195,10 @@ private:
 	                                                       uint64_t address, uint64_t slice_size,
 	                                                       uint32_t count, uint32_t image_first);
 	void                        InitializeImage(ImageId id);
-	[[nodiscard]] TextureTransfer
-	BuildTextureTransfer(const Image& image, BindingType binding, TransferDirection direction) const;
-	[[nodiscard]] ImageDownload BuildDownload(const Image& image) const;
+	[[nodiscard]] bool          CanDownload(const Image& image) const;
 	void UploadImage(Image& image, Buffer& source, uint64_t source_offset);
 	void DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
-	                       uint64_t destination_size, ImageDownload transfer);
+	                   uint64_t destination_size, uint32_t levels);
 	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);
 	void CommitGpuWrite(Image& image);
 	// Caller holds m_lock. Volume layer ranges select depth slices.
@@ -188,7 +210,9 @@ private:
 	void               CopyImage(ImageId destination, ImageId source);
 	[[nodiscard]] ImageId AssociateStencil(ImageId depth, GuestRange stencil);
 	void CopyImageMip(ImageId destination, ImageId source, uint32_t mip, uint32_t layer);
-	void ValidateImageDesc(const ImageDesc& desc) const;
+	// Validates the view and binding of a description; ImageOps::Validate() checks its image
+	// information.
+	void ValidateImageViewDesc(const ImageDesc& desc) const;
 
 	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
 	// tolerant_write: the deferred guest write skips (instead of exiting) if the range was unmapped.
@@ -210,6 +234,9 @@ private:
 	ImagePageTable                                    m_image_page_table;
 	// Registered images by exact start address (FindImage fast path).
 	std::unordered_map<uint64_t, std::vector<ImageId>> m_images_by_address;
+	MultiLevelPageTable<uint64_t, ImagePageTable::kPageBits, ImagePageTable::kAddressSpaceBits,
+	                    ImagePageTable::kFirstLevelBits>
+	    m_image_page_epochs;
 	std::unordered_map<vk::Format, ImageId>           m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
@@ -220,6 +247,7 @@ private:
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
 	uint64_t         m_gc_tick                = 0;
 	mutable uint32_t m_image_query_epoch      = 0;
+	uint64_t         m_image_set_epoch        = 0;
 	bool             m_readback_linear_images = false;
 	// Set while an overlap/alias resolution frees an image; only those frees write back.
 	bool             m_alias_free_in_progress = false;
@@ -232,10 +260,28 @@ private:
 	static constexpr uint64_t GEN_LOG_SIZE = 64;
 	mutable std::mutex        m_gen_log_mutex;
 	GenLogEntry               m_gen_log[GEN_LOG_SIZE] {};
+	// Lookups that found an existing image with the same backing, by description: while no image
+	// on the pages of the range was registered or unregistered since, the same lookup finds the
+	// same image.
+	struct ExactLookup {
+		ImageInfo info;
+		ImageId   id;
+		uint64_t  epoch        = 0;
+		bool      exact_format = false;
+		bool      valid        = false;
+	};
+	static constexpr size_t                                   ExactLookupWays = 1024;
+	std::unique_ptr<std::array<ExactLookup, ExactLookupWays>> m_exact_lookups =
+	    std::make_unique<std::array<ExactLookup, ExactLookupWays>>();
+	[[nodiscard]] static size_t ExactLookupSlot(const ImageInfo& info) noexcept;
+	[[nodiscard]] uint64_t      ImageEpochInRegionUnlocked(uint64_t address, uint64_t size) const;
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;
 	friend class RenderExecutor;
+	friend bool BcAlias::Matches(const ImageInfo&, const ImageInfo&);
+	friend bool BcAlias::Publish(TextureCache&, Image&);
+	friend void BcAlias::Resolve(TextureCache&, ImageId, ImageId);
 };
 
 } // namespace Libs::Graphics

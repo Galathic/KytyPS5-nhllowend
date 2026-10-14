@@ -3,7 +3,6 @@
 #include "common/assert.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
-#include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 
 #include <algorithm>
 #include <array>
@@ -19,95 +18,17 @@ namespace {
 }
 
 void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
-	using Kind                                             = IR::DescriptorBindingKind;
-	constexpr auto                               KindCount = static_cast<size_t>(Kind::Count);
-	std::array<std::vector<uint32_t>, KindCount> expected;
-	std::array<bool, KindCount>                  present {};
-	const auto                                   Dense = [](size_t size) {
-		std::vector<uint32_t> values(size);
-		for (uint32_t i = 0; i < values.size(); i++) {
-			values[i] = i;
-		}
-		return values;
+	uint64_t live_buffers = 0;
+	bool uses_lds = false;
+	bool uses_gds = false;
+	const auto uses_mapping = [](const auto& resource) {
+		return resource.indirect_root != UINT32_MAX;
 	};
-	auto Expect = [&](Kind kind, std::vector<uint32_t> resources = {}) {
-		const auto index = static_cast<size_t>(kind);
-		present[index]   = true;
-		expected[index]  = std::move(resources);
-	};
-	for (uint32_t i = 0; i < program.info.images.size(); i++) {
-		const auto kind = IR::DescriptorBindingForImage(program.info.images[i]);
-		if (!kind.has_value()) {
-			Fail(program, "native shader plan has an invalid image class");
-		}
-		present[static_cast<size_t>(*kind)] = true;
-		const auto dynamic = program.info.images[i].mip_mode == IR::ImageMipMode::Dynamic;
-		const auto count   = dynamic ? program.info.images[i].mip_count : 1u;
-		if (count == 0u || (!dynamic && program.info.images[i].mip_count != 1u)) {
-			Fail(program, "native shader plan has an invalid image mip descriptor count");
-		}
-		expected[static_cast<size_t>(*kind)].insert(expected[static_cast<size_t>(*kind)].end(),
-		                                            count, i);
-	}
-	if (!program.info.samplers.empty()) {
-		Expect(Kind::Samplers, Dense(program.info.samplers.size()));
-	}
-	auto& buffers = expected[static_cast<size_t>(Kind::Buffers)];
-	const auto shared = IR::CollectMemoryResources(program, buffers);
-	present[static_cast<size_t>(Kind::Buffers)] = !buffers.empty();
-	if (shared.gds) {
-		Expect(Kind::Gds);
-	}
-	if (shared.lds && lds_storage) {
-		Expect(Kind::SharedMemory);
-	}
-	if (program.info.uses_dma) {
-		Expect(Kind::BdaPagetable);
-		Expect(Kind::FaultBuffer);
-	}
-	if (IR::UsesFlattenedSrt(program)) {
-		Expect(Kind::FlattenedSrt);
-	}
-	if (program.bindings.ShaderDataDwords() != 0 && !program.bindings.UsesPushData()) {
-		Expect(Kind::ShaderData);
-	}
-
-	std::array<bool, KindCount> seen {};
-	for (const auto& binding: program.bindings.descriptors) {
-		const auto kind = static_cast<size_t>(binding.kind);
-		if (kind >= KindCount || seen[kind] || !present[kind] ||
-		    binding.resources != expected[kind]) {
-			Fail(program, "native descriptor groups do not match shader topology");
-		}
-		seen[kind] = true;
-	}
-	for (size_t i = 0; i < KindCount; i++) {
-		if (present[i] != seen[i]) {
-			Fail(program, "native shader plan is missing a required descriptor group");
-		}
-	}
-	const auto has_shader_data_storage = present[static_cast<size_t>(Kind::ShaderData)];
-	const auto shader_data_dwords = program.bindings.ShaderDataDwords();
-	const auto user_data_dwords = program.bindings.user_data_registers.size();
-	const bool has_dispatch_threads = program.bindings.dispatch_thread_dword != IR::PushData::NoStart;
-	const bool has_native_draw = program.bindings.native_draw_dword != IR::PushData::NoStart;
-	if ((program.bindings.UsesPushData() &&
-	     !IR::PushData::CanFit(program.bindings.push_data_start_dword, shader_data_dwords)) ||
-	    (has_dispatch_threads && (program.stage != ShaderType::Compute ||
-	                              program.bindings.dispatch_thread_dword != user_data_dwords)) ||
-	    has_native_draw != program.info.native_draw ||
-	    (has_native_draw && (program.stage != ShaderType::Vertex || program.bindings.native_draw_dword != user_data_dwords)) ||
-	    program.bindings.memory_offset_dword != user_data_dwords + (has_dispatch_threads ? 3u : 0u) + (has_native_draw ? 3u : 0u) ||
-	    program.bindings.memory_offset_count != buffers.size() ||
-	    has_shader_data_storage != (shader_data_dwords != 0 && !program.bindings.UsesPushData()) ||
-	    !std::is_sorted(program.bindings.user_data_registers.begin(),
-	                    program.bindings.user_data_registers.end()) ||
-	    std::adjacent_find(program.bindings.user_data_registers.begin(),
-	                       program.bindings.user_data_registers.end()) !=
-	        program.bindings.user_data_registers.end()) {
-		Fail(program, "native shader-data layout is inconsistent");
-	}
-
+	bool uses_flattened_srt = std::ranges::any_of(program.info.buffers, uses_mapping) ||
+	                          std::ranges::any_of(program.info.images, uses_mapping) ||
+	                          std::ranges::any_of(program.info.images, [](const IR::ImageResource& image) {
+		                          return image.table_capacity != 0u;
+	                          });
 	const auto planning_only_handle = [&](const IR::Inst& handle) {
 		return !handle.Uses().empty() &&
 		       std::ranges::all_of(handle.Uses(), [&](const IR::Use& use) {
@@ -124,7 +45,8 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 	const auto indirect_buffer_handle = [&](const IR::Inst& handle) {
 		return program.info.uses_dma && handle.NumArgs() == 4u && !handle.Uses().empty() &&
 		       std::ranges::all_of(handle.Uses(), [&](const IR::Use& use) {
-			       if (IR::BufferAccessOf(use.user->GetOpcode()) != IR::BufferAccess::Read) {
+			       const auto access = IR::BufferAccessOf(use.user->GetOpcode());
+			       if (access != IR::BufferAccess::Read && access != IR::BufferAccess::Write) {
 				       return false;
 			       }
 			       const auto index = use.user->Flags<IR::MemoryFlags>().index;
@@ -144,6 +66,39 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 	};
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
+			const auto op = inst.GetOpcode();
+			uses_flattened_srt |= op == IR::ValueOpcode::ReadConst;
+			if (IR::BufferAccessOf(op) != IR::BufferAccess::None ||
+			    IR::SharedAccessOf(op) != IR::SharedAccess::None ||
+			    IR::AddressOpcodeInfoOf(op).access != IR::AddressAccess::None) {
+				const auto index = inst.Flags<IR::MemoryFlags>().index;
+				if (index >= program.memory_info.size()) {
+					Fail(program, "typed shader contains invalid memory metadata");
+				}
+				const auto& memory = program.memory_info[index];
+				if (!memory.planning_only) {
+					uses_lds |= memory.kind == IR::ResourceKind::FlatLocal;
+					if (IR::SharedAccessOf(op) != IR::SharedAccess::None) {
+						if (memory.kind != IR::ResourceKind::Lds && memory.kind != IR::ResourceKind::Gds) {
+							Fail(program, "typed shader contains invalid shared-memory metadata");
+						}
+						uses_gds |= memory.kind == IR::ResourceKind::Gds;
+						uses_lds |= memory.kind == IR::ResourceKind::Lds;
+					} else if (memory.kind == IR::ResourceKind::Buffer ||
+					           memory.kind == IR::ResourceKind::ScalarBuffer) {
+						if (memory.resource >= program.info.buffers.size()) {
+							Fail(program, "typed shader contains an invalid buffer resource");
+						}
+						live_buffers |= uint64_t{1} << memory.resource;
+						for (const auto child: program.info.buffers[memory.resource].indirect_resources) {
+							if (child >= program.info.buffers.size()) {
+								Fail(program, "typed shader contains an invalid indirect buffer resource");
+							}
+							live_buffers |= uint64_t{1} << child;
+						}
+					}
+				}
+			}
 			const auto dense = inst.Flags<uint32_t>();
 			switch (inst.GetOpcode()) {
 				case IR::ValueOpcode::GetBufferResource:
@@ -188,6 +143,69 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 				default: break;
 			}
 		}
+	}
+	using Kind = IR::DescriptorBindingKind;
+	std::array<uint32_t, static_cast<size_t>(Kind::Count)> expected {};
+	auto& buffer_count = expected[static_cast<size_t>(Kind::Buffers)];
+	for (uint32_t index = 0; index < program.info.buffers.size(); ++index) {
+		const auto slot = (live_buffers & (uint64_t{1} << index)) != 0 ? buffer_count++ : UINT32_MAX;
+		if (program.info.buffers[index].descriptor_index != slot) {
+			Fail(program, "native buffer descriptor index does not match shader topology");
+		}
+	}
+	for (const auto& image: program.info.images) {
+		const auto kind = IR::DescriptorBindingForImage(image);
+		if (!kind.has_value()) {
+			Fail(program, "native shader plan has an invalid image class");
+		}
+		if (image.mip_count == 0u ||
+		    (image.mip_mode != IR::ImageMipMode::Dynamic && image.mip_count != 1u)) {
+			Fail(program, "native shader plan has an invalid image mip descriptor count");
+		}
+		auto& count = expected[static_cast<size_t>(*kind)];
+		if (image.descriptor_index != count) {
+			Fail(program, "native image descriptor index does not match shader topology");
+		}
+		count += image.mip_count;
+	}
+	const auto table_bases = IR::AllocateImageTableDescriptors(program.info.images, expected);
+	for (size_t index = 0; index < program.info.images.size(); ++index) {
+		if (program.info.images[index].table_descriptor_base != table_bases[index]) {
+			Fail(program, "native image table descriptors do not match shader topology");
+		}
+	}
+	expected[static_cast<size_t>(Kind::Samplers)] = static_cast<uint32_t>(program.info.samplers.size());
+	expected[static_cast<size_t>(Kind::Gds)] = uses_gds;
+	expected[static_cast<size_t>(Kind::SharedMemory)] = uses_lds && lds_storage;
+	expected[static_cast<size_t>(Kind::BdaPagetable)] = program.info.uses_dma;
+	expected[static_cast<size_t>(Kind::FaultBuffer)] = program.info.uses_dma;
+	expected[static_cast<size_t>(Kind::FlattenedSrt)] = uses_flattened_srt;
+	expected[static_cast<size_t>(Kind::ShaderData)] =
+	    program.bindings.ShaderDataDwords() != 0 && !program.bindings.UsesPushData();
+	uint64_t descriptor_mask = 0;
+	for (uint32_t index = 0; index < expected.size(); ++index) {
+		if (expected[index] != 0) descriptor_mask |= uint64_t{1} << index;
+	}
+	if (program.bindings.descriptor_counts != expected ||
+	    program.bindings.descriptor_mask != descriptor_mask) {
+		Fail(program, "native descriptor counts do not match shader topology");
+	}
+	const auto shader_data_dwords = program.bindings.ShaderDataDwords();
+	const auto& registers = program.info.user_data_registers;
+	const bool has_dispatch_threads = program.bindings.dispatch_thread_dword != IR::PushData::NoStart;
+	const bool has_native_draw = program.bindings.native_draw_dword != IR::PushData::NoStart;
+	if ((program.bindings.UsesPushData() &&
+	     !IR::PushData::CanFit(program.bindings.push_data_start_dword, shader_data_dwords)) ||
+	    (has_dispatch_threads && (program.stage != ShaderType::Compute ||
+	                              program.bindings.dispatch_thread_dword != registers.size())) ||
+	    has_native_draw != program.info.native_draw ||
+	    (has_native_draw && (program.stage != ShaderType::Vertex ||
+	                         program.bindings.native_draw_dword != registers.size())) ||
+	    program.bindings.memory_offset_dword !=
+	        registers.size() + (has_dispatch_threads ? 3u : 0u) + (has_native_draw ? 3u : 0u) ||
+	    !std::is_sorted(registers.begin(), registers.end()) ||
+	    std::adjacent_find(registers.begin(), registers.end()) != registers.end()) {
+		Fail(program, "native shader-data layout is inconsistent");
 	}
 }
 
@@ -246,9 +264,12 @@ bool Emitter::MatchLaneSlotLdsAddress(IR::Value address, uint32_t& constant) {
 
 namespace {
 
-// Decides SpirvRequirements::function_lds_lane_slots once every instruction is known.
-void AnalyzeLaneSlotLds(const IR::Program& program, Emitter::SpirvRequirements& requirements) {
-	if (!requirements.function_lds || requirements.shared_int64_atomics || !ShaderLdsLaneSlots()) {
+// Decides ShaderInfo::function_lds_lane_slots once every instruction is known.
+void AnalyzeLaneSlotLds(IR::Program& program) {
+	auto& info                   = program.info;
+	info.function_lds_lane_slots = false;
+	info.function_lds_dwords     = 0;
+	if (!info.function_lds || info.shared_int64_atomics || !ShaderLdsLaneSlots()) {
 		return;
 	}
 	uint32_t end = 0;
@@ -280,193 +301,14 @@ void AnalyzeLaneSlotLds(const IR::Program& program, Emitter::SpirvRequirements& 
 	if (end == 0 || end > 0x8000u) {
 		return;
 	}
-	requirements.function_lds_lane_slots = true;
-	requirements.function_lds_dwords     = (end + 3u) / 4u;
+	info.function_lds_lane_slots = true;
+	info.function_lds_dwords     = (end + 3u) / 4u;
 }
 
 } // namespace
 
-Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program& program) {
-	SpirvRequirements requirements {};
-	bool              has_barrier      = false;
-	bool              has_buffer_write = false;
-	for (const auto* block: program.blocks) {
-		for (const auto& inst: *block) {
-			requirements.float64 |= inst.GetType() == IR::Type::F64;
-			requirements.float16 |= inst.GetOpcode() == IR::ValueOpcode::FPAdd16x2 ||
-			                        inst.GetOpcode() == IR::ValueOpcode::FPMul16x2 ||
-			                        inst.GetOpcode() == IR::ValueOpcode::FPFma16x2 ||
-			                        inst.GetOpcode() == IR::ValueOpcode::FPClamp16x2;
-			has_barrier |= inst.GetOpcode() == IR::ValueOpcode::Barrier;
-			{
-				const auto access = IR::BufferAccessOf(inst.GetOpcode());
-				has_buffer_write |= access == IR::BufferAccess::Write || access == IR::BufferAccess::Atomic;
-			}
-			if (IR::BufferAccessOf(inst.GetOpcode()) == IR::BufferAccess::Atomic &&
-			    inst.GetType() == IR::Type::U64) {
-				requirements.buffer_int64_atomics = true;
-			}
-			const auto address_access = IR::AddressOpcodeInfoOf(inst.GetOpcode()).access;
-			if (address_access != IR::AddressAccess::None) {
-				const auto memory_index = inst.Flags<IR::MemoryFlags>().index;
-				if (memory_index >= program.memory_info.size()) {
-					Fail(program, "address operation has invalid memory metadata");
-				}
-				const auto& memory = program.memory_info[memory_index];
-				const auto kind = memory.kind;
-				if (kind == IR::ResourceKind::Scratch || kind == IR::ResourceKind::FlatLocal) {
-					if (program.scratch_dwords == 0) {
-						Fail(program, "scratch operation has no per-thread storage");
-					}
-					requirements.function_scratch = true;
-					if (kind == IR::ResourceKind::FlatLocal && program.stage != ShaderType::Compute &&
-					    program.stage != ShaderType::Mesh) {
-						requirements.function_lds = true;
-					}
-				} else if (address_access == IR::AddressAccess::Write) {
-					Fail(program, "writable FLAT/GLOBAL addresses require GPU ownership tracking");
-				} else {
-					// Descriptor stores can alias coherent physical-address loads.
-					requirements.coherent_buffers |= memory.coherent;
-				}
-			}
-			if (IR::BufferAccessOf(inst.GetOpcode()) != IR::BufferAccess::None) {
-				const auto memory_index = inst.Flags<IR::MemoryFlags>().index;
-				if (memory_index >= program.memory_info.size()) {
-					Fail(program, "buffer operation has invalid memory metadata");
-				}
-				const auto& memory = program.memory_info[memory_index];
-				if (memory.kind == IR::ResourceKind::IndirectBuffer &&
-				    inst.GetOpcode() != IR::ValueOpcode::ReadConstBuffer) {
-					requirements.subgroup_local_invocation_id = true;
-				}
-				if (memory.kind == IR::ResourceKind::Buffer) {
-					requirements.coherent_buffers |= memory.coherent;
-					if (memory.resource >= program.info.buffers.size()) {
-						Fail(program, "buffer operation has invalid resource metadata");
-					}
-					const auto bits = StorageBufferElementBits(program, memory);
-					requirements.buffer_u8 |= bits == 8u;
-					requirements.buffer_u16 |= bits == 16u;
-					if ((program.info.buffers[memory.resource].packed_stride & (1u << 20u)) != 0u) {
-						if (program.stage != ShaderType::Compute) {
-							Fail(program, "buffer ADD_TID is only valid for compute shaders");
-						}
-						requirements.subgroup_local_invocation_id = true;
-					}
-				}
-			}
-			const auto shared_access = IR::SharedAccessOf(inst.GetOpcode());
-			if (shared_access != IR::SharedAccess::None) {
-				const auto index = inst.Flags<IR::MemoryFlags>().index;
-				if (index >= program.memory_info.size()) {
-					Fail(program, "shared operation has invalid memory metadata");
-				}
-				const auto kind = program.memory_info[index].kind;
-				if (kind != IR::ResourceKind::Lds && kind != IR::ResourceKind::Gds) {
-					Fail(program, "shared operation has invalid resource kind");
-				}
-				if (shared_access == IR::SharedAccess::Atomic &&
-				    IR::SharedComponentCount(inst.GetOpcode()) == 2u) {
-					if (kind != IR::ResourceKind::Lds || program.stage != ShaderType::Compute) {
-						Fail(program, "64-bit shared atomics require compute LDS");
-					}
-					requirements.shared_int64_atomics = true;
-				}
-				if (program.stage != ShaderType::Compute && program.stage != ShaderType::Mesh &&
-				    kind == IR::ResourceKind::Lds) {
-					requirements.function_lds = true;
-				}
-				if (shared_access == IR::SharedAccess::Append ||
-				    shared_access == IR::SharedAccess::Consume) {
-					requirements.subgroup_ballot              = true;
-					requirements.subgroup_shuffle             = true;
-					requirements.subgroup_local_invocation_id = true;
-				}
-			}
-			switch (inst.GetOpcode()) {
-				case IR::ValueOpcode::StoreCompletion: requirements.subgroup_barrier = true; break;
-				case IR::ValueOpcode::BvhIntersect: requirements.bvh = true; break;
-				case IR::ValueOpcode::ConditionRef:
-					requirements.subgroup_ballot |=
-					    inst.Flags<CFG::BranchCondition>() != CFG::BranchCondition::ScalarInstruction;
-					break;
-				case IR::ValueOpcode::Ballot: requirements.subgroup_ballot = true; break;
-				case IR::ValueOpcode::DppMoveU32:
-				case IR::ValueOpcode::ReadFirstLane:
-				case IR::ValueOpcode::ReadLane: {
-					requirements.subgroup_ballot  = true;
-					requirements.subgroup_shuffle = true;
-					if (inst.GetOpcode() == IR::ValueOpcode::DppMoveU32) {
-						requirements.subgroup_local_invocation_id = true;
-					}
-					break;
-				}
-				case IR::ValueOpcode::WaveReduceU32:
-					requirements.subgroup_arithmetic = true;
-					break;
-				case IR::ValueOpcode::DppUpdateU32:
-				case IR::ValueOpcode::WriteLane: {
-					requirements.subgroup_ballot              = true;
-					requirements.subgroup_local_invocation_id = true;
-					break;
-				}
-				case IR::ValueOpcode::Permlane16U32: {
-					requirements.subgroup_ballot              = true;
-					requirements.subgroup_shuffle             = true;
-					requirements.subgroup_local_invocation_id = true;
-					break;
-				}
-				case IR::ValueOpcode::SwizzleU32:
-				case IR::ValueOpcode::PermuteU32:
-				case IR::ValueOpcode::BpermuteU32: {
-					requirements.subgroup_ballot              = true;
-					requirements.subgroup_shuffle             = true;
-					requirements.subgroup_local_invocation_id = true;
-					break;
-				}
-				case IR::ValueOpcode::LaneId:
-					requirements.subgroup_local_invocation_id |=
-					    program.stage != ShaderType::TessellationControl;
-					break;
-				case IR::ValueOpcode::ImageQueryLod: requirements.compute_derivatives = true; break;
-				case IR::ValueOpcode::ImageGatherRaw:
-					requirements.image_gather_extended = true;
-					break;
-				case IR::ValueOpcode::SetAttribute: {
-					const auto index = inst.Flags<IR::ExportFlags>().index;
-					if (index >= program.export_info.size()) {
-						Fail(program, "attribute export has invalid metadata");
-					}
-					if (program.stage == ShaderType::Pixel &&
-					    program.export_info[index].vm) {
-						requirements.pixel_valid_mask = true;
-					}
-					break;
-				}
-				default: break;
-			}
-		}
-	}
-	// KYTY_WORKGROUP_BUFFER_SYNC=1: guest compute shaders (e.g. ea94f09b2981eb43, which builds
-	// per-cell linked lists with BUFFER_STORE and walks them in other lanes after s_barrier) rely
-	// on RDNA L0 ordering between waves of a workgroup (glc=0 everywhere). Vulkan needs coherent
-	// buffer accesses plus a barrier whose semantics include buffer memory.
-	static const bool workgroup_buffer_sync = [] {
-		const char* v = std::getenv("KYTY_WORKGROUP_BUFFER_SYNC");
-		return v != nullptr && v[0] == '1';
-	}();
-	if (workgroup_buffer_sync && program.stage == ShaderType::Compute && has_barrier &&
-	    has_buffer_write) {
-		requirements.workgroup_buffer_sync = true;
-		requirements.coherent_buffers      = true;
-	}
-	AnalyzeLaneSlotLds(program, requirements);
-	return requirements;
-}
-
-std::vector<uint32_t> EmitProgram(const IR::Program& program,
-                                  ShaderStageInputInfo input_info) {
+std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo input_info,
+                                  uint32_t push_data_start_dword) {
 	using namespace Emitter;
 
 	if (program.stage != ShaderType::Compute && program.stage != ShaderType::Vertex &&
@@ -476,12 +318,15 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 		Fail(program, "binary SPIR-V emitter received an unsupported shader stage");
 	}
 	if (!program.srt_plan_complete || !program.resource_tracking_complete ||
-	    !program.shader_info_complete || !program.binding_layout_complete) {
+	    !program.shader_info_complete) {
 		Fail(program, "SPIR-V emitter requires a fully planned native shader program");
 	}
-	ValidateNativeProgram(program, program.stage == ShaderType::Compute &&
-	                                   input_info.compute != nullptr && input_info.compute->lds_storage);
+	if (program.info.buffers.size() > IR::ShaderInfo::MaxBuffers) {
+		Fail(program, "native shader exceeds the buffer resource limit");
+	}
 	IR::ValidateProgram(program, true);
+	program.bindings = {.push_data_start_dword = push_data_start_dword};
+	AnalyzeLaneSlotLds(program);
 	EmitterState state(program, input_info);
 	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);
 	state.lane_count =
@@ -489,6 +334,8 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	        ? 2u
 	        : 1u;
 	DefineModule(state);
+	ValidateNativeProgram(program, program.stage == ShaderType::Compute &&
+	                                   input_info.compute != nullptr && input_info.compute->lds_storage);
 	EmitProgram(state);
 	state.builder.AddEntryPoint(ExecutionModelForStage(state.program.stage), state.main_func,
 	                            "main", state.interface_variables);

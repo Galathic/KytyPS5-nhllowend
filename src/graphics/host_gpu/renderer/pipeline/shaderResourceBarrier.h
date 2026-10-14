@@ -3,6 +3,7 @@
 
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/bindEpoch.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 #include <atomic>
@@ -29,10 +30,10 @@ vk::MemoryBarrier       MakeShaderWriteHazardDependency();
 vk::MemoryBarrier       MakeShaderWriteDependency();
 vk::BufferMemoryBarrier MakeGdsDependency(vk::Buffer buffer);
 bool HasShaderBufferWrites(const ShaderStageRuntime& runtime);
-void ShaderAccessBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages);
-void ShaderWriteHazardBarrier(vk::CommandBuffer      vk_buffer,
+void ShaderAccessBarrier(CommandRecorder vk_buffer, vk::PipelineStageFlags source_stages);
+void ShaderWriteHazardBarrier(CommandRecorder        vk_buffer,
                               vk::PipelineStageFlags destination_stages);
-void ShaderWriteBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages);
+void ShaderWriteBarrier(CommandRecorder vk_buffer, vk::PipelineStageFlags source_stages);
 
 } // namespace Libs::Graphics
 

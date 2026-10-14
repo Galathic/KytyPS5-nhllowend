@@ -36,7 +36,7 @@ void CheckWaveReduction(VulkanHarness& vulkan) {
       for (u32 id = 0; id < 3; ++id) {
         program.block_storage.push_back(std::make_unique<Block>());
         program.blocks.push_back(program.block_storage.back().get());
-        program.block_info.push_back({.id = id});
+        program.blocks.back()->id = id;
       }
       auto* entry = program.blocks[0];
       auto* body = program.blocks[1];
@@ -47,10 +47,10 @@ void CheckWaveReduction(VulkanHarness& vulkan) {
       auto& lane = entry->AppendNewInst(ValueOpcode::LaneId);
       auto& odd = entry->AppendNewInst(ValueOpcode::BitwiseAnd32, {Value(&lane), Value(1u)});
       auto& active = entry->AppendNewInst(ValueOpcode::IEqual32, {Value(&odd), Value(0u)});
-      program.block_info[0].condition = sparse ? Value(&active) : Value(true);
-      program.block_info[0].terminator = {.kind = TerminatorKind::ConditionalBranch,
-          .true_block = 1, .false_block = 2, .merge_block = 2};
-      program.block_info[1].terminator = {.kind = TerminatorKind::Branch, .true_block = 2};
+      entry->condition = sparse ? Value(&active) : Value(true);
+      entry->terminator = {.kind = TerminatorKind::ConditionalBranch,
+          .true_block = body, .false_block = end, .merge_block = end};
+      body->terminator = {.kind = TerminatorKind::Branch, .true_block = end};
       auto& magnitude = body->AppendNewInst(ValueOpcode::IAdd32, {Value(&lane), Value(1u)});
       auto& sign = body->AppendNewInst(ValueOpcode::ShiftLeftLogical32, {Value(&odd), Value(31u)});
       auto& input = body->AppendNewInst(ValueOpcode::BitwiseXor32, {Value(&magnitude), Value(&sign)});
@@ -76,14 +76,13 @@ void CheckWaveReduction(VulkanHarness& vulkan) {
           if (!sparse || (lane_id & 1u) == 0) test.expected[lane_id * operations.size() + index] = expected;
         }
       }
-      AllocateBindings(program);
-      compiled.packed_user_data.resize(program.bindings.ShaderDataDwords());
       ShaderComputeInputInfo compute{};
       compute.wave_size = 32;
       compute.host_subgroup_size = vulkan.SubgroupSize();
       compute.threads_num[0] = threads;
       compute.threads_num[1] = compute.threads_num[2] = 1;
       compiled.spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute});
+      compiled.packed_user_data.resize(program.bindings.ShaderDataDwords());
       ValidateSpirv(test.name, compiled.spirv);
       spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
       std::string text;

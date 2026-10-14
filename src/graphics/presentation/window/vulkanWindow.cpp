@@ -544,6 +544,13 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		provoking_vertex.pNext = supported_features2.pNext;
 		supported_features2.pNext = &provoking_vertex;
 	}
+	const bool maintenance8_extension =
+	    HasExtension(device_extensions, VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
+	vk::PhysicalDeviceMaintenance8FeaturesKHR maintenance8 {};
+	if (maintenance8_extension) {
+		maintenance8.pNext = supported_features2.pNext;
+		supported_features2.pNext = &maintenance8;
+	}
 	const bool image_atomic_int64_extension =
 	    HasExtension(device_extensions, VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME);
 	vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT image_atomic_int64 {};
@@ -585,6 +592,14 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		    workgroup_layout.workgroupMemoryExplicitLayout != VK_FALSE));
 	}
 	graphics.mesh_shader_enabled = mesh_extension && supported_mesh.meshShader;
+	// Bindless image tables index sampled image arrays per lane.
+	features12.shaderSampledImageArrayNonUniformIndexing =
+	    supported_features12.shaderSampledImageArrayNonUniformIndexing;
+	if (supported_features12.shaderSampledImageArrayNonUniformIndexing != VK_TRUE ||
+	    supported_features2.features.shaderSampledImageArrayDynamicIndexing != VK_TRUE) {
+		LOGF("WARNING: non-uniform sampled image indexing is not supported; bindless image "
+		     "tables will not work\n");
+	}
 
 	vk::PhysicalDeviceSubgroupSizeControlProperties subgroup_size_control {};
 
@@ -623,6 +638,9 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	graphics.attachment_feedback_loop_enabled =
 	    feedback_extensions && feedback_layout.attachmentFeedbackLoopLayout &&
 	    feedback_dynamic.attachmentFeedbackLoopDynamicState;
+	graphics.depth_color_copy_enabled = maintenance8_extension && maintenance8.maintenance8;
+	LOGF("Vulkan depth/color copy support: %s\n",
+	     graphics.depth_color_copy_enabled ? "true" : "false");
 	LOGF("Vulkan depth feedback support: %s\n",
 	     graphics.attachment_feedback_loop_enabled ? "true" : "false");
 	if (graphics.mesh_shader_enabled) {
@@ -655,6 +673,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.depthClamp  = VK_TRUE;
 #endif
 	device_features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
+	device_features.shaderSampledImageArrayDynamicIndexing =
+	    supported_features2.features.shaderSampledImageArrayDynamicIndexing;
 	device_features.shaderImageGatherExtended            = VK_TRUE;
 	device_features.independentBlend                     = VK_TRUE;
 	device_features.dualSrcBlend                         = VK_TRUE;
@@ -783,6 +803,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		device_fault.deviceFault = VK_TRUE;
 		create_info.pNext        = &device_fault;
 	}
+	if (graphics.depth_color_copy_enabled) {
+		maintenance8.pNext = const_cast<void*>(create_info.pNext);
+		create_info.pNext = &maintenance8;
+	}
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
 	create_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
@@ -834,6 +858,11 @@ static void VulkanGetExtensions(VulkanExtensions& r) {
 	        });
 
 	r.enable_validation_layers = Config::VulkanValidationEnabled();
+	if (Config::HdrEnabled() &&
+	    HasExtension(r.available_extensions, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME) &&
+	    !HasExtension(r.required_extensions, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME)) {
+		r.required_extensions.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
+	}
 
 	if (HasExtension(r.available_extensions, VK_EXT_DEBUG_UTILS_EXTENSION_NAME)) {
 		r.required_extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
@@ -1196,6 +1225,7 @@ void WindowContext::CreateVulkan() {
 			graphic_ctx.memory_budget_ext_enabled = true;
 		}
 		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
+		                             VK_KHR_MAINTENANCE_8_EXTENSION_NAME,
 		                             VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
 		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,

@@ -14,19 +14,32 @@ class RangeSet final {
 public:
 	void Add(uint64_t address, uint64_t size) {
 		const auto end = End(address, size);
-		auto       it  = m_ranges.lower_bound(address);
-		if (it != m_ranges.begin() && std::prev(it)->second >= address) {
-			it = std::prev(it);
+		// Every path below covers [address, end) and keeps ranges already marked.
+		FilterMark(address, end);
+		// Written ranges are added again for every draw that binds them: extend a range that
+		// begins at or before the address in place, and allocate a node only for a new range.
+		auto it = m_ranges.upper_bound(address);
+		if (it != m_ranges.begin()) {
+			const auto previous = std::prev(it);
+			if (previous->second >= address) {
+				if (previous->second >= end) {
+					return;
+				}
+				uint64_t last = end;
+				while (it != m_ranges.end() && it->first <= last) {
+					last = std::max(last, it->second);
+					it   = m_ranges.erase(it);
+				}
+				previous->second = last;
+				return;
+			}
 		}
-		uint64_t begin = address;
-		uint64_t last  = end;
+		uint64_t last = end;
 		while (it != m_ranges.end() && it->first <= last) {
-			begin = std::min(begin, it->first);
-			last  = std::max(last, it->second);
-			it    = m_ranges.erase(it);
+			last = std::max(last, it->second);
+			it   = m_ranges.erase(it);
 		}
-		m_ranges.emplace(begin, last);
-		FilterMark(begin, last);
+		m_ranges.emplace_hint(it, address, last);
 	}
 
 	void Subtract(uint64_t address, uint64_t size) {

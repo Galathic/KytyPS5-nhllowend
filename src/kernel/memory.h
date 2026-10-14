@@ -132,9 +132,19 @@ void                   NoteReadFaultPage(uint64_t vaddr) noexcept;
 // Never copies, downloads, faults or changes any state.
 enum class CleanBackingCompare { Equal, Different, Dirty, Unavailable };
 CleanBackingCompare    TryValidateCleanBacking(uint64_t vaddr, const void* expected, uint64_t size);
+// Where the backing store keeps [vaddr, vaddr + size) when one mapping holds it, else null. The
+// pointer stays readable for the emulator's lifetime and reads what TryReadBacking() reads.
+[[nodiscard]] const void* FindBackingPointer(uint64_t vaddr, uint64_t size);
+bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
+// Whether TryReadBacking or TryReadSparseBacking can read the whole range.
+bool                   IsBackingReadable(uint64_t vaddr, uint64_t size);
+// Changes whenever backing is mapped or unmapped, or a PRT aperture changes: an unchanged value
+// means IsBackingReadable still answers as before.
+[[nodiscard]] uint64_t BackingEpoch() noexcept;
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
-void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
+// Not noexcept: under a Common::SoftExitScope its failure throws to the scope's owner.
+void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
@@ -209,6 +219,7 @@ bool FreeGuestMemory(uint64_t vaddr, uint64_t size);
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 void     TestBeforeNextBackingMap(callback_func_t callback);
+void     TestSetBackingReadCallback(callback_func_t callback);
 void     TestFailNextPhysicalMemoryUnmap();
 void     TestFailPhysicalMemoryUnmapAfter(uint32_t successful_unmaps);
 void     TestFailGuestBackingStoreUnmapAfter(uint32_t successful_unmaps);

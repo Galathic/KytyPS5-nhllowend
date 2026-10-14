@@ -8,10 +8,6 @@
 #include <condition_variable> // IWYU pragma: keep
 #include <mutex>
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS && KYTY_COMPILER == KYTY_COMPILER_CLANG
-#define KYTY_WIN_CS
-#endif
-
 // macOS has no clock_nanosleep.
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS && !defined(__APPLE__)
 #define KYTY_POSIX_HIGH_RES_SLEEP
@@ -22,7 +18,7 @@
 #include <string>
 #include <thread>
 
-#ifdef KYTY_WIN_CS
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
 // IWYU pragma: no_include <winbase.h>
 constexpr DWORD KYTY_CS_SPIN_COUNT = 4000;
@@ -133,7 +129,7 @@ namespace Common {
 using thread_id_t = std::thread::id;
 
 struct MutexPrivate {
-#ifdef KYTY_WIN_CS
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	MutexPrivate() { InitializeCriticalSectionAndSpinCount(&m_cs, KYTY_CS_SPIN_COUNT); }
 	~MutexPrivate() { DeleteCriticalSection(&m_cs); }
 	KYTY_CLASS_NO_COPY(MutexPrivate);
@@ -144,7 +140,7 @@ struct MutexPrivate {
 };
 
 struct CondVarPrivate {
-#ifdef KYTY_WIN_CS
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	CondVarPrivate() {
 		static auto func = ResolveInitializeConditionVariable();
 		EXIT_NOT_IMPLEMENTED(func == nullptr);
@@ -215,8 +211,26 @@ void Thread::Detach() {
 	m_thread->m_thread.detach();
 }
 
+void Thread::RaiseCurrentPriority() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+#endif
+}
+
+void Thread::PinCurrent(int logical_cpu) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (logical_cpu >= 0 && logical_cpu < 64) {
+		const auto mask = DWORD_PTR {1} << static_cast<uint32_t>(logical_cpu);
+		::SetThreadAffinityMask(::GetCurrentThread(), mask);
+		::SetThreadIdealProcessor(::GetCurrentThread(), static_cast<DWORD>(logical_cpu));
+	}
+#else
+	(void)logical_cpu;
+#endif
+}
+
 void Thread::SleepMicro(uint32_t micros) {
-#ifdef KYTY_WIN_CS
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	SleepHighResolution100ns(static_cast<uint64_t>(micros) * 10);
 #elif defined(KYTY_POSIX_HIGH_RES_SLEEP)
 	SleepHighResolutionNanos(static_cast<uint64_t>(micros) * 1000);
@@ -226,7 +240,7 @@ void Thread::SleepMicro(uint32_t micros) {
 }
 
 void Thread::SleepNano(uint64_t nanos) {
-#ifdef KYTY_WIN_CS
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	SleepHighResolution100ns((nanos + 99) / 100);
 #elif defined(KYTY_POSIX_HIGH_RES_SLEEP)
 	SleepHighResolutionNanos(nanos);
@@ -237,12 +251,6 @@ void Thread::SleepNano(uint64_t nanos) {
 
 bool Thread::IsMainThread() {
 	return g_main_thread == std::this_thread::get_id();
-}
-
-void Thread::SetCurrentHighPriority([[maybe_unused]] bool high) {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	SetThreadPriority(GetCurrentThread(), high ? THREAD_PRIORITY_HIGHEST : THREAD_PRIORITY_NORMAL);
-#endif
 }
 
 std::string Thread::GetId() const {
@@ -268,7 +276,7 @@ Mutex::~Mutex() {
 }
 
 void Mutex::Lock() {
-#ifdef KYTY_WIN_CS
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	EnterCriticalSection(&m_mutex->m_cs);
 #else
 	m_mutex->m_mutex.lock();
@@ -276,7 +284,7 @@ void Mutex::Lock() {
 }
 
 void Mutex::Unlock() {
-#ifdef KYTY_WIN_CS
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	LeaveCriticalSection(&m_mutex->m_cs);
 #else
 	m_mutex->m_mutex.unlock();
@@ -284,7 +292,7 @@ void Mutex::Unlock() {
 }
 
 bool Mutex::TryLock() {
-#ifdef KYTY_WIN_CS
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	return (TryEnterCriticalSection(&m_mutex->m_cs) != 0);
 #else
 	return m_mutex->m_mutex.try_lock();
@@ -298,7 +306,7 @@ CondVar::~CondVar() {
 }
 
 void CondVar::Wait(Mutex* mutex) {
-#ifndef KYTY_WIN_CS
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 	std::unique_lock<std::recursive_mutex> cpp_lock(mutex->m_mutex->m_mutex, std::adopt_lock_t());
 #endif
 	auto poll_callback = [&] {
@@ -306,7 +314,7 @@ void CondVar::Wait(Mutex* mutex) {
 		if (callback == nullptr) {
 			return;
 		}
-#if defined(KYTY_WIN_CS)
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		LeaveCriticalSection(&mutex->m_mutex->m_cs);
 		callback();
 		EnterCriticalSection(&mutex->m_mutex->m_cs);
@@ -316,7 +324,7 @@ void CondVar::Wait(Mutex* mutex) {
 		cpp_lock.lock();
 #endif
 	};
-#ifdef KYTY_WIN_CS
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	static auto func = ResolveSleepConditionVariableCS();
 	EXIT_NOT_IMPLEMENTED(func == nullptr);
 	if (g_cond_wait_poll_callback == nullptr) {
@@ -346,10 +354,10 @@ void CondVar::SetWaitPollCallback(wait_poll_func_t callback) {
 
 bool CondVar::WaitFor(Mutex* mutex, uint32_t micros) {
 	bool ok = false;
-#ifndef KYTY_WIN_CS
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 	std::unique_lock<std::recursive_mutex> cpp_lock(mutex->m_mutex->m_mutex, std::adopt_lock_t());
 #endif
-#ifdef KYTY_WIN_CS
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	static auto func = ResolveSleepConditionVariableCS();
 	EXIT_NOT_IMPLEMENTED(func == nullptr);
 	ok = !(func(&m_cond_var->m_cv, &mutex->m_mutex->m_cs, (micros < 1000 ? 1 : micros / 1000)) ==
@@ -364,7 +372,7 @@ bool CondVar::WaitFor(Mutex* mutex, uint32_t micros) {
 }
 
 void CondVar::Signal() {
-#ifdef KYTY_WIN_CS
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	static auto func = ResolveWakeConditionVariable();
 	EXIT_NOT_IMPLEMENTED(func == nullptr);
 	func(&m_cond_var->m_cv);
@@ -374,7 +382,7 @@ void CondVar::Signal() {
 }
 
 void CondVar::SignalAll() {
-#ifdef KYTY_WIN_CS
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	static auto func = ResolveWakeAllConditionVariable();
 	EXIT_NOT_IMPLEMENTED(func == nullptr);
 	func(&m_cond_var->m_cv);

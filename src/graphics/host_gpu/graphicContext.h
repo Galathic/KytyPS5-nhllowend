@@ -34,6 +34,7 @@ struct GraphicContext {
 	// bool fp64_denorm_preserve = false; // Temporarily disabled.
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
+	bool                               depth_color_copy_enabled               = false;
 	bool                               supports_block_texel_view              = false;
 	bool native_indirect_enabled = false;
 	bool native_draw_parameters_enabled = false;
@@ -124,26 +125,6 @@ private:
 	                            vk::ImageCreateFlags>,
 	                 std::pair<vk::Result, vk::ImageFormatProperties>>
 	    m_image_format_properties;
-
-	// Experiment ImageRecycle: deleted images, idle on the GPU, that CreateImage hands out again for
-	// the same creation parameters instead of allocating (oldest first out when over the limits).
-	struct RecycledImage {
-		vk::ImageCreateFlags flags;
-		vk::ImageType        image_type;
-		vk::Format           format;
-		vk::Extent3D         extent;
-		uint32_t             mip_levels;
-		uint32_t             layers;
-		uint32_t             samples;
-		vk::ImageUsageFlags  usage;
-		vk::Image            image;
-		VmaAllocation        allocation;
-		uint64_t             bytes;
-	};
-	std::mutex                 m_recycle_mutex;
-	std::vector<RecycledImage> m_recycled_images;
-	uint64_t                   m_recycled_bytes = 0;
-	void                       DestroyRecycledImages();
 };
 
 struct VulkanImageState {

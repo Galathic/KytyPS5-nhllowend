@@ -87,25 +87,28 @@ struct CachedColorTarget {
 	ImageId         last_image {};
 };
 
-std::unordered_map<ColorTargetKey, CachedColorTarget, ColorTargetKeyHash>& ColorTargetMemo() {
+std::unordered_map<ColorTargetKey, CachedColorTarget, ColorTargetKeyHash>& NhlColorTargetMemo() {
 	static std::unordered_map<ColorTargetKey, CachedColorTarget, ColorTargetKeyHash> memo;
 	return memo;
-}
-
-// The entry each render-target slot used last: consecutive draws mostly keep their targets.
-// Cleared with the memo (entries are node-stable until then).
-struct LastColorTarget {
-	ColorTargetKey     key;
-	CachedColorTarget* entry = nullptr;
-};
-std::array<LastColorTarget, 8>& LastColorTargets() {
-	static std::array<LastColorTarget, 8> last;
-	return last;
 }
 
 } // namespace
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
+// A color target's description is a pure function of its registers and the draw's slice offset;
+// draws of a pass keep them, so each slot remembers the last few descriptions it derived.
+struct RenderExecutor::ColorTargetMemo {
+	struct Entry {
+		HW::RenderTarget registers {};
+		uint32_t         slice_offset = 0;
+		bool             valid        = false;
+		RenderColorInfo  info;
+	};
+	static constexpr uint32_t                                         Ways = 2;
+	std::array<std::array<Entry, Ways>, RENDER_COLOR_ATTACHMENTS_MAX> slots {};
+	std::array<uint32_t, RENDER_COLOR_ATTACHMENTS_MAX>                next {};
+};
+
 void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& r,
                                               uint32_t         render_target_slice_offset,
                                               uint32_t rt_slot, bool ignore_target_mask,
@@ -130,26 +133,15 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		key.mask         = mask;
 		key.ignore_mask  = ignore_target_mask;
 		key.exact_format = exact_format;
-		auto&              memo   = ColorTargetMemo();
-		CachedColorTarget* cached = nullptr;
-		auto*              last   = rt_slot < 8 ? &LastColorTargets()[rt_slot] : nullptr;
-		if (last != nullptr && last->entry != nullptr && last->key == key) {
-			cached = last->entry;
-		} else if (auto found = memo.find(key); found != memo.end()) {
-			cached = &found->second;
-			if (last != nullptr) {
-				last->key   = key;
-				last->entry = cached;
-			}
-		}
-		if (cached != nullptr) {
-			r = cached->info;
+		auto& memo = NhlColorTargetMemo();
+		if (auto found = memo.find(key); found != memo.end()) {
+			r = found->second.info;
 			auto& texture_cache = m_context.GetTextureCache();
 			if (Common::Experiments::Enabled(Common::Experiments::ImageLookupHint)) {
 				bool exact = false;
 				r.image_id = texture_cache.FindImageHinted(r.desc, exact_format,
-				                                           cached->last_image, exact);
-				cached->last_image = exact ? r.image_id : ImageId {};
+				                                           found->second.last_image, exact);
+				found->second.last_image = exact ? r.image_id : ImageId {};
 			} else {
 				r.image_id = texture_cache.FindImage(r.desc, exact_format);
 			}
@@ -175,6 +167,21 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		}
 
 		return;
+	}
+	if (m_color_target_memo == nullptr) {
+		m_color_target_memo = {new ColorTargetMemo {}, [](ColorTargetMemo* memo) { delete memo; }};
+	}
+	auto& memo = m_color_target_memo->slots[rt_slot];
+	if (!graphics_debug_dump_enabled()) {
+		for (const auto& entry: memo) {
+			if (entry.valid && entry.slice_offset == render_target_slice_offset &&
+			    std::memcmp(&entry.registers, &rt, sizeof(rt)) == 0) {
+				r          = entry.info;
+				r.image_id = m_context.GetTextureCache().FindImage(r.desc, exact_format);
+				BindRenderTarget(r.image_id);
+				return;
+			}
+		}
 	}
 	const auto samples = render_sample_count(rt.attrib.num_fragments);
 	if (samples == 0 || rt.attrib.num_samples != rt.attrib.num_fragments) {
@@ -244,9 +251,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	// Nonlinear clear values are still stored as normalized components.
 	// Metadata clears are materialized during image discovery; render-pass loads preserve contents.
 	uint32_t   width  = 0;
-	uint32_t   height = 0;
-	uint32_t   pitch  = 0;
-	uint64_t   size   = 0;
+	uint32_t       height       = 0;
 	bool       tile   = false;
 	const bool     standard4    = rt.attrib3.tile_mode == Prospero::TileMode::kStandard4KB;
 	const bool     standard64   = rt.attrib3.tile_mode == Prospero::TileMode::kStandard64KB;
@@ -268,6 +273,9 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	}
 	if (texture_tile && samples != 1) {
 		EXIT("texture-tiled color render targets do not support multisampling\n");
+	}
+	if (volume && !tile) {
+		EXIT("linear 3D render targets are unsupported\n");
 	}
 
 	width  = rt.attrib2.width + 1;
@@ -303,80 +311,25 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		     " layer=%u/%u\n",
 		     rt.attrib3.dimension, rt.attrib3.depth, view.base_layer, view.image_layers);
 	}
-	if (samples == 1) {
-		pitch = TileGetTexturePitch(transfer_format, width, rt.attrib3.tile_mode);
-	} else {
-		pitch = TileGetRenderTargetPitch(width, bytes_per_element, rt.attrib.num_fragments);
-	}
-	if (pitch == 0) {
-		EXIT("unsupported render-target pitch: width=%u bytes=%u\n", width, bytes_per_element);
-	}
-
-	TileSizeOffset    mip_sizes[16] {};
-	TilePaddedSize    mip_padded[16] {};
-	TileSurfaceLayout volume_layout {};
-	uint64_t          backing_size = 0;
-	if (volume) {
-		const TileSurfaceDescription description {transfer_format,
-		                                          rt.attrib3.tile_mode,
-		                                          TileSurfaceDimension::Dim3D,
-		                                          width,
-		                                          height,
-		                                          depth,
-		                                          levels,
-		                                          1};
-		if (!tile || !TileGetTiledTextureLayout(description, volume_layout)) {
-			EXIT("unsupported 3D render-target layout: %ux%ux%u levels=%u tile=%u\n", width, height,
-			     depth, levels, static_cast<uint32_t>(rt.attrib3.tile_mode));
-		}
-		size         = volume_layout.block_slice_size;
-		backing_size = volume_layout.total_size;
-	} else {
-		TileSizeAlign layout {};
-		bool          valid_layout = false;
-		if (samples == 1) {
-			TileGetTextureSize(transfer_format, width, height, levels, rt.attrib3.tile_mode,
-			                   &layout, mip_sizes, mip_padded);
-			valid_layout = layout.size != 0 && layout.align != 0 &&
-			               (rt.attrib3.tile_mode != Prospero::TileMode::kRenderTarget ||
-			                levels <= std::bit_width(std::max(width, height)));
-		} else {
-			valid_layout = TileGetRenderTargetSize(width, height, pitch, bytes_per_element,
-			                                       layout, rt.attrib.num_fragments);
-			mip_sizes[0]  = {layout.size, 0, 0, 0, 0, 0};
-			mip_padded[0] = {pitch, height};
-		}
-		if (!valid_layout) {
-			EXIT("unsupported render-target layout: %ux%u pitch=%u bytes=%u levels=%u\n", width,
-			     height, pitch, bytes_per_element, levels);
-		}
-		size = layout.size;
-	}
-	if (size == 0 || (!volume && size > UINT64_MAX / view.image_layers)) {
-		EXIT("render-target memory footprint is invalid\n");
-	}
-	if (!volume) {
-		backing_size = size * view.image_layers;
-	}
-	if (backing_size == 0) {
-		EXIT("render-target backing is empty\n");
-	}
-	if (!GuestRange {rt.base.addr, backing_size}.Valid()) {
-		EXIT("render-target backing range is invalid\n");
-	}
-
 	auto& desc = r.desc;
 	desc.type              = TextureCache::BindingType::RenderTarget;
-	desc.info.data         = {rt.base.addr, backing_size};
+	desc.info.data            = {rt.base.addr, 0};
 	desc.info.pixel_format = target_format.format;
 	desc.info.guest_format = target_format.guest_format;
 	desc.info.type         = image_type;
 	desc.info.extent       = {width, height, depth};
-	desc.info.resources    = {levels, volume ? 1u : view.image_layers};
-	desc.info.pitch        = pitch;
+	desc.info.resources       = {levels, volume ? 1u : view.image_layers};
 	desc.info.bytes_per_block = bytes_per_element;
 	desc.info.samples         = samples;
 	desc.info.tile_mode       = rt.attrib3.tile_mode;
+	if (!volume && rt.attrib3.tile_mode == Prospero::TileMode::kRenderTarget &&
+	    levels > std::bit_width(std::max(width, height))) {
+		EXIT("unsupported render-target mip count\n");
+	}
+	desc.info.UpdateSize();
+	if (!desc.info.data.Valid()) {
+		EXIT("render-target backing range is invalid\n");
+	}
 	const bool has_dcc        = rt.info.dcc_compression_enable && rt.dcc_addr.addr != 0;
 	const bool has_cmask      = !rt.info.dcc_compression_enable && rt.info.cmask_fast_clear_enable &&
 	                            rt.cmask.addr != 0 && samples == 1 &&
@@ -399,30 +352,6 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		desc.info.metadata.clear_word1          = rt.clear_word1.word1;
 		desc.info.metadata.clear_register_valid = true;
 	}
-	for (uint32_t level = 0; level < levels; level++) {
-		if (volume) {
-			const auto& mip             = volume_layout.mips[level];
-			desc.info.mip_layout[level] = {
-			    mip.offset,
-			    mip.size,
-			    mip.padded_width,
-			    mip.padded_height,
-			};
-			continue;
-		}
-		const auto level_offset =
-		    mip_sizes[level].src_size != 0 ? mip_sizes[level].src_offset : mip_sizes[level].offset;
-		const auto level_size =
-		    static_cast<uint64_t>(mip_sizes[level].src_size != 0 ? mip_sizes[level].src_size
-		                                                         : mip_sizes[level].size) *
-		    view.image_layers;
-		desc.info.mip_layout[level] = {
-		    level_offset,
-		    level_size,
-		    mip_padded[level].width,
-		    mip_padded[level].height,
-		};
-	}
 	desc.view_info.format = target_format.format;
 	if (is_1d) {
 		desc.view_info.type =
@@ -441,18 +370,22 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	r.guest_mip_level          = rt.view.current_mip_level;
 	r.guest_array_layer        = view.base_layer;
 	if (memoize) {
-		auto& memo = ColorTargetMemo();
-		if (memo.size() > 16384u) {
-			memo.clear();
-			LastColorTargets() = {};
-		}
+		auto& memo = NhlColorTargetMemo();
+		if (memo.size() > 16384u) memo.clear();
 		auto& cached = memo[key];
 		cached.info                = r;
 		cached.info.export_mapping = target_format.export_mapping;
 		cached.last_image          = {};
 	}
-	r.image_id                 = texture_cache.FindImage(r.desc, exact_format);
 	r.export_mapping           = target_format.export_mapping;
+	auto& entry                = memo[m_color_target_memo->next[rt_slot]];
+	m_color_target_memo->next[rt_slot] =
+	    (m_color_target_memo->next[rt_slot] + 1u) % ColorTargetMemo::Ways;
+	std::memcpy(&entry.registers, &rt, sizeof(rt));
+	entry.slice_offset = render_target_slice_offset;
+	entry.info         = r;
+	entry.valid        = true;
+	r.image_id         = texture_cache.FindImage(r.desc, exact_format);
 	BindRenderTarget(r.image_id);
 }
 

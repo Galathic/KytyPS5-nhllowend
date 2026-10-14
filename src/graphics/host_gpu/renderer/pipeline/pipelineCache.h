@@ -4,10 +4,14 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/threads.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 
+#include <array>
+#include <atomic>
 #include <cstddef>
 #include <atomic>
 #include <filesystem>
@@ -16,8 +20,56 @@
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <vector>
 
 namespace Libs::Graphics {
+
+// Guest memory that a resolution ahead of execution read. The execution thread repeats the reads
+// before it uses the resolution: guest memory may have changed in between (operations that
+// execute before the draw write it), and ahead of execution GPU-owned bytes cannot be read.
+class GuestReadLog {
+public:
+	void Clear() {
+		m_entries.clear();
+		m_bytes.clear();
+		m_failed = false;
+	}
+	// Reads the backing store without faulting. Strict reads are checked the way specialization
+	// memory is read (GPU-owned bytes fail), the others as plain loads.
+	bool               Read(uint64_t address, void* data, uint64_t size, bool strict);
+	void               Fail() { m_failed = true; }
+	[[nodiscard]] bool Failed() const { return m_failed; }
+	// Execution thread: whether every read still gives the recorded bytes.
+	[[nodiscard]] bool StillValid() const;
+
+private:
+	static constexpr uint64_t StrictCheckBytes = 64;
+	struct Entry {
+		uint64_t address = 0;
+		uint32_t size    = 0;
+		uint32_t offset  = 0;
+		bool     strict  = false;
+	};
+	std::vector<Entry>   m_entries;
+	std::vector<uint8_t> m_bytes;
+	bool                 m_failed = false;
+};
+
+// Storage of the shader programs a draw resolved ahead of its execution: the resource snapshots
+// and specializations its stages point to, and the guest memory they read.
+struct ProgramResolution {
+	static constexpr uint32_t MaxStages = 4;
+
+	std::array<ShaderRecompiler::IR::ResourceSnapshot, MaxStages>       resources;
+	std::array<ShaderRecompiler::IR::ResourceSpecialization, MaxStages> specializations;
+	GuestReadLog                                                        reads;
+	uint32_t                                                            stages = 0;
+
+	void Reset() {
+		reads.Clear();
+		stages = 0;
+	}
+};
 
 struct GraphicContext;
 struct RenderColorInfo;
@@ -110,8 +162,6 @@ public:
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
 	void Save();
-	// NHL26: periodic save so pipelines survive emulator crashes (call after creating one).
-	void AutoSave();
 
 	struct Pipeline {
 		vk::PipelineLayout      pipeline_layout       = nullptr;
@@ -133,7 +183,7 @@ public:
 	                    const HW::Context& context, const HW::UserConfig& user_config,
 	                    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
 	                    bool pixel_active, std::array<ShaderVertexInputInfo, 3>& vertex_info,
-	                    ShaderPixelInputInfo& pixel_info, const NativeDrawShaderInfo& native_draw = {});
+	                    ShaderPixelInputInfo& pixel_info, const NativeDrawShaderInfo& native_draw = {}, ProgramResolution* ahead = nullptr);
 	ShaderProgram GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                const HW::ShaderRegisters&   sh,
 	                                ShaderComputeInputInfo&      input_info);
@@ -178,14 +228,16 @@ private:
 
 	GraphicContext&               m_graphics;
 	std::unique_ptr<ProgramCache> m_program_cache;
+	// Draws resolve their programs on the resolve thread and, when a resolution is not usable,
+	// on the execution thread, which also resolves dispatches.
+	std::atomic_flag              m_program_lock;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
-	uint64_t                      m_unsaved_pipelines = 0;
-	uint64_t                      m_last_save_ms      = 0;
-	// AutoSave writes the driver cache on this thread: serializing and writing it (tens of MB)
-	// on the GPU thread took about 2% of its time in gameplay. One save runs at a time.
-	std::thread                   m_save_thread;
-	std::atomic<bool>             m_save_running {false};
+	// Pipelines created since the driver cache was last written; a background thread writes
+	// the cache periodically so a crash does not lose the pipelines compiled until then.
+	std::atomic_uint64_t          m_unsaved_pipelines {0};
+	Common::Mutex                 m_write_mutex;
+	std::jthread                  m_save_thread;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
@@ -194,6 +246,9 @@ private:
 	GraphicsPipelineKey m_last_key {};
 	Pipeline*           m_last_pipeline = nullptr;
 	uint64_t            m_last_compute_id = 0;
+	// The pipeline the last lookup found; pipelines are never removed while the cache lives.
+	GraphicsPipelineKey m_last_graphics_key {};
+	Pipeline*           m_last_graphics_pipeline = nullptr;
 
 	void InitializeDriverCache();
 	std::unique_ptr<PipelineRecord::RecordFile> m_record;
@@ -202,6 +257,8 @@ private:
 	void RecordGraphicsPipeline(const GraphicsPipelineKey& key,
 	                            std::span<const ShaderVertexInputInfo> vertex_info,
 	                            const ShaderPixelInputInfo* ps_input_info);
+	// Writes the driver cache data to m_driver_cache_path; the cache must stay alive meanwhile.
+	void WriteDriverCache();
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);

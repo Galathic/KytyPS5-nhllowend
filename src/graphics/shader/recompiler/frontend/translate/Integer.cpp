@@ -221,8 +221,12 @@ void Translator::V_XOR3_B32(const Decoder::Instruction& inst) {
 	WriteOperand(DestinationOperand(inst), result);
 }
 
-void Translator::S_FF1_I32_B64(const Decoder::Instruction& inst) {
-	const auto source        = ExtractU64(ReadU64(inst.src0));
+void Translator::S_FF_I32_B64(const Decoder::Instruction& inst, bool find_zero) {
+	auto source = ReadU32Pair(inst.src0);
+	if (find_zero) {
+		source[0] = ir.BitwiseNot(source[0]);
+		source[1] = ir.BitwiseNot(source[1]);
+	}
 	const auto low_lsb       = IR::U32(ir.Emit(IR::ValueOpcode::FindILsb32, {source[0]}));
 	const auto high_lsb      = IR::U32(ir.Emit(IR::ValueOpcode::FindILsb32, {source[1]}));
 	const auto high_position = ir.IAdd(high_lsb, IR::U32(IR::Value(32u)));
@@ -539,6 +543,19 @@ void Translator::V_CNDMASK_B32(const Decoder::Instruction& inst) {
 		result = ir.Select(condition, ReadU32(inst.src1), ReadU32(inst.src0));
 	}
 	WriteOperand(DestinationOperand(inst), result);
+}
+
+void Translator::V_CVT_PK_16_32(const Decoder::Instruction& inst, bool sign) {
+	// u32_to_u16/i32_to_i16 saturate to the 16-bit range; they are not plain truncations.
+	const auto convert = [&](const Decoder::Operand& operand) {
+		const auto value = ReadU32(operand);
+		if (!sign) {
+			return IR::U32(ir.Emit(IR::ValueOpcode::UMin32, {value, IR::Value(0xffffu)}));
+		}
+		const auto low = IR::U32(ir.Emit(IR::ValueOpcode::SMax32, {value, IR::Value(0xffff8000u)}));
+		return IR::U32(ir.Emit(IR::ValueOpcode::SMin32, {low, IR::Value(0x7fffu)}));
+	};
+	WriteOperand(DestinationOperand(inst), PackU16Lanes(convert(inst.src0), convert(inst.src1)));
 }
 
 void Translator::PackB16(const Decoder::Instruction& inst, bool high0, bool high1) {

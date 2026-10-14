@@ -167,6 +167,49 @@ uint32_t FaultElementPointer(EmitterState& state, uint32_t index) {
 	return pointer;
 }
 
+// The BufferCache caching page of a guest address: the index of its BDA page table entry and of
+// its bits in the fault buffer.
+uint32_t BdaPageIndex(EmitterState& state, uint32_t address) {
+	const auto type     = TypeU64(state);
+	const auto extended = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), address,
+	                             ConstantU64(state, LibKernel::Memory::kExtendedMemoryBase));
+	const auto packed   = Select(state, type, extended,
+	                             Binary(state, spv::OpISub, type, address,
+	                                    ConstantU64(state,
+	                                        LibKernel::Memory::kExtendedMemoryBase - LOWER_ADDRESS_SIZE)),
+	                             address);
+	const auto page64   = Binary(state, spv::OpShiftRightLogical, type, packed,
+	                             ConstantU64(state, BufferCache::CACHING_PAGEBITS));
+	return Unary(state, spv::OpUConvert, TypeU32(state), page64);
+}
+
+// Sets the page's bit in the write bitmap, so the host learns which pages V#-table stores wrote.
+// Most stores find the bit set already; only the first store to a page pays for the atomic.
+void RecordBdaWrite(EmitterState& state, uint32_t page) {
+	static_assert(BufferCache::WRITE_BITMAP_OFFSET % sizeof(uint32_t) == 0 &&
+	              BufferCache::WRITE_BITMAP_OFFSET / sizeof(uint32_t) <= UINT32_MAX);
+	const auto word = Binary(
+	    state, spv::OpIAdd, TypeU32(state),
+	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), page, ConstantU32(state, 5)),
+	    ConstantU32(state,
+	                static_cast<uint32_t>(BufferCache::WRITE_BITMAP_OFFSET / sizeof(uint32_t))));
+	const auto bit =
+	    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), ConstantU32(state, 1),
+	           Binary(state, spv::OpBitwiseAnd, TypeU32(state), page, ConstantU32(state, 31)));
+	const auto pointer = FaultElementPointer(state, word);
+	const auto scope   = ConstantU32(state, spv::ScopeDevice);
+	const auto relaxed = ConstantU32(state, spv::MemorySemanticsMaskNone);
+	const auto value   = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAtomicLoad, TypeU32(state), value, pointer, scope, relaxed);
+	const auto missing =
+	    Binary(state, spv::OpIEqual, TypeBool(state),
+	           Binary(state, spv::OpBitwiseAnd, TypeU32(state), value, bit), ConstantU32(state, 0));
+	EmitIfCondition(state, missing, [&]() {
+		state.builder.AddFunction(spv::OpAtomicOr, TypeU32(state), state.builder.AllocateId(),
+		                          pointer, scope, relaxed, bit);
+	});
+}
+
 void RecordBdaFault(EmitterState& state, uint32_t page) {
 	const auto word =
 	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), page, ConstantU32(state, 5));
@@ -178,11 +221,12 @@ void RecordBdaFault(EmitterState& state, uint32_t page) {
 	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
 	state.builder.AddFunction(spv::OpStore, pointer,
 	                          Binary(state, spv::OpBitwiseOr, TypeU32(state), value, bit));
-	// Dirty flag for FaultManager's gate pass: one word past the bitmap. Every bitmap store is
+	// Dirty flag for FaultManager's gate pass: one word past both bitmaps. Every bitmap store is
 	// followed by a plain store of 1 here, so "dirty == 0" implies no bit was set since the last
-	// parser clear. Must stay in sync with FaultManager (DirtyWordIndex).
+	// parser clear.
+	static_assert(BufferCache::FAULT_DIRTY_WORD <= UINT32_MAX);
 	const auto dirty_pointer = FaultElementPointer(
-	    state, ConstantU32(state, static_cast<uint32_t>(BufferCache::CACHING_NUMPAGES / 32)));
+	    state, ConstantU32(state, static_cast<uint32_t>(BufferCache::FAULT_DIRTY_WORD)));
 	state.builder.AddFunction(spv::OpStore, dirty_pointer, ConstantU32(state, 1u));
 }
 
@@ -257,8 +301,7 @@ uint32_t LoadBda(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint3
 
 uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
 	if (mem.kind == IR::ResourceKind::Buffer) {
-		const auto resource = ResourceForDescriptor(ctx.state, IR::DescriptorBindingKind::Buffers,
-		                                            mem.resource);
+		const auto resource = ctx.state.program.info.buffers.at(mem.resource).descriptor_index;
 		const auto prefix = ctx.state.memory_byte_offsets[resource];
 		const auto address = Binary(ctx.state, spv::OpIAdd, TypeU32(ctx.state),
 		                            BufferByteAddress(ctx, inst, mem), prefix);
@@ -267,7 +310,7 @@ uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memo
 		              Binary(ctx.state, spv::OpUGreaterThanEqual, TypeBool(ctx.state), address, prefix),
 		              address, ConstantU32(ctx.state, UINT32_MAX));
 	}
-	if (mem.kind == IR::ResourceKind::Lds && ctx.state.requirements.function_lds_lane_slots) {
+	if (mem.kind == IR::ResourceKind::Lds && ctx.state.program.info.function_lds_lane_slots) {
 		// Per-lane slots: drop the LaneId * 4 every access shares (see SpirvRequirements).
 		uint32_t constant = 0;
 		if (!MatchLaneSlotLdsAddress(inst.Arg(0), constant)) {
@@ -347,7 +390,8 @@ uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& 
 	uint32_t value;
 	if (resource.element_bits < 32u) {
 		const auto loaded = ctx.state.builder.AllocateId();
-		ctx.state.builder.AddFunction(spv::OpLoad, TypeStorageBufferElement(ctx.state, bits), loaded,
+		ctx.state.builder.AddFunction(spv::OpLoad,
+		                              ctx.state.storage_buffers[bits == 8u ? 0 : 1].element_type, loaded,
 		                              EmitMemoryElementPointer(ctx.state, resource, index),
 		                              resource.memory_access);
 		value = Unary(ctx.state, spv::OpUConvert, TypeU32(ctx.state), loaded);
@@ -452,7 +496,8 @@ void StoreSubwordInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
 	if (resource.element_bits < 32u) {
 		ctx.state.builder.AddFunction(
 		    spv::OpStore, pointer,
-		    Unary(ctx.state, spv::OpUConvert, TypeStorageBufferElement(ctx.state, bits), data),
+		    Unary(ctx.state, spv::OpUConvert,
+		          ctx.state.storage_buffers[bits == 8u ? 0 : 1].element_type, data),
 		    resource.memory_access);
 		return;
 	}
@@ -792,6 +837,27 @@ uint32_t EncodeFormattedStoreComponent(ValueEmitContext& ctx,
 		    state, EmitBitCastF32U32(state, data), ConstantF32Value(state, 0.0f));
 		return EmitPackHalf2x16(state, pair);
 	}
+	if ((bits == 11u || bits == 10u) && info.type == Format::ComponentType::Float) {
+		// Unsigned 11/10-bit floats share the half-float exponent: drop the sign and the low
+		// mantissa bits of the f16 encoding, clamping negatives to zero and keeping NaN a NaN.
+		const auto value = EmitBitCastF32U32(ctx.state, data);
+		const auto pair  = EmitCompositeConstructF32x2(ctx.state, value,
+		                                               ConstantF32Value(ctx.state, 0.0f));
+		const auto half  = EmitPackHalf2x16(ctx.state, pair);
+		const auto shift = ConstantU32(ctx.state, bits == 11u ? 4u : 5u);
+		const auto packed_small = Binary(ctx.state, spv::OpShiftRightLogical, TypeU32(ctx.state),
+		                          EmitAndConstant(ctx.state, half, 0x7fffu), shift);
+		const auto nan   = Binary(ctx.state, spv::OpUGreaterThan, TypeBool(ctx.state),
+		                          EmitAndConstant(ctx.state, half, 0x7fffu),
+		                          ConstantU32(ctx.state, 0x7c00u));
+		const auto negative = Binary(ctx.state, spv::OpINotEqual, TypeBool(ctx.state),
+		                             EmitAndConstant(ctx.state, half, 0x8000u),
+		                             ConstantU32(ctx.state, 0u));
+		const auto finite =
+		    Select(ctx.state, TypeU32(ctx.state), negative, ConstantU32(ctx.state, 0u), packed_small);
+		return Select(ctx.state, TypeU32(ctx.state), nan,
+		              ConstantU32(ctx.state, bits == 11u ? 0x7ffu : 0x3ffu), finite);
+	}
 	return data;
 }
 
@@ -989,6 +1055,55 @@ uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_
 	return ConstructU32Composite(state, components, values);
 }
 
+void StoreBdaDword(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint32_t value) {
+	auto& state = ctx.state;
+	EmitIfCondition(state, active, [&]() {
+		// RDNA2 DWORD accesses ignore the two low address bits.
+		const auto aligned = Binary(state, spv::OpBitwiseAnd, TypeU64(state), address,
+		                            ConstantU64(state, ~uint64_t {3}));
+		const auto bda     = GetBdaPointer(state, aligned);
+		const auto present =
+		    Binary(state, spv::OpINotEqual, TypeBool(state), bda, ConstantU64(state, 0));
+		EmitIfCondition(state, present, [&]() {
+			const auto pointer = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
+			                          bda);
+			constexpr uint32_t alignment = sizeof(uint32_t);
+			state.builder.AddFunction(spv::OpStore, pointer, value, spv::MemoryAccessAlignedMask,
+			                          alignment);
+			RecordBdaWrite(state, BdaPageIndex(state, aligned));
+		});
+	});
+}
+
+void StoreIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
+	auto& state = ctx.state;
+	EmitIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
+		const auto buffer       = PrepareIndirectBuffer(ctx, inst);
+		const auto valid_format = Binary(state, spv::OpINotEqual, TypeBool(state), buffer.format,
+		                                 ConstantU32(state, 0));
+		const auto base = Binary(state, spv::OpBitwiseAnd, TypeU64(state), buffer.address,
+		                         ConstantU64(state, ~uint64_t {3}));
+		const auto data = ctx.Arg(inst, inst.NumArgs() - 2);
+		for (uint32_t component = 0; component < components; component++) {
+			auto value = data;
+			if (components != 1u) {
+				value = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), value, data,
+				                          component);
+			}
+			const auto address = component == 0u ? base : Binary(
+			    state, spv::OpIAdd, TypeU64(state), base,
+			    ConstantU64(state, component * 4u));
+			StoreBdaDword(ctx, address,
+			              AndCondition(state, valid_format,
+			                           IndirectBufferInBounds(state, buffer, component * 4u, 4u,
+			                                                  false)),
+			              value);
+		}
+	});
+}
+
 uint32_t LoadIndirectFormattedX(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto& state = ctx.state;
 	return EmitValueOrZeroIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
@@ -1157,16 +1272,7 @@ void DefineGetBdaPointer(EmitterState& state) {
 	state.builder.AddFunction(spv::OpFunctionParameter, type, address);
 	EmitLabel(state, entry_label);
 
-	const auto extended = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), address,
-	                             ConstantU64(state, LibKernel::Memory::kExtendedMemoryBase));
-	const auto packed   = Select(
-	    state, type, extended,
-	    Binary(state, spv::OpISub, type, address,
-	           ConstantU64(state, LibKernel::Memory::kExtendedMemoryBase - LOWER_ADDRESS_SIZE)),
-	    address);
-	const auto page64        = Binary(state, spv::OpShiftRightLogical, type, packed,
-	                                  ConstantU32(state, BufferCache::CACHING_PAGEBITS));
-	const auto page          = Unary(state, spv::OpUConvert, TypeU32(state), page64);
+	const auto page          = BdaPageIndex(state, address);
 	const auto entry_pointer = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state, 64),
 	                          entry_pointer, state.bda_pagetable_variable, ConstantU32(state, 0),
@@ -1214,8 +1320,8 @@ uint32_t EmitBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&       state = ctx.state;
 	return EmitValueOrDefaultIfCondition(
 	    state, ctx.Arg(inst, inst.NumArgs() - 1), TypeU64(state), ConstantU64(state, 0), [&]() {
-		    const auto resource = PrepareStorageBufferResourceAccess(
-		        state, mem, state.storage_buffer_u64_variable, TypeStorageBufferPointer(state, 64));
+		    const auto resource =
+		        PrepareStorageBufferResourceAccess(state, mem, state.storage_buffers[3]);
 		    const auto byte_address = ByteAddress(ctx, inst, mem);
 		    const auto index = Binary(state, spv::OpShiftRightLogical, TypeU32(state), byte_address,
 		                              ConstantU32(state, 3u));
@@ -1431,6 +1537,8 @@ void EmitStoreMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto  type              = inst.Arg(inst.NumArgs() - 2).GetType();
 	if (mem.kind == IR::ResourceKind::FlatLocal)
 		StoreLocalFlat(ctx, inst);
+	else if (mem.kind == IR::ResourceKind::IndirectBuffer)
+		StoreIndirectBuffer(ctx, inst, std::max(buffer_components, 1u));
 	else if (buffer_components > 1u)
 		StoreWideBuffer(ctx, inst, buffer_components);
 	else if (shared_components > 1u)
