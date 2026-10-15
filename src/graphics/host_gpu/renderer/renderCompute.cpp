@@ -425,6 +425,10 @@ void RenderExecutor::PrepareComputeInputInfo(const HW::Shader& shaders, uint32_t
 	}
 }
 
+// Dispatches the resolve thread could not resolve ahead: [0] no program yet (or busy), [1] a
+// guest-memory read it could not make (GPU-written bytes, for example).
+static std::atomic<uint64_t> g_dispatch_ahead_misses[2] {};
+
 RenderExecutor::ResolvedDispatch* RenderExecutor::ResolveDispatchAhead(const HW::Context& context,
                                                                        const HW::Shader& shaders,
                                                                        uint32_t thread_group_x,
@@ -454,6 +458,8 @@ RenderExecutor::ResolvedDispatch* RenderExecutor::ResolveDispatchAhead(const HW:
 	dispatch.program = m_context.GetPipelineCache().GetComputeProgramAhead(
 	    shaders.GetCs(), context.GetShaderRegisters(), dispatch.input_info, dispatch.programs);
 	if (!dispatch.program || dispatch.programs.reads.Failed()) {
+		// KYTY_DBG_CP_READS: why (printed with NHL27AHEAD by the execution thread).
+		g_dispatch_ahead_misses[dispatch.programs.reads.Failed() ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
 		return nullptr;
 	}
 	// Published to the execution thread with the operation that carries it.
@@ -527,7 +533,26 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	// holds when the guest memory it read still has the same bytes.
 	auto* resolved = std::exchange(m_resolved_dispatch, nullptr);
 	const auto compute_program = [&] {
-		if (resolved != nullptr && resolved->programs.reads.StillValid()) {
+		const bool ahead = resolved != nullptr && resolved->programs.reads.StillValid(true);
+		// KYTY_DBG_CP_READS=1: how many dispatches use the resolve thread's read-ahead (2 s).
+		if (Libs::Graphics::CpReadDebugEnabled() && Common::Experiments::Enabled(Common::Experiments::DispatchAhead)) {
+			static uint64_t counts[3] {};
+			static auto     last = std::chrono::steady_clock::now();
+			counts[resolved == nullptr ? 0 : ahead ? 1 : 2]++;
+			if ((counts[0] + counts[1] + counts[2]) % 512 == 0 &&
+			    std::chrono::steady_clock::now() - last > std::chrono::seconds(2)) {
+				last = std::chrono::steady_clock::now();
+				std::printf("NHL27AHEAD: dispatches resolved ahead=%llu stale=%llu not resolved=%llu "
+				            "(no program %llu, failed read %llu)\n",
+				            static_cast<unsigned long long>(counts[1]), static_cast<unsigned long long>(counts[2]),
+				            static_cast<unsigned long long>(counts[0]),
+				            static_cast<unsigned long long>(g_dispatch_ahead_misses[0].exchange(0)),
+				            static_cast<unsigned long long>(g_dispatch_ahead_misses[1].exchange(0)));
+				std::fflush(stdout);
+				counts[0] = counts[1] = counts[2] = 0;
+			}
+		}
+		if (ahead) {
 			input_info = resolved->input_info;
 			return resolved->program;
 		}

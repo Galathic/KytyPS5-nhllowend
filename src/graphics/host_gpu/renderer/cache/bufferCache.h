@@ -99,6 +99,9 @@ public:
 	// KYTY_PERF_STATS=1: the faulting guest instruction of the calling thread, so CPU-write
 	// readbacks can be attributed to the code that caused them (NHL27WRITEBACK).
 	static void               NoteFaultRip(uint64_t rip);
+	// KYTY_DBG_CP_READS: the shader whose resources the calling thread materializes, named by
+	// NHL27RBWAIT for the downloads of GPU-written bytes it waits for.
+	static void               NoteReadbackShader(uint64_t hash) noexcept;
 	[[nodiscard]] static uint64_t PerfFlipCount();
 	// KYTY_PERF_STATS: device memory use the texture/buffer collectors last saw.
 	static void PerfSetMemoryUsage(uint64_t used, uint64_t texture_trigger, uint64_t buffer_trigger);

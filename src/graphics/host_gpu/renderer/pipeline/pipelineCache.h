@@ -40,7 +40,9 @@ public:
 	void               Fail() { m_failed = true; }
 	[[nodiscard]] bool Failed() const { return m_failed; }
 	// Execution thread: whether every read still gives the recorded bytes.
-	[[nodiscard]] bool StillValid() const;
+	// without_faults: bytes the GPU may have written since fail the check instead of being read back
+	// (a plain load of their page would fault and wait for all queued GPU work).
+	[[nodiscard]] bool StillValid(bool without_faults = false) const;
 
 private:
 	static constexpr uint64_t StrictCheckBytes = 64;

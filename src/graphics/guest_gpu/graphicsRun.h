@@ -79,6 +79,7 @@ public:
 	// of the stream: from the value of a pending write when it is known, otherwise from memory
 	// once the operations that write it executed.
 	void ReadDecisionMemory(const volatile void* address, void* value, size_t size);
+	[[nodiscard]] size_t PendingWriteCount() const { return m_pending_count; }
 	// True when the newest pending write over [address, address + size) is an end-of-pipe clock
 	// write of the current guest queue covering it (its value is the reference clock when it
 	// executes).

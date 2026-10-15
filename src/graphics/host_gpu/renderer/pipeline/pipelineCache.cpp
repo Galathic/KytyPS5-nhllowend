@@ -11,6 +11,7 @@
 #include "common/threads.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
@@ -288,7 +289,7 @@ static bool SameGuestBytes(const void* guest, const uint8_t* recorded, uint32_t 
 	}
 }
 
-bool GuestReadLog::StillValid() const {
+bool GuestReadLog::StillValid(bool without_faults) const {
 	if (m_failed) {
 		return false;
 	}
@@ -306,14 +307,17 @@ bool GuestReadLog::StillValid() const {
 		} else {
 			// Experiment FaultPageDirect: on a page that faulted before (the GPU wrote other
 			// bytes of it), clean bytes are compared in the backing instead of faulting again.
+			// Dispatch read-ahead checks never fault: their pages change every frame (ring
+			// buffers), so the first read of each faulted (about 5 ms each, 15% of the thread).
 			if (Common::Experiments::Enabled(Common::Experiments::FaultPageDirect) &&
-			    Libs::LibKernel::Memory::IsReadFaultPage(entry.address, entry.size)) {
+			    (without_faults || Libs::LibKernel::Memory::IsReadFaultPage(entry.address, entry.size))) {
 				const auto compare =
 				    Libs::LibKernel::Memory::TryValidateCleanBacking(entry.address, recorded, entry.size);
 				if (compare == Libs::LibKernel::Memory::CleanBackingCompare::Equal) {
 					continue;
 				}
-				if (compare == Libs::LibKernel::Memory::CleanBackingCompare::Different) {
+				if (compare == Libs::LibKernel::Memory::CleanBackingCompare::Different ||
+				    (without_faults && compare == Libs::LibKernel::Memory::CleanBackingCompare::Dirty)) {
 					return false;
 				}
 			}
@@ -743,6 +747,7 @@ struct PipelineCache::ProgramCache {
 		}
 
 		ApplyExperiments();
+		BufferCache::NoteReadbackShader(params.hash);
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
 		lookup_key.stage           = stage;
 		lookup_key.hash            = params.hash;

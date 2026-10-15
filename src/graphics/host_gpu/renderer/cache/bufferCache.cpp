@@ -548,10 +548,12 @@ namespace {
 thread_local uint32_t g_readback_origin = 3;
 thread_local uint32_t g_readback_exact  = 2;
 thread_local uint32_t g_readback_caller = 3;
+thread_local uint64_t g_readback_shader = 0;
 struct ReadbackWaitNote {
 	bool                                  active = false;
 	bool                                  queue  = false;
 	uint32_t                              key    = 0;
+	uint64_t                              shader = 0;
 	std::chrono::steady_clock::time_point start;
 
 	void Begin(CommandScheduler& scheduler, uint64_t write_tick) {
@@ -560,6 +562,8 @@ struct ReadbackWaitNote {
 		const bool done = scheduler.GetMasterSemaphore().KnownGpuTick() >= write_tick;
 		active          = true;
 		key = g_readback_caller * 10000 + g_readback_origin * 1000 + g_readback_exact * 100 + lag * 10 + (done ? 1 : 0);
+		// Strict resource reads of GPU-written bytes (caller other, exact): by shader.
+		shader = g_readback_caller == 0 && g_readback_exact == 1 ? g_readback_shader : 0;
 		start             = std::chrono::steady_clock::now();
 		g_readback_origin = 3;
 		g_readback_exact  = 2;
@@ -578,7 +582,13 @@ struct ReadbackWaitNote {
 		const auto                                        now = std::chrono::steady_clock::now();
 		auto& stat = stats[key + (queue ? 100000u : 0u)];
 		stat.count++;
-		stat.ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count());
+		const auto ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count());
+		stat.ns += ns;
+		static std::map<uint64_t, Stat> shaders;
+		if (shader != 0) {
+			shaders[shader].count++;
+			shaders[shader].ns += ns;
+		}
 		if (now - last < std::chrono::seconds(2)) {
 			return;
 		}
@@ -592,8 +602,17 @@ struct ReadbackWaitNote {
 			            exacts[(k / 100) % 10], (k / 10) % 10, k % 10, static_cast<unsigned long long>(s.count),
 			            static_cast<double>(s.ns) / 1e6);
 		}
+		std::vector<std::pair<uint64_t, Stat>> by_time(shaders.begin(), shaders.end());
+		std::sort(by_time.begin(), by_time.end(), [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
+		for (size_t i = 0; i < by_time.size() && i < 6; i++) {
+			std::printf("NHL27RBWAIT: strict GPU-written reads of shader %016llx count=%llu ms=%.1f\n",
+			            static_cast<unsigned long long>(by_time[i].first),
+			            static_cast<unsigned long long>(by_time[i].second.count),
+			            static_cast<double>(by_time[i].second.ns) / 1e6);
+		}
 		std::fflush(stdout);
 		stats.clear();
+		shaders.clear();
 	}
 };
 } // namespace
@@ -984,6 +1003,10 @@ void BufferCache::FinishPendingGuestReads(uint64_t vaddr, uint64_t size) {
 }
 
 static thread_local uint64_t g_fault_rip = 0;
+
+void BufferCache::NoteReadbackShader(uint64_t hash) noexcept {
+	g_readback_shader = hash;
+}
 
 void BufferCache::NoteFaultRip(uint64_t rip) {
 	g_fault_rip = rip;

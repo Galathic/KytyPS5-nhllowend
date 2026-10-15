@@ -146,6 +146,8 @@ public:
 	// Reads guest memory the CP decides on (WAIT_REG_MEM, COND_EXEC, predication, branches) as a
 	// serial GPU would: after the earlier operations that write it.
 	void ReadDecisionMemory(const volatile void* address, void* value, size_t size);
+	void NoteStuckWait(uint64_t address, uint64_t value, uint64_t ref, uint64_t mask, uint32_t func,
+	                   uint32_t size);
 	template <typename T>
 	[[nodiscard]] T ReadDecisionValue(const volatile void* address) {
 		T value {};

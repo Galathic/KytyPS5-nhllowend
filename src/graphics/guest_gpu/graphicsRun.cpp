@@ -943,6 +943,42 @@ bool CommandProcessor::TryPeekGuest(const volatile void* addr, void* out, uint64
 	return true;
 }
 
+// A WAIT_REG_MEM that keeps failing for the same memory: NHL 27 menus sometimes hang this way
+// (the game then calls Coredump). Printed as NHL27STUCKWAIT after 2 s and every 5 s while stuck.
+void CommandProcessor::NoteStuckWait(uint64_t address, uint64_t value, uint64_t ref, uint64_t mask,
+                                     uint32_t func, uint32_t size) {
+	struct Stuck {
+		uint64_t                              address = 0;
+		uint64_t                              ref     = 0;
+		uint32_t                              func    = 0;
+		uint64_t                              count   = 0;
+		std::chrono::steady_clock::time_point since {};
+		std::chrono::steady_clock::time_point printed {};
+	};
+	static thread_local Stuck stuck;
+	if (stuck.address != address || stuck.ref != ref || stuck.func != func) {
+		stuck = {.address = address, .ref = ref, .func = func, .count = 0, .since = std::chrono::steady_clock::now()};
+	}
+	if ((++stuck.count & 255u) != 0) {
+		return;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (now - stuck.since < std::chrono::seconds(2) || now - stuck.printed < std::chrono::seconds(5)) {
+		return;
+	}
+	stuck.printed      = now;
+	const bool gpu_dirty = m_renderer.GetBufferCache().HasGpuDirtyBytes(address, size);
+	std::printf("NHL27STUCKWAIT: addr=0x%llx size=%u func=%u ref=0x%llx mask=0x%llx value=0x%llx polls=%llu "
+	            "for %.1f s queue=%u async=%d gpu_dirty=%d pending_writes=%llu\n",
+	            static_cast<unsigned long long>(address), size, func, static_cast<unsigned long long>(ref),
+	            static_cast<unsigned long long>(mask), static_cast<unsigned long long>(value),
+	            static_cast<unsigned long long>(stuck.count),
+	            std::chrono::duration<double>(now - stuck.since).count(), static_cast<unsigned>(m_interrupt_event_id), IsAsyncComputeQueue() ? 1 : 0,
+	            gpu_dirty ? 1 : 0,
+	            static_cast<unsigned long long>(m_pipeline != nullptr ? m_pipeline->PendingWriteCount() : 0));
+	std::fflush(stdout);
+}
+
 template <typename T>
 void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, uint32_t poll,
                                   uint32_t wait_op) {
@@ -968,7 +1004,10 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 			return;
 		}
 	}
-	if (!TestWaitRegMemValue(ReadDecisionValue<T>(addr), ref, mask, func)) {
+	const T current = ReadDecisionValue<T>(addr);
+	if (!TestWaitRegMemValue(current, ref, mask, func)) {
+		NoteStuckWait(reinterpret_cast<uint64_t>(addr), static_cast<uint64_t>(current), ref, mask, func,
+		              sizeof(T));
 		SuspendPm4();
 	}
 	// KYTY_GUEST_SYNC: labels are written at CP time, so a guest RELEASE_MEM + WAIT_REG_MEM pair
