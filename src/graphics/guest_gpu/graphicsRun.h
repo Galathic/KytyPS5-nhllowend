@@ -80,6 +80,10 @@ public:
 	// once the operations that write it executed.
 	void ReadDecisionMemory(const volatile void* address, void* value, size_t size);
 	[[nodiscard]] size_t PendingWriteCount() const { return m_pending_count; }
+	// Execution thread: an end-of-pipe clock write ran with this value. Command processor: takes the
+	// newest such value covering the range (once).
+	void NoteExecutedWrite(uint64_t address, const void* value, uint64_t size);
+	bool TakeExecutedWrite(uint64_t address, void* value, uint64_t size);
 	// True when the newest pending write over [address, address + size) is an end-of-pipe clock
 	// write of the current guest queue covering it (its value is the reference clock when it
 	// executes).
@@ -149,6 +153,15 @@ private:
 	std::atomic_int m_done_num  = 0;
 
 	// Pipelined execution. m_emitted is only used by the command processor thread.
+	struct ExecutedWrite {
+		uint64_t address  = 0;
+		uint64_t size     = 0;
+		uint8_t  value[8] = {};
+	};
+	std::mutex                     m_executed_writes_mutex;
+	std::array<ExecutedWrite, 16> m_executed_writes {};
+	size_t                         m_executed_writes_next = 0;
+
 	struct GuestWrite {
 		uint64_t sequence = 0;
 		uint64_t address  = 0;

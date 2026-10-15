@@ -2536,7 +2536,14 @@ bool SrtWalker::RefreshDirectControlFlow(std::vector<uint32_t>& flat) {
 			    std::equal(cache.last_values.begin(), cache.last_values.end(), now)) {
 				condition = cache.last_result;
 				decided   = true;
-			} else if (predicate.Evaluate(block.condition, condition)) {
+			} else if ([&] {
+				           const bool nonblocking =
+				               Common::Experiments::Enabled(Common::Experiments::GpuConditionsBothPaths);
+				           if (nonblocking) SetConditionReadsNonBlocking(true);
+				           const bool ok = predicate.Evaluate(block.condition, condition);
+				           if (nonblocking) SetConditionReadsNonBlocking(false);
+				           return ok;
+			           }()) {
 				decided = true;
 				if (ready) {
 					std::copy(now, now + cache.leaves.size(), cache.last_values.begin());

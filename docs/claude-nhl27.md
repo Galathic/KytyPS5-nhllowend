@@ -189,6 +189,45 @@ thread materializes; the resolve thread waits 90 to 300 ms/s for the lock and ab
 room in the execution queue. With bits 14 and 16 together both lock waits drop to about 0, but
 in-match fps (8 rounds) and the paused fps did not move beyond noise, so they stay off.
 
+### How a frame is paced
+
+The game's submission thread waits on an event queue for the end-of-pipe interrupt that the
+execution thread raises right after it runs the frame's flip, then submits all of the next frame's
+command buffers (about 55) at once. A frame therefore takes as long as the execution thread needs
+for it, plus its waits for the GPU: the strict resource reads of bytes the GPU wrote in the command
+buffer being recorded submit it and wait for all queued GPU work (`NHL27RBWAIT: inline via=other
+from=gpu exact=yes lag=0`, now also by shader with `KYTY_DBG_CP_READS=1`). Nearly all of those came
+from one small compute shader (45066550b711ac4b, about 17 dispatches per frame): its first block
+reads a GPU-written counter and an index table and exits early when the entry is -1; the resource
+walk evaluated that branch, so it downloaded the counter (up to 0.7 s per 2 s while a match loads,
+2-10% of the execution thread in play).
+
+Bit 13 (`KYTY_GPU_CONDITIONS_BOTH_PATHS`, default on; was `KYTY_CLOCK_WAIT_AHEAD`, now env-only):
+while the direct resource walk evaluates a branch condition, strict reads decline GPU-written bytes
+instead of waiting; the condition stays undecided and the walk takes both successors (the union of
+their resources; the GPU still takes the branch itself). Those waits are gone; a six-boot A/B was
+within the cross-boot noise (33.8 vs 32.2 fps, single boots range 28-39).
+
+Crowd shots: with the stands in view a frame has about 4,050 draws (2,360 in normal play: 556
+extra tiny draws of PS 1fa12ecb into an R16 1024x256 target, 250 more depth draws, 140 more of PS
+f5a3c1b7), and drops to about 18 fps with the GPU half idle: the execution thread is the limit.
+`KYTY_DBG_DRAW_COST=1` (`NHL27DRAWCOST`, every 5 s) gives the execution-thread cost per draw by
+shader pair: the common draws take 2 to 2.5 us; the draw that carries the CPU-write
+synchronization (BDA sync of the pages the CPU wrote since the last one) takes about 1.6 ms.
+
+Device losses still happen at match load or late in a match in about 1 of 6 boots (2 of 6 in one
+run, 1 of 4 in another). With `KYTY_DBG_BREADCRUMBS=1` none occurred in 6 boots, so the markers
+change the timing; it is not understood yet. `KYTY_DBG_DUMP_SHADERS=<hash>` now also writes the
+guest disassembly and the IR (`_Shaders/NNNN_ir_<stage>_<hash>.txt`); a WAIT_REG_MEM that keeps
+failing prints `NHL27STUCKWAIT` (the menu hangs: the game then calls Coredump).
+
+Menu hangs (about 1 boot in 6 since 2026-10-14, the game then calls Coredump): `NHL27STUCKWAIT`
+showed the graphics queue waiting on a 64-bit label for "not zero" with no pending write left: the
+command processor had waited for the end-of-pipe clock write before it, the execution thread had
+written the clock and raised the interrupt, the game woke and reset the label to 0, and only then
+did the command processor read memory. The execution thread now records the clock values it
+writes, and a wait that had to wait for such a write takes the value written.
+
 `KYTY_FORCE_FLIP_RATE=0` keeps 60 Hz flips where the game asks for 30 (menus reach 40+ fps) and
 `KYTY_VBLANK_HZ` overrides the vblank rate; the paused match still ran at about 30 fps with both,
 because that is what it costs (GPU busy 70%, the execution thread 93%).

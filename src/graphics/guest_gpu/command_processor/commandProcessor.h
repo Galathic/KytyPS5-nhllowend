@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
+#include <chrono>
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -148,6 +149,15 @@ public:
 	void ReadDecisionMemory(const volatile void* address, void* value, size_t size);
 	void NoteStuckWait(uint64_t address, uint64_t value, uint64_t ref, uint64_t mask, uint32_t func,
 	                   uint32_t size);
+	struct StuckWait {
+		uint64_t                              address = 0;
+		uint64_t                              ref     = 0;
+		uint32_t                              func    = 0;
+		uint64_t                              count   = 0;
+		std::chrono::steady_clock::time_point since {};
+		std::chrono::steady_clock::time_point printed {};
+	};
+	StuckWait m_stuck_wait;
 	template <typename T>
 	[[nodiscard]] T ReadDecisionValue(const volatile void* address) {
 		T value {};

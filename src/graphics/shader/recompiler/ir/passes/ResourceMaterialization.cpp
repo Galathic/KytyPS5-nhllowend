@@ -28,6 +28,18 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 
 namespace {
 std::atomic<FaultPageReader> g_fault_page_reader_slot {nullptr};
+thread_local bool            t_condition_reads_nonblocking = false;
+} // namespace
+
+bool ConditionReadsNonBlocking() noexcept {
+	return t_condition_reads_nonblocking;
+}
+
+void SetConditionReadsNonBlocking(bool value) noexcept {
+	t_condition_reads_nonblocking = value;
+}
+
+namespace {
 }
 
 void SetFaultPageReader(FaultPageReader reader) {

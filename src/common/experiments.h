@@ -16,7 +16,7 @@ namespace Common::Experiments {
 // Features that also have a live runtime flag (common/runtimeFlags.h, flags.ctl) are NOT here:
 // KYTY_GUEST_SYNC, KYTY_LONG_BUFFER_GC_AGE, KYTY_RENDER_TARGET_MEMO (flag KYTY_RT_DECODE_MEMO),
 // KYTY_FAULT_COALESCE, KYTY_SPARSE_BUFFER_GC, KYTY_DIRECT_EOP_INTERRUPTS, KYTY_READBACK_QUEUE.
-// Their bit numbers are reused: 13 ClockWaitAhead, 14 ComputeUnlocked, 16 AheadUnlocked, 17 BackingReadMru, 19
+// Their bit numbers are reused: 13 ClockWaitAhead (now env-only KYTY_CLOCK_WAIT_AHEAD, bit 13 is GpuConditionsBothPaths), 14 ComputeUnlocked, 16 AheadUnlocked, 17 BackingReadMru, 19
 // DispatchAhead, 20 BackingLookupCache. Bit 0 (once GuestSync) is
 // EarlySubmitWriters, bit 8 (once GpuThreadPriority, then ReadbackTransfer) is RobustLoads and bit 9 (once
 // ImageRecycle, unconditional since the GTA port, then ReadbackSpin) is FusedMad.
@@ -33,7 +33,7 @@ enum Bit : uint32_t {
 	FalseShareReads    = 1u << 6u, // KYTY_FALSE_SHARE_READS (default off)
 	SrtBatchReads      = 1u << 7u, // KYTY_SRT_BATCH_READS (default on; also read by the program cache)
 	DirectSrtReads     = 1u << 10u, // KYTY_DIRECT_SRT_READS (default on; SRT reads without the IR walk)
-	ClockWaitAhead     = 1u << 13u, // KYTY_CLOCK_WAIT_AHEAD (default off; a WAIT_REG_MEM on this queue's pending end-of-pipe clock write that any later clock satisfies does not wait)
+	GpuConditionsBothPaths = 1u << 13u, // KYTY_GPU_CONDITIONS_BOTH_PATHS (default on; a resource walk takes both paths of a branch on GPU-written bytes instead of waiting for them; was ClockWaitAhead, now env-only)
 	ComputeUnlocked    = 1u << 14u, // KYTY_COMPUTE_UNLOCKED (default off; the execution thread materializes compute resources without the program lock)
 	AheadUnlocked      = 1u << 16u, // KYTY_AHEAD_UNLOCKED (default off; the resolve thread materializes resources ahead without the program lock)
 	BackingLookupCache = 1u << 20u, // KYTY_BACKING_LOOKUP_CACHE (default off; backing reads of another mapping use a per-64 KiB lookup cache)

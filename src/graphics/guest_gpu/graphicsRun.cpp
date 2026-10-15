@@ -446,9 +446,16 @@ void GuestGpu::ReadDecisionMemory(const volatile void* address, void* value, siz
 			           static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
 			                                     std::chrono::steady_clock::now() - start)
 			                                     .count()));
-			break;
+		} else {
+			WaitForExecution(write->sequence);
 		}
-		WaitForExecution(write->sequence);
+		// An end-of-pipe clock: the value it wrote, not what memory holds now. The interrupt after
+		// it wakes the game, which may reset the label before this read (the menus then hung on a
+		// WAIT_REG_MEM for a nonzero clock that read 0 forever).
+		if (write->address <= begin && end <= write->address + write->size &&
+		    TakeExecutedWrite(begin, value, size)) {
+			return;
+		}
 		break;
 	}
 	if (CpReadDebugEnabled()) {
@@ -492,6 +499,32 @@ static void PrintStageStats() {
 	            items != 0 ? (busy - ms[StageStats::ExecProgramLock]) * 1e3 * seconds / static_cast<double>(items) : 0.0,
 	            ms[StageStats::ResolveProgramLock], ms[StageStats::ResolveQueueFull]);
 	std::fflush(stdout);
+}
+
+void GuestGpu::NoteExecutedWrite(uint64_t address, const void* value, uint64_t size) {
+	if (size > sizeof(ExecutedWrite::value)) {
+		return;
+	}
+	std::lock_guard lock(m_executed_writes_mutex);
+	auto& entry   = m_executed_writes[m_executed_writes_next++ % m_executed_writes.size()];
+	entry.address = address;
+	entry.size    = size;
+	std::memcpy(entry.value, value, size);
+}
+
+bool GuestGpu::TakeExecutedWrite(uint64_t address, void* value, uint64_t size) {
+	std::lock_guard lock(m_executed_writes_mutex);
+	// The newest write covering the range.
+	for (size_t i = 0; i < m_executed_writes.size(); i++) {
+		auto& entry = m_executed_writes[(m_executed_writes_next + m_executed_writes.size() - 1 - i) %
+		                                m_executed_writes.size()];
+		if (entry.size != 0 && entry.address <= address && address + size <= entry.address + entry.size) {
+			std::memcpy(value, entry.value + (address - entry.address), size);
+			entry.size = 0;
+			return true;
+		}
+	}
+	return false;
 }
 
 void GuestGpu::ExecuteSync(Common::UniqueFunction<void>&& command) {
@@ -947,17 +980,11 @@ bool CommandProcessor::TryPeekGuest(const volatile void* addr, void* out, uint64
 // (the game then calls Coredump). Printed as NHL27STUCKWAIT after 2 s and every 5 s while stuck.
 void CommandProcessor::NoteStuckWait(uint64_t address, uint64_t value, uint64_t ref, uint64_t mask,
                                      uint32_t func, uint32_t size) {
-	struct Stuck {
-		uint64_t                              address = 0;
-		uint64_t                              ref     = 0;
-		uint32_t                              func    = 0;
-		uint64_t                              count   = 0;
-		std::chrono::steady_clock::time_point since {};
-		std::chrono::steady_clock::time_point printed {};
-	};
-	static thread_local Stuck stuck;
+	// Per queue (command processor): queues that all wait take turns on the same thread.
+	auto& stuck = m_stuck_wait;
 	if (stuck.address != address || stuck.ref != ref || stuck.func != func) {
-		stuck = {.address = address, .ref = ref, .func = func, .count = 0, .since = std::chrono::steady_clock::now()};
+		stuck = {.address = address, .ref = ref, .func = func, .count = 0, .since = std::chrono::steady_clock::now(),
+		         .printed = {}};
 	}
 	if ((++stuck.count & 255u) != 0) {
 		return;
@@ -995,7 +1022,11 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	// at least / more than the reference) needs no wait for the execution.
 	if constexpr (sizeof(T) == sizeof(uint64_t)) {
 		const bool monotone = mask == ~T {0} && (func == 5 || func == 6 || (func == 4 && ref == 0));
-		if (m_pipeline != nullptr && monotone && Common::Experiments::Enabled(Common::Experiments::ClockWaitAhead) &&
+		static const bool clock_wait_ahead = [] {
+			const char* value = std::getenv("KYTY_CLOCK_WAIT_AHEAD");
+			return value != nullptr && value[0] == '1';
+		}();
+		if (m_pipeline != nullptr && monotone && clock_wait_ahead &&
 		    m_pipeline->PendingClockWrite(reinterpret_cast<uint64_t>(addr), sizeof(T)) &&
 		    TestWaitRegMemValue(Sync::ReadReferenceClock(), ref, mask, func)) {
 			if (BufferCache::GuestSyncOnly()) {
@@ -2783,6 +2814,11 @@ void CommandProcessor::ExecuteWriteAtEndOfPipe(uint64_t submit_id, uint32_t eop_
 					EXIT_IF(dst == nullptr);
 					(void)command.Handle();
 					write_label(dst, &value, sizeof(value));
+					// The command processor may be waiting for this clock (WAIT_REG_MEM): it gets the
+					// value written, even if the game resets the label once the interrupt wakes it.
+					if (event_write_source == 0x04 && m_pipeline != nullptr) {
+						m_pipeline->NoteExecutedWrite(reinterpret_cast<uint64_t>(dst), &value, sizeof(value));
+					}
 
 					if (with_interrupt) {
 						DeferEopInterrupt(interrupt_context_id);

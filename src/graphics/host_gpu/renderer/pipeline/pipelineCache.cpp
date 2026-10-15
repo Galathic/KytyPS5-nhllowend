@@ -128,6 +128,11 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 	// Scalar and unformatted buffer dependencies use the same backing as native raw loads.
 	// Image synchronization belongs to formatted buffer bindings, not these reads.
 	if (FrameBreakdown::g_spec_collect != nullptr) FrameBreakdown::SpecCollectRead(address, values.size_bytes());
+	// Experiment GpuConditionsBothPaths: a branch condition on GPU-written bytes is left undecided.
+	if (ShaderRecompiler::IR::ConditionReadsNonBlocking()) {
+		return !values.empty() && Libs::LibKernel::Memory::TryReadCleanBufferBacking(
+		                              address, values.data(), values.size_bytes());
+	}
 	return !values.empty() &&
 	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
 }
@@ -544,6 +549,18 @@ struct PipelineCache::ProgramCache {
 			     options.shader_hash);
 		}
 		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
+		// KYTY_DBG_DUMP_SHADERS: the guest disassembly and the IR next to the SPIR-V.
+		if (ForceDumpShader(options.shader_hash) && !result.decoded_dump.empty()) {
+			static std::atomic_int text_id = 0;
+			const auto path = Config::GetShaderLogFolder() /
+			                  fmt::format("{:04d}_ir_{}_{:016x}.txt", text_id++, stage_name, options.shader_hash);
+			Common::File::CreateDirectories(path.parent_path());
+			Common::File file(path);
+			if (!file.IsInvalid()) {
+				file.Write(result.decoded_dump.data(), result.decoded_dump.size());
+				file.Write(result.ir_dump.data(), result.ir_dump.size());
+			}
+		}
 
 		const auto module = CompileSPV(result.spirv, device);
 		EXIT_IF(module == nullptr);
@@ -609,8 +626,9 @@ struct PipelineCache::ProgramCache {
 		options.shader_hash = params.hash;
 		options.user_data   = user_data;
 		options.back_code   = params.back_code;
-		options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
-		options.early_dump  = options.dump_ir;
+		options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent ||
+		                      ForceDumpShader(params.hash);
+		options.early_dump  = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
 		const char* scalar = std::getenv("KYTY_GPU_SCALAR_DATA");
 		options.gpu_scalar_data = scalar != nullptr && scalar[0] == '1' && scalar[1] == 0;
 		options.dump_label  = label;
