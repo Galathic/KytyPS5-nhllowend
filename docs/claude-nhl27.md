@@ -228,6 +228,17 @@ written the clock and raised the interrupt, the game woke and reset the label to
 did the command processor read memory. The execution thread now records the clock values it
 writes, and a wait that had to wait for such a write takes the value written.
 
+Bits 14, 16 and 19 are on by default since 2026-10-15 (lock-free materialization on both threads
+and dispatch read-ahead): the execution thread's program-lock waits (40 to 125 ms/s, the most in
+crowd shots) are gone, 98.6% of dispatches are resolved on the resolve thread, and its checks no
+longer fault (`StillValid(true)`). Four 120 s boots, no hang or device loss; the execution thread
+idles 130 to 170 ms/s now (it waits for the command processor more often).
+
+Device losses are GPU timeouts (Windows logs LiveKernelEvent 141, VIDEO_ENGINE_TIMEOUT_DETECTED,
+at the same second; such events go back to 2026-10-12). `KYTY_DBG_LOOP_CAP=4000000` did not
+prevent them. The draws and dispatches recorded are kept in a CPU-side ring with their command
+buffer's tick; on a device loss `NHL27HANG` prints the ones in ticks the GPU had not finished.
+
 `KYTY_FORCE_FLIP_RATE=0` keeps 60 Hz flips where the game asks for 30 (menus reach 40+ fps) and
 `KYTY_VBLANK_HZ` overrides the vblank rate; the paused match still ran at about 30 fps with both,
 because that is what it costs (GPU busy 70%, the execution thread 93%).

@@ -147,9 +147,53 @@ void DumpBreadcrumbs() {
 	std::fflush(stdout);
 }
 
+// Always on, CPU side only (no GPU markers, so no timing change): the last draws and dispatches
+// recorded, with the scheduler tick of their command buffer. After a device loss, the ones in ticks
+// the GPU had not finished name the work it hung on.
+struct CpuCrumb {
+	const char* kind = nullptr;
+	uint64_t    hash_a = 0, hash_b = 0, info = 0, tick = 0;
+};
+std::array<CpuCrumb, 16384> g_cpu_crumbs;
+std::atomic<uint64_t>       g_cpu_crumb_next {0};
+const MasterSemaphore*      g_crumb_master = nullptr;
+
+void NoteCpuCrumb(const char* kind, uint64_t hash_a, uint64_t hash_b, uint64_t info) {
+	if (g_crumb_master == nullptr) {
+		return;
+	}
+	const auto n = g_cpu_crumb_next.fetch_add(1, std::memory_order_relaxed);
+	g_cpu_crumbs[n % g_cpu_crumbs.size()] = {kind, hash_a, hash_b, info, g_crumb_master->CurrentTick()};
+}
+
+void DumpCpuCrumbs() {
+	if (g_crumb_master == nullptr) {
+		return;
+	}
+	const auto known = g_crumb_master->KnownGpuTick();
+	const auto next  = g_cpu_crumb_next.load(std::memory_order_relaxed);
+	const auto first = next > g_cpu_crumbs.size() ? next - g_cpu_crumbs.size() : 0;
+	std::printf("NHL27HANG: GPU finished tick %llu, recording tick %llu\n",
+	            static_cast<unsigned long long>(known),
+	            static_cast<unsigned long long>(g_crumb_master->CurrentTick()));
+	uint32_t shown = 0;
+	for (auto n = first; n < next && shown < 48; n++) {
+		const auto& c = g_cpu_crumbs[n % g_cpu_crumbs.size()];
+		if (c.kind == nullptr || c.tick <= known) {
+			continue;
+		}
+		std::printf("NHL27HANG:   tick %llu %s a=0x%016llx b=0x%016llx info=0x%llx\n",
+		            static_cast<unsigned long long>(c.tick), c.kind, static_cast<unsigned long long>(c.hash_a),
+		            static_cast<unsigned long long>(c.hash_b), static_cast<unsigned long long>(c.info));
+		shown++;
+	}
+	std::fflush(stdout);
+}
+
 // NHL26 debugging: after a device loss, print what VK_EXT_device_fault reports (faulting GPU
 // addresses and vendor fault codes). No-op when the extension is not enabled.
 void DumpDeviceFault(vk::Device device) {
+	DumpCpuCrumbs();
 	DumpBreadcrumbs();
 	const auto get_fault_info = reinterpret_cast<PFN_vkGetDeviceFaultInfoEXT>(
 	    VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr(device, "vkGetDeviceFaultInfoEXT"));
@@ -410,6 +454,7 @@ uint64_t BreadcrumbBegin(GraphicContext& graphics, const CommandRecorder& cmd, c
                          uint64_t hash_a, uint64_t hash_b, uint64_t info, uint64_t aux) {
 	// Bits 0-31: breadcrumb id (0 = none). Bits 32-46: KYTY_PERF_GPU_TIMING slot + 1 (0 = none).
 	// Bits 47-63: KYTY_IDLE_TRACE per-command slot + 1 (0 = none).
+	NoteCpuCrumb(kind, hash_a, hash_b, info);
 	uint32_t id = 0;
 	if (!(g_breadcrumbs.initialized && !g_breadcrumbs.available)) {
 		std::lock_guard lock(g_breadcrumbs.mutex);
@@ -1026,6 +1071,7 @@ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graph
       m_command_pool(graphics, m_master), m_deferred(deferred_recording),
       m_stream(&m_chunk_queue), m_command(*this, deferred_recording ? &m_stream : nullptr),
       m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {
+	g_crumb_master = &m_master;
 	if (m_deferred) {
 		m_host_copies = std::make_unique<HostCopyQueue>(
 		    [] { Config::ConfigureGpuStageThread(Config::GpuStageThread::HostCopy); });
