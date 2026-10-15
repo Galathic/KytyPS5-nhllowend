@@ -24,6 +24,9 @@ enum class Role : uint8_t { Other, Execution, Resolve };
 
 inline std::atomic<uint64_t> g_ns[CounterCount] {};
 inline std::atomic<uint64_t> g_ops {0}; // operations the execution thread ran (written by it only)
+// Execution-thread time and count by operation kind (GpuOperationKind; execution thread only).
+inline std::atomic<uint64_t> g_kind_ns[8] {};
+inline std::atomic<uint64_t> g_kind_count[8] {};
 inline thread_local Role     t_role = Role::Other;
 
 [[nodiscard]] inline bool Enabled() {

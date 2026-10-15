@@ -498,6 +498,22 @@ static void PrintStageStats() {
 	            items != 0 ? busy * 1e3 * seconds / static_cast<double>(items) : 0.0,
 	            items != 0 ? (busy - ms[StageStats::ExecProgramLock]) * 1e3 * seconds / static_cast<double>(items) : 0.0,
 	            ms[StageStats::ResolveProgramLock], ms[StageStats::ResolveQueueFull]);
+	// By operation kind: ms/s and us per operation.
+	static uint64_t last_kind_ns[8] {}, last_kind_count[8] {};
+	static const char* const kinds[] = {"draw", "draw-auto", "draw-indirect", "dispatch", "dispatch-indirect", "callback", "?", "?"};
+	std::string line = "NHL27OPS:";
+	for (size_t k = 0; k < 6; k++) {
+		const auto total_ns    = StageStats::g_kind_ns[k].load(std::memory_order_relaxed);
+		const auto total_count = StageStats::g_kind_count[k].load(std::memory_order_relaxed);
+		const auto ns          = total_ns - last_kind_ns[k];
+		const auto count       = total_count - last_kind_count[k];
+		last_kind_ns[k]        = total_ns;
+		last_kind_count[k]     = total_count;
+		if (count == 0) continue;
+		line += fmt::format(" {}={:.0f}/s {:.1f}ms/s {:.2f}us", kinds[k], static_cast<double>(count) / seconds,
+		                    static_cast<double>(ns) / 1e6 / seconds, static_cast<double>(ns) / 1e3 / static_cast<double>(count));
+	}
+	std::printf("%s\n", line.c_str());
 	std::fflush(stdout);
 }
 
@@ -563,9 +579,17 @@ void GuestGpu::ExecutionThread() {
 				break;
 			}
 		}
-		operation->processor->Execute(*operation);
 		if (StageStats::Enabled()) {
+			const auto kind  = static_cast<size_t>(operation->kind) & 7u;
+			const auto start = std::chrono::steady_clock::now();
+			operation->processor->Execute(*operation);
+			const auto ns    = static_cast<uint64_t>(
+			    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+			StageStats::g_kind_ns[kind].store(StageStats::g_kind_ns[kind].load(std::memory_order_relaxed) + ns, std::memory_order_relaxed);
+			StageStats::g_kind_count[kind].store(StageStats::g_kind_count[kind].load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
 			StageStats::g_ops.store(StageStats::g_ops.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+		} else {
+			operation->processor->Execute(*operation);
 		}
 		const auto sequence = operation->sequence;
 		// Destroy the callback before the command processor may reuse what it references.
