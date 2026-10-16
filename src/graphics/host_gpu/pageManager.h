@@ -30,6 +30,8 @@ public:
 	[[nodiscard]] uint64_t GetPageSize() const;
 	// Whether cache tracking currently restricts access to the page holding vaddr.
 	[[nodiscard]] bool IsWatched(uint64_t vaddr) const;
+	// Whether reads of the page holding vaddr fault (it holds GPU-written bytes not downloaded).
+	[[nodiscard]] bool IsReadWatched(uint64_t vaddr) const;
 
 	template <bool track>
 	void UpdatePageWatchers(uint64_t vaddr, uint64_t size);

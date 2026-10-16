@@ -253,6 +253,36 @@ Measured and dropped on the way: per-range write ticks (a download waits for the
 its bytes instead of its buffer's): fewer than 1% of the downloads would wait for an older
 submission, and the A/B was -14% +- 7.5.
 
+Slow scenes (about 20 fps, some replays and crowd shots) were readback-bound: the execution
+thread spent up to half of each second waiting for GPU-to-CPU downloads (`KYTY_DBG_CP_READS=1`,
+`NHL27RBWAIT`). Two kinds dominated:
+
+* Command-processor reads of pages that hold GPU-written bytes (NHL 27 embeds labels the GPU
+  writes in its command buffers, and keeps register tables and WAIT_REG_MEM values next to
+  compute-written bytes). The page is read-protected, so the read faulted and its download waited
+  for the writer, about 6-10 ms each while it still ran, though the bytes read were nearly always
+  CPU-written ones. Bit 4 (`KYTY_CP_BACKING_READS`, default on; was `KYTY_SRT_JIT`, now env-only):
+  on a read-protected page the command processor reads the backing instead (indirect SH/CX/UC
+  register tables, WAIT_REG_MEM/decision values, and PM4 packets), and the execution thread checks
+  each such read in order: if an earlier operation wrote those bytes it downloads them and compares
+  (`NHL27CPSPEC`; a difference turns the reads off). Reading through the execution thread
+  synchronously instead cost 0.24 ms per read and stopped the CP running ahead (exec idle 28%).
+  In 1.58 million checked reads over six boots: 0.5-1.6% touched GPU-written bytes, all with the same value,
+  no mismatch.
+* Guest stores into GPU-written pages: once the CP no longer downloaded those pages early, game
+  memcpy fills (vmovntdq/vmovdqa) over whole GPU-written pages faulted once per page, each a
+  readback (~90-120 us; up to 1,100/s). Bit 6 (`KYTY_WIDE_WRITE_DOWNLOADS`, default on; was
+  `KYTY_FALSE_SHARE_READS`, now env-only): such a store downloads the GPU-written bytes of its
+  64 KiB window at once (the window a CPU write fault releases), down to about 50-70/s.
+
+Three in-boot A/B boots (`abwin.sh`, 12 s phases alternating bits 4+6 on/off): readback waits
+86/74/71 ms/s on vs 98/133/277 off, execution thread busy 4-5% lower; with the PM4 fix as well no
+CP fault remained (normal play ~15 ms/s of readback waits in total, slow windows ~30). The
+`NHL27OWNW` diagnostic lists the GPU-written ranges of a page a guest store hits;
+`NHL27UNMAP` counts unmaps that drained the GPU and why; `NHL27COREDUMP` prints the guest thread
+and return addresses when the game calls Coredump (its `Heartbeat` watchdog does when a boot
+stalls, for example while every shader recompiles).
+
 ## Merged defaults (nhl27 + claude/nhl27-perf)
 
 Where both branches implemented the same feature, only one implementation is left and it is a
@@ -290,7 +320,8 @@ defaults; turn them on with `KYTY_X=1` or a `flags.ctl` line, or flip the defaul
 | `KYTY_TEXTURE_DESC_CACHE` | 2048 | No consumer in the merged tree (pengui07's draw-prep delta replaces it); accepted for compatibility | was +15.5% |
 | `KYTY_ADAPTIVE_RESOURCE_MEMO` | 32768 | No consumer in the merged tree (`KYTY_RESOURCE_MEMO_BYPASS` replaces it); accepted for compatibility | was +2.3% |
 
-Default off (set to `1` to enable): `KYTY_CPU_COPY_FORWARD` (8), `KYTY_FALSE_SHARE_READS` (64),
+Default off (set to `1` to enable): `KYTY_CPU_COPY_FORWARD` (8), `KYTY_FALSE_SHARE_READS` (env only since
+2026-10-16; bit 64 is now `KYTY_WIDE_WRITE_DOWNLOADS`),
 `KYTY_ASYNC_SUBMIT` (2097152), `KYTY_LAZY_SHARED_WRITES` (4194304), `KYTY_NATIVE_FP16` (8388608),
 `KYTY_FAULT_PAGE_READS` (16777216), `KYTY_GPU_COLOR_CLEAR` (67108864), `KYTY_POOLED_BDA_BUFFERS`
 (134217728), `KYTY_ASYNC_GUEST_READS` (268435456), `KYTY_BDA_DIRTY_REGIONS` (536870912). All but `KYTY_CPU_COPY_FORWARD`, `KYTY_NATIVE_FP16`
@@ -330,7 +361,7 @@ On top of the fork's usual flags (`KYTY_PROGRAM_RESOURCE_CACHE=1`, `KYTY_PERF_NO
 | `KYTY_CLEAN_FROM_DIRECT=1` | 262144 | The strict resource-table evaluator (branch conditions, uniform fills, written descriptors) takes words the direct reads already fetched | +3.1% paused match |
 | `KYTY_READBACK_QUEUE=1` | 1048576 | GPU-to-CPU downloads of a buffer last written by an already submitted command buffer run on a second queue and wait only for that submission (about 45 us instead of draining everything queued) | +1.4% paused match |
 | `KYTY_DIRECT_EOP_INTERRUPTS=1` | 524288 | End-of-pipe interrupts are delivered when the CP reaches them, like the labels (`KYTY_EOP_DIRECT_LABELS`) | +0.7% paused match (+0.8% with the readback queue) |
-| `KYTY_FALSE_SHARE_READS=1` | 64 | The GPU thread parses PM4 packets (and serves its own faulting loads) from the backing when the bytes are clean but share a page with GPU-written bytes | +0.5% paused match |
+| `KYTY_FALSE_SHARE_READS=1` | 64 (env only since 2026-10-16) | The GPU thread parses PM4 packets (and serves its own faulting loads) from the backing when the bytes are clean but share a page with GPU-written bytes | +0.5% paused match |
 | `KYTY_ASYNC_SUBMIT=1` | 2097152 | `vkQueueSubmit` runs on a worker thread in tick order (about 65 us of GPU-thread time per submit); submit splits default to 48 draws / 0.75 ms with it | +1.5% paused match, +4.5% more with the finer splits |
 | `KYTY_LAZY_SHARED_WRITES=1` | 4194304 | A guest thread's store into a page where the GPU wrote at most 256 other bytes no longer waits for that GPU work: the download is queued and merged into guest memory later, keeping bytes the CPU changed meanwhile | +7.3% paused match |
 | `KYTY_FAULT_PAGE_READS=1` | 16777216 | Resource-table reads of a page on which the GPU thread took a read fault (the GPU wrote other bytes of it) read clean bytes through the backing instead of faulting and downloading again | +4.8% paused match (busy scene) |

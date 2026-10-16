@@ -158,6 +158,8 @@ public:
 		std::chrono::steady_clock::time_point printed {};
 	};
 	StuckWait m_stuck_wait;
+	// Command processor thread: see GuestGpu::TryReadProtectedForCp.
+	[[nodiscard]] bool TryReadProtected(const volatile void* address, void* out, uint64_t size);
 	template <typename T>
 	[[nodiscard]] T ReadDecisionValue(const volatile void* address) {
 		T value {};
@@ -229,6 +231,7 @@ private:
 	                      uint32_t interrupt_context_id);
 	void ProcessPm4(Pm4Execution& execution);
 	const uint32_t* ShadowPm4Packet(const uint32_t* packet, uint32_t remaining_dw);
+	const uint32_t* ShadowProtectedPm4Packet(const uint32_t* packet, uint32_t remaining_dw);
 	void SuspendPm4();
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
@@ -337,6 +340,9 @@ private:
 	uint64_t              m_pm4_page_generation = ~uint64_t {0};
 	bool                  m_pm4_page_dirty      = false;
 	std::vector<uint32_t> m_pm4_shadow;
+	// ShadowProtectedPm4Packet: the page of the last packet, and whether it was read-protected.
+	uint64_t              m_cp_shadow_page      = ~uint64_t {0};
+	bool                  m_cp_shadow_protected = false;
 
 	// State of the execution side, on cache lines of its own.
 	alignas(64) uint64_t m_synthetic_occlusion_counter = 0;

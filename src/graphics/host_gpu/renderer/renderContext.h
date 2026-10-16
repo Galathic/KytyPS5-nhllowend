@@ -57,6 +57,8 @@ public:
 	void PrepareGpuWrite(const void* destination, uint64_t size) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
+	// Whether a read of the range would fault on a page holding GPU-written bytes. Any thread.
+	[[nodiscard]] bool IsReadProtected(uint64_t vaddr, uint64_t size) const noexcept;
 	// Advances whenever a range is mapped or unmapped.
 	[[nodiscard]] uint64_t MappedRangesVersion() const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);

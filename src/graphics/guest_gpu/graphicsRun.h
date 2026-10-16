@@ -79,6 +79,18 @@ public:
 	// of the stream: from the value of a pending write when it is known, otherwise from memory
 	// once the operations that write it executed.
 	void ReadDecisionMemory(const volatile void* address, void* value, size_t size);
+	// Command processor thread, experiment CpBackingReads: reads guest memory on a page whose reads
+	// fault (the GPU wrote other bytes of it) through the execution thread, in order after the
+	// operations emitted so far, without downloading the page unless the bytes read are
+	// GPU-written themselves. False when the range is not read-protected or the backing cannot
+	// serve it: the caller then reads it directly.
+	[[nodiscard]] bool TryReadProtectedForCp(uint64_t address, void* value, size_t size);
+	// Command processor thread: whether CpBackingReads is on (and no check found it wrong).
+	[[nodiscard]] bool CpBackingReadsOn() const;
+	// Command processor thread: `cp` used `size` bytes at `address` read from the backing of a
+	// read-protected page; the execution thread checks in order that no earlier operation wrote
+	// them (when one did, it compares them with what it wrote; a difference turns the reads off).
+	void CheckCpBackingRead(CommandProcessor& cp, uint64_t address, const void* bytes, size_t size);
 	[[nodiscard]] size_t PendingWriteCount() const { return m_pending_count; }
 	// Execution thread: an end-of-pipe clock write ran with this value. Command processor: takes the
 	// newest such value covering the range (once).

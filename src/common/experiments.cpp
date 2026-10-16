@@ -47,7 +47,7 @@ uint32_t EnvironmentMask() {
 	set("KYTY_LDS_LANE_SLOTS", LdsLaneSlots, true);
 	// Not part of the recommended set: opt in with 1.
 	set("KYTY_CPU_COPY_FORWARD", CpuCopyForward, false);
-	set("KYTY_FALSE_SHARE_READS", FalseShareReads, false);
+	set("KYTY_WIDE_WRITE_DOWNLOADS", WideWriteDownloads, true);
 	set("KYTY_ASYNC_SUBMIT", AsyncSubmit, false);
 	set("KYTY_LAZY_SHARED_WRITES", LazySharedWrites, false);
 	set("KYTY_NATIVE_FP16", NativeFp16, false);
@@ -57,7 +57,7 @@ uint32_t EnvironmentMask() {
 	set("KYTY_POOLED_BDA_BUFFERS", PooledBdaBuffers, false);
 	set("KYTY_ASYNC_GUEST_READS", AsyncGuestReads, false);
 	set("KYTY_BDA_DIRTY_REGIONS", BdaDirtyRegions, false);
-	set("KYTY_SRT_JIT", SrtJit, false);
+	set("KYTY_CP_BACKING_READS", CpBackingReads, true);
 	set("KYTY_EARLY_SUBMIT_WRITERS", EarlySubmitWriters, false);
 	set("KYTY_READBACK_COMPUTE", ReadbackCompute, true);
 	set("KYTY_ROBUST_LOADS", RobustLoads, true);
@@ -111,6 +111,11 @@ State& GetState() {
 }
 
 } // namespace
+
+bool FalseShareReads() noexcept {
+	static const bool enabled = EnvSwitch("KYTY_FALSE_SHARE_READS", false);
+	return enabled;
+}
 
 namespace Detail {
 constinit std::atomic<uint64_t> g_mask {Uninitialized};

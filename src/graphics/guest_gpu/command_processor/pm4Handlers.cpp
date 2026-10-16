@@ -1991,7 +1991,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	backing_registers.resize(indirect_num_dw * 2u);
 	if (LibKernel::Memory::TryReadBufferBacking(reinterpret_cast<uint64_t>(indirect_buffer),
 	                                          backing_registers.data(),
-	                                          backing_registers.size() * sizeof(uint32_t))) {
+	                                          backing_registers.size() * sizeof(uint32_t)) ||
+	    cp.TryReadProtected(indirect_buffer, backing_registers.data(),
+	                        backing_registers.size() * sizeof(uint32_t))) {
 		indirect_buffer = backing_registers.data();
 		static std::atomic_flag reported = ATOMIC_FLAG_INIT;
 		if (!reported.test_and_set(std::memory_order_relaxed)) {
@@ -2088,7 +2090,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 	backing_registers.resize(indirect_num_dw * 2u);
 	if (LibKernel::Memory::TryReadBufferBacking(reinterpret_cast<uint64_t>(indirect_buffer),
 	                                          backing_registers.data(),
-	                                          backing_registers.size() * sizeof(uint32_t))) {
+	                                          backing_registers.size() * sizeof(uint32_t)) ||
+	    cp.TryReadProtected(indirect_buffer, backing_registers.data(),
+	                        backing_registers.size() * sizeof(uint32_t))) {
 		indirect_buffer = backing_registers.data();
 		static std::atomic_flag reported = ATOMIC_FLAG_INIT;
 		if (!reported.test_and_set(std::memory_order_relaxed)) {
@@ -2174,7 +2178,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	backing_registers.resize(indirect_num_dw * 2u);
 	if (LibKernel::Memory::TryReadBufferBacking(reinterpret_cast<uint64_t>(indirect_buffer),
 	                                          backing_registers.data(),
-	                                          backing_registers.size() * sizeof(uint32_t))) {
+	                                          backing_registers.size() * sizeof(uint32_t)) ||
+	    cp.TryReadProtected(indirect_buffer, backing_registers.data(),
+	                        backing_registers.size() * sizeof(uint32_t))) {
 		indirect_buffer = backing_registers.data();
 		static std::atomic_flag reported = ATOMIC_FLAG_INIT;
 		if (!reported.test_and_set(std::memory_order_relaxed)) {

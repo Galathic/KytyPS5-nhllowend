@@ -277,6 +277,29 @@ static KYTY_SYSV_ABI uint64_t UnresolvedImportStub(uint64_t record_id) {
 		if (record_id < g_stubbed_imports.size()) {
 			const auto& record = g_stubbed_imports[record_id];
 			printf("Unresolved import stub called: %s\n", record.name.c_str());
+			// NHL 27 calls Coredump when it gives up (a hang at the match-load screen): which
+			// thread, and the guest code addresses on its stack (the first calls only).
+			static std::atomic<uint32_t> coredump_reports {0};
+			if (record.name.find("Coredump") != std::string::npos &&
+			    coredump_reports.fetch_add(1, std::memory_order_relaxed) < 4) {
+				char thread_name[64] = "(host thread)";
+				if (auto self = Libs::LibKernel::PthreadSelfOrNull(); self != nullptr) {
+					if (Libs::LibKernel::PthreadGetname(self, thread_name) != 0) {
+						std::snprintf(thread_name, sizeof(thread_name), "(unnamed guest thread)");
+					}
+				}
+				std::string frames;
+				const auto* stack = static_cast<const uint64_t*>(__builtin_frame_address(0));
+				for (int i = 0, found = 0; i < 1024 && found < 24; i++) {
+					const uint64_t word = stack[i];
+					if (word >= 0x900000000ull && word < 0xa00000000ull) {
+						frames += fmt::format(" {:x}", word);
+						found++;
+					}
+				}
+				printf("NHL27COREDUMP: thread=%s guest return addresses:%s\n", thread_name, frames.c_str());
+				std::fflush(stdout);
+			}
 			LOGF("Unresolved import stub called [%u]: patch_vaddr=0x%016" PRIx64
 			     " jmprela_index=%" PRIu32 " symbol=%s type=%s bind=%s program=%s\n",
 			     log_index, record.patch_vaddr, record.index, record.name.c_str(),
@@ -813,7 +836,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		// page protected for other GPU-written bytes, is served from the backing instead of
 		// downloading the page, which would wait for all queued GPU work.
 		if (access == GpuAccess::Read && Libs::Graphics::GuestGpu::IsGpuThread() &&
-		    Common::Experiments::Enabled(Common::Experiments::FalseShareReads) &&
+		    Common::Experiments::FalseShareReads() &&
 		    Loader::X64InstructionEmulator::TryEmulateLoad(info->native_context,
 		                                                   Libs::LibKernel::Memory::TryReadCleanBacking)) {
 			Libs::Graphics::BufferCache::PerfCount(Libs::Graphics::BufferCache::PerfEvent::FalseShareRead);

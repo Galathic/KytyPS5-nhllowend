@@ -2581,8 +2581,12 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	} call_timer;
 	// Upstream's x64 walker (CompileSrtWalker): plans without control flow or captured reads,
 	// read straight from guest memory. It fills the flat words and seeds the evaluation memo.
-	if (m_program.srt_code && m_runtime.read_memory == nullptr &&
-	    Common::Experiments::Enabled(Common::Experiments::SrtJit)) {
+	// KYTY_SRT_JIT=1 (env only; was experiment bit 4).
+	static const bool srt_jit = [] {
+		const char* value = std::getenv("KYTY_SRT_JIT");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (m_program.srt_code && m_runtime.read_memory == nullptr && srt_jit) {
 		flat.resize(m_program.srt_reads.size());
 		m_program.active_sources.clear();
 		m_context.values.resize(m_program.evaluation_value_count);

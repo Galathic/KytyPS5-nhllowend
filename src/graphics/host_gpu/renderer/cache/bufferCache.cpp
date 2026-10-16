@@ -595,7 +595,9 @@ struct ReadbackWaitNote {
 		last = now;
 		for (const auto& [k, s]: stats) {
 			static const char* const origins[] = {"gpu", "cp", "guest", "?"};
-			static const char* const exacts[]  = {"no", "yes", "?"};
+			// Writes: own = the stored bytes are GPU-written, many = next to more than 256 GPU-written
+			// bytes of the page, lazy-off = next to a few (LazySharedWrites off).
+			static const char* const exacts[]  = {"no", "yes", "?", "own", "many", "lazy-off"};
 			static const char* const callers[] = {"other", "clear", "fault", "?"};
 			std::printf("NHL27RBWAIT: %s via=%s from=%s exact=%s lag=%u done=%u count=%llu ms=%.1f\n",
 			            k >= 100000 ? "queue " : "inline", callers[(k / 10000) % 10], origins[(k / 1000) % 10],
@@ -1117,11 +1119,62 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadC
 		                  LazySharedWriteEligible(vaddr, size);
 		if (CpReadDebugEnabled()) {
 			g_readback_origin = origin;
-			g_readback_exact  = is_write ? 2u : HasGpuDirtyBytes(vaddr, size) ? 1u : 0u;
+			g_readback_exact  = !is_write                          ? (HasGpuDirtyBytes(vaddr, size) ? 1u : 0u)
+			                    : HasGpuDirtyBytes(vaddr, size)    ? 3u
+			                    : !LazySharedWriteEligible(vaddr, size) ? 4u
+			                                                       : 5u;
 			g_readback_caller = static_cast<uint32_t>(caller);
+			// A guest store over GPU-written bytes: the GPU-written ranges of its page (NHL27OWNW,
+			// at most 24 lines per 5 s), to see whether the store would cover them all.
+			if (is_write && !on_gpu && g_readback_exact == 3u) {
+				static auto     window = std::chrono::steady_clock::now();
+				static uint32_t lines  = 0;
+				const auto      now    = std::chrono::steady_clock::now();
+				if (now - window >= std::chrono::seconds(5)) {
+					window = now;
+					lines  = 0;
+				}
+				if (lines++ < 24) {
+					const auto  page = vaddr & ~(TRACKER_PAGE_SIZE - 1);
+					std::string ranges;
+					uint64_t    bytes = 0;
+					m_gpu_modified_ranges.ForEachInRange(page, TRACKER_PAGE_SIZE, [&](uint64_t start, uint64_t end) {
+						bytes += end - start;
+						if (ranges.size() < 160) {
+							char text[48];
+							std::snprintf(text, sizeof(text), " +0x%llx..0x%llx",
+							              static_cast<unsigned long long>(start - page),
+							              static_cast<unsigned long long>(end - page));
+							ranges += text;
+						}
+					});
+					std::printf("NHL27OWNW: vaddr=0x%016" PRIx64 " rip=0x%016" PRIx64 " page_gpu_bytes=%llu last_write=%llu "
+					            "current=%llu ranges:%s\n",
+					            vaddr, fault_rip, static_cast<unsigned long long>(bytes),
+					            static_cast<unsigned long long>(buffer.last_write_tick),
+					            static_cast<unsigned long long>(m_scheduler.CurrentTick()), ranges.c_str());
+				}
+			}
+		}
+		// Experiment WideWriteDownloads: NHL 27 fills whole GPU-written pages with memcpy-style
+		// stores (vmovntdq/vmovdqa), each page one fault and one readback (~90 us). The GPU-written
+		// bytes of the store's 64 KiB window (the window a CPU write fault releases) come down at
+		// once, so the next pages of the fill fault only for CPU-write tracking.
+		uint64_t download_vaddr = vaddr;
+		uint64_t download_size  = size;
+		if (is_write && !on_gpu && !lazy &&
+		    Common::Experiments::Enabled(Common::Experiments::WideWriteDownloads)) {
+			constexpr uint64_t Window = 16 * TRACKER_PAGE_SIZE;
+			const auto begin = std::max(vaddr & ~(Window - 1), buffer.CpuAddress());
+			const auto end   = std::min((vaddr + size + Window - 1) & ~(Window - 1),
+			                            buffer.CpuAddress() + buffer.Size());
+			if (begin <= vaddr && vaddr + size <= end) {
+				download_vaddr = begin;
+				download_size  = end - begin;
+			}
 		}
 		const bool downloaded = lazy ? DownloadBufferMemory<true, true>(buffer, vaddr, size)
-		                             : DownloadBufferMemory<false>(buffer, vaddr, size);
+		                             : DownloadBufferMemory<false>(buffer, download_vaddr, download_size);
 		if (lazy) {
 			Common::Timeline::Mark("lazy-shared-write", vaddr);
 		}
@@ -1198,7 +1251,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadC
 			}
 		}
 		if (downloaded) {
-			m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+			m_memory_tracker.UnmarkRegionAsGpuModified(download_vaddr, download_size);
 		}
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);

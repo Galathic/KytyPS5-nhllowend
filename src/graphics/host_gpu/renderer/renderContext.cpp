@@ -208,6 +208,19 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 	return m_mapped_ranges.Contains(vaddr, size);
 }
 
+bool RenderContext::IsReadProtected(uint64_t vaddr, uint64_t size) const noexcept {
+	if (size == 0 || !GuestRange {vaddr, size}.Valid()) {
+		return false;
+	}
+	const auto page_size = m_page_manager.GetPageSize();
+	for (auto page = vaddr & ~(page_size - 1); page < vaddr + size; page += page_size) {
+		if (m_page_manager.IsReadWatched(page)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 uint64_t RenderContext::MappedRangesVersion() const noexcept {
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	return m_mapped_ranges_version;
@@ -237,14 +250,38 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		if (m_command_scheduler.Active()) {
 			m_command_scheduler.PopPendingOperations();
 		}
-		const bool drain = m_command_scheduler.Active() &&
-		                   (m_buffer_cache.IsRegionGpuModified(vaddr, size) ||
-		                    m_texture_cache.HasImagesInRegion(vaddr, size) ||
-		                    m_command_scheduler.HasPendingGuestOperations(vaddr, size));
+		const bool active  = m_command_scheduler.Active();
+		const bool gpu     = active && m_buffer_cache.IsRegionGpuModified(vaddr, size);
+		const bool images  = active && !gpu && m_texture_cache.HasImagesInRegion(vaddr, size);
+		const bool pending = active && !gpu && !images && m_command_scheduler.HasPendingGuestOperations(vaddr, size);
+		const bool drain   = gpu || images || pending;
+		const auto start   = CpReadDebugEnabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 		if (drain) {
 			const auto tick = m_command_scheduler.CurrentTick();
 			m_command_scheduler.Finish();
 			m_command_scheduler.WaitPriorityOperations(tick);
+		}
+		if (CpReadDebugEnabled()) {
+			// KYTY_DBG_CP_READS: unmaps by why they drained the GPU, NHL27UNMAP every 2 s (execution thread).
+			static uint64_t counts[4] {}, ns[4] {}, bytes = 0;
+			static auto     last  = std::chrono::steady_clock::now();
+			const auto      now   = std::chrono::steady_clock::now();
+			const size_t    why   = gpu ? 1 : images ? 2 : pending ? 3 : 0;
+			counts[why]++;
+			ns[why] += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count());
+			bytes += size;
+			if (now - last >= std::chrono::seconds(2)) {
+				last = now;
+				std::printf("NHL27UNMAP: none=%llu gpu-modified=%llu (%.1f ms) images=%llu (%.1f ms) pending=%llu (%.1f ms) MiB=%.1f\n",
+				            static_cast<unsigned long long>(counts[0]), static_cast<unsigned long long>(counts[1]),
+				            static_cast<double>(ns[1]) / 1e6, static_cast<unsigned long long>(counts[2]),
+				            static_cast<double>(ns[2]) / 1e6, static_cast<unsigned long long>(counts[3]),
+				            static_cast<double>(ns[3]) / 1e6, static_cast<double>(bytes) / (1024.0 * 1024.0));
+				std::fflush(stdout);
+				std::fill(std::begin(counts), std::end(counts), 0);
+				std::fill(std::begin(ns), std::end(ns), 0);
+				bytes = 0;
+			}
 		}
 		m_buffer_cache.InvalidateMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);

@@ -70,7 +70,7 @@ static thread_local Pm4FaultScope g_pm4_fault_scope;
 void NotePm4MemoryFault(uint64_t fault_vaddr, uint32_t access) noexcept {
 	static const bool enabled = [] {
 		const char* setting = std::getenv("KYTY_PERF_STATS");
-		return setting != nullptr && setting[0] == '1';
+		return (setting != nullptr && setting[0] == '1') || std::getenv("KYTY_DBG_CP_READS") != nullptr;
 	}();
 	if (!enabled || (!GuestGpu::IsGpuThread() && !g_cp_thread) || g_pm4_fault_scope.packet_addr == 0) return;
 	// Limit log traffic without exhausting the diagnostic during startup before training.
@@ -460,14 +460,89 @@ void GuestGpu::ReadDecisionMemory(const volatile void* address, void* value, siz
 	}
 	if (CpReadDebugEnabled()) {
 		const auto start = std::chrono::steady_clock::now();
-		CopyFromGuest(value, address, size);
+		if (!TryReadProtectedForCp(begin, value, size)) {
+			CopyFromGuest(value, address, size);
+		}
 		NoteCpRead("wait-reg-mem", begin, nullptr, 0,
 		           static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
 		                                     std::chrono::steady_clock::now() - start)
 		                                     .count()));
 		return;
 	}
-	CopyFromGuest(value, address, size);
+	if (!TryReadProtectedForCp(begin, value, size)) {
+		CopyFromGuest(value, address, size);
+	}
+}
+
+namespace {
+// Experiment CpBackingReads: reads served from the backing, and what their in-order checks found.
+struct CpBackingReadStats {
+	std::atomic<uint64_t> reads {0};
+	uint64_t              checked = 0, dirty = 0, mismatches = 0;
+	std::atomic<bool>     disabled {false};
+	std::chrono::steady_clock::time_point last {};
+};
+CpBackingReadStats g_cp_backing_reads;
+
+uint64_t HashBytes(const void* data, size_t size) {
+	const auto* bytes = static_cast<const uint8_t*>(data);
+	uint64_t    hash  = 0xcbf29ce484222325ull;
+	for (size_t i = 0; i < size; i++) {
+		hash = (hash ^ bytes[i]) * 0x100000001b3ull;
+	}
+	return hash;
+}
+} // namespace
+
+bool GuestGpu::CpBackingReadsOn() const {
+	return g_cp_thread && Common::Experiments::Enabled(Common::Experiments::CpBackingReads) &&
+	       !g_cp_backing_reads.disabled.load(std::memory_order_relaxed);
+}
+
+void GuestGpu::CheckCpBackingRead(CommandProcessor& cp, uint64_t address, const void* bytes, size_t size) {
+	g_cp_backing_reads.reads.fetch_add(1, std::memory_order_relaxed);
+	cp.EmitHostCommand([this, address, size, hash = HashBytes(bytes, size)] {
+		auto& stats = g_cp_backing_reads;
+		stats.checked++;
+		if (m_renderer.GetBufferCache().HasGpuDirtyBytes(address, size)) {
+			// An earlier operation wrote bytes the CP already used: compare with what it wrote.
+			stats.dirty++;
+			std::vector<uint8_t> actual(size);
+			if (!LibKernel::Memory::TryReadBufferBacking(address, actual.data(), actual.size()) ||
+			    HashBytes(actual.data(), actual.size()) != hash) {
+				stats.mismatches++;
+				stats.disabled.store(true, std::memory_order_relaxed);
+				std::printf("NHL27CPSPEC: MISMATCH addr=0x%016" PRIx64 " size=%zu: GPU-written bytes the command "
+				            "processor read early; CP backing reads now off\n",
+				            address, size);
+				std::fflush(stdout);
+			}
+		}
+		const auto now = std::chrono::steady_clock::now();
+		if (CpReadDebugEnabled() && now - stats.last >= std::chrono::seconds(5)) {
+			stats.last = now;
+			std::printf("NHL27CPSPEC: reads=%llu checked=%llu dirty=%llu mismatches=%llu\n",
+			            static_cast<unsigned long long>(stats.reads.load(std::memory_order_relaxed)),
+			            static_cast<unsigned long long>(stats.checked), static_cast<unsigned long long>(stats.dirty),
+			            static_cast<unsigned long long>(stats.mismatches));
+			std::fflush(stdout);
+		}
+	});
+}
+
+bool GuestGpu::TryReadProtectedForCp(uint64_t address, void* value, size_t size) {
+	// The page holds GPU-written bytes, in NHL 27 nearly always other ones than the CP reads
+	// (register tables and WAIT_REG_MEM values next to compute-written bytes). A plain read
+	// faulted, and its download waited for the writer (~6 ms each while it still ran); reading
+	// through the execution thread instead waits for it to catch up (~0.25 ms each, and the CP
+	// stops running ahead). The CP reads the backing now, as it reads an unprotected page, and the
+	// execution thread checks in order that no earlier operation wrote these bytes.
+	if (size == 0 || !CpBackingReadsOn() || !m_renderer.IsReadProtected(address, size) ||
+	    !LibKernel::Memory::TryReadBacking(address, value, size)) {
+		return false;
+	}
+	CheckCpBackingRead(*m_gfx_cp, address, value, size);
+	return true;
 }
 
 // KYTY_DBG_STAGE_STATS: every 5 s (checked when the execution thread runs out of operations).
@@ -987,6 +1062,11 @@ bool CommandProcessor::TryPeekCleanBackingBytes(const volatile void* addr, void*
 		return false;
 	}
 	return true;
+}
+
+bool CommandProcessor::TryReadProtected(const volatile void* address, void* out, uint64_t size) {
+	return m_pipeline != nullptr &&
+	       m_pipeline->TryReadProtectedForCp(reinterpret_cast<uint64_t>(address), out, size);
 }
 
 bool CommandProcessor::TryPeekGuest(const volatile void* addr, void* out, uint64_t size) {
@@ -1860,6 +1940,48 @@ void CommandProcessor::SuspendPm4() {
 // buffer itself, which protects the whole page. Reading the following packets on that page
 // would then fault and wait for all queued GPU work. When the page holds GPU-dirty bytes but the
 // packet's own bytes are clean, parse a copy taken from the backing instead.
+// Experiment CpBackingReads: the pipelined command processor's packets on a read-protected page
+// (NHL 27 embeds labels the GPU writes in its command buffers) are parsed from a copy of the
+// backing, checked in order like GuestGpu::TryReadProtectedForCp, instead of faulting into a
+// download that waits for the label's writer.
+const uint32_t* CommandProcessor::ShadowProtectedPm4Packet(const uint32_t* packet, uint32_t remaining_dw) {
+	if (m_pipeline == nullptr || remaining_dw == 0 || !m_pipeline->CpBackingReadsOn()) {
+		return packet;
+	}
+	const auto address = reinterpret_cast<uint64_t>(packet);
+	const auto page    = address & ~uint64_t {0xfff};
+	// The execution thread protects a page the moment it records the GPU write next to the
+	// packets the CP is parsing, so only "protected" is remembered for the page (a page that stops
+	// being protected is still read correctly from the backing; one that becomes protected after
+	// the check faults as before).
+	if (page != m_cp_shadow_page || !m_cp_shadow_protected) {
+		m_cp_shadow_page      = page;
+		m_cp_shadow_protected = m_renderer.IsReadProtected(address, 8);
+	}
+	if (!m_cp_shadow_protected) {
+		return packet;
+	}
+	uint32_t header[2] {};
+	if (!LibKernel::Memory::TryReadBacking(address, header, std::min<uint32_t>(2u, remaining_dw) * 4u)) {
+		return packet;
+	}
+	uint32_t length = header[0] == 0x80000000u
+	                      ? 1u
+	                      : std::min<uint32_t>(KYTY_PM4_LEN(header[0]), remaining_dw);
+	// A plain NOP wraps embedded data, often the very bytes the GPU writes. Its handler reads
+	// only the first payload dword unless the NOP carries a marker string.
+	if (((header[0] >> 8u) & 0xffu) == Pm4::IT_NOP && KYTY_PM4_R(header[0]) == Pm4::R_ZERO &&
+	    length > 2u && (header[1] & 0xffff0000u) != 0x68750000u) {
+		length = 2u;
+	}
+	m_pm4_shadow.resize(length);
+	if (!LibKernel::Memory::TryReadBacking(address, m_pm4_shadow.data(), length * 4u)) {
+		return packet;
+	}
+	m_pipeline->CheckCpBackingRead(*this, address, m_pm4_shadow.data(), length * 4u);
+	return m_pm4_shadow.data();
+}
+
 const uint32_t* CommandProcessor::ShadowPm4Packet(const uint32_t* packet, uint32_t remaining_dw) {
 	if (!GuestGpu::IsGpuThread() || remaining_dw == 0) {
 		return packet;
@@ -1932,10 +2054,11 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		const auto* const guest_packet  = cursor.commands.data() + cursor.offset_dw;
 		const auto        total_dw      = static_cast<uint32_t>(cursor.commands.size());
 		const auto        remaining_dw  = total_dw - cursor.offset_dw;
+		// KYTY_FALSE_SHARE_READS shadows packets on the GPU thread only (the unpipelined design).
+		const auto* const shadow =
+		    Common::Experiments::FalseShareReads() ? ShadowPm4Packet(guest_packet, remaining_dw) : guest_packet;
 		const auto* const packet =
-		    Common::Experiments::Enabled(Common::Experiments::FalseShareReads)
-		        ? ShadowPm4Packet(guest_packet, remaining_dw)
-		        : guest_packet;
+		    shadow != guest_packet ? shadow : ShadowProtectedPm4Packet(guest_packet, remaining_dw);
 		g_pm4_fault_scope = {reinterpret_cast<uint64_t>(packet), 1, 0, false};
 		uint32_t packet_header = 0;
 		if (!clean_backing || !TryPeekGuest(packet, &packet_header, sizeof(packet_header))) {
