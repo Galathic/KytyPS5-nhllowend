@@ -318,6 +318,7 @@ private:
 	// the range and releases their pages that hold no newer GPU-written bytes.
 	void FinishPendingGuestReads(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool OverlapsPendingGuestRead(uint64_t vaddr, uint64_t size) const;
+	[[nodiscard]] bool OverlapsPendingGuestBytes(uint64_t vaddr, uint64_t size) const;
 
 	// Experiment EarlySubmitWriters: GPU-written ranges strict resource reads downloaded (oldest
 	// replaced first), and whether a write to one of them asks for a submit.
@@ -359,10 +360,13 @@ private:
 	// Experiment AsyncGuestReads: downloads queued for a guest thread's read fault. Until the
 	// guest thread finishes one, its pages stay protected but m_gpu_modified_ranges no longer
 	// lists their bytes, so HasGpuDirtyBytes reports them and readers finish the read first.
+	// `bytes` are the GPU-written ranges the download carries: other bytes of the pages are
+	// current in guest memory already (HasGpuDirtyBytes looks at these).
 	struct PendingGuestRead {
-		uint64_t vaddr;
-		uint64_t size;
-		uint64_t tick;
+		uint64_t                                     vaddr;
+		uint64_t                                     size;
+		uint64_t                                     tick;
+		std::vector<std::pair<uint64_t, uint64_t>> bytes;
 	};
 	std::vector<PendingGuestRead>                     m_pending_guest_reads;
 	// One bit per (64 KiB chunk % 256) that a recorded fill touches (a superset). DropGpuFills runs

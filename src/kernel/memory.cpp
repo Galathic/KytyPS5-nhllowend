@@ -1202,6 +1202,10 @@ bool IsReadFaultPage(uint64_t vaddr, uint64_t size) noexcept {
 	return false;
 }
 
+bool IsGpuReadProtected(uint64_t vaddr, uint64_t size) noexcept {
+	return g_gpu_resources != nullptr && g_gpu_resources->IsReadProtected(vaddr, size);
+}
+
 bool TryReadCleanBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	if (g_gpu_resources == nullptr || !Graphics::GuestGpu::IsGpuThread() || data == nullptr ||
 	    !Graphics::GuestRange {vaddr, size}.Valid()) {

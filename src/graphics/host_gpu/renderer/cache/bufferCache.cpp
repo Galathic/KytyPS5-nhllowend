@@ -838,6 +838,11 @@ bool BufferCache::ReadbackOnSecondQueue(const Buffer& source, const Buffer& dest
 	// A wait for a tick the recording thread has not submitted yet (wait before signal) lost the
 	// device on NHL 27 with the threaded GPU pipeline.
 	m_scheduler.WaitSubmitted(wait_tick);
+	// The compute queue's own wait for the writer timed the GPU out (TDR, device lost) at one
+	// point of NHL 27's match load in about one boot of four (none in five boots without the
+	// second queue): the CPU waits for the writer first, so the queue's wait (kept for its memory
+	// dependency) is already satisfied.
+	m_scheduler.GetMasterSemaphore().Wait(wait_tick);
 	vk::Result result;
 	{
 		Common::LockGuard lock(graphics.queue_mutex);
@@ -975,6 +980,16 @@ bool BufferCache::LazySharedWriteEligible(uint64_t vaddr, uint64_t size) {
 	return dirty != 0 && dirty <= 256;
 }
 
+bool BufferCache::OverlapsPendingGuestBytes(uint64_t vaddr, uint64_t size) const {
+	for (const auto& read: m_pending_guest_reads) {
+		if (!(read.vaddr < vaddr + size && vaddr < read.vaddr + read.size)) continue;
+		for (const auto& [begin, end]: read.bytes) {
+			if (begin < vaddr + size && vaddr < end) return true;
+		}
+	}
+	return false;
+}
+
 bool BufferCache::OverlapsPendingGuestRead(uint64_t vaddr, uint64_t size) const {
 	for (const auto& read: m_pending_guest_reads) {
 		if (read.vaddr < vaddr + size && vaddr < read.vaddr + read.size) return true;
@@ -1093,12 +1108,16 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadC
 		}
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 		if (!is_write && !on_gpu && Common::Experiments::Enabled(Common::Experiments::AsyncGuestReads)) {
+			// The download covers whole tracker pages; so does the pending record. The bytes it
+			// carries are the GPU-written ones of those pages.
+			const auto first = vaddr & ~(TRACKER_PAGE_SIZE - 1);
+			const auto last  = (vaddr + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
+			std::vector<std::pair<uint64_t, uint64_t>> bytes;
+			m_gpu_modified_ranges.ForEachInRange(first, last - first,
+			                                     [&](uint64_t begin, uint64_t end) { bytes.emplace_back(begin, end); });
 			if (DownloadBufferMemory<true>(buffer, vaddr, size)) {
-				// The download covers whole tracker pages; so does the pending record.
-				const auto first = vaddr & ~(TRACKER_PAGE_SIZE - 1);
-				const auto last  = (vaddr + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
 				async_tick       = m_scheduler.CurrentTick();
-				m_pending_guest_reads.push_back({first, last - first, async_tick});
+				m_pending_guest_reads.push_back({first, last - first, async_tick, std::move(bytes)});
 				m_scheduler.Flush();
 				Common::Timeline::Mark("async-guest-read", vaddr);
 			}
@@ -1450,9 +1469,8 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4);
 	if (mapped != nullptr) {
 		// The copies into coherent staging memory go to the host copy thread like the stream
-		// buffer's (StreamGuestData); the submission waits for them. A/B: AbLegacy copies here.
-		const bool async = m_staging_buffer.IsCoherent() &&
-		                   !Common::Experiments::Enabled(Common::Experiments::AbLegacy);
+		// buffer's (StreamGuestData); the submission waits for them.
+		const bool async = m_staging_buffer.IsCoherent();
 		for (auto& copy: copies) {
 			const auto address = buffer.CpuAddress() + copy.dstOffset;
 			if (async) {
@@ -1763,8 +1781,16 @@ bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
-	return m_gpu_modified_ranges.Intersects(vaddr, size) ||
-	       (!m_pending_guest_reads.empty() && OverlapsPendingGuestRead(vaddr, size));
+	// A pending guest read makes only the bytes it carries dirty: the execution thread's resource
+	// checks on the other bytes of its pages read the backing instead of faulting and waiting for
+	// that download (2.7% of the thread in a match).
+	if (m_gpu_modified_ranges.Intersects(vaddr, size)) {
+		return true;
+	}
+	if (m_pending_guest_reads.empty()) {
+		return false;
+	}
+	return OverlapsPendingGuestBytes(vaddr, size);
 }
 
 bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {

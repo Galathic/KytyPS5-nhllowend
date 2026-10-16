@@ -292,6 +292,20 @@ A GPU A/B of the stronger EXEC-select rules (`KYTY_DBG_EXECSEL_MODE=31`) on the 
 shader alone (c556aaf3, 3.1 ms per frame in a paused scene of 26.8 ms GPU per frame) removed 901 of
 1,506 selects for -8% of its time: not worth the rules' known breakage. It uses 154 VGPRs (wave64).
 
+Device losses at match load (TDR, Windows LiveKernelEvent 141): three of five boots on 2026-10-16
+lost the device at the same point of the load (around tick 500,000, the failing submit showing
+args=2,1,1,97,0x1140100a00); none did in five boots with `KYTY_READBACK_QUEUE=0`. The second-queue
+readback (on the compute family since 2026-10-14, when the losses started) made that queue wait
+for the writer's submission on the GPU. Now the CPU waits for the writer first, so the queue's
+wait (kept for its memory dependency) is already satisfied when it is submitted: 6 of 6 boots
+without a loss.
+
+Two more execution-thread fixes: draw checks of resolved-ahead draws (`GuestReadLog::StillValid`)
+compare read-protected pages in the backing instead of taking an exception per plain load (the
+16-page fault cache thrashed; 2.7% of the thread), and a pending asynchronous guest read marks
+only the GPU-written bytes it carries dirty, not its whole pages (a draw check that hit such a page
+waited for that download: another 2.7%).
+
 ## Merged defaults (nhl27 + claude/nhl27-perf)
 
 Where both branches implemented the same feature, only one implementation is left and it is a

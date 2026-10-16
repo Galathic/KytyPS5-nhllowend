@@ -314,8 +314,11 @@ bool GuestReadLog::StillValid(bool without_faults) const {
 			// bytes of it), clean bytes are compared in the backing instead of faulting again.
 			// Dispatch read-ahead checks never fault: their pages change every frame (ring
 			// buffers), so the first read of each faulted (about 5 ms each, 15% of the thread).
+			// Draw checks look at the page protection too: their plain loads of such pages took an
+			// exception each (2.7% of the execution thread; the 16-page fault cache thrashes).
 			if (Common::Experiments::Enabled(Common::Experiments::FaultPageDirect) &&
-			    (without_faults || Libs::LibKernel::Memory::IsReadFaultPage(entry.address, entry.size))) {
+			    (without_faults || Libs::LibKernel::Memory::IsReadFaultPage(entry.address, entry.size) ||
+			     Libs::LibKernel::Memory::IsGpuReadProtected(entry.address, entry.size))) {
 				const auto compare =
 				    Libs::LibKernel::Memory::TryValidateCleanBacking(entry.address, recorded, entry.size);
 				if (compare == Libs::LibKernel::Memory::CleanBackingCompare::Equal) {
