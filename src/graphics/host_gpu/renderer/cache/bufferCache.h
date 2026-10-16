@@ -196,8 +196,8 @@ public:
 	                                                              bool is_written, bool is_texel_buffer,
 	                                                              BufferId id = {});
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
-	// Copies guest memory into the mapped stream buffer, possibly on the host copy thread (see
-	// CommandScheduler::HostCopies()).
+	// Copies guest memory into coherent mapped memory (the stream buffer, staging), possibly on the
+	// host copy thread (see CommandScheduler::HostCopies()).
 	void StreamGuestData(uint8_t* destination, uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,

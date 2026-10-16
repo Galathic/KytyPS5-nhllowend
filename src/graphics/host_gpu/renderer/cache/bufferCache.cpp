@@ -1449,9 +1449,17 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 
 	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4);
 	if (mapped != nullptr) {
+		// The copies into coherent staging memory go to the host copy thread like the stream
+		// buffer's (StreamGuestData); the submission waits for them. A/B: AbLegacy copies here.
+		const bool async = m_staging_buffer.IsCoherent() &&
+		                   !Common::Experiments::Enabled(Common::Experiments::AbLegacy);
 		for (auto& copy: copies) {
 			const auto address = buffer.CpuAddress() + copy.dstOffset;
-			std::memcpy(mapped + copy.srcOffset, reinterpret_cast<const void*>(address), copy.size);
+			if (async) {
+				StreamGuestData(mapped + copy.srcOffset, address, copy.size);
+			} else {
+				std::memcpy(mapped + copy.srcOffset, reinterpret_cast<const void*>(address), copy.size);
+			}
 			copy.srcOffset += base_offset;
 		}
 		m_staging_buffer.Commit();
@@ -1477,8 +1485,8 @@ void BufferCache::StreamGuestData(uint8_t* destination, uint64_t vaddr, uint64_t
 	// runs after a later draw protected the range for GPU writes does not fault.
 	constexpr uint64_t MinHostCopy = 256;
 	auto*              copies      = m_scheduler.HostCopies();
-	if (copies != nullptr && size >= MinHostCopy && m_stream_buffer.IsCoherent() &&
-	    GuestGpu::IsGpuThread()) {
+	// Callers write coherent memory (the stream buffer, coherent staging).
+	if (copies != nullptr && size >= MinHostCopy && GuestGpu::IsGpuThread()) {
 		if (const void* source = Libs::LibKernel::Memory::FindBackingPointer(vaddr, size)) {
 			copies->Copy(destination, source, size);
 			return;
@@ -1540,7 +1548,11 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
 		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
 		if (mapped != nullptr) {
-			StreamGuestData(mapped, vaddr, size);
+			if (m_stream_buffer.IsCoherent()) {
+				StreamGuestData(mapped, vaddr, size);
+			} else {
+				std::memcpy(mapped, reinterpret_cast<const void*>(vaddr), size);
+			}
 			m_stream_buffer.Commit();
 			if (bon) bs.ob_stream.fetch_add(1, std::memory_order_relaxed);
 			stream = {.vaddr            = vaddr,

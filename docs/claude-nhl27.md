@@ -283,6 +283,15 @@ CP fault remained (normal play ~15 ms/s of readback waits in total, slow windows
 and return addresses when the game calls Coredump (its `Heartbeat` watchdog does when a boot
 stalls, for example while every shader recompiles).
 
+Upload copies (CPU-written buffer pages into the staging buffer before their GPU copy, 3.3% of the
+execution thread) now go to the host copy thread like the stream buffer's; the submission waits for
+them and guest-visible operations drain them first. In-boot A/B against `AbLegacy` (bit 31, the old
+copies): execution-thread time per draw 5.72 -> 5.46 us, per dispatch 4.45 -> 4.26 us.
+
+A GPU A/B of the stronger EXEC-select rules (`KYTY_DBG_EXECSEL_MODE=31`) on the heaviest compute
+shader alone (c556aaf3, 3.1 ms per frame in a paused scene of 26.8 ms GPU per frame) removed 901 of
+1,506 selects for -8% of its time: not worth the rules' known breakage. It uses 154 VGPRs (wave64).
+
 ## Merged defaults (nhl27 + claude/nhl27-perf)
 
 Where both branches implemented the same feature, only one implementation is left and it is a
