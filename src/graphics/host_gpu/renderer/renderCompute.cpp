@@ -429,12 +429,18 @@ void RenderExecutor::PrepareComputeInputInfo(const HW::Shader& shaders, uint32_t
 // guest-memory read it could not make (GPU-written bytes, for example).
 static std::atomic<uint64_t> g_dispatch_ahead_misses[2] {};
 
+RenderExecutor::ResolvedDispatch* RenderExecutor::ResolveDispatchIndirectAhead(const HW::Context& context,
+                                                                               const HW::Shader& shaders,
+                                                                               bool async_compute) {
+	return ResolveDispatchAhead(context, shaders, 1, 1, 1, 0, async_compute, true);
+}
+
 RenderExecutor::ResolvedDispatch* RenderExecutor::ResolveDispatchAhead(const HW::Context& context,
                                                                        const HW::Shader& shaders,
                                                                        uint32_t thread_group_x,
                                                                        uint32_t thread_group_y,
                                                                        uint32_t thread_group_z, uint32_t mode,
-                                                                       bool async_compute) {
+                                                                       bool async_compute, bool indirect) {
 	if (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0 ||
 	    shaders.GetCs().cs_regs.data_addr == 0) {
 		return nullptr;
@@ -453,8 +459,13 @@ RenderExecutor::ResolvedDispatch* RenderExecutor::ResolveDispatchAhead(const HW:
 	ring.next = (ring.next + 1) % ResolvedDispatchRing::Size;
 	dispatch.programs.Reset();
 	dispatch.input_info = {};
-	PrepareComputeInputInfo(shaders, thread_group_x, thread_group_y, thread_group_z, mode, async_compute,
-	                        dispatch.input_info);
+	if (indirect) {
+		// As DispatchIndirect() builds it: the group counts are only known when it executes.
+		dispatch.input_info.async_compute = async_compute;
+	} else {
+		PrepareComputeInputInfo(shaders, thread_group_x, thread_group_y, thread_group_z, mode, async_compute,
+		                        dispatch.input_info);
+	}
 	dispatch.program = m_context.GetPipelineCache().GetComputeProgramAhead(
 	    shaders.GetCs(), context.GetShaderRegisters(), dispatch.input_info, dispatch.programs);
 	if (!dispatch.program || dispatch.programs.reads.Failed()) {
@@ -933,7 +944,14 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	ShaderComputeInputInfo input_info {};
 	BufferCache::PerfTimerScope program_timer(BufferCache::PerfTimer::DispatchProgram);
 	input_info.async_compute = async_compute;
+	// As for direct dispatches: the resolve thread may have resolved the program already (it
+	// holds while the guest memory it read has the same bytes).
+	auto* resolved = std::exchange(m_resolved_dispatch, nullptr);
 	const auto compute_program = [&] {
+		if (resolved != nullptr && resolved->programs.reads.StillValid(true)) {
+			input_info = resolved->input_info;
+			return resolved->program;
+		}
 		FrameBreakdown::Timer materialize_timer(FrameBreakdown::g_counters.dc_materialize_ns);
 		return m_context.GetPipelineCache().GetComputeProgram(
 		    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);

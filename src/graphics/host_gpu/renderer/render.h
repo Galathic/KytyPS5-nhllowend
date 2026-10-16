@@ -298,7 +298,11 @@ public:
 	struct ResolvedDispatch;
 	[[nodiscard]] ResolvedDispatch* ResolveDispatchAhead(const HW::Context& context, const HW::Shader& shaders,
 	                                                     uint32_t thread_group_x, uint32_t thread_group_y,
-	                                                     uint32_t thread_group_z, uint32_t mode, bool async_compute);
+	                                                     uint32_t thread_group_z, uint32_t mode, bool async_compute,
+	                                                     bool indirect = false);
+	// Indirect dispatches: their program does not depend on the group counts.
+	[[nodiscard]] ResolvedDispatch* ResolveDispatchIndirectAhead(const HW::Context& context, const HW::Shader& shaders,
+	                                                             bool async_compute);
 	void UseResolvedDispatch(ResolvedDispatch* resolved) noexcept { m_resolved_dispatch = resolved; }
 	static void ReleaseResolvedDispatch(ResolvedDispatch* resolved) noexcept;
 	// Execution thread: the context register snapshot of the operation about to execute (0 for

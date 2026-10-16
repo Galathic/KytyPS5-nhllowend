@@ -705,6 +705,13 @@ void GuestGpu::ResolveThread() {
 			    *operation->state.context, *operation->state.shaders, dispatch.thread_group_x,
 			    dispatch.thread_group_y, dispatch.thread_group_z, dispatch.mode,
 			    operation->processor->IsAsyncComputeQueue());
+		} else if (operation->kind == GpuOperationKind::DispatchIndirect &&
+		           (operation->dispatch.mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) == 0 &&
+		           Common::Experiments::Enabled(Common::Experiments::DispatchAhead)) {
+			// Indirect dispatches materialized on the execution thread: 3.5% of it in a match
+			// (in-boot A/B: 24.9 -> 11.5 us of the execution thread per indirect dispatch).
+			operation->resolved_dispatch = executor.ResolveDispatchIndirectAhead(
+			    *operation->state.context, *operation->state.shaders, operation->processor->IsAsyncComputeQueue());
 		}
 		if (StageStats::Enabled() && !m_resolved.TryPush(*operation)) {
 			const auto start = std::chrono::steady_clock::now();
@@ -922,7 +929,14 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 			}
 			break;
 		}
-		case GpuOperationKind::DispatchIndirect: ExecuteDispatchIndirect(operation); break;
+		case GpuOperationKind::DispatchIndirect:
+			executor.UseResolvedDispatch(operation.resolved_dispatch);
+			ExecuteDispatchIndirect(operation);
+			executor.UseResolvedDispatch(nullptr);
+			if (operation.resolved_dispatch != nullptr) {
+				RenderExecutor::ReleaseResolvedDispatch(operation.resolved_dispatch);
+			}
+			break;
 		case GpuOperationKind::Callback:
 			if (operation.callback) {
 				operation.callback();

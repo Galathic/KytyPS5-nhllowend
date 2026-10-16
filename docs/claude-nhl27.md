@@ -306,6 +306,10 @@ compare read-protected pages in the backing instead of taking an exception per p
 only the GPU-written bytes it carries dirty, not its whole pages (a draw check that hit such a page
 waited for that download: another 2.7%).
 
+Indirect dispatches are resolved ahead on the resolve thread too (their program does not depend
+on the group counts; with bit 19 `KYTY_DISPATCH_AHEAD`): execution-thread time per indirect dispatch
+24.9 -> 11.5 us in an in-boot A/B (about 2.5% of the thread).
+
 ## Merged defaults (nhl27 + claude/nhl27-perf)
 
 Where both branches implemented the same feature, only one implementation is left and it is a
