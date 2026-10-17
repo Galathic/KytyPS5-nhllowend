@@ -88,13 +88,18 @@ std::pair<vk::Buffer, uint64_t> DispatchArgsGuard::Record(CommandBuffer& buffer,
  command.pipelineBarrier(vk::PipelineStageFlagBits::eAllGraphics | vk::PipelineStageFlagBits::eComputeShader |
                              vk::PipelineStageFlagBits::eTransfer | vk::PipelineStageFlagBits::eDrawIndirect,
                          vk::PipelineStageFlagBits::eComputeShader, {}, 1, &written, 0, nullptr, 0, nullptr);
- struct Params { uint64_t source, destination, trips, guest_address; uint32_t max_x, max_y, max_z, reserved; };
+ struct Params { uint64_t source, destination, trips, guest_address; uint32_t max_x, max_y, max_z, max_groups; };
  static_assert(sizeof(Params) == 48);
  const auto& limits = m_graphics.GetPhysicalDeviceProperties().limits;
+ // NHL 27 also dispatches a CS (9ba58a11, 8714aa79) with 50,589,920 x 1 x 1 groups from a record
+ // that grows over a match: within the limits, but the GPU then runs for seconds (TDR, device
+ // lost; caught by breadcrumbs). Its normal dispatches stay below 1,000 groups, a full-screen 4K
+ // pass of 8x8 groups is about 130,000: more than 4M groups is taken as garbage.
+ constexpr uint32_t MaxGroups = 1u << 22u;
  const Params params {args.BufferDeviceAddress() + offset, m_ring->BufferDeviceAddress() + slot,
                       m_trips->BufferDeviceAddress(), guest_address,
                       limits.maxComputeWorkGroupCount[0], limits.maxComputeWorkGroupCount[1],
-                      limits.maxComputeWorkGroupCount[2], 0};
+                      limits.maxComputeWorkGroupCount[2], MaxGroups};
  // Binding another compute pipeline invalidates the elided-bind caches of the dispatch path.
  Libs::Graphics::g_compute_pipeline_epoch.fetch_add(1, std::memory_order_relaxed);
  command.bindPipeline(vk::PipelineBindPoint::eCompute, m_pipeline);

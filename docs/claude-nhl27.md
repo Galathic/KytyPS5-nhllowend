@@ -310,6 +310,19 @@ Indirect dispatches are resolved ahead on the resolve thread too (their program 
 on the group counts; with bit 19 `KYTY_DISPATCH_AHEAD`): execution-thread time per indirect dispatch
 24.9 -> 11.5 us in an in-boot A/B (about 2.5% of the thread).
 
+Breadcrumbs (`KYTY_DBG_BREADCRUMBS=1`) caught the remaining device loss in a soak: the GPU was
+running an indirect dispatch of CS 9ba58a112a994ad8 with 50,589,920 x 1 x 1 groups (the record at
+0x11c020a000 grows over a match; CS 8714aa79 had just run with the same record). The counts are
+within the device limits, so the guard let them through and the GPU ran for seconds (TDR). The
+guard now also zeroes records whose product exceeds 4M groups (NHL 27's normal indirect dispatches
+stay below 1,000; a full-screen 4K pass of 8x8 groups is about 130,000). The record itself is
+still wrong (not reset where the game expects it); not found yet.
+
+Scalar constant reads (S_BUFFER_LOAD) under robust loads no longer branch on their bounds per
+dword (a branch per constant kept each load in a block of its own; the heaviest compute shader had
+189): GPU time -6 to -7% per frame in a paused-scene A/B/A (29.0 -> 27.0 ms; d7cfa519 -17%,
+others -5 to -15%). Part of the shader keys (code-gen key bit 32).
+
 ## Merged defaults (nhl27 + claude/nhl27-perf)
 
 Where both branches implemented the same feature, only one implementation is left and it is a
