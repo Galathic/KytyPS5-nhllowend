@@ -1920,6 +1920,39 @@ uint64_t BufferCache::SynchronizeBuffersInRanges(const RangeSet& ranges, bool fu
 	return visited;
 }
 
+bool BufferCache::SynchronizeBuffersInRangesBefore(const RangeSet& ranges, bool full, uint32_t limit,
+                                                   uint32_t& first_left) {
+	bool       left = false;
+	const auto sync = [&](uint64_t vaddr, uint64_t size) {
+		left |= m_memory_tracker.ForEachCpuDirtySpanBefore(
+		    vaddr, size, limit, first_left, [&](uint64_t span, uint64_t span_size) {
+			    const auto end = span + span_size;
+			    auto       it  = m_buffers.upper_bound(span);
+			    if (it != m_buffers.begin()) {
+				    --it;
+			    }
+			    for (; it != m_buffers.end() && it->first < end; ++it) {
+				    auto&      buffer = m_slot_buffers[it->second];
+				    const auto start  = std::max(buffer.CpuAddress(), span);
+				    const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
+				    if (start < finish) {
+					    (void)SynchronizeBuffer(buffer, start, finish - start, false, false);
+				    }
+			    }
+		    });
+	};
+	// Drain before a full scan so a CPU write during that scan remains queued.
+	m_memory_tracker.DrainCpuDirtyRegions([&](uint64_t address, uint64_t size) {
+		if (!full) {
+			ranges.ForEachInRange(address, size, [&](uint64_t begin, uint64_t end) { sync(begin, end - begin); });
+		}
+	});
+	if (full) {
+		ranges.ForEach([&](uint64_t begin, uint64_t end) { sync(begin, end - begin); });
+	}
+	return left;
+}
+
 void BufferCache::SynchronizeDirtyRegionsInRanges(const RangeSet& ranges, bool all) {
 	// Read each region's epoch before scanning it: pages dirtied during or after the scan advance
 	// it again, and the next call visits the region again.

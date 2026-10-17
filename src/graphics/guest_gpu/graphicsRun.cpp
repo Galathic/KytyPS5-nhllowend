@@ -630,6 +630,7 @@ void GuestGpu::ExecutionThread() {
 	StageStats::t_role = StageStats::Role::Execution;
 	g_gpu_thread    = true;
 	g_execution_gpu = this;
+	RegionManager::MarkGpuOrderedThread();
 	// Waking the command processor costs a fence: publish every operation, but only look for a
 	// waiter now and then and before sleeping.
 	constexpr uint32_t NotifyInterval = 16;
@@ -796,6 +797,7 @@ GpuOperation CommandProcessor::MakeOperation(GpuOperationKind kind) {
 	operation.submit_id     = m_submit_id;
 	operation.num_instances = m_num_instances;
 	operation.after_wait    = std::exchange(m_wait_since_operation, false);
+	operation.write_epoch   = RegionManager::CurrentWriteEpoch();
 	if (m_pipeline == nullptr) {
 		operation.state = {&m_ctx, &m_ucfg, &m_sh_ctx};
 	} else if (kind == GpuOperationKind::Callback) {
@@ -876,6 +878,8 @@ void CommandProcessor::ReadDecisionMemory(const volatile void* address, void* va
 }
 
 void CommandProcessor::BdaBoundary(RenderContext::BdaBoundary kind) {
+	// Guest writes from now on belong to the operations after this boundary.
+	RegionManager::AdvanceWriteEpoch();
 	if (m_pipeline == nullptr) {
 		m_renderer.BdaBatchBoundary(kind);
 		return;
@@ -892,6 +896,7 @@ uint64_t CommandProcessor::EmitCallback(GpuCallback&& callback) {
 
 void CommandProcessor::Execute(GpuOperation& operation) {
 	EXIT_IF(operation.processor != this);
+	m_renderer.SetOperationWriteEpoch(operation.write_epoch);
 	BindState(operation.state);
 	auto& executor = m_renderer.GetRenderExecutor();
 	executor.UseContextId(operation.state.context_id);
@@ -1458,6 +1463,7 @@ void GuestGpu::ThreadRun(void* data) {
 	KYTY_PROFILER_THREAD("Thread_Gpu");
 	g_gpu_thread = !gpu->m_pipelined;
 	g_cp_thread  = gpu->m_pipelined;
+	RegionManager::MarkGpuOrderedThread();
 	g_gpu_state  = gpu;
 	if (gpu->m_pipelined) {
 		Config::ConfigureGpuStageThread(Config::GpuStageThread::CommandProcessor);
@@ -3434,6 +3440,7 @@ void NoteCpRead(const char* kind, uint64_t address, const uint32_t* pairs, uint3
 		            static_cast<unsigned long long>(now_stats[3] - previous[3]),
 		            static_cast<unsigned long long>(now_stats[4] - previous[4]));
 		std::copy(std::begin(now_stats), std::end(now_stats), std::begin(previous));
+		ProtectStats::PrintFaultPages();
 	}
 	for (size_t i = 0; i < sorted.size() && i < 10; ++i) {
 		const auto& s = *sorted[i];

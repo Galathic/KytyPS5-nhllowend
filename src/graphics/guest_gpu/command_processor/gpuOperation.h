@@ -98,6 +98,8 @@ struct GpuOperation {
 	// The command processor processed a WAIT_REG_MEM since the previous operation: the guest may
 	// have written memory the operations before it read.
 	bool after_wait = false;
+	// The write epoch when the command processor emitted the operation (see RegionManager).
+	uint32_t write_epoch = 0;
 	union {
 		DrawIndexArgs       draw_index;
 		DrawAutoArgs        draw_auto;

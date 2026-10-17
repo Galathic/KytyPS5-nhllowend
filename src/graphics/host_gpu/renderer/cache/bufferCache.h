@@ -245,6 +245,10 @@ public:
 	}
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	uint64_t           SynchronizeBuffersInRanges(const RangeSet& ranges, bool full);
+	// Synchronizes only the pages dirtied before write epoch `limit` (see RegionManager); returns
+	// whether later ones were left (first_left: the earliest of their epochs).
+	bool               SynchronizeBuffersInRangesBefore(const RangeSet& ranges, bool full, uint32_t limit,
+	                                                    uint32_t& first_left);
 	[[nodiscard]] uint64_t CpuModificationGeneration() const noexcept {
 		return m_memory_tracker.CpuModificationGeneration();
 	}

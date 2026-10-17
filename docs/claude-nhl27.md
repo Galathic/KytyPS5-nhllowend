@@ -360,6 +360,22 @@ The execution thread's checks of resolved reads look up the GPU-dirty state (buf
 GPU-modified images) once per page instead of per read: execution time per dispatch -14%, draws
 per second +1.5% in a paused, execution-bound A/B (52 fps).
 
+Page protection churn (in play: ~45k protect calls/s, ~11k write faults/s; 87% of the execution
+thread's protect calls came from the BDA synchronization uploading every CPU-dirty page):
+- Write epochs (`RegionManager`): the command processor advances an epoch at each batch boundary
+  and stamps it on the operations it emits; a page that becomes CPU dirty takes the epoch of that
+  moment (0 when the execution or command processor thread writes it). The BDA synchronization of
+  an operation uploads (and protects again) only the pages of earlier epochs: a game writes a
+  submission's data before submitting it, and data the GPU waits for before the label. Pages the
+  game is still filling stay writable until an operation of a later epoch needs them. Protect
+  calls and write faults -20% (in-play A/B).
+- A write fault releases its 16-page window before the faulting page instead of after, so the
+  window, faulting page included, is one protection change instead of three: protect calls -41%,
+  those of the faulting (game) threads -56%.
+Together about 89k -> 30k protect calls per 2 s. Execution time per draw did not change
+measurably. `NHL27FAULTPAGES` (with `KYTY_DBG_CP_READS`) counts write faults per page every 2 s:
+about 1,800 pages fault 11k times, two thirds of them on ~470 pages rewritten every 2-8 frames.
+
 The low-energy preset patch (`patches/nhl27_lowenergy.json`: resolution scale 0.5, no FSR3)
 changes nothing on the CPU side (same draws per second and thread load).
 
