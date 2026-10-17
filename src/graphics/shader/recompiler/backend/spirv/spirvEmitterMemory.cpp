@@ -556,6 +556,12 @@ void StoreSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR:
 	const auto index = Binary(
 	    ctx.state, spv::OpShiftRightLogical, TypeU32(ctx.state), address,
 	    ConstantU32(ctx.state, std::countr_zero(resource.element_bits / 8u)));
+	// Only plain 8/16-bit stores: a read-modify-write of the containing dword out of range must not
+	// spin on a compare-exchange.
+	if (RobustLoad(ctx.state, resource.kind) && ShaderRobustStores() && resource.element_bits < 32u) {
+		StoreSubwordInBounds(ctx, mem, resource, address, index, bits, data);
+		return;
+	}
 	EmitIfCondition(
 	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index), [&]() {
 		    StoreSubwordInBounds(ctx, mem, resource, address, index, bits, data);
@@ -623,6 +629,10 @@ void StoreLocalFlat(ValueEmitContext& ctx, const IR::Inst& inst) {
 void StoreWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                        const MemoryResourceAccess& resource, uint32_t data) {
 	const auto index = DwordIndex(ctx, inst, mem);
+	if (RobustLoad(ctx.state, resource.kind) && ShaderRobustStores()) {
+		StoreWordInBounds(ctx, resource, index, data);
+		return;
+	}
 	EmitIfCondition(ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index), [&]() {
 		StoreWordInBounds(ctx, resource, index, data);
 	});

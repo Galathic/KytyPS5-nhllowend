@@ -80,11 +80,16 @@ inline std::atomic<bool> g_shader_robust_buffer_access2 {false};
 [[nodiscard]] inline bool ShaderRobustConstReads() {
 	return ShaderRobustLoads();
 }
+// Robust loads also drop the bounds branch of storage-buffer stores (out of range writes are
+// discarded on the device); the EXEC branch stays (key bit 64; GPU time -3 to -4% per frame).
+[[nodiscard]] inline bool ShaderRobustStores() {
+	return ShaderRobustLoads();
+}
 [[nodiscard]] inline uint32_t ShaderFloatCodegenKey() {
 	return static_cast<uint32_t>(ShaderNativeFp16()) | (ShaderNativeMinMax() ? 2u : 0u) |
 	       (ShaderFusedMad() ? 4u : 0u) |
 	       (ShaderRobustLoads() ? (ShaderRobustLoadsKeepExec() ? 24u : 8u) : 0u) |
-	       (ShaderRobustConstReads() ? 32u : 0u);
+	       (ShaderRobustConstReads() ? 32u : 0u) | (ShaderRobustStores() ? 64u : 0u);
 }
 [[nodiscard]] inline uint32_t ShaderNativeFp16Modes() {
 	return g_shader_native_fp16_modes.load(std::memory_order_relaxed);

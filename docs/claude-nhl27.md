@@ -333,6 +333,11 @@ the match). Deeper queues between the stages (resolved queue 256 -> 768, rings 3
 snapshots 512 -> 1536) cut execution-thread idle time 181 -> 156 ms/s but not the operations per
 second (in-boot A/B): dropped.
 
+Storage-buffer stores (32-bit, and plain 8/16-bit ones) under robust loads drop their bounds branch
+too (the EXEC branch stays; a read-modify-write of a containing dword keeps it, so an out-of-range
+compare-exchange cannot spin): GPU time -3.1 / -3.7% per frame in a paused A/B/A (pixel shaders
+with buffer stores -5 to -9%). Code-gen key bit 64.
+
 ## Merged defaults (nhl27 + claude/nhl27-perf)
 
 Where both branches implemented the same feature, only one implementation is left and it is a
