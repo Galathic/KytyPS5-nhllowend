@@ -271,6 +271,20 @@ uint32_t EmitCompositeExtractU32x2(EmitterState& state, uint32_t arg0, IR::Value
 }
 
 uint32_t EmitPackFloat2x16Rtz(EmitterState& state, uint32_t arg0, uint32_t arg1) {
+	if (ShaderNativePkrtz()) {
+		// One lane per PackHalf2x16, merged with integer ops (see the RDNA4 driver note in
+		// spirvEmitterImage.cpp). The AMD compiler emits v_cvt_pk_rtz_f16_f32 for PackHalf2x16 also in
+		// shaders that declare RoundingModeRTE for f16 (seen in their ISA).
+		const auto pack_lane = [&](uint32_t lane) {
+			const auto pair = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2), pair, lane,
+			                          ConstantF32(state, 0));
+			return EmitPackHalf2x16(state, pair);
+		};
+		return Binary(state, spv::OpBitwiseOr, TypeU32(state), pack_lane(arg0),
+		              Binary(state, spv::OpShiftLeftLogical, TypeU32(state), pack_lane(arg1),
+		                     ConstantU32(state, 16)));
+	}
 	const auto low  = EmitF32ToF16RtzBits(state, arg0);
 	const auto high = Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
 	                         EmitF32ToF16RtzBits(state, arg1), ConstantU32(state, 16));

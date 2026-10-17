@@ -380,6 +380,14 @@ Together about 89k -> 30k protect calls per 2 s. Execution time per draw did not
 measurably. `NHL27FAULTPAGES` (with `KYTY_DBG_CP_READS`) counts write faults per page every 2 s:
 about 1,800 pages fault 11k times, two thirds of them on ~470 pages rewritten every 2-8 frames.
 
+`V_CVT_PKRTZ_F16_F32` (pack two floats as halves, rounding toward zero) was emulated with about
+forty integer instructions per half; on AMD devices it is now GLSL `PackHalf2x16`, which the AMD
+compiler turns into the same `v_cvt_pk_rtz_f16_f32` (seen in the pipeline ISA, also in shaders that
+declare RTE for f16). The two vertex shaders drawn with PS f5a3c1b7 (crowd and players) shrink from
+46k to 22k and 24k to 12k ISA instructions; GPU time per frame -5% in a paused A/B/A (code-gen key
+bit 128). Native scalar f16 ops also take SDWA word-select sources (480 `V_SUB_F16` in each of those
+shaders; key bit 256): GPU time unchanged, but they round like the guest.
+
 The low-energy preset patch (`patches/nhl27_lowenergy.json`: resolution scale 0.5, no FSR3)
 changes nothing on the CPU side (same draws per second and thread load).
 
