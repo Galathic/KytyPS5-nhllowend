@@ -36,6 +36,20 @@ struct LaneDemandStats {
 [[nodiscard]] bool FastDenormEnabled();
 uint32_t RewriteLaneDemand(std::vector<uint32_t>& spirv, LaneDemandStats* stats = nullptr);
 
+// KYTY_LANE_REGIONS=1 (experiment, default off): a run of exec-guarded work whose results only feed
+// select(exec, new, old) is moved into a real "if (exec) { ... }" block and merged with OpPhi, so the
+// driver masks inactive lanes for free instead of emitting one v_cndmask per value. Runs after
+// KYTY_HALF_VECTOR and before KYTY_LANE_DEMAND. Returns the number of if-blocks created.
+struct LaneRegionStats {
+	uint32_t regions = 0;
+	uint32_t moved   = 0;
+	uint32_t phis    = 0;
+};
+
+[[nodiscard]] bool LaneRegionsEnabled();
+[[nodiscard]] int  LaneRegionsMode(); // 1 = loops only, 2 = everywhere
+uint32_t RewriteLaneRegions(std::vector<uint32_t>& spirv, LaneRegionStats* stats = nullptr);
+
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv
 
 #endif

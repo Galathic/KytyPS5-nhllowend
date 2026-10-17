@@ -695,6 +695,17 @@ struct PipelineCache::ProgramCache {
 				            half_stats.writes);
 			}
 		}
+		if (ShaderRecompiler::Spirv::LaneRegionsEnabled() && std::strcmp(stage_name, "ps") != 0) {
+			// KYTY_LANE_REGIONS=1: exec-guarded runs of work as real if-blocks merged with OpPhi.
+			// Not for pixel shaders: the Oct 17 A/B made draw f2e5 ~2x slower with them.
+			ShaderRecompiler::Spirv::LaneRegionStats region_stats;
+			const auto regions = ShaderRecompiler::Spirv::RewriteLaneRegions(result.spirv, &region_stats);
+			static std::atomic<uint32_t> region_shaders {0};
+			if (regions != 0 && region_shaders.fetch_add(1, std::memory_order_relaxed) < 256u) {
+				std::printf("NHL27REGION: %s 0x%016" PRIx64 " regions=%u moved=%u phis=%u\n", stage_name,
+				            options.shader_hash, region_stats.regions, region_stats.moved, region_stats.phis);
+			}
+		}
 		if (ShaderRecompiler::Spirv::LaneDemandEnabled()) {
 			// KYTY_LANE_DEMAND=1: drop select(exec, new, old) whose old lanes are never observed.
 			ShaderRecompiler::Spirv::LaneDemandStats lane_stats;
