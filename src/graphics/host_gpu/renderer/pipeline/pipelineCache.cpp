@@ -299,6 +299,20 @@ bool GuestReadLog::StillValid(bool without_faults) const {
 		return false;
 	}
 	std::array<uint8_t, StrictCheckBytes> buffer {};
+	// Consecutive entries mostly lie on one page: its protection is looked up once.
+	uint64_t   protected_page = ~uint64_t {0};
+	bool       page_protected = false;
+	const auto read_protected = [&](uint64_t address, uint64_t size) {
+		const auto page = address & ~uint64_t {0xfff};
+		if (page != ((address + size - 1) & ~uint64_t {0xfff})) {
+			return Libs::LibKernel::Memory::IsGpuReadProtected(address, size);
+		}
+		if (page != protected_page) {
+			protected_page = page;
+			page_protected = Libs::LibKernel::Memory::IsGpuReadProtected(page, 0x1000);
+		}
+		return page_protected;
+	};
 	for (const auto& entry: m_entries) {
 		const auto* recorded = m_bytes.data() + entry.offset;
 		if (entry.strict) {
@@ -318,7 +332,7 @@ bool GuestReadLog::StillValid(bool without_faults) const {
 			// exception each (2.7% of the execution thread; the 16-page fault cache thrashes).
 			if (Common::Experiments::Enabled(Common::Experiments::FaultPageDirect) &&
 			    (without_faults || Libs::LibKernel::Memory::IsReadFaultPage(entry.address, entry.size) ||
-			     Libs::LibKernel::Memory::IsGpuReadProtected(entry.address, entry.size))) {
+			     read_protected(entry.address, entry.size))) {
 				const auto compare =
 				    Libs::LibKernel::Memory::TryValidateCleanBacking(entry.address, recorded, entry.size);
 				if (compare == Libs::LibKernel::Memory::CleanBackingCompare::Equal) {

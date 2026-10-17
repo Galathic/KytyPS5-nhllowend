@@ -323,6 +323,16 @@ dword (a branch per constant kept each load in a block of its own; the heaviest 
 189): GPU time -6 to -7% per frame in a paused-scene A/B/A (29.0 -> 27.0 ms; d7cfa519 -17%,
 others -5 to -15%). Part of the shader keys (code-gen key bit 32).
 
+With the readback waits gone, the pipeline is limited by two threads at once: the resolve thread
+(resource walks of the draws and dispatches ahead) is about 88% busy and the execution thread about
+80%; the command processor mostly waits for free register snapshots. `NHL27STALLS` now also prints
+the resolve thread's idle and busy time. Bits 17 (`KYTY_BACKING_READ_MRU`) and 20
+(`KYTY_BACKING_LOOKUP_CACHE`), whose earlier A/Bs were invalid (the mask carry bug), are on by
+default: resolve-thread time per operation -7.7% in an in-boot A/B (soak: 6 of 6 boots, 2 min in
+the match). Deeper queues between the stages (resolved queue 256 -> 768, rings 320 -> 960, register
+snapshots 512 -> 1536) cut execution-thread idle time 181 -> 156 ms/s but not the operations per
+second (in-boot A/B): dropped.
+
 ## Merged defaults (nhl27 + claude/nhl27-perf)
 
 Where both branches implemented the same feature, only one implementation is left and it is a

@@ -17,6 +17,7 @@ enum Counter : uint32_t {
 	ExecProgramLock, // execution thread waiting for the program lock
 	ResolveProgramLock,
 	ResolveQueueFull, // resolve thread waiting for room in the execution queue
+	ResolveIdle,      // resolve thread waiting for operations from the command processor
 	CounterCount,
 };
 

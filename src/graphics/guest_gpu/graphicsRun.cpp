@@ -567,12 +567,13 @@ static void PrintStageStats() {
 	last_items           = ops;
 	const double   busy  = 1000.0 - ms[StageStats::ExecIdle];
 	std::printf("NHL27STALLS mask=%u ops/s=%.0f exec busy=%.1f idle=%.1f lock=%.1f ms/s busy/op=%.2f us"
-	            " (%.2f us without lock waits) | resolve lock=%.1f queue-full=%.1f ms/s\n",
+	            " (%.2f us without lock waits) | resolve lock=%.1f queue-full=%.1f idle=%.1f busy=%.1f ms/s\n",
 	            static_cast<unsigned>(Common::Experiments::Mask()), static_cast<double>(items) / seconds, busy,
 	            ms[StageStats::ExecIdle], ms[StageStats::ExecProgramLock],
 	            items != 0 ? busy * 1e3 * seconds / static_cast<double>(items) : 0.0,
 	            items != 0 ? (busy - ms[StageStats::ExecProgramLock]) * 1e3 * seconds / static_cast<double>(items) : 0.0,
-	            ms[StageStats::ResolveProgramLock], ms[StageStats::ResolveQueueFull]);
+	            ms[StageStats::ResolveProgramLock], ms[StageStats::ResolveQueueFull], ms[StageStats::ResolveIdle],
+	            1000.0 - ms[StageStats::ResolveQueueFull] - ms[StageStats::ResolveIdle]);
 	// By operation kind: ms/s and us per operation.
 	static uint64_t last_kind_ns[8] {}, last_kind_count[8] {};
 	static const char* const kinds[] = {"draw", "draw-auto", "draw-indirect", "dispatch", "dispatch-indirect", "callback", "?", "?"};
@@ -687,7 +688,12 @@ void GuestGpu::ResolveThread() {
 	for (;;) {
 		auto operation = m_operations.TryPop();
 		if (!operation) {
+			const auto start = StageStats::Enabled() ? std::chrono::steady_clock::now()
+			                                         : std::chrono::steady_clock::time_point {};
 			operation = m_operations.Pop();
+			if (StageStats::Enabled()) {
+				StageStats::Add(StageStats::ResolveIdle, start);
+			}
 			if (!operation) {
 				break;
 			}

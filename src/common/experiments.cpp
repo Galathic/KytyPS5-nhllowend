@@ -63,12 +63,12 @@ uint32_t EnvironmentMask() {
 	set("KYTY_ROBUST_LOADS", RobustLoads, true);
 	set("KYTY_FUSED_MAD", FusedMad, false);
 	set("KYTY_FAULT_PAGE_DIRECT", FaultPageDirect, true);
-	set("KYTY_BACKING_READ_MRU", BackingReadMru, false);
+	set("KYTY_BACKING_READ_MRU", BackingReadMru, true);
 	set("KYTY_DISPATCH_AHEAD", DispatchAhead, true);
 	set("KYTY_GPU_CONDITIONS_BOTH_PATHS", GpuConditionsBothPaths, true);
 	set("KYTY_COMPUTE_UNLOCKED", ComputeUnlocked, true);
 	set("KYTY_AHEAD_UNLOCKED", AheadUnlocked, true);
-	set("KYTY_BACKING_LOOKUP_CACHE", BackingLookupCache, false);
+	set("KYTY_BACKING_LOOKUP_CACHE", BackingLookupCache, true);
 	return mask;
 }
 
