@@ -13,6 +13,7 @@
 #include <array>
 #include <atomic>
 #include <cstddef>
+#include <atomic>
 #include <filesystem>
 #include <memory>
 #include <span>
@@ -39,7 +40,9 @@ public:
 	void               Fail() { m_failed = true; }
 	[[nodiscard]] bool Failed() const { return m_failed; }
 	// Execution thread: whether every read still gives the recorded bytes.
-	[[nodiscard]] bool StillValid() const;
+	// without_faults: bytes the GPU may have written since fail the check instead of being read back
+	// (a plain load of their page would fault and wait for all queued GPU work).
+	[[nodiscard]] bool StillValid(bool without_faults = false) const;
 
 private:
 	static constexpr uint64_t StrictCheckBytes = 64;
@@ -187,6 +190,10 @@ public:
 	                                const HW::ShaderRegisters&   sh,
 	                                ShaderComputeInputInfo&      input_info,
 	                                ProgramResolution*          ahead = nullptr);
+	// Resolve thread: the program of a dispatch ahead of its execution, reading guest memory
+	// through `ahead`'s log; empty when it is not compiled yet or cannot be resolved ahead.
+	ShaderProgram GetComputeProgramAhead(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
+	                                     ShaderComputeInputInfo& input_info, ProgramResolution& ahead);
 
 	Pipeline& GetGraphicsPipeline(std::span<const RenderColorInfo>       colors,
 	                              const RenderDepthInfo&                 depth,

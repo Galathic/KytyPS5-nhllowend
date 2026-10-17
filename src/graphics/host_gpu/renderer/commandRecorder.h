@@ -441,6 +441,25 @@ public:
 		clearDepthStencilImage(image, layout, &value, 1, &range);
 	}
 
+	// Experiment GpuColorClear: predicated clears of a render pass's attachments.
+	void clearAttachments(uint32_t attachment_count, const vk::ClearAttachment* attachments,
+	                      uint32_t rect_count, const vk::ClearRect* rects) const;
+	void beginConditionalRenderingEXT(const vk::ConditionalRenderingBeginInfoEXT* begin) const {
+		if (m_stream == nullptr) {
+			m_direct.beginConditionalRenderingEXT(begin);
+			return;
+		}
+		const auto info = *begin;
+		m_stream->Record([=](vk::CommandBuffer c) { c.beginConditionalRenderingEXT(&info); });
+	}
+	void endConditionalRenderingEXT() const {
+		if (m_stream == nullptr) {
+			m_direct.endConditionalRenderingEXT();
+			return;
+		}
+		m_stream->Record([](vk::CommandBuffer c) { c.endConditionalRenderingEXT(); });
+	}
+
 	void setViewport(uint32_t first, uint32_t count, const vk::Viewport* viewports) const;
 	void setScissor(uint32_t first, uint32_t count, const vk::Rect2D* scissors) const;
 	void setViewportWithCount(uint32_t count, const vk::Viewport* viewports) const;

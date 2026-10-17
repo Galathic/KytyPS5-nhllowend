@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cstdlib>
 #include <memory>
 #include <string_view>
@@ -93,7 +94,13 @@ bool AmdCpuEnabled() {
 }
 
 uint32_t GetVblankFrequency() {
-	return std::clamp(g_config->vblank_frequency, 30u, 360u);
+	// Benchmarking: KYTY_VBLANK_HZ overrides the configured rate (a paused NHL 27 match renders every
+	// second vblank, so 100 lifts its 30 fps cap above what the emulator reaches).
+	static const uint32_t forced = [] {
+		const char* value = std::getenv("KYTY_VBLANK_HZ");
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+	}();
+	return std::clamp(forced != 0 ? forced : g_config->vblank_frequency, 30u, 360u);
 }
 
 uint32_t GetConsoleLanguage() {
@@ -231,6 +238,13 @@ void ConfigureGpuStageThread(GpuStageThread stage) {
 		Common::Thread::RaiseCurrentPriority();
 	}
 	Common::Thread::PinCurrent(cpus[static_cast<uint32_t>(stage)]);
+	// For profilers that sample one thread (KytyPS5-tools/prof-stage.sh): which OS thread runs
+	// which stage.
+	static constexpr const char* Names[] = {"command-processor", "execution", "recording", "resolve",
+	                                        "host-copy"};
+	std::printf("NHL27STAGE: %s tid=%s cpu=%d\n", Names[static_cast<uint32_t>(stage)],
+	            Common::Thread::GetThreadId().c_str(), cpus[static_cast<uint32_t>(stage)]);
+	std::fflush(stdout);
 }
 
 uint32_t GpuPipelineStages() {

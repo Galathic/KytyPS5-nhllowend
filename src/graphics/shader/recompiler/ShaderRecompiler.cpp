@@ -16,6 +16,8 @@
 #include "graphics/shader/recompiler/ir/passes/PartialWaveReduction.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "common/experiments.h"
+#include "graphics/shader/recompiler/ir/passes/ExecSelectElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 #include "graphics/shader/recompiler/ir/passes/SsaRewrite.h"
@@ -25,6 +27,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fmt/format.h>
 #include <functional>
 #include <map>
@@ -1031,6 +1034,36 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	ir.value_storage.clear();
 	IR::RemoveIdentities(ir.blocks);
 	IR::EliminateDeadCode(ir.blocks);
+	// Experiment ExecSelects: VGPR writes under a partial EXEC whose old lanes nobody reads.
+	if (Common::Experiments::Enabled(Common::Experiments::ExecSelects)) {
+		uint32_t selects = 0;
+		for (auto* block: ir.blocks) {
+			for (const auto& inst: *block) {
+				const auto op = inst.GetOpcode();
+				selects += op == IR::ValueOpcode::SelectU32 || op == IR::ValueOpcode::SelectF32 ||
+				           op == IR::ValueOpcode::SelectU1;
+			}
+		}
+		// KYTY_DBG_EXECSEL_BISECT=<bits>:<value>: only shaders whose top hash bits equal value.
+		static const std::pair<uint32_t, uint64_t> bisect = [] {
+			const char* v = std::getenv("KYTY_DBG_EXECSEL_BISECT");
+			if (v == nullptr) return std::pair<uint32_t, uint64_t> {0, 0};
+			char*      end  = nullptr;
+			const auto bits = static_cast<uint32_t>(std::strtoul(v, &end, 10));
+			const auto val  = (end != nullptr && *end == ':') ? std::strtoull(end + 1, nullptr, 0) : 0ull;
+			return std::pair<uint32_t, uint64_t> {bits, val};
+		}();
+		static const char* stage_filter = std::getenv("KYTY_DBG_EXECSEL_STAGE");
+		const bool chosen = (bisect.first == 0 || (ir.shader_hash >> (64u - bisect.first)) == bisect.second) &&
+		                    (stage_filter == nullptr || std::strcmp(stage_filter, StageName(ir.stage)) == 0);
+		const auto removed = chosen ? IR::EliminateExecSelects(ir.blocks) : 0u;
+		if (std::getenv("KYTY_DBG_EXECSEL") != nullptr) std::printf("NHL27EXECSEL: hash=0x%016" PRIx64 " stage=%s selects=%u removed=%u\n", ir.shader_hash,
+		            StageName(ir.stage), selects, removed);
+		if (removed != 0) {
+			IR::RemoveIdentities(ir.blocks);
+			IR::EliminateDeadCode(ir.blocks);
+		}
+	}
 
 	IR::CollectShaderInfo(ir, options.input_info);
 	std::string ir_dump;

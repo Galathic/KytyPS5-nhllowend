@@ -30,18 +30,18 @@ FPS ranges in normal play mode (no profiler or debug logging), measured after th
 | In match | 12-19 | 22-28 |
 | Free skate | 34-39 | 49-56 |
 
-Fps is mainly limited by CPU-side per-draw preparation (descriptor/resource setup). Newer CPU's will preform better due to 
+Fps is mainly limited by CPU-side per-draw preparation (descriptor/resource setup). Newer CPU's will preform better due to
 greater single thread performance.
 
 ## Known bugs
 
 - **Jersey cloth glitches**
-- **Some skin tones look wrong in cut-scenes** 
+- **Some skin tones look wrong in cut-scenes**
 - **Occasional crashes**
 - **Blurry facial hair**
 - **Bright pixels**
 - **Scrambled team logos**
-- **Volume normalization issues** 
+- **Volume normalization issues**
 
 ## Notable fixes in this fork
 
@@ -95,6 +95,27 @@ KYTY_BDA_DIRTY_CACHE=1
 KYTY_PROGRAM_RESOURCE_CACHE=1
 KYTY_PERF_NO_SYNC_READBACK=1
 ```
+
+Performance switches measured on NHL 27 (`docs/claude-nhl27.md` has what each does):
+
+```
+KYTY_READBACK_QUEUE=1
+KYTY_DIRECT_EOP_INTERRUPTS=1
+KYTY_LONG_BUFFER_GC_AGE=1
+KYTY_SPARSE_BUFFER_GC=1
+KYTY_PM4_WRITE_DATA_FAST=1
+KYTY_FALSE_SHARE_READS=1
+KYTY_ASYNC_SUBMIT=1
+KYTY_LAZY_SHARED_WRITES=1
+KYTY_FAULT_PAGE_READS=1
+KYTY_GPU_COLOR_CLEAR=1
+KYTY_ASYNC_GUEST_READS=1
+KYTY_BDA_DIRTY_REGIONS=1
+KYTY_NATIVE_FP16=1
+```
+
+Building with `-DKYTY_PGO=use` (clang-cl 22.1.8) adds about 15% from the NHL 27 gameplay profile in
+`tools/pgo`.
 
 Useful debug options:
 

@@ -168,6 +168,7 @@ public:
 	ImageSubresourceRange stencil_subresources;
 	uint64_t         tick_accessed_last = 0;
 	size_t           lru_id             = 0;
+	uint64_t         lru_tick           = ~uint64_t {0}; // GC tick of the last LRU touch
 
 private:
 	friend struct ImageTestAccess;

@@ -9,6 +9,8 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/presentation/videoOut.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "kernel/memory.h"
 #include "libs/errno.h"
 
 #include <algorithm>
@@ -28,6 +30,14 @@ RenderContext::RenderContext(GraphicContext& graphics)
       m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache),
       m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	// Experiment FaultPageReads: resource-table reads of a page the GPU thread took a read fault on
+	// (the GPU wrote other bytes of it) read clean bytes through the backing instead of faulting
+	// again; GPU-written bytes still fault and download.
+	ShaderRecompiler::IR::SetFaultPageReader([](uint64_t address, void* data, uint64_t size) {
+		return Common::Experiments::Enabled(Common::Experiments::FaultPageReads) &&
+		       LibKernel::Memory::IsReadFaultPage(address, size) &&
+		       LibKernel::Memory::TryReadCleanBufferBacking(address, data, size);
+	});
 }
 
 RenderContext::~RenderContext() {
@@ -128,11 +138,16 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		// are GPU-modified or already CPU-dirty are skipped; marking an unwritten page CPU-dirty
 		// only costs an upload.
 		if (Common::RuntimeFlags::Current().fault_coalesce) {
-			static const uint64_t window = [] {
+			static const uint64_t wide_window = [] {
 				const char* value = std::getenv("KYTY_FAULT_COALESCE_PAGES");
 				const auto  pages = value != nullptr ? std::strtoull(value, nullptr, 10) : 16ull;
 				return std::bit_ceil(std::clamp<uint64_t>(pages, 1, 256)) * TRACKER_PAGE_SIZE;
 			}();
+			// Experiment WideFaultWindows off: 4-page windows. NHL 27 faults ~200 times per frame and
+			// the 16-page windows upload ~11 MB per frame, mostly unwritten neighbors.
+			const uint64_t window = Common::Experiments::Enabled(Common::Experiments::WideFaultWindows)
+			                            ? wide_window
+			                            : std::min<uint64_t>(wide_window, 4 * TRACKER_PAGE_SIZE);
 			const uint64_t begin = fault_vaddr & ~(window - 1);
 			if (window > TRACKER_PAGE_SIZE && IsMapped(begin, window)) {
 				const uint64_t marked = m_buffer_cache.MarkCpuDirtyAhead(begin, window);
@@ -154,6 +169,9 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		}
 	} else {
 		FrameBreakdown::FaultTimer t(FrameBreakdown::g_fault_cost.rd_readmem_ns);
+		if (GuestGpu::IsGpuThread()) {
+			LibKernel::Memory::NoteReadFaultPage(fault_vaddr);
+		}
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size, false, BufferCache::ReadCaller::Fault);
 	}
 	return true;
@@ -190,6 +208,19 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 	return m_mapped_ranges.Contains(vaddr, size);
 }
 
+bool RenderContext::IsReadProtected(uint64_t vaddr, uint64_t size) const noexcept {
+	if (size == 0 || !GuestRange {vaddr, size}.Valid()) {
+		return false;
+	}
+	const auto page_size = m_page_manager.GetPageSize();
+	for (auto page = vaddr & ~(page_size - 1); page < vaddr + size; page += page_size) {
+		if (m_page_manager.IsReadWatched(page)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 uint64_t RenderContext::MappedRangesVersion() const noexcept {
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	return m_mapped_ranges_version;
@@ -219,14 +250,38 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		if (m_command_scheduler.Active()) {
 			m_command_scheduler.PopPendingOperations();
 		}
-		const bool drain = m_command_scheduler.Active() &&
-		                   (m_buffer_cache.IsRegionGpuModified(vaddr, size) ||
-		                    m_texture_cache.HasImagesInRegion(vaddr, size) ||
-		                    m_command_scheduler.HasPendingGuestOperations(vaddr, size));
+		const bool active  = m_command_scheduler.Active();
+		const bool gpu     = active && m_buffer_cache.IsRegionGpuModified(vaddr, size);
+		const bool images  = active && !gpu && m_texture_cache.HasImagesInRegion(vaddr, size);
+		const bool pending = active && !gpu && !images && m_command_scheduler.HasPendingGuestOperations(vaddr, size);
+		const bool drain   = gpu || images || pending;
+		const auto start   = CpReadDebugEnabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 		if (drain) {
 			const auto tick = m_command_scheduler.CurrentTick();
 			m_command_scheduler.Finish();
 			m_command_scheduler.WaitPriorityOperations(tick);
+		}
+		if (CpReadDebugEnabled()) {
+			// KYTY_DBG_CP_READS: unmaps by why they drained the GPU, NHL27UNMAP every 2 s (execution thread).
+			static uint64_t counts[4] {}, ns[4] {}, bytes = 0;
+			static auto     last  = std::chrono::steady_clock::now();
+			const auto      now   = std::chrono::steady_clock::now();
+			const size_t    why   = gpu ? 1 : images ? 2 : pending ? 3 : 0;
+			counts[why]++;
+			ns[why] += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count());
+			bytes += size;
+			if (now - last >= std::chrono::seconds(2)) {
+				last = now;
+				std::printf("NHL27UNMAP: none=%llu gpu-modified=%llu (%.1f ms) images=%llu (%.1f ms) pending=%llu (%.1f ms) MiB=%.1f\n",
+				            static_cast<unsigned long long>(counts[0]), static_cast<unsigned long long>(counts[1]),
+				            static_cast<double>(ns[1]) / 1e6, static_cast<unsigned long long>(counts[2]),
+				            static_cast<double>(ns[2]) / 1e6, static_cast<unsigned long long>(counts[3]),
+				            static_cast<double>(ns[3]) / 1e6, static_cast<double>(bytes) / (1024.0 * 1024.0));
+				std::fflush(stdout);
+				std::fill(std::begin(counts), std::end(counts), 0);
+				std::fill(std::begin(ns), std::end(ns), 0);
+				bytes = 0;
+			}
 		}
 		BufferCache::WriteTagScope tag(BufferCache::WriteTag::Unmap);
 		m_buffer_cache.InvalidateMemory(vaddr, size);
@@ -288,10 +343,9 @@ void RenderContext::PrepareBda() {
 		const char* value = std::getenv("KYTY_PERF_STATS");
 		return value != nullptr && value[0] == '1';
 	}();
-	static const bool dirty_regions = [] {
-		const char* value = std::getenv("KYTY_BDA_DIRTY_REGIONS");
-		return value != nullptr && value[0] == '1' && value[1] == '\0';
-	}();
+	// KYTY_BDA_DIRTY_REGIONS (experiment bit, switchable while running: the dirty-region queue
+	// fills either way, and a full scan covers whatever it holds).
+	const bool dirty_regions = Common::Experiments::Enabled(Common::Experiments::BdaDirtyRegions);
 	FrameBreakdown::Add(FrameBreakdown::g_counters.bda_calls);
 	FrameBreakdown::Timer total_timer(FrameBreakdown::g_counters.bda_total_ns);
 	std::shared_lock<decltype(m_mapped_ranges_mutex)> lock;

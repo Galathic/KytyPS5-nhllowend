@@ -2199,6 +2199,7 @@ bool BuildDirectSrtReads(const ResourcePlan& program, std::span<const uint8_t> c
 	auto& direct = program.direct_srt_reads;
 	direct.clear();
 	direct.reserve(program.srt_reads.size());
+	program.direct_cf_batch = -1;
 	const auto user_data_index = [&](Value value, uint32_t& index) {
 		value = value.Resolve();
 		const auto* inst = value.TryInstruction();
@@ -2298,7 +2299,10 @@ bool SrtWalker::DirectReadRun(uint32_t slot, uint32_t count, std::vector<uint32_
 	const auto words = std::span(flat).subspan(first, count);
 	if (evaluator.m_runtime.read_memory != nullptr) {
 		if (!evaluator.m_runtime.read_memory(evaluator.m_runtime.userdata, address, words)) return false;
-	} else {
+	} else if (!Common::Experiments::Enabled(Common::Experiments::FaultPageDirect) ||
+	           !TryFaultPageRead(address, words.data(), words.size_bytes())) {
+		// Experiment FaultPageDirect: clean bytes of a page that faulted before (the GPU wrote
+		// others) come from the backing; the plain read would fault and wait for the GPU.
 		std::memcpy(words.data(), reinterpret_cast<const void*>(address), words.size_bytes());
 	}
 	// Descriptor and condition expressions refer back to these reads through the memo.
@@ -2335,63 +2339,227 @@ bool SrtWalker::RefreshDirectFlat(std::vector<uint32_t>& flat) {
 	return true;
 }
 
-// Direct plans with control flow: the blocks reached from the entry read their slots directly;
-// branch conditions are evaluated as before (strictly, through the clean evaluator).
-bool SrtWalker::RefreshDirectControlFlow(std::vector<uint32_t>& flat) {
-	auto& active = m_program.active_sources;
-	flat.assign(m_program.srt_reads.size(), 0u);
-	{
-		m_program.direct_filled.assign(m_program.srt_reads.size(), 0u);
-		// Conditions below see the words of the blocks visited so far.
-		ShareDirectFlat(flat, &m_program.direct_filled);
+namespace {
+
+// The inputs of a branch condition, when they are only user data, flat (resource-table) words
+// and the shader base: everything else on the way is a pure operation of its arguments.
+bool CollectConditionLeaves(const ResourcePlan& program, Value root,
+                            std::vector<ResourcePlan::DirectCfCondition::Leaf>& leaves) {
+	using Leaf = ResourcePlan::DirectCfCondition::Leaf;
+	using Kind = ResourcePlan::DirectCfCondition::Kind;
+	std::vector<const Inst*> stack;
+	std::vector<const Inst*> visited;
+	const auto push = [&](Value value) {
+		value = value.Resolve();
+		if (value.IsImmediate()) return true;
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr) return false;
+		if (std::find(visited.begin(), visited.end(), inst) != visited.end()) return true;
+		visited.push_back(inst);
+		stack.push_back(inst);
+		return visited.size() <= 256;
+	};
+	const auto add = [&](Leaf leaf) {
+		for (const auto& known: leaves) {
+			if (known.kind == leaf.kind && known.index == leaf.index) return true;
+		}
+		leaves.push_back(leaf);
+		return leaves.size() <= ResourcePlan::DirectCfCondition::MaxLeaves;
+	};
+	if (!push(root)) return false;
+	while (!stack.empty()) {
+		const auto* inst = stack.back();
+		stack.pop_back();
+		switch (inst->GetOpcode()) {
+			case ValueOpcode::GetUserData: {
+				const auto reg = RegIndex(inst->Arg(0).ScalarRegister());
+				if (reg < program.user_data_base || !add({Kind::UserData, reg - program.user_data_base})) return false;
+				break;
+			}
+			case ValueOpcode::GetShaderBase:
+				if (!add({Kind::ShaderBase, 0})) return false;
+				break;
+			case ValueOpcode::ReadConst: {
+				const auto slot = inst->Arg(1).Resolve();
+				if (!slot.IsImmediate() || slot.GetType() != Type::U32 || slot.U32() >= program.srt_reads.size() ||
+				    !add({Kind::Flat, program.srt_reads[slot.U32()].flat_offset})) {
+					return false;
+				}
+				break;
+			}
+			case ValueOpcode::LoadAddressU32: {
+				// Only the plan's own direct reads, whose words the refresh has already fetched.
+				bool found = false;
+				for (size_t slot = 0; slot < program.srt_reads.size(); ++slot) {
+					if (program.srt_reads[slot].value.Resolve().TryInstruction() == inst) {
+						if (!add({Kind::Flat, program.srt_reads[slot].flat_offset})) return false;
+						found = true;
+						break;
+					}
+				}
+				if (!found) return false;
+				break;
+			}
+			case ValueOpcode::Phi:
+			case ValueOpcode::ReadFirstLane:
+			case ValueOpcode::ReadConstBuffer:
+			case ValueOpcode::LoadBufferU32:
+			case ValueOpcode::UndefU1:
+			case ValueOpcode::UndefU8:
+			case ValueOpcode::UndefU16:
+			case ValueOpcode::UndefU32:
+			case ValueOpcode::UndefU64: return false;
+			default:
+				for (size_t i = 0; i < inst->NumArgs(); ++i) {
+					if (!push(inst->Arg(i))) return false;
+				}
+				break;
+		}
 	}
-	active.assign(m_program.descriptor_sources.size(), 1u);
-	for (const auto& block: m_program.control_flow) {
-		for (const auto source: block.sources) active.at(source) = 0u;
-	}
-	auto& visited = m_program.visited_blocks;
-	auto& pending = m_program.pending_blocks;
-	visited.assign(m_program.control_flow.size(), 0u);
-	pending.clear();
-	pending.push_back(0u);
-	while (!pending.empty()) {
-		const auto index = pending.back();
-		pending.pop_back();
-		if (visited.at(index)) continue;
-		visited[index] = 1u;
-		const auto& block = m_program.control_flow[index];
-		for (const auto source: block.sources) active[source] = 1u;
+	return true;
+}
+
+} // namespace
+
+void SrtWalker::BuildDirectCfRuns(bool batch) {
+	const auto& reads  = m_program.direct_srt_reads;
+	const auto& blocks = m_program.control_flow;
+	auto&       runs   = m_program.direct_cf_runs;
+	auto&       begin  = m_program.direct_cf_run_begin;
+	runs.clear();
+	begin.clear();
+	begin.reserve(blocks.size() + 1);
+	m_program.direct_cf_batch = batch ? 1 : 0;
+	m_program.direct_cf_valid = false;
+	for (const auto& block: blocks) {
+		begin.push_back(static_cast<uint32_t>(runs.size()));
 		for (size_t position = 0; position < block.srt_reads.size();) {
-			// Direct reads: extend the run while this block's next slot continues it.
-			const auto  slot  = block.srt_reads[position];
-			const auto& reads = m_program.direct_srt_reads;
-			if (slot >= reads.size()) return false;
+			// Extend the run while this block's next slot continues it.
+			const auto slot = block.srt_reads[position];
+			if (slot >= reads.size()) return;
 			uint32_t count = 1;
-			while (m_runtime.batch_reads && position + count < block.srt_reads.size() &&
+			while (batch && position + count < block.srt_reads.size() &&
 			       block.srt_reads[position + count] == slot + count && slot + count < reads.size() &&
 			       reads[slot + count].run == 0u && reads[slot + count].clean == reads[slot].clean) {
 				++count;
 			}
-			if (!DirectReadRun(slot, count, flat)) return false;
-			for (uint32_t i = 0; i < count; ++i) {
-				const auto offset = m_program.srt_reads[slot + i].flat_offset;
-				if (offset < m_program.direct_filled.size()) m_program.direct_filled[offset] = 1u;
-			}
+			runs.push_back({slot, count});
 			position += count;
 		}
-		uint32_t condition = 0;
-		auto& predicate = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
-		if (!block.condition.IsEmpty() && m_runtime.read_specialization_memory != nullptr &&
-		    predicate.Evaluate(block.condition, condition)) {
-			pending.push_back(block.successors[condition != 0u ? 0u : 1u]);
-		} else {
-			pending.insert(pending.end(), block.successors.begin(), block.successors.end());
+		for (const auto successor: block.successors) {
+			if (successor >= blocks.size()) return;
+		}
+		if (!block.condition.IsEmpty() && block.successors.size() < 2) return;
+	}
+	begin.push_back(static_cast<uint32_t>(runs.size()));
+	auto& conditions = m_program.direct_cf_conditions;
+	conditions.assign(blocks.size(), {});
+	for (size_t index = 0; index < blocks.size(); ++index) {
+		if (blocks[index].condition.IsEmpty()) continue;
+		auto& condition     = conditions[index];
+		condition.cacheable = CollectConditionLeaves(m_program, blocks[index].condition, condition.leaves);
+		if (!condition.cacheable) condition.leaves.clear();
+		condition.last_values.resize(condition.leaves.size());
+	}
+	auto& active = m_program.direct_cf_active;
+	active.assign(m_program.descriptor_sources.size(), 1u);
+	for (const auto& block: blocks) {
+		for (const auto source: block.sources) {
+			if (source >= active.size()) return;
+			active[source] = 0u;
 		}
 	}
-	{
-		m_direct_flat   = &flat;
-		m_direct_filled = &m_program.direct_filled;
+	m_program.direct_cf_valid = !blocks.empty();
+}
+
+// Direct plans with control flow: the blocks reached from the entry read their slots directly;
+// branch conditions are evaluated as before (strictly, through the clean evaluator).
+bool SrtWalker::RefreshDirectControlFlow(std::vector<uint32_t>& flat) {
+	const bool batch = m_runtime.batch_reads;
+	if (m_program.direct_cf_batch != (batch ? 1 : 0)) {
+		BuildDirectCfRuns(batch);
 	}
+	if (!m_program.direct_cf_valid) return false;
+	const auto& blocks    = m_program.control_flow;
+	const auto& runs      = m_program.direct_cf_runs;
+	const auto& run_begin = m_program.direct_cf_run_begin;
+	const auto& srt_reads = m_program.srt_reads;
+	auto&       filled    = m_program.direct_filled;
+	flat.assign(srt_reads.size(), 0u);
+	filled.assign(srt_reads.size(), 0u);
+	// Conditions below see the words of the blocks visited so far.
+	ShareDirectFlat(flat, &filled);
+	m_program.active_sources = m_program.direct_cf_active;
+	auto& active  = m_program.active_sources;
+	auto& visited = m_program.visited_blocks;
+	auto& pending = m_program.pending_blocks;
+	visited.assign(blocks.size(), 0u);
+	pending.clear();
+	pending.push_back(0u);
+	auto& predicate = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
+	while (!pending.empty()) {
+		const auto index = pending.back();
+		pending.pop_back();
+		if (visited[index] != 0u) continue;
+		visited[index] = 1u;
+		const auto& block = blocks[index];
+		for (const auto source: block.sources) active[source] = 1u;
+		for (uint32_t r = run_begin[index]; r < run_begin[index + 1]; ++r) {
+			const auto run = runs[r];
+			if (!DirectReadRun(run.slot, run.count, flat)) return false;
+			for (uint32_t i = 0; i < run.count; ++i) {
+				const auto offset = srt_reads[run.slot + i].flat_offset;
+				if (offset < filled.size()) filled[offset] = 1u;
+			}
+		}
+		uint32_t condition = 0;
+		bool     decided   = false;
+		if (!block.condition.IsEmpty() && m_runtime.read_specialization_memory != nullptr) {
+			// A condition whose inputs all equal the last ones has the last result.
+			auto&    cache = m_program.direct_cf_conditions[index];
+			uint64_t now[ResourcePlan::DirectCfCondition::MaxLeaves];
+			bool     ready = cache.cacheable;
+			for (size_t i = 0; ready && i < cache.leaves.size(); ++i) {
+				const auto& leaf = cache.leaves[i];
+				using Kind       = ResourcePlan::DirectCfCondition::Kind;
+				if (leaf.kind == Kind::UserData) {
+					ready  = leaf.index < m_runtime.user_data.size();
+					now[i] = ready ? m_runtime.user_data[leaf.index] : 0;
+				} else if (leaf.kind == Kind::Flat) {
+					ready  = leaf.index < filled.size() && filled[leaf.index] != 0u;
+					now[i] = ready ? flat[leaf.index] : 0;
+				} else {
+					now[i] = m_runtime.shader_base;
+				}
+			}
+			if (ready && cache.has_last &&
+			    std::equal(cache.last_values.begin(), cache.last_values.end(), now)) {
+				condition = cache.last_result;
+				decided   = true;
+			} else if ([&] {
+				           const bool nonblocking =
+				               Common::Experiments::Enabled(Common::Experiments::GpuConditionsBothPaths);
+				           if (nonblocking) SetConditionReadsNonBlocking(true);
+				           const bool ok = predicate.Evaluate(block.condition, condition);
+				           if (nonblocking) SetConditionReadsNonBlocking(false);
+				           return ok;
+			           }()) {
+				decided = true;
+				if (ready) {
+					std::copy(now, now + cache.leaves.size(), cache.last_values.begin());
+					cache.last_result = condition;
+					cache.has_last    = true;
+				}
+			}
+		}
+		if (decided) {
+			pending.push_back(block.successors[condition != 0u ? 0u : 1u]);
+		} else {
+			for (const auto successor: block.successors) pending.push_back(successor);
+		}
+	}
+	m_direct_flat   = &flat;
+	m_direct_filled = &filled;
 	return true;
 }
 
@@ -2413,8 +2581,12 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	} call_timer;
 	// Upstream's x64 walker (CompileSrtWalker): plans without control flow or captured reads,
 	// read straight from guest memory. It fills the flat words and seeds the evaluation memo.
-	if (m_program.srt_code && m_runtime.read_memory == nullptr &&
-	    Common::Experiments::Enabled(Common::Experiments::SrtJit)) {
+	// KYTY_SRT_JIT=1 (env only; was experiment bit 4).
+	static const bool srt_jit = [] {
+		const char* value = std::getenv("KYTY_SRT_JIT");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (m_program.srt_code && m_runtime.read_memory == nullptr && srt_jit) {
 		flat.resize(m_program.srt_reads.size());
 		m_program.active_sources.clear();
 		m_context.values.resize(m_program.evaluation_value_count);
@@ -2425,7 +2597,11 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		m_context.refreshed_flat = ok ? &flat : nullptr;
 		return ok;
 	}
-	if (m_cfg_gather_enabled) {
+	// Direct plans never mark gathered sources; every reader bounds-checks this vector, so an
+	// empty one means "none ready" without allocating it for each fresh walker.
+	const bool direct_plan = DirectSrtReadsEnabled() && m_active_mask.IsEmpty() &&
+	                         m_program.direct_srt_state == ResourcePlan::DirectSrtState::Direct;
+	if (m_cfg_gather_enabled && !direct_plan) {
 		m_cfg_gather_ready_sources.assign(m_program.descriptor_sources.size(), 0u);
 		if (m_clean_evaluator != nullptr)
 			m_clean_evaluator->m_cfg_gather_ready_sources.assign(m_program.descriptor_sources.size(), 0u);

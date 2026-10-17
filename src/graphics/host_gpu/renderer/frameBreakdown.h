@@ -34,33 +34,38 @@ namespace Libs::Graphics::FrameBreakdown {
 
 using Clock = std::chrono::steady_clock;
 
+// The gates are read millions of times per second; namespace-scope constants avoid the
+// thread-safe-static guard check a function-local static costs on every call.
+inline const bool g_enabled = [] {
+	const char* value = std::getenv("KYTY_PERF_STATS");
+	return value != nullptr && value[0] == '1';
+}();
+
 inline bool Enabled() {
-	static const bool enabled = [] {
-		const char* value = std::getenv("KYTY_PERF_STATS");
-		return value != nullptr && value[0] == '1';
-	}();
-	return enabled;
+	return g_enabled;
 }
 
 // KYTY_PERF_STATS_VERBOSE=1 (with KYTY_PERF_STATS=1): the heavy sub-timers and per-slot counters
 // (NHL27TEXTURES, NHL27PIPELINE, NHL27BUFFERS2, NHL27DELTA, NHL27DELTAREUSE_SPLIT, NHL27DELTAGEN,
 // NHL27SPECULATE). They run thousands of times per frame, so they are off unless asked for; when off the
 // hot paths take no timestamps and touch none of those atomics.
+inline const bool g_verbose = [] {
+	const char* value = std::getenv("KYTY_PERF_STATS_VERBOSE");
+	return g_enabled && value != nullptr && value[0] == '1';
+}();
+
 inline bool Verbose() {
-	static const bool verbose = [] {
-		const char* value = std::getenv("KYTY_PERF_STATS_VERBOSE");
-		return Enabled() && value != nullptr && value[0] == '1';
-	}();
-	return verbose;
+	return g_verbose;
 }
 
 // Fine-grained CPU preparation timing is intentionally opt-in; it can perturb hot paths.
+inline const bool g_detail_enabled = [] {
+	const char* value = std::getenv("KYTY_PERF_DRAW_DETAIL");
+	return g_enabled && value != nullptr && value[0] == '1';
+}();
+
 inline bool DetailEnabled() {
-	static const bool enabled = [] {
-		const char* value = std::getenv("KYTY_PERF_DRAW_DETAIL");
-		return Enabled() && value != nullptr && value[0] == '1';
-	}();
-	return enabled;
+	return g_detail_enabled;
 }
 
 struct Counters {

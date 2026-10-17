@@ -3,6 +3,7 @@
 
 #include "common/abi.h"
 #include "common/common.h"
+#include "common/experiments.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/shader/recompiler/ir/ResourceSnapshot.h"
 #include "graphics/shader/shaderBindings.h"
@@ -18,15 +19,77 @@
 namespace Libs::Graphics {
 
 // Codegen option: native f16 (Float16 capability) for V_PK_{ADD,MUL,FMA,FMAC}_F16 with plain
-// operands. Set once at device creation (KYTY_NATIVE_FP16=1 and shaderFloat16 supported). The mode
-// bits describe which float-controls f16 execution modes the device allows the emitter to declare.
+// operands, when the device supports shaderFloat16 and experiment NativeFp16 (KYTY_NATIVE_FP16=1) is
+// on. The option is part of every stage key, so switching it at runtime compiles new variants. The
+// mode bits describe which float-controls f16 execution modes the device allows the emitter to declare.
 inline constexpr uint32_t kNativeFp16DenormPreserve = 1u << 0u;
 inline constexpr uint32_t kNativeFp16SignedZeroInfNan = 1u << 1u;
 inline constexpr uint32_t kNativeFp16RoundTiesEven = 1u << 2u;
 inline std::atomic<bool>     g_shader_native_fp16 {false};
 inline std::atomic<uint32_t> g_shader_native_fp16_modes {0};
 [[nodiscard]] inline bool ShaderNativeFp16() {
-	return g_shader_native_fp16.load(std::memory_order_relaxed);
+	return g_shader_native_fp16.load(std::memory_order_relaxed) &&
+	       Common::Experiments::Enabled(Common::Experiments::NativeFp16);
+}
+// Codegen option: experiment ExecSelects (IR::EliminateExecSelects) and its rule set
+// (KYTY_DBG_EXECSEL_MODE, default 16). Part of every stage key: 0 when off.
+[[nodiscard]] inline uint32_t ShaderExecSelects() {
+	if (!Common::Experiments::Enabled(Common::Experiments::ExecSelects)) return 0;
+	static const uint32_t mode = [] {
+		const char* value = std::getenv("KYTY_DBG_EXECSEL_MODE");
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0)) : 16u;
+	}();
+	return 0x100u | mode;
+}
+// Codegen option: experiment LdsLaneSlots (ShaderInfo::function_lds_lane_slots). Part of the
+// vertex and pixel stage keys.
+[[nodiscard]] inline bool ShaderLdsLaneSlots() {
+	return Common::Experiments::Enabled(Common::Experiments::LdsLaneSlots);
+}
+// Codegen option: experiment NativeMinMax. V_MIN/V_MAX/V_MIN3/V_MAX3/V_MED3_F32 (and the f32
+// math of the f16 forms) use GLSL NMin/NMax, which an AMD host compiles to the same v_min/v_max
+// as the guest, instead of exact NaN and signed-zero emulation (about ten instructions each). Folded
+// into the NativeFp16 key word so keys are unchanged while it is off.
+[[nodiscard]] inline bool ShaderNativeMinMax() {
+	return Common::Experiments::Enabled(Common::Experiments::NativeMinMax);
+}
+// Codegen option: experiment FusedMad. V_MAD_F32/V_MAC_F32 (a separately rounded multiply and
+// add on the guest) as one fused multiply-add instead of a NoContraction multiply and add.
+[[nodiscard]] inline bool ShaderFusedMad() {
+	return Common::Experiments::Enabled(Common::Experiments::FusedMad);
+}
+// Codegen option: experiment RobustLoads, on devices with robustBufferAccess2 (out-of-range
+// storage-buffer reads return zero, as the guest's do). Raw storage-buffer loads then skip their
+// EXEC branch and per-dword bounds branch, so the host compiler can batch them.
+inline std::atomic<bool> g_shader_robust_buffer_access2 {false};
+[[nodiscard]] inline bool ShaderRobustLoads() {
+	return g_shader_robust_buffer_access2.load(std::memory_order_relaxed) &&
+	       Common::Experiments::Enabled(Common::Experiments::RobustLoads);
+}
+// KYTY_ROBUST_LOADS_KEEP_EXEC=1: robust loads still branch on EXEC (skipping waves with no active
+// lane), dropping only the bounds branches.
+[[nodiscard]] inline bool ShaderRobustLoadsKeepExec() {
+	static const bool keep = [] {
+		const char* value = std::getenv("KYTY_ROBUST_LOADS_KEEP_EXEC");
+		return value != nullptr && value[0] == '1';
+	}();
+	return keep;
+}
+// Robust loads also cover scalar constant reads (S_BUFFER_LOAD): no bounds branch per dword
+// (code-gen key bit 32; GPU time -6 to -7% per frame in an A/B/A).
+[[nodiscard]] inline bool ShaderRobustConstReads() {
+	return ShaderRobustLoads();
+}
+// Robust loads also drop the bounds branch of storage-buffer stores (out of range writes are
+// discarded on the device); the EXEC branch stays (key bit 64; GPU time -3 to -4% per frame).
+[[nodiscard]] inline bool ShaderRobustStores() {
+	return ShaderRobustLoads();
+}
+[[nodiscard]] inline uint32_t ShaderFloatCodegenKey() {
+	return static_cast<uint32_t>(ShaderNativeFp16()) | (ShaderNativeMinMax() ? 2u : 0u) |
+	       (ShaderFusedMad() ? 4u : 0u) |
+	       (ShaderRobustLoads() ? (ShaderRobustLoadsKeepExec() ? 24u : 8u) : 0u) |
+	       (ShaderRobustConstReads() ? 32u : 0u) | (ShaderRobustStores() ? 64u : 0u);
 }
 [[nodiscard]] inline uint32_t ShaderNativeFp16Modes() {
 	return g_shader_native_fp16_modes.load(std::memory_order_relaxed);

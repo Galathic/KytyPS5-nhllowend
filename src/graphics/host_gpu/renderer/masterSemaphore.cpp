@@ -129,6 +129,7 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	const auto start  = timed || stats ? std::chrono::steady_clock::now()
 	                                   : std::chrono::steady_clock::time_point {};
 	Common::Timeline::Mark("host-wait", tick);
+	Common::Timeline::MarkStack();
 	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
 	Common::Timeline::Mark("host-done", tick);
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);

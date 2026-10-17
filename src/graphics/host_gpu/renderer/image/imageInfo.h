@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <cstring>
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -200,15 +201,13 @@ struct ImageViewInfo {
 	vk::ComponentMapping mapping     = {};
 	vk::ImageUsageFlags  usage       = vk::ImageUsageFlagBits::eSampled;
 
+	// Thirteen 32-bit fields and no padding (asserted below): compare the bytes. Image views
+	// are looked up by linear search for every bound texture.
 	[[nodiscard]] bool operator==(const ImageViewInfo& rhs) const noexcept {
-		return format == rhs.format && type == rhs.type && aspect == rhs.aspect &&
-		       base_level == rhs.base_level && level_count == rhs.level_count &&
-		       min_lod == rhs.min_lod && base_layer == rhs.base_layer &&
-		       layer_count == rhs.layer_count && mapping.r == rhs.mapping.r &&
-		       mapping.g == rhs.mapping.g && mapping.b == rhs.mapping.b &&
-		       mapping.a == rhs.mapping.a && usage == rhs.usage;
+		return std::memcmp(this, &rhs, sizeof(ImageViewInfo)) == 0;
 	}
 };
+static_assert(sizeof(ImageViewInfo) == 13 * sizeof(uint32_t), "ImageViewInfo must have no padding");
 
 struct DepthFormatPolicy {
 	Prospero::DepthFormat     depth_format;

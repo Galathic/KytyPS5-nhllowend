@@ -249,6 +249,7 @@ public:
 			// Not page aligned, or outside the windows: such queries take the slow path.
 			if (((start | size) & PageMask) != 0) {
 				m_imprecise.store(true, std::memory_order_relaxed);
+				m_generation.fetch_add(1, std::memory_order_release);
 			}
 			return;
 		}
@@ -270,6 +271,28 @@ public:
 			}
 			page = leaf_end;
 		}
+		m_generation.fetch_add(1, std::memory_order_release);
+	}
+
+	// Advances after every change of the pages (CommittedRunCached).
+	[[nodiscard]] uint64_t Generation() const { return m_generation.load(std::memory_order_acquire); }
+
+	// CommittedRun, remembered per thread while no page changed: the GPU threads clamp the same
+	// large buffer ranges (up to 256 MiB, a thousand bitmap words each) for every binding.
+	[[nodiscard]] uint64_t CommittedRunCached(uint64_t address, uint64_t size) const {
+		struct Entry {
+			uint64_t address, size, generation, run;
+		};
+		static thread_local Entry entries[16];
+		const auto generation = Generation();
+		auto&      entry      = entries[((address >> 12u) ^ (size >> 12u)) % 16u];
+		if (entry.address == address && entry.size == size && entry.generation == generation &&
+		    generation != 0) {
+			return entry.run;
+		}
+		const auto run = CommittedRun(address, size);
+		entry          = {address, size, generation, run};
+		return run;
 	}
 
 	// How many bytes from `address` (at most `size`) lie in contiguous committed pages, or
@@ -308,6 +331,8 @@ private:
 	static constexpr uint64_t PageMask       = (uint64_t {1} << PageBits) - 1u;
 	static constexpr uint64_t LowerSize      = uint64_t {1} << 40u;
 	static constexpr uint64_t LeafPages      = uint64_t {1} << 19u; // 2 GiB, 64 KiB of bits
+	// Starts at 1 so that a zeroed cache entry never matches.
+	std::atomic<uint64_t>     m_generation {1};
 	static constexpr uint64_t LowerLeaves    = (LowerSize >> PageBits) / LeafPages;
 	static constexpr uint64_t ExtendedLeaves = (kExtendedMemorySize >> PageBits) / LeafPages;
 
@@ -563,7 +588,7 @@ public:
 		}
 		// The GPU threads clamp every buffer they bind: answer from the page map, without the
 		// lock, whenever it covers the range.
-		if (const auto run = m_committed.CommittedRun(virtual_addr, size);
+		if (const auto run = m_committed.CommittedRunCached(virtual_addr, size);
 		    run != CommittedPageMap::Unknown) {
 			return run;
 		}
@@ -1159,6 +1184,7 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 		}
 		auto& buffers = GetGpuResources().GetBufferCache();
 		if (buffers.HasGpuDirtyBytes(vaddr, size)) {
+			buffers.NoteDirtyRead(vaddr, size);
 			// Experiment SpeculateDirtyReads: bytes the GPU keeps rewriting with the values the
 			// backing already holds are read from the backing without waiting; the GPU's bytes are
 			// checked when it gets there.
@@ -1323,6 +1349,51 @@ bool TryReadCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return read;
 }
 
+namespace {
+thread_local std::array<uint64_t, 16> t_read_fault_pages {};
+thread_local uint32_t                 t_read_fault_next = 0;
+// One bit per (page number % 256) of the pages in t_read_fault_pages: resource-table reads ask
+// IsReadFaultPage hundreds of thousands of times per frame and nearly always miss.
+thread_local std::array<uint64_t, 4> t_read_fault_filter {};
+
+constexpr uint64_t FaultFilterBit(uint64_t page) noexcept {
+	return uint64_t {1} << ((page >> 12u) & 63u);
+}
+constexpr size_t FaultFilterWord(uint64_t page) noexcept {
+	return (page >> 18u) & 3u;
+}
+} // namespace
+
+void NoteReadFaultPage(uint64_t vaddr) noexcept {
+	const auto page = vaddr & ~uint64_t {0xfff};
+	for (const auto known: t_read_fault_pages) {
+		if (known == page) return;
+	}
+	t_read_fault_pages[t_read_fault_next++ % t_read_fault_pages.size()] = page;
+	t_read_fault_filter = {};
+	for (const auto known: t_read_fault_pages) {
+		if (known != 0) t_read_fault_filter[FaultFilterWord(known)] |= FaultFilterBit(known);
+	}
+}
+
+bool IsReadFaultPage(uint64_t vaddr, uint64_t size) noexcept {
+	if (size == 0) return false;
+	const auto first = vaddr & ~uint64_t {0xfff};
+	const auto last  = (vaddr + size - 1) & ~uint64_t {0xfff};
+	if ((t_read_fault_filter[FaultFilterWord(first)] & FaultFilterBit(first)) == 0 &&
+	    (t_read_fault_filter[FaultFilterWord(last)] & FaultFilterBit(last)) == 0) {
+		return false;
+	}
+	for (const auto known: t_read_fault_pages) {
+		if (known != 0 && (known == first || known == last)) return true;
+	}
+	return false;
+}
+
+bool IsGpuReadProtected(uint64_t vaddr, uint64_t size) noexcept {
+	return g_gpu_resources != nullptr && g_gpu_resources->IsReadProtected(vaddr, size);
+}
+
 bool TryReadCleanBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	if (g_gpu_resources == nullptr || !Graphics::GuestGpu::IsGpuThread() || data == nullptr ||
 	    !Graphics::GuestRange {vaddr, size}.Valid()) {
@@ -1357,6 +1428,24 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	if (clamped_size != size) {
 		LOGF("Memory: clamped buffer range addr=0x%016" PRIx64 " size=0x%016" PRIx64
 		     " to 0x%016" PRIx64 "\n",
+		     vaddr, size, clamped_size);
+	}
+	return clamped_size;
+}
+
+uint64_t ClampRangeSizeOrZero(uint64_t vaddr, uint64_t size) {
+	EXIT_IF(g_virtual_ranges == nullptr);
+	const auto clamped_size = g_virtual_ranges->ClampRangeSize(vaddr, size);
+	if (clamped_size == 0) {
+		static std::atomic<uint32_t> reported {0};
+		if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
+			std::printf("NHL27UNMAPPED: buffer descriptor at unmapped 0x%016" PRIx64 " size 0x%" PRIx64
+			            " bound as null\n",
+			            vaddr, size);
+			std::fflush(stdout);
+		}
+	} else if (clamped_size != size) {
+		LOGF("Memory: clamped buffer range addr=0x%016" PRIx64 " size=0x%016" PRIx64 " to 0x%016" PRIx64 "\n",
 		     vaddr, size, clamped_size);
 	}
 	return clamped_size;

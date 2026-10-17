@@ -40,7 +40,8 @@ struct RecycledImage {
 };
 
 constexpr size_t   RecycledImagesMax     = 32;
-constexpr uint64_t RecycledImageBytesMax = 256ull * 1024 * 1024;
+// NHL 27 frees and recreates about seven aliased full-screen targets (some 125 MiB) every frame.
+constexpr uint64_t RecycledImageBytesMax = 768ull * 1024 * 1024;
 
 std::mutex                 g_recycled_mutex;
 std::vector<RecycledImage> g_recycled;

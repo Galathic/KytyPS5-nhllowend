@@ -42,6 +42,7 @@
 #include <cstring>
 #include <fmt/format.h>
 #include <cstdlib>
+#include <functional>
 #include <limits>
 #include <mutex>
 #include <span>
@@ -1288,7 +1289,13 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 				     descriptor.NumRecords(), raw.dwords[0], raw.dwords[1], raw.dwords[2], raw.dwords[3]);
 				std::fflush(stderr);
 			}
-			size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
+			// A descriptor wholly outside guest memory (NHL 27 menus, base 0x11ffffffff once in
+			// ~50 boots) is bound as a null buffer instead of ending the emulator.
+			size = Libs::LibKernel::Memory::ClampRangeSizeOrZero(address, size);
+			if (size == 0) {
+				source = {};
+				continue;
+			}
 			source = {address, size, cache.FindBuffer(address, size)};
 		}
 	}
@@ -1520,8 +1527,27 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	}
 	// The written ranges do not depend on the read, so collect them once per commit
 	// (bound images can number in the hundreds; slot lookups per read dominated here).
-	bool written_ready = false;
+	bool     written_ready = false;
+	uint64_t written_lo    = UINT64_MAX;
+	uint64_t written_hi    = 0;
+	const auto check_read = [&](uint64_t address, uint64_t size) {
+		if (address >= written_hi || address + size <= written_lo) return;
+		for (const auto& [written_address, written_size]: m_written_image_ranges) {
+			if (ImageRangeOverlaps(address, size, written_address, written_size)) {
+				EXIT("scalar resource reads overlap an image or attachment write\n");
+			}
+		}
+		for (const auto& [written_address, written_size]: m_written_buffer_ranges) {
+			if (ImageRangeOverlaps(address, size, written_address, written_size)) {
+				EXIT("scalar resource reads overlap a shader buffer write\n");
+			}
+		}
+	};
+	// KYTY_DBG_CHECK_SCALAR_READS=1: proves per draw that no scalar resource read overlaps a write
+	// of the same draw (it never fired in NHL 27; about 1% of the execution thread).
+	static const bool check_scalar_reads = std::getenv("KYTY_DBG_CHECK_SCALAR_READS") != nullptr;
 	for (const auto* reader: prepared_bindings) {
+		if (!check_scalar_reads) break;
 		const auto& reads = reader->runtime->resources->specialization_reads;
 		if (reads.empty()) continue;
 		if (!written_ready) {
@@ -1550,19 +1576,28 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					if (written.size != 0) m_written_buffer_ranges.emplace_back(written.address, written.size);
 				}
 			}
+			for (const auto& ranges: {std::cref(m_written_image_ranges), std::cref(m_written_buffer_ranges)}) {
+				for (const auto& [written_address, written_size]: ranges.get()) {
+					written_lo = std::min(written_lo, written_address);
+					written_hi = std::max(written_hi, written_address + written_size);
+				}
+			}
 		}
+		// Reads are hundreds per draw, mostly adjacent and in address order: check each run of
+		// touching reads once, and skip runs outside the span of all writes.
+		uint64_t run_begin = 0;
+		uint64_t run_end   = 0;
 		for (const auto [address, size]: reads) {
-			for (const auto& [written_address, written_size]: m_written_image_ranges) {
-				if (ImageRangeOverlaps(address, size, written_address, written_size)) {
-					EXIT("scalar resource reads overlap an image or attachment write\n");
-				}
+			if (size == 0) continue;
+			if (run_end != 0 && address >= run_begin && address <= run_end) {
+				run_end = std::max(run_end, address + size);
+				continue;
 			}
-			for (const auto& [written_address, written_size]: m_written_buffer_ranges) {
-				if (ImageRangeOverlaps(address, size, written_address, written_size)) {
-					EXIT("scalar resource reads overlap a shader buffer write\n");
-				}
-			}
+			if (run_end != 0) check_read(run_begin, run_end - run_begin);
+			run_begin = address;
+			run_end   = address + size;
 		}
+		if (run_end != 0) check_read(run_begin, run_end - run_begin);
 	}
 	m_descriptor_images.resize(image_descriptor_count);
 	m_descriptor_writes.clear();

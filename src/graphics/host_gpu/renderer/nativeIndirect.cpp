@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "gpu_tiler_shaders/gpu_tiler_native_indirect_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_dispatch_guard_spv.h"
+#include "gpu_tiler_shaders/gpu_tiler_color_clear_check_spv.h"
 #include "common/assert.h"
 #include "kernel/memory.h"
 #include <cstdio>
@@ -62,6 +63,9 @@ DispatchArgsGuard::~DispatchArgsGuard() {
 std::pair<vk::Buffer, uint64_t> DispatchArgsGuard::Record(CommandBuffer& buffer, const Buffer& args,
                                                           uint64_t offset, uint64_t guest_address) {
  const auto command = buffer.Handle();
+ // The trip counter is only reported: look every 64 dispatches (it lives in video memory the
+ // CPU reads uncached, about 1% of the execution thread when read every time).
+ if ((m_next & 63u) == 0) {
  if (!m_trips->IsCoherent()) m_trips->Invalidate(0, m_trips->Size());
  const auto* trips = reinterpret_cast<const volatile uint32_t*>(m_trips->Mapped().data());
  if (const uint32_t count = trips[0]; count != m_reported_trips) {
@@ -76,6 +80,7 @@ std::pair<vk::Buffer, uint64_t> DispatchArgsGuard::Record(CommandBuffer& buffer,
   std::fflush(stdout);
   m_reported_trips = count;
  }
+ }
  const uint64_t slot = (m_next++ % SlotCount) * SlotBytes;
  vk::MemoryBarrier written {};
  written.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
@@ -83,13 +88,18 @@ std::pair<vk::Buffer, uint64_t> DispatchArgsGuard::Record(CommandBuffer& buffer,
  command.pipelineBarrier(vk::PipelineStageFlagBits::eAllGraphics | vk::PipelineStageFlagBits::eComputeShader |
                              vk::PipelineStageFlagBits::eTransfer | vk::PipelineStageFlagBits::eDrawIndirect,
                          vk::PipelineStageFlagBits::eComputeShader, {}, 1, &written, 0, nullptr, 0, nullptr);
- struct Params { uint64_t source, destination, trips, guest_address; uint32_t max_x, max_y, max_z, reserved; };
+ struct Params { uint64_t source, destination, trips, guest_address; uint32_t max_x, max_y, max_z, max_groups; };
  static_assert(sizeof(Params) == 48);
  const auto& limits = m_graphics.GetPhysicalDeviceProperties().limits;
+ // NHL 27 also dispatches a CS (9ba58a11, 8714aa79) with 50,589,920 x 1 x 1 groups from a record
+ // that grows over a match: within the limits, but the GPU then runs for seconds (TDR, device
+ // lost; caught by breadcrumbs). Its normal dispatches stay below 1,000 groups, a full-screen 4K
+ // pass of 8x8 groups is about 130,000: more than 4M groups is taken as garbage.
+ constexpr uint32_t MaxGroups = 1u << 22u;
  const Params params {args.BufferDeviceAddress() + offset, m_ring->BufferDeviceAddress() + slot,
                       m_trips->BufferDeviceAddress(), guest_address,
                       limits.maxComputeWorkGroupCount[0], limits.maxComputeWorkGroupCount[1],
-                      limits.maxComputeWorkGroupCount[2], 0};
+                      limits.maxComputeWorkGroupCount[2], MaxGroups};
  // Binding another compute pipeline invalidates the elided-bind caches of the dispatch path.
  Libs::Graphics::g_compute_pipeline_epoch.fetch_add(1, std::memory_order_relaxed);
  command.bindPipeline(vk::PipelineBindPoint::eCompute, m_pipeline);
@@ -102,6 +112,66 @@ std::pair<vk::Buffer, uint64_t> DispatchArgsGuard::Record(CommandBuffer& buffer,
  command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eDrawIndirect,
                          {}, 1, &guarded, 0, nullptr, 0, nullptr);
  return {m_ring->Handle(), slot};
+}
+ColorClearCheck::ColorClearCheck(GraphicContext& graphics, CommandScheduler& scheduler)
+    : m_graphics(graphics) {
+ m_ring = std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::DeviceLocal, 0,
+                                   AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress |
+                                       vk::BufferUsageFlagBits::eConditionalRenderingEXT,
+                                   SliceBytes * SlotCount);
+ const vk::PushConstantRange range {vk::ShaderStageFlagBits::eCompute, 0, 40};
+ vk::PipelineLayoutCreateInfo layout {};
+ layout.pushConstantRangeCount = 1;
+ layout.pPushConstantRanges = &range;
+ RequireVulkanSuccess(graphics.device.createPipelineLayout(&layout, nullptr, &m_layout), "color clear check layout");
+ const auto module = CompileSPV(GPU_TILER_COLOR_CLEAR_CHECK_SPV, graphics.device);
+ vk::ComputePipelineCreateInfo info {};
+ info.layout = m_layout;
+ info.stage.stage = vk::ShaderStageFlagBits::eCompute;
+ info.stage.module = module;
+ info.stage.pName = "main";
+ const auto result = graphics.device.createComputePipelines(nullptr, 1, &info, nullptr, &m_pipeline);
+ graphics.device.destroyShaderModule(module, nullptr);
+ RequireVulkanSuccess(result, "color clear check pipeline");
+}
+ColorClearCheck::~ColorClearCheck() {
+ m_graphics.device.destroyPipeline(m_pipeline, nullptr);
+ m_graphics.device.destroyPipelineLayout(m_layout, nullptr);
+}
+std::pair<vk::Buffer, uint64_t> ColorClearCheck::Record(CommandBuffer& buffer, vk::DeviceAddress metadata,
+                                                        uint32_t slice_words, uint32_t slices,
+                                                        std::span<const uint8_t> codes, bool expand) {
+ EXIT_IF(slices == 0 || slices > SlotCount || codes.empty() || codes.size() > 8);
+ const auto command = buffer.Handle();
+ if (m_next + slices > SlotCount) m_next = 0;
+ const uint64_t first = m_next * SliceBytes;
+ m_next += slices;
+ // The metadata was written by earlier GPU work; the ring slots by an earlier check.
+ vk::MemoryBarrier written {};
+ written.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+ written.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+ command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eComputeShader, {}, 1,
+                         &written, 0, nullptr, 0, nullptr);
+ struct Params { uint64_t metadata, predicates; uint32_t slice_words, candidates_lo, candidates_hi, count, expand, reserved; };
+ static_assert(sizeof(Params) == 40);
+ Params params {metadata, m_ring->BufferDeviceAddress() + first, slice_words, 0, 0,
+                static_cast<uint32_t>(codes.size()), expand ? 1u : 0u, 0};
+ for (size_t k = 0; k < codes.size(); ++k) {
+  (k < 4 ? params.candidates_lo : params.candidates_hi) |= static_cast<uint32_t>(codes[k]) << (8u * (k & 3u));
+ }
+ Libs::Graphics::g_compute_pipeline_epoch.fetch_add(1, std::memory_order_relaxed);
+ command.bindPipeline(vk::PipelineBindPoint::eCompute, m_pipeline);
+ InvalidateRedundantBinds();
+ command.pushConstants(m_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(params), &params);
+ command.dispatch(slices, 1, 1);
+ vk::MemoryBarrier checked {};
+ checked.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+ checked.dstAccessMask = vk::AccessFlagBits::eConditionalRenderingReadEXT | vk::AccessFlagBits::eMemoryRead |
+                         vk::AccessFlagBits::eMemoryWrite;
+ command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+                         vk::PipelineStageFlagBits::eConditionalRenderingEXT | vk::PipelineStageFlagBits::eAllCommands,
+                         {}, 1, &checked, 0, nullptr, 0, nullptr);
+ return {m_ring->Handle(), first};
 }
 void NativeIndirectPrep::Record(CommandBuffer& buffer, const NativeIndirectDraw& source) {
  const auto command = buffer.Handle();

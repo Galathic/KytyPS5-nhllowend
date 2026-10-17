@@ -22,6 +22,7 @@
 #include "graphics/host_gpu/renderer/depthAliasLog.h"
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/host_gpu/renderer/frameDump.h"
+#include <chrono>
 #include <fmt/format.h>
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -759,6 +760,20 @@ DrawRenderState& RenderExecutor::AcquireDrawRenderState(bool tessellation, bool&
 	auto* resolved = std::exchange(m_resolved_draw, nullptr);
 	shaders_resolved =
 	    resolved != nullptr && !tessellation && resolved->programs.reads.StillValid();
+	// KYTY_DBG_CP_READS=1: how many draws use the resolve thread's read-ahead (NHL27AHEAD, 2 s).
+	if (Libs::Graphics::CpReadDebugEnabled()) {
+		static uint64_t counts[3] {};
+		static auto     last = std::chrono::steady_clock::now();
+		counts[resolved == nullptr ? 0 : shaders_resolved ? 1 : 2]++;
+		if ((counts[0] + counts[1] + counts[2]) % 1024 == 0 && std::chrono::steady_clock::now() - last > std::chrono::seconds(2)) {
+			last = std::chrono::steady_clock::now();
+			std::printf("NHL27AHEAD: draws resolved ahead=%llu stale=%llu not resolved=%llu\n",
+			            static_cast<unsigned long long>(counts[1]), static_cast<unsigned long long>(counts[2]),
+			            static_cast<unsigned long long>(counts[0]));
+			std::fflush(stdout);
+			counts[0] = counts[1] = counts[2] = 0;
+		}
+	}
 	if (shaders_resolved) {
 		return resolved->storage.state;
 	}
@@ -2154,9 +2169,66 @@ static void LogZeroInstanceDraw(const char* kind, uint64_t submit_id, CommandBuf
 	            static_cast<unsigned>(dc.zfunc), static_cast<unsigned long long>(rt0));
 }
 
+namespace {
+// KYTY_DBG_DRAW_COST=1: CPU time of RenderExecutor::DrawIndex per shader pair (program addresses),
+// printed every 5 s as NHL27DRAWCOST lines (top 16 by total time).
+struct DrawCostScope {
+	static bool Enabled() {
+		static const bool enabled = std::getenv("KYTY_DBG_DRAW_COST") != nullptr;
+		return enabled;
+	}
+	struct Entry {
+		uint64_t ns = 0, count = 0, vs = 0, ps = 0;
+	};
+	static std::unordered_map<uint64_t, Entry>& Table() {
+		static std::unordered_map<uint64_t, Entry> table;
+		return table;
+	}
+	uint64_t                              vs = 0, ps = 0;
+	std::chrono::steady_clock::time_point start;
+	DrawCostScope(uint64_t vs_addr, uint64_t ps_addr): vs(vs_addr), ps(ps_addr), start(std::chrono::steady_clock::now()) {}
+	~DrawCostScope() {
+		const auto now = std::chrono::steady_clock::now();
+		auto&      e   = Table()[vs * 0x9E3779B97F4A7C15ull ^ ps];
+		e.ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count());
+		e.count++;
+		e.vs = vs;
+		e.ps = ps;
+		static auto last = now;
+		if (now - last < std::chrono::seconds(5)) return;
+		last = now;
+		std::vector<Entry> rows;
+		uint64_t           total = 0, draws = 0;
+		for (const auto& [key, entry]: Table()) {
+			rows.push_back(entry);
+			total += entry.ns;
+			draws += entry.count;
+		}
+		std::sort(rows.begin(), rows.end(), [](const Entry& x, const Entry& y) { return x.ns > y.ns; });
+		std::printf("NHL27DRAWCOST: ---- total=%.1f ms draws=%llu pairs=%zu\n", static_cast<double>(total) / 1e6,
+		            static_cast<unsigned long long>(draws), rows.size());
+		for (size_t i = 0; i < rows.size() && i < 16; ++i) {
+			std::printf("NHL27DRAWCOST: %7.1f ms %5.1f%% n=%7llu avg=%6.2f us vs=0x%llx ps=0x%llx\n",
+			            static_cast<double>(rows[i].ns) / 1e6, 100.0 * static_cast<double>(rows[i].ns) / std::max<double>(1.0, static_cast<double>(total)),
+			            static_cast<unsigned long long>(rows[i].count),
+			            static_cast<double>(rows[i].ns) / 1e3 / static_cast<double>(std::max<uint64_t>(1, rows[i].count)),
+			            static_cast<unsigned long long>(rows[i].vs), static_cast<unsigned long long>(rows[i].ps));
+		}
+		std::fflush(stdout);
+		Table().clear();
+	}
+};
+} // namespace
+
 void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const DrawIndexArgs& args) {
 	KYTY_PROFILER_FUNCTION();
+	std::optional<DrawCostScope> draw_cost;
+	if (DrawCostScope::Enabled()) {
+		const auto& vs_info = buffer.GetShaders().GetVs();
+		draw_cost.emplace(vs_info.gs_regs.data_addr != 0 ? vs_info.gs_regs.data_addr : vs_info.es_regs.data_addr,
+		                  buffer.GetShaders().GetPs().ps_regs.data_addr);
+	}
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
@@ -2442,7 +2514,8 @@ bool RenderExecutor::DrawAutoIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	     state.ps_input_info.input_num != 0)) { ResetBindings(); return false; }
 	auto& scheduler = m_context.GetCommandScheduler();
 	source.snapshot = std::make_shared<Buffer>(m_context.GetGraphics(), scheduler,
-	    MemoryUsage::Download, 0, AllFlags | (source.indexed || state.vertex_info[0].native_draw.Enabled()
+	    MemoryUsage::Download, 0, AllFlags | (source.indexed || state.vertex_info[0].native_draw.Enabled() ||
+	                                          state.vertex_info[0].stage.program->info.native_draw
 	        ? vk::BufferUsageFlagBits::eShaderDeviceAddress : vk::BufferUsageFlags {}),
 	    source.ArgsSize() + sizeof(uint32_t));
 	// The scheduler retains ownership even if SET_NUM_INSTANCES discards the CPU snapshot early.

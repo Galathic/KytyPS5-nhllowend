@@ -385,93 +385,118 @@ static bool ShouldBindComputePipeline(RenderContext& context, const CommandRecor
 }
 
 struct RenderExecutor::ResolvedDispatch {
+	ProgramResolution      programs;
 	ShaderComputeInputInfo input_info;
-	ShaderProgram         program;
-	ProgramResolution     programs;
-	uint64_t              flags = 0;
-	std::atomic_bool      busy {false};
+	ShaderProgram          program;
+	uint64_t               flags = 0;
+	std::atomic_bool       busy {false};
 };
 
+// As for draws: more resolutions than operations can wait between the two threads.
 struct RenderExecutor::ResolvedDispatchRing {
-	// Larger than the queue between resolve and execution, as with ResolvedDrawRing.
 	static constexpr size_t Size = 320;
+
 	std::array<ResolvedDispatch, Size> dispatches;
-	size_t next = 0;
+	size_t                             next = 0;
 };
-
-static void SetDispatchDimensions(ShaderComputeInputInfo& info, const HW::ComputeShaderInfo& cs,
-                                  uint32_t x, uint32_t y, uint32_t z, uint32_t mode) {
-	info.dispatch_thread_dimensions = (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
-	info.workgroup_counts[0] = x;
-	info.workgroup_counts[1] = y;
-	info.workgroup_counts[2] = z;
-	if (info.dispatch_thread_dimensions) {
-		const uint32_t sizes[] = {cs.cs_regs.num_thread_x, cs.cs_regs.num_thread_y, cs.cs_regs.num_thread_z};
-		for (uint32_t axis = 0; axis < 3; ++axis) {
-			const auto size = std::max(sizes[axis], 1u);
-			const auto threads = info.workgroup_counts[axis];
-			info.workgroup_counts[axis] = threads / size + (threads % size != 0u);
-		}
-	}
-}
-
-RenderExecutor::ResolvedDispatch* RenderExecutor::ResolveDispatchAhead(
-    const HW::Context& context, const HW::Shader& shaders, uint32_t x, uint32_t y, uint32_t z,
-    uint32_t mode, bool async_compute, bool indirect) {
-	const auto& cs = shaders.GetCs();
-	if (cs.cs_regs.data_addr == 0 || (!indirect && (x == 0 || y == 0 || z == 0)) ||
-	    (indirect && (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0)) {
-		return nullptr;
-	}
-	Common::RuntimeFlags::EvaluationScope flags_scope;
-	FrameBreakdown::Add(FrameBreakdown::g_counters.dc_ahead_attempts);
-	FrameBreakdown::Timer timer(FrameBreakdown::g_counters.dc_ahead_ns);
-	if (!m_dispatch_ring) {
-		m_dispatch_ring = {new ResolvedDispatchRing {}, [](ResolvedDispatchRing* ring) { delete ring; }};
-	}
-	auto& ring = *m_dispatch_ring;
-	auto& dispatch = ring.dispatches[ring.next];
-	for (Common::SpinWait wait; dispatch.busy.load(std::memory_order_acquire);) {
-		if (!wait.Spin()) std::this_thread::yield();
-	}
-	ring.next = (ring.next + 1) % ResolvedDispatchRing::Size;
-	dispatch.programs.Reset();
-	dispatch.input_info = {};
-	dispatch.input_info.async_compute = async_compute;
-	if (!indirect) SetDispatchDimensions(dispatch.input_info, cs, x, y, z, mode);
-	dispatch.flags = Common::RuntimeFlags::g_evaluation_bits;
-	dispatch.program = m_context.GetPipelineCache().GetComputeProgram(
-	    cs, context.GetShaderRegisters(), dispatch.input_info, &dispatch.programs);
-	if (!dispatch.program || dispatch.programs.reads.Failed()) return nullptr;
-	FrameBreakdown::Add(FrameBreakdown::g_counters.dc_ahead_ready);
-	dispatch.busy.store(true, std::memory_order_relaxed);
-	return &dispatch;
-}
 
 void RenderExecutor::ReleaseResolvedDispatch(ResolvedDispatch* resolved) noexcept {
 	resolved->busy.store(false, std::memory_order_release);
 }
 
-static ShaderProgram AcquireComputeProgram(PipelineCache& cache, const HW::ComputeShaderInfo& cs,
-                                           const HW::ShaderRegisters& sh, ShaderComputeInputInfo& info,
-                                           RenderExecutor::ResolvedDispatch* resolved) {
-	if (resolved != nullptr) {
-		bool valid = false;
-		{
-			FrameBreakdown::Timer timer(FrameBreakdown::g_counters.dc_ahead_validate_ns);
-			// A runtime switch changed since resolution: recompute with the current configuration.
-			const auto bits = Common::RuntimeFlags::Bits(Common::RuntimeFlags::Current());
-			valid = Common::RuntimeFlags::Current().compute_resolve_ahead &&
-			        bits == resolved->flags && resolved->programs.reads.StillValid();
+void RenderExecutor::PrepareComputeInputInfo(const HW::Shader& shaders, uint32_t thread_group_x,
+                                             uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
+                                             bool async_compute, ShaderComputeInputInfo& input_info) {
+	constexpr uint32_t DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS = 1u << 5u;
+	const auto&        cs_regs                                  = shaders.GetCs();
+	input_info.async_compute                                    = async_compute;
+	const bool use_thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
+	input_info.dispatch_thread_dimensions = use_thread_dimensions;
+	input_info.workgroup_counts[0] = thread_group_x;
+	input_info.workgroup_counts[1] = thread_group_y;
+	input_info.workgroup_counts[2] = thread_group_z;
+	if (use_thread_dimensions) {
+		const uint32_t group_sizes[] = {cs_regs.cs_regs.num_thread_x, cs_regs.cs_regs.num_thread_y,
+		                                cs_regs.cs_regs.num_thread_z};
+		for (uint32_t axis = 0; axis < 3u; ++axis) {
+			const auto size = std::max(group_sizes[axis], 1u);
+			const auto threads = input_info.workgroup_counts[axis];
+			input_info.workgroup_counts[axis] = threads / size + (threads % size != 0u);
 		}
-		if (valid) {
-			FrameBreakdown::Add(FrameBreakdown::g_counters.dc_ahead_hits);
-			info = resolved->input_info;
-			return resolved->program;
-		}
-		FrameBreakdown::Add(FrameBreakdown::g_counters.dc_ahead_invalid);
 	}
-	return cache.GetComputeProgram(cs, sh, info);
+}
+
+// Dispatches the resolve thread could not resolve ahead: [0] no program yet (or busy), [1] a
+// guest-memory read it could not make (GPU-written bytes, for example).
+static std::atomic<uint64_t> g_dispatch_ahead_misses[2] {};
+
+RenderExecutor::ResolvedDispatch* RenderExecutor::ResolveDispatchIndirectAhead(const HW::Context& context,
+                                                                               const HW::Shader& shaders,
+                                                                               bool async_compute) {
+	return ResolveDispatchAhead(context, shaders, 1, 1, 1, 0, async_compute, true);
+}
+
+RenderExecutor::ResolvedDispatch* RenderExecutor::ResolveDispatchAhead(const HW::Context& context,
+                                                                       const HW::Shader& shaders,
+                                                                       uint32_t thread_group_x,
+                                                                       uint32_t thread_group_y,
+                                                                       uint32_t thread_group_z, uint32_t mode,
+                                                                       bool async_compute, bool indirect) {
+	if ((!indirect && (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0)) ||
+	    shaders.GetCs().cs_regs.data_addr == 0 ||
+	    (indirect && (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0)) {
+		return nullptr;
+	}
+	Common::RuntimeFlags::EvaluationScope flags_scope;
+	FrameBreakdown::Add(FrameBreakdown::g_counters.dc_ahead_attempts);
+	FrameBreakdown::Timer ahead_timer(FrameBreakdown::g_counters.dc_ahead_ns);
+	if (m_resolved_dispatch_ring == nullptr) {
+		m_resolved_dispatch_ring = {new ResolvedDispatchRing {}, [](ResolvedDispatchRing* ring) { delete ring; }};
+	}
+	auto& ring     = *m_resolved_dispatch_ring;
+	auto& dispatch = ring.dispatches[ring.next];
+	// The execution thread releases resolutions in order.
+	for (Common::SpinWait wait; dispatch.busy.load(std::memory_order_acquire);) {
+		if (!wait.Spin()) {
+			std::this_thread::yield();
+		}
+	}
+	ring.next = (ring.next + 1) % ResolvedDispatchRing::Size;
+	dispatch.programs.Reset();
+	dispatch.input_info = {};
+	if (indirect) {
+		// As DispatchIndirect() builds it: the group counts are only known when it executes.
+		dispatch.input_info.async_compute = async_compute;
+	} else {
+		PrepareComputeInputInfo(shaders, thread_group_x, thread_group_y, thread_group_z, mode, async_compute,
+		                        dispatch.input_info);
+	}
+	dispatch.flags = Common::RuntimeFlags::g_evaluation_bits;
+	dispatch.program = m_context.GetPipelineCache().GetComputeProgramAhead(
+	    shaders.GetCs(), context.GetShaderRegisters(), dispatch.input_info, dispatch.programs);
+	if (!dispatch.program || dispatch.programs.reads.Failed()) {
+		// KYTY_DBG_CP_READS: why (printed with NHL27AHEAD by the execution thread).
+		g_dispatch_ahead_misses[dispatch.programs.reads.Failed() ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
+		return nullptr;
+	}
+	FrameBreakdown::Add(FrameBreakdown::g_counters.dc_ahead_ready);
+	// Published to the execution thread with the operation that carries it.
+	dispatch.busy.store(true, std::memory_order_relaxed);
+	return &dispatch;
+}
+
+static bool ValidateResolvedDispatch(RenderExecutor::ResolvedDispatch* resolved) {
+	if (resolved == nullptr) {
+		return false;
+	}
+	FrameBreakdown::Timer timer(FrameBreakdown::g_counters.dc_ahead_validate_ns);
+	const auto& flags = Common::RuntimeFlags::Current();
+	const bool enabled = flags.compute_resolve_ahead ||
+	                     Common::Experiments::Enabled(Common::Experiments::DispatchAhead);
+	const bool valid = enabled && Common::RuntimeFlags::Bits(flags) == resolved->flags &&
+	                   resolved->programs.reads.StillValid(true);
+	FrameBreakdown::Add(valid ? FrameBreakdown::g_counters.dc_ahead_hits : FrameBreakdown::g_counters.dc_ahead_invalid);
+	return valid;
 }
 
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
@@ -534,13 +559,37 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	const auto& sh_regs = ctx.GetShaderRegisters();
 
 	ShaderComputeInputInfo input_info {};
-	input_info.async_compute = async_compute;
-	const bool use_thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
-	SetDispatchDimensions(input_info, cs_regs, thread_group_x, thread_group_y, thread_group_z, mode);
+	PrepareComputeInputInfo(sh_ctx, thread_group_x, thread_group_y, thread_group_z, mode, async_compute, input_info);
+	const bool use_thread_dimensions = input_info.dispatch_thread_dimensions;
 	BufferCache::PerfTimerScope program_timer(BufferCache::PerfTimer::DispatchProgram);
+	// Experiment DispatchAhead: the resolve thread may have resolved the program already; it
+	// holds when the guest memory it read still has the same bytes.
 	const auto compute_program = [&] {
+		const bool ahead = ValidateResolvedDispatch(resolved);
+		// KYTY_DBG_CP_READS=1: how many dispatches use the resolve thread's read-ahead (2 s).
+		if (Libs::Graphics::CpReadDebugEnabled() && Common::Experiments::Enabled(Common::Experiments::DispatchAhead)) {
+			static uint64_t counts[3] {};
+			static auto     last = std::chrono::steady_clock::now();
+			counts[resolved == nullptr ? 0 : ahead ? 1 : 2]++;
+			if ((counts[0] + counts[1] + counts[2]) % 512 == 0 &&
+			    std::chrono::steady_clock::now() - last > std::chrono::seconds(2)) {
+				last = std::chrono::steady_clock::now();
+				std::printf("NHL27AHEAD: dispatches resolved ahead=%llu stale=%llu not resolved=%llu "
+				            "(no program %llu, failed read %llu)\n",
+				            static_cast<unsigned long long>(counts[1]), static_cast<unsigned long long>(counts[2]),
+				            static_cast<unsigned long long>(counts[0]),
+				            static_cast<unsigned long long>(g_dispatch_ahead_misses[0].exchange(0)),
+				            static_cast<unsigned long long>(g_dispatch_ahead_misses[1].exchange(0)));
+				std::fflush(stdout);
+				counts[0] = counts[1] = counts[2] = 0;
+			}
+		}
+		if (ahead) {
+			input_info = resolved->input_info;
+			return resolved->program;
+		}
 		FrameBreakdown::Timer materialize_timer(FrameBreakdown::g_counters.dc_materialize_ns);
-		return AcquireComputeProgram(m_context.GetPipelineCache(), cs_regs, sh_regs, input_info, resolved);
+		return m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
 	}();
 	program_timer.Stop();
 	if (!compute_program) {
@@ -812,7 +861,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 		}
 	}
-	const auto crumb = BreadcrumbBegin(m_context.GetGraphics(), vk_buffer, "dispatch",
+	// GPU timing tells dispatches from the guest's compute rings apart ("dispatch-acq").
+	const auto crumb = BreadcrumbBegin(m_context.GetGraphics(), vk_buffer,
+	                                   GuestGpu::CurrentQueue() != 0 ? "dispatch-acq" : "dispatch",
 	                                   program.shader_hash,
 	                                   (static_cast<uint64_t>(thread_group_x) << 40u) |
 	                                       (static_cast<uint64_t>(thread_group_y) << 20u) |
@@ -915,10 +966,15 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	ShaderComputeInputInfo input_info {};
 	BufferCache::PerfTimerScope program_timer(BufferCache::PerfTimer::DispatchProgram);
 	input_info.async_compute = async_compute;
+	// As for direct dispatches: the resolve thread may have resolved the program already (it
+	// holds while the guest memory it read has the same bytes).
 	const auto compute_program = [&] {
+		if (ValidateResolvedDispatch(resolved)) {
+			input_info = resolved->input_info;
+			return resolved->program;
+		}
 		FrameBreakdown::Timer materialize_timer(FrameBreakdown::g_counters.dc_materialize_ns);
-		return AcquireComputeProgram(m_context.GetPipelineCache(), cs_regs,
-		                             buffer.GetRegisters().GetShaderRegisters(), input_info, resolved);
+		return m_context.GetPipelineCache().GetComputeProgram(cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
 	}();
 	program_timer.Stop();
 	if (!compute_program) {
@@ -961,7 +1017,9 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
 	// KYTY_DISPATCH_ARGS_GUARD (runtime flag, default on; =0 disables) is the GPU-side check of the group counts.
-	const bool guard_args = Common::RuntimeFlags::Current().dispatch_args_guard;
+	// Arguments the CPU wrote come from the stream buffer, which has no device address: the guard
+	// is for counts the GPU wrote (a fatal error during an NHL 27 match load).
+	const bool guard_args = Common::RuntimeFlags::Current().dispatch_args_guard && args_buffer->HasDeviceAddress();
 	vk::Buffer indirect_buffer = args_buffer->Handle();
 	uint64_t   indirect_offset = args_offset;
 	if (guard_args) {

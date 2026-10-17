@@ -6,6 +6,7 @@
 #include <array>
 #include <bit>
 #include <cstdio>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <unordered_map>
 #include <utility>
@@ -1073,6 +1074,13 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			}
 			IncludeInstructionVectorRegisters(instruction, vector_limit);
 		}
+	}
+	// KYTY_DBG_SHADER_SHAPE=1: the guest program's size and VGPR use, to compare with the host's.
+	static const bool shape_debug = std::getenv("KYTY_DBG_SHADER_SHAPE") != nullptr;
+	if (shape_debug) {
+		std::printf("NHL27SHAPE: hash=0x%016llx stage=%u guest_vgprs=%u blocks=%zu instructions=%zu\n",
+		            static_cast<unsigned long long>(options.shader_hash), static_cast<unsigned>(options.stage),
+		            vector_limit, cfg.blocks.size(), decoded.instructions.size());
 	}
 
 	result.block_storage.reserve(cfg.blocks.size() + 1u);

@@ -326,10 +326,12 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 		normalized.aspect = vk::ImageAspectFlagBits::eStencil;
 	}
 	normalized.usage = is_storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlags {};
-	for (const auto& cached: views) {
-		if (cached.info == normalized) {
+	for (size_t i = 0; i < views.size(); i++) {
+		if (views[i].info == normalized) {
 			FrameBreakdown::TexAdd(FrameBreakdown::g_tex.view_hit);
-			return cached.view;
+			// Most recently used first: draws mostly ask for the view the last draw used.
+			if (i != 0) std::swap(views[i], views[0]);
+			return views[0].view;
 		}
 	}
 

@@ -65,7 +65,15 @@ struct ColorTargetKey {
 struct ColorTargetKeyHash {
 	size_t operator()(const ColorTargetKey& key) const noexcept {
 		uint64_t hash = 0xcbf29ce484222325ull;
-		for (const auto byte: key.registers) hash = (hash ^ byte) * 0x100000001b3ull;
+		// Eight register bytes per step; the tail (if any) bytewise.
+		size_t at = 0;
+		for (; at + 8 <= key.registers.size(); at += 8) {
+			uint64_t word = 0;
+			std::memcpy(&word, key.registers.data() + at, 8);
+			hash = (hash ^ word) * 0x100000001b3ull;
+			hash ^= hash >> 32u;
+		}
+		for (; at < key.registers.size(); ++at) hash = (hash ^ key.registers[at]) * 0x100000001b3ull;
 		hash = (hash ^ key.slice_offset) * 0x100000001b3ull;
 		hash = (hash ^ (key.slot | (key.mask << 8u) | (key.ignore_mask ? 1u << 16u : 0u) |
 		                (key.exact_format ? 1u << 17u : 0u))) *

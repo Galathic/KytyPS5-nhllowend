@@ -1,3 +1,4 @@
+#include "graphics/guest_gpu/stageStats.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 
 #include "common/assert.h"
@@ -10,6 +11,7 @@
 #include "common/threads.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
@@ -126,6 +128,11 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 	// Scalar and unformatted buffer dependencies use the same backing as native raw loads.
 	// Image synchronization belongs to formatted buffer bindings, not these reads.
 	if (FrameBreakdown::g_spec_collect != nullptr) FrameBreakdown::SpecCollectRead(address, values.size_bytes());
+	// Experiment GpuConditionsBothPaths: a branch condition on GPU-written bytes is left undecided.
+	if (ShaderRecompiler::IR::ConditionReadsNonBlocking()) {
+		return !values.empty() && Libs::LibKernel::Memory::TryReadCleanBufferBacking(
+		                              address, values.data(), values.size_bytes());
+	}
 	return !values.empty() &&
 	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
 }
@@ -287,11 +294,25 @@ static bool SameGuestBytes(const void* guest, const uint8_t* recorded, uint32_t 
 	}
 }
 
-bool GuestReadLog::StillValid() const {
+bool GuestReadLog::StillValid(bool without_faults) const {
 	if (m_failed) {
 		return false;
 	}
 	std::array<uint8_t, StrictCheckBytes> buffer {};
+	// Consecutive entries mostly lie on one page: its protection is looked up once.
+	uint64_t   protected_page = ~uint64_t {0};
+	bool       page_protected = false;
+	const auto read_protected = [&](uint64_t address, uint64_t size) {
+		const auto page = address & ~uint64_t {0xfff};
+		if (page != ((address + size - 1) & ~uint64_t {0xfff})) {
+			return Libs::LibKernel::Memory::IsGpuReadProtected(address, size);
+		}
+		if (page != protected_page) {
+			protected_page = page;
+			page_protected = Libs::LibKernel::Memory::IsGpuReadProtected(page, 0x1000);
+		}
+		return page_protected;
+	};
 	for (const auto& entry: m_entries) {
 		const auto* recorded = m_bytes.data() + entry.offset;
 		if (entry.strict) {
@@ -302,11 +323,31 @@ bool GuestReadLog::StillValid() const {
 			    std::memcmp(buffer.data(), recorded, entry.size) != 0) {
 				return false;
 			}
-		} else if (!SameGuestBytes(reinterpret_cast<const void*>(entry.address), recorded,
-		                           entry.size)) {
+		} else {
+			// Experiment FaultPageDirect: on a page that faulted before (the GPU wrote other
+			// bytes of it), clean bytes are compared in the backing instead of faulting again.
+			// Dispatch read-ahead checks never fault: their pages change every frame (ring
+			// buffers), so the first read of each faulted (about 5 ms each, 15% of the thread).
+			// Draw checks look at the page protection too: their plain loads of such pages took an
+			// exception each (2.7% of the execution thread; the 16-page fault cache thrashes).
+			if (Common::Experiments::Enabled(Common::Experiments::FaultPageDirect) &&
+			    (without_faults || Libs::LibKernel::Memory::IsReadFaultPage(entry.address, entry.size) ||
+			     read_protected(entry.address, entry.size))) {
+				const auto compare =
+				    Libs::LibKernel::Memory::TryValidateCleanBacking(entry.address, recorded, entry.size);
+				if (compare == Libs::LibKernel::Memory::CleanBackingCompare::Equal) {
+					continue;
+				}
+				if (compare == Libs::LibKernel::Memory::CleanBackingCompare::Different ||
+				    (without_faults && compare == Libs::LibKernel::Memory::CleanBackingCompare::Dirty)) {
+					return false;
+				}
+			}
 			// A plain load, as the execution thread's own resolution reads: GPU-owned pages
 			// fault and read the GPU's bytes back.
-			return false;
+			if (!SameGuestBytes(reinterpret_cast<const void*>(entry.address), recorded, entry.size)) {
+				return false;
+			}
 		}
 	}
 	return true;
@@ -317,10 +358,18 @@ namespace {
 class ProgramLockGuard {
 public:
 	explicit ProgramLockGuard(std::atomic_flag& flag): m_flag(flag) {
-		while (m_flag.test_and_set(std::memory_order_acquire)) {
+		if (!m_flag.test_and_set(std::memory_order_acquire)) {
+			return;
+		}
+		const bool stats = StageStats::Enabled();
+		const auto start = stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+		do {
 			while (m_flag.test(std::memory_order_relaxed)) {
 				Common::SpinPause();
 			}
+		} while (m_flag.test_and_set(std::memory_order_acquire));
+		if (stats && StageStats::ProgramLockCounter() != StageStats::CounterCount) {
+			StageStats::Add(StageStats::ProgramLockCounter(), start);
 		}
 	}
 	~ProgramLockGuard() { m_flag.clear(std::memory_order_release); }
@@ -473,6 +522,10 @@ struct PipelineCache::ProgramCache {
 		size_t                                     last_permutation = std::numeric_limits<size_t>::max();
 		bool                                       native_plan_checked = false;
 		bool                                       native_plan_allowed = false;
+		// Experiments AheadUnlocked / ComputeUnlocked: a thread materializes this entry's plan
+		// without the program lock (the plan's scratch is the entry's own); set and cleared
+		// under the lock. The resolve thread skips a busy entry, the execution thread waits.
+		std::atomic<bool>                          busy {false};
 		uint64_t                                   refresh_ns = 0;
 		uint64_t                                   refresh_calls = 0;
 		uint64_t                                   refresh_hits = 0;
@@ -513,6 +566,18 @@ struct PipelineCache::ProgramCache {
 			     options.shader_hash);
 		}
 		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
+		// KYTY_DBG_DUMP_SHADERS: the guest disassembly and the IR next to the SPIR-V.
+		if (ForceDumpShader(options.shader_hash) && !result.decoded_dump.empty()) {
+			static std::atomic_int text_id = 0;
+			const auto path = Config::GetShaderLogFolder() /
+			                  fmt::format("{:04d}_ir_{}_{:016x}.txt", text_id++, stage_name, options.shader_hash);
+			Common::File::CreateDirectories(path.parent_path());
+			Common::File file(path);
+			if (!file.IsInvalid()) {
+				file.Write(result.decoded_dump.data(), result.decoded_dump.size());
+				file.Write(result.ir_dump.data(), result.ir_dump.size());
+			}
+		}
 
 		const auto module = CompileSPV(result.spirv, device);
 		EXIT_IF(module == nullptr);
@@ -578,8 +643,9 @@ struct PipelineCache::ProgramCache {
 		options.shader_hash = params.hash;
 		options.user_data   = user_data;
 		options.back_code   = params.back_code;
-		options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
-		options.early_dump  = options.dump_ir;
+		options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent ||
+		                      ForceDumpShader(params.hash);
+		options.early_dump  = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
 		const char* scalar = std::getenv("KYTY_GPU_SCALAR_DATA");
 		options.gpu_scalar_data = scalar != nullptr && scalar[0] == '1' && scalar[1] == 0;
 		options.dump_label  = label;
@@ -604,13 +670,14 @@ struct PipelineCache::ProgramCache {
 	ShaderProgram GetAhead(const ShaderParams& params, InputInfo& input_info,
 	                       uint32_t& push_data_cursor, ProgramResolution& ahead) {
 		ShaderType stage;
+		constexpr bool compute = std::is_same_v<InputInfo, ShaderComputeInputInfo>;
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			stage = input_info.logical_stage;
-		} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
-			stage = ShaderType::Pixel;
-		} else {
-			static_assert(std::is_same_v<InputInfo, ShaderComputeInputInfo>);
+		} else if constexpr (compute) {
 			stage = ShaderType::Compute;
+		} else {
+			static_assert(std::is_same_v<InputInfo, ShaderPixelInputInfo>);
+			stage = ShaderType::Pixel;
 		}
 		lookup_key.stage           = stage;
 		lookup_key.hash            = params.hash;
@@ -618,45 +685,72 @@ struct PipelineCache::ProgramCache {
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
 		const auto entry = programs.find(lookup_key);
-		if (entry == programs.end() && ahead.stages != ProgramResolution::MaxStages) {
-			// Compute compilation remains on the execution path; the async compiler owns
-			// graphics-only input storage. This experiment resolves existing permutations.
-			if constexpr (!std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+		// Compute programs are compiled by the execution thread itself.
+		if constexpr (!compute) {
+			if (entry == programs.end() && ahead.stages != ProgramResolution::MaxStages) {
 				QueueCompile(stage, params, input_info, push_data_cursor, nullptr);
 			}
 		}
 		// SWAPPC programs link the functions they call from guest memory: the execution thread
 		// resolves them.
 		if (entry == programs.end() || ahead.stages == ProgramResolution::MaxStages ||
-		    entry->second.call_source) {
+		    entry->second.call_source || entry->second.busy.load(std::memory_order_acquire)) {
 			ahead.reads.Fail();
 			return {};
 		}
 		const auto                             stage_index    = ahead.stages++;
 		auto&                                  resources      = ahead.resources[stage_index];
 		auto&                                  specialization = ahead.specializations[stage_index];
-		const ShaderRecompiler::IR::SrtRuntime runtime {
+		ShaderRecompiler::IR::SrtRuntime runtime {
 		    .user_data                  = std::span(params.user_data).first(params.user_data_count),
 		    .shader_base                = params.Base(),
 		    .read_memory                = ReadAheadPlain,
 		    .userdata                   = &ahead.reads,
 		    .read_specialization_memory = ReadAheadStrict,
 		};
-		if (!ShaderRecompiler::IR::MaterializeResources(entry->second.resource_plan, runtime,
-		                                                resources, specialization)) {
+		if constexpr (compute) {
+			runtime.workgroup_counts = input_info.workgroup_counts;
+		}
+		// Contiguous resource-table words are read with one call, as the execution thread reads them
+		// (the resolve thread read each dword with its own call chain, 25% of the thread; and each
+		// switch between the two rebuilt the plan's read runs). AbLegacy: one call per dword.
+		runtime.batch_reads = !Common::Experiments::Enabled(Common::Experiments::AbLegacy) &&
+		                      (env_batch_reads || Common::Experiments::Enabled(Common::Experiments::SrtBatchReads));
+		auto& source = entry->second;
+		bool  materialized = false;
+		// Experiment AheadUnlocked: the execution thread may take the lock meanwhile; it keeps
+		// off this entry until the materialization is done.
+		if (program_lock != nullptr && Common::Experiments::Enabled(Common::Experiments::AheadUnlocked)) {
+			source.busy.store(true, std::memory_order_release);
+			UnlockPrograms();
+			materialized =
+			    ShaderRecompiler::IR::MaterializeResources(source.resource_plan, runtime, resources, specialization);
+			LockPrograms();
+			source.busy.store(false, std::memory_order_release);
+			// The other thread may have used the shared lookup key meanwhile.
+			lookup_key.stage           = stage;
+			lookup_key.hash            = params.hash;
+			lookup_key.user_data_count = params.user_data_count;
+			lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
+			BuildStageStaticKey(input_info, lookup_key.static_state);
+		} else {
+			materialized =
+			    ShaderRecompiler::IR::MaterializeResources(source.resource_plan, runtime, resources, specialization);
+		}
+		if (!materialized) {
 			ahead.reads.Fail();
 			return {};
 		}
 		const auto permutation =
-		    std::ranges::find_if(entry->second.permutations, [&](const Permutation& candidate) {
+		    std::ranges::find_if(source.permutations, [&](const Permutation& candidate) {
 			    const auto& layout = candidate.program.bindings;
 			    return layout.push_data_start_dword ==
 			               ShaderRecompiler::IR::PushData::StartFor(push_data_cursor,
 			                                                        layout.ShaderDataDwords()) &&
 			           candidate.specialization == specialization;
 		    });
-		if (permutation == entry->second.permutations.end()) {
-			if constexpr (!std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+		if (permutation == source.permutations.end()) {
+			if constexpr (!compute) {
 				QueueCompile(stage, params, input_info, push_data_cursor, &specialization);
 			}
 			ahead.reads.Fail();
@@ -693,6 +787,7 @@ struct PipelineCache::ProgramCache {
 		}
 
 		ApplyExperiments();
+		BufferCache::NoteReadbackShader(params.hash);
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
 		lookup_key.stage           = stage;
 		lookup_key.hash            = params.hash;
@@ -714,6 +809,16 @@ struct PipelineCache::ProgramCache {
 		} else if (auto found = programs.find(lookup_key); found != programs.end()) {
 			entry = &found->second;
 			last = {&found->first, entry};
+		}
+		// Experiments AheadUnlocked / ComputeUnlocked: another thread materializes this entry
+		// without the lock; wait without it, then look up again.
+		if (entry != nullptr && entry->busy.load(std::memory_order_acquire)) {
+			UnlockPrograms();
+			while (entry->busy.load(std::memory_order_acquire)) {
+				Common::SpinPause();
+			}
+			LockPrograms();
+			return Get(params, input_info, push_data_cursor);
 		}
 		const auto runtime_flags = Common::RuntimeFlags::Current();
 		ShaderRecompiler::IR::SrtRuntime             runtime {
@@ -822,8 +927,26 @@ struct PipelineCache::ProgramCache {
 		}
 		if (entry != nullptr && !source_changed) {
 			if (!check_native_plan(*entry)) return {};
-			bool reused = false;
-			if (!refresh(*entry, reused)) return {};
+			bool reused    = false;
+			bool refreshed = false;
+			// Experiment ComputeUnlocked: the resolve thread may look up graphics programs while
+			// the execution thread materializes a compute program (the entry is marked busy).
+			if (std::is_same_v<InputInfo, ShaderComputeInputInfo> && program_lock != nullptr &&
+			    replaying == nullptr && Common::Experiments::Enabled(Common::Experiments::ComputeUnlocked)) {
+				entry->busy.store(true, std::memory_order_release);
+				UnlockPrograms();
+				refreshed = refresh(*entry, reused);
+				LockPrograms();
+				entry->busy.store(false, std::memory_order_release);
+				lookup_key.stage           = stage;
+				lookup_key.hash            = params.hash;
+				lookup_key.user_data_count = params.user_data_count;
+				lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
+				BuildStageStaticKey(input_info, lookup_key.static_state);
+			} else {
+				refreshed = refresh(*entry, reused);
+			}
+			if (!refreshed) return {};
 			resource_hits += reused;
 			materializations += !reused;
 			if (memo_enabled && !reused) ++resource_misses[static_cast<size_t>(entry->resource_memo.LastMiss())];
@@ -1097,7 +1220,7 @@ struct PipelineCache::ProgramCache {
 	// one match; compiled shaders and pipelines are kept.
 	void ApplyExperiments() {
 		constexpr uint32_t Bits = Common::Experiments::SrtBatchReads;
-		const uint32_t mask = Common::Experiments::Mask() & Bits;
+		const uint32_t mask = static_cast<uint32_t>(Common::Experiments::Mask() & Bits);
 		if (mask == applied_experiments) return;
 		applied_experiments = mask;
 		batch_reads = env_batch_reads || (mask & Common::Experiments::SrtBatchReads) != 0;
@@ -1183,10 +1306,18 @@ struct PipelineCache::ProgramCache {
 	std::vector<std::jthread>                      workers;
 
 	void LockPrograms() {
-		while (program_lock->test_and_set(std::memory_order_acquire)) {
+		if (!program_lock->test_and_set(std::memory_order_acquire)) {
+			return;
+		}
+		const bool stats = StageStats::Enabled();
+		const auto start = stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+		do {
 			while (program_lock->test(std::memory_order_relaxed)) {
 				Common::SpinPause();
 			}
+		} while (program_lock->test_and_set(std::memory_order_acquire));
+		if (stats && StageStats::ProgramLockCounter() != StageStats::CounterCount) {
+			StageStats::Add(StageStats::ProgramLockCounter(), start);
 		}
 	}
 	void UnlockPrograms() { program_lock->clear(std::memory_order_release); }
@@ -1229,6 +1360,9 @@ struct PipelineCache::ProgramCache {
 		const auto key = lookup_key;
 		do {
 			UnlockPrograms();
+			// A worker that faults on a GPU-written page of the shader code waits for this
+			// thread to read the page back (a menu deadlock on NHL 27).
+			GuestGpu::ServiceUrgentCommands();
 			std::this_thread::yield();
 			LockPrograms();
 		} while (in_flight.contains(key));
@@ -1988,6 +2122,23 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 		return m_program_cache->GetAhead(params, input_info, push_data_cursor, *ahead);
 	}
 	return m_program_cache->Get(params, input_info, push_data_cursor);
+}
+
+ShaderProgram PipelineCache::GetComputeProgramAhead(const HW::ComputeShaderInfo& regs,
+                                                    const HW::ShaderRegisters& sh,
+                                                    ShaderComputeInputInfo& input_info, ProgramResolution& ahead) {
+	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
+	const ShaderGuestReaderScope reader(ReadAheadShaderState, &ahead.reads);
+	const auto params = PrepareProgram(regs, sh, input_info);
+	if (ahead.reads.Failed()) {
+		return {};
+	}
+	input_info.lds_storage = input_info.lds_size_dwords * 4u >
+	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
+	uint32_t               push_data_cursor = 0;
+	const ProgramLockGuard lock(m_program_lock);
+	auto program = m_program_cache->GetAhead(params, input_info, push_data_cursor, ahead);
+	return ahead.reads.Failed() ? ShaderProgram {} : program;
 }
 
 bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other) const noexcept {

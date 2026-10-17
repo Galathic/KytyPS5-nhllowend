@@ -1,0 +1,52 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+// One workgroup per color-metadata slice (DCC/CMASK). When every byte of the slice equals one of
+// the candidate fast-clear codes, sets that code's predicate (conditional rendering then clears
+// the image slice) and, with `expand`, rewrites the slice to 0xff keys, as the CPU path does after
+// materializing a fast clear. This replaces reading GPU-written metadata back to the CPU.
+layout(local_size_x=256) in;
+layout(buffer_reference, std430, buffer_reference_align=4) buffer Words { uint words[]; };
+layout(push_constant, std430) uniform Params {
+ uint64_t metadata;    // first slice
+ uint64_t predicates;  // 8 dwords per slice
+ uint slice_words;
+ uint candidates_lo;   // candidate codes 0-3, one per byte
+ uint candidates_hi;   // candidate codes 4-7
+ uint candidate_count;
+ uint expand;
+} p;
+shared uint s_mismatch;
+uint Candidate(uint k) {
+ return ((k < 4u ? p.candidates_lo : p.candidates_hi) >> (8u * (k & 3u))) & 0xffu;
+}
+void main() {
+ const uint slice = gl_WorkGroupID.x;
+ Words meta = Words(p.metadata + uint64_t(slice) * uint64_t(p.slice_words) * 4ul);
+ const uint first = meta.words[0];
+ if (gl_LocalInvocationIndex == 0u) s_mismatch = 0u;
+ barrier();
+ const uint want = (first & 0xffu) * 0x01010101u;
+ bool same = true;
+ for (uint i = gl_LocalInvocationIndex; i < p.slice_words; i += 256u) {
+  same = same && meta.words[i] == want;
+ }
+ if (!same) atomicOr(s_mismatch, 1u);
+ barrier();
+ const bool uniform_code = s_mismatch == 0u;
+ const uint code = first & 0xffu;
+ bool matched = false;
+ for (uint k = 0u; k < p.candidate_count; ++k) {
+  matched = matched || (uniform_code && code == Candidate(k));
+ }
+ if (gl_LocalInvocationIndex < 8u) {
+  Words pred = Words(p.predicates + uint64_t(slice) * 32ul);
+  const uint k = gl_LocalInvocationIndex;
+  pred.words[k] = (k < p.candidate_count && uniform_code && code == Candidate(k)) ? 1u : 0u;
+ }
+ if (matched && p.expand != 0u) {
+  memoryBarrierBuffer();
+  barrier();
+  for (uint i = gl_LocalInvocationIndex; i < p.slice_words; i += 256u) meta.words[i] = 0xffffffffu;
+ }
+}

@@ -268,6 +268,7 @@ set(gpu_tiler_shader_names
 	native_indirect
 	dispatch_guard
 	color_transform
+	color_clear_check
 )
 file(GLOB gpu_tiler_shader_includes CONFIGURE_DEPENDS "${gpu_tiler_shader_dir}/gpu_tiler_*.inc")
 foreach(shader_name IN LISTS gpu_tiler_shader_names)
@@ -477,6 +478,15 @@ add_executable(memory_tracker_tests EXCLUDE_FROM_ALL
 target_link_libraries(memory_tracker_tests fmt::fmt common)
 target_include_directories(memory_tracker_tests PRIVATE ${inc_headers})
 
+add_executable(experiments_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ExperimentsTests.cpp"
+	"${KYTY_SOURCE_DIR}/common/experiments.cpp"
+)
+target_include_directories(experiments_tests PRIVATE "${KYTY_SOURCE_DIR}")
+if(LINUX OR APPLE)
+	target_link_libraries(experiments_tests PRIVATE Threads::Threads)
+endif()
+
 add_executable(gpu_pipeline_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/GpuPipelineTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/commandRecorder.cpp"
@@ -671,6 +681,13 @@ if(BUILD_TESTING)
 	add_test(NAME emulator_present_mode_invalid
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --present-mode Invalid)
 	set_tests_properties(emulator_present_mode_invalid PROPERTIES WILL_FAIL TRUE)
+	add_test(NAME experiments COMMAND $<TARGET_FILE:experiments_tests>)
+	add_test(NAME compute_resolve_ahead
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --compute-resolve-ahead-only)
+	# The perf branch initializes diagnostic gates before main(), so the counter-based
+	# assertions need the environment set by the launcher rather than by the test body.
+	set_tests_properties(compute_resolve_ahead PROPERTIES
+		ENVIRONMENT "KYTY_PERF_STATS=1;KYTY_SHADER_PREGEN=0;KYTY_DBG_LOOP_CAP=1024")
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
 	add_test(NAME shader_front_face COMMAND $<TARGET_FILE:shader_cfg_tests> --front-face-only)
@@ -750,6 +767,7 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-range-only)
 
 	add_custom_target(kyty_tests DEPENDS
+		experiments_tests
 		ime_dialog_tests
 		shader_cfg_tests
 		scalar_provenance_tests
@@ -820,6 +838,56 @@ if (WIN32)
 endif()
 if (KYTY_CLANG_CL)
 	target_link_libraries(kyty_emulator onecore)
+endif()
+# Profiling: source lines and inline frames in the PDB for tools/profiling/sampler.exe.
+option(KYTY_LINE_TABLES "Emit line tables for the emulator (profiling; no codegen change)" OFF)
+if (KYTY_LINE_TABLES AND KYTY_CLANG_CL)
+	target_compile_options(kyty_emulator PRIVATE "-gline-tables-only")
+endif()
+# Profile-guided optimization of the emulator and common (clang-cl). KYTY_PGO=generate builds an
+# instrumented emulator that writes LLVM_PROFILE_FILE every 30 s (creating "pgo.reset" in the
+# working directory drops the counts so far, e.g. the boot); merge the .profraw with
+# llvm-profdata, then build with KYTY_PGO=use (KYTY_PGO_PROFILE defaults to the NHL 27 gameplay
+# profile in tools/pgo, see tools/pgo/README.md). A profile only matches the clang that made it.
+set(KYTY_PGO "" CACHE STRING "Profile-guided optimization (clang-cl): generate or use")
+set(KYTY_PGO_PROFILE "${CMAKE_CURRENT_SOURCE_DIR}/tools/pgo/nhl27.profdata" CACHE FILEPATH
+	"Merged .profdata for KYTY_PGO=use")
+set(KYTY_PGO_PROFILE_COMPILER "22.1.8" CACHE STRING "clang version that recorded KYTY_PGO_PROFILE")
+option(KYTY_THIN_LTO "ThinLTO for the emulator and common (clang-cl)" OFF)
+if (KYTY_CLANG_CL AND KYTY_PGO STREQUAL "generate")
+	execute_process(COMMAND "${CMAKE_CXX_COMPILER}" /clang:-print-resource-dir
+		OUTPUT_VARIABLE KYTY_CLANG_RESOURCE_DIR OUTPUT_STRIP_TRAILING_WHITESPACE)
+	foreach(target kyty_emulator common)
+		target_compile_options(${target} PRIVATE "-fprofile-generate")
+	endforeach()
+	target_compile_definitions(kyty_emulator PRIVATE KYTY_PGO_GENERATE=1)
+	target_link_libraries(kyty_emulator "${KYTY_CLANG_RESOURCE_DIR}/lib/windows/clang_rt.profile-x86_64.lib")
+	target_link_options(kyty_emulator PRIVATE "/INCLUDE:__llvm_profile_runtime")
+elseif (KYTY_CLANG_CL AND KYTY_PGO STREQUAL "use")
+	if (NOT EXISTS "${KYTY_PGO_PROFILE}")
+		message(FATAL_ERROR "KYTY_PGO=use needs KYTY_PGO_PROFILE=<merged .profdata>")
+	endif()
+	if (NOT CMAKE_CXX_COMPILER_VERSION VERSION_EQUAL KYTY_PGO_PROFILE_COMPILER)
+		message(WARNING "KYTY_PGO=use ignored: the profile was recorded with clang "
+			"${KYTY_PGO_PROFILE_COMPILER}, this is ${CMAKE_CXX_COMPILER_VERSION}")
+	else()
+		# The hash changes every command line when the profile changes, so compiler caches
+		# (sccache) cannot serve objects built from an older profile.
+		file(SHA256 "${KYTY_PGO_PROFILE}" KYTY_PGO_PROFILE_HASH)
+		string(SUBSTRING "${KYTY_PGO_PROFILE_HASH}" 0 16 KYTY_PGO_PROFILE_HASH)
+		foreach(target kyty_emulator common)
+			target_compile_options(${target} PRIVATE "-fprofile-use=${KYTY_PGO_PROFILE}"
+				"-Wno-profile-instr-unprofiled" "-Wno-profile-instr-out-of-date" "-Wno-profile-instr-missing")
+			target_compile_definitions(${target} PRIVATE KYTY_PGO_PROFILE_HASH=0x${KYTY_PGO_PROFILE_HASH})
+		endforeach()
+		message(STATUS "PGO: ${KYTY_PGO_PROFILE} (${KYTY_PGO_PROFILE_HASH})")
+	endif()
+endif()
+if (KYTY_CLANG_CL AND KYTY_THIN_LTO)
+	foreach(target kyty_emulator common)
+		target_compile_options(${target} PRIVATE "-flto=thin")
+	endforeach()
+	target_link_options(kyty_emulator PRIVATE "/lldltocache:${CMAKE_CURRENT_BINARY_DIR}/lto.cache")
 endif()
 if (CLANG AND NOT KYTY_CLANG_CL)
 	target_link_libraries(kyty_emulator pthread)
