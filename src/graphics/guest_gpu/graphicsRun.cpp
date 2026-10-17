@@ -521,7 +521,10 @@ void GuestGpu::ReadDecisionMemory(const volatile void* address, void* value, siz
 		const auto write_address = write->address;
 		const auto write_origin  = write->origin;
 		const auto wait_start    = (timed || CpReadDebugEnabled()) ? DecisionNowNs() : 0;
-		WaitForExecution(write->sequence);
+		{
+			StageStats::CpStateScope state(StageStats::CpState::WaitDecision);
+			WaitForExecution(write->sequence);
+		}
 		if (CpReadDebugEnabled()) NoteCpRead(write->kind, begin, nullptr, 0,
 		    DecisionNowNs() - wait_start);
 		if (timed) {
@@ -661,6 +664,10 @@ static void PrintStageStats() {
 	            items != 0 ? (busy - ms[StageStats::ExecProgramLock]) * 1e3 * seconds / static_cast<double>(items) : 0.0,
 	            ms[StageStats::ResolveProgramLock], ms[StageStats::ResolveQueueFull], ms[StageStats::ResolveIdle],
 	            1000.0 - ms[StageStats::ResolveQueueFull] - ms[StageStats::ResolveIdle]);
+	std::printf("NHL27EXECIDLE ms/s: resolve=%.1f cp-busy=%.1f no-submission=%.1f blocked=%.1f "
+	            "cp-decision-wait=%.1f cp-other-wait=%.1f\n",
+	            ms[StageStats::ExecIdleResolve], ms[StageStats::ExecIdleCp], ms[StageStats::ExecIdleNoWork],
+	            ms[StageStats::ExecIdleBlocked], ms[StageStats::ExecIdleDecision], ms[StageStats::ExecIdleOther]);
 	// By operation kind: ms/s and us per operation.
 	static uint64_t last_kind_ns[8] {}, last_kind_count[8] {};
 	static const char* const kinds[] = {"draw", "draw-auto", "draw-indirect", "dispatch", "dispatch-indirect", "callback", "?", "?"};
@@ -754,8 +761,10 @@ void GuestGpu::ExecutionThread() {
 			Common::EventTrace::Record(Common::EventTrace::EXEC_WAIT_BEGIN);
 			if (StageStats::Enabled()) {
 				const auto start = std::chrono::steady_clock::now();
+				const auto cause = StageStats::ExecIdleCause();
 				operation        = operations.Pop();
 				StageStats::Add(StageStats::ExecIdle, start);
+				StageStats::Add(cause, start);
 				PrintStageStats();
 			} else {
 				operation = operations.Pop();
@@ -821,6 +830,7 @@ void GuestGpu::ResolveThread() {
 				break;
 			}
 		}
+		if (StageStats::Enabled()) StageStats::g_resolve_working.store(true, std::memory_order_relaxed);
 		if (operation->kind == GpuOperationKind::DrawIndex ||
 		    operation->kind == GpuOperationKind::DrawAuto) {
 			// The register snapshots stay valid until the operation executed.
@@ -844,6 +854,7 @@ void GuestGpu::ResolveThread() {
 			operation->resolved_dispatch = executor.ResolveDispatchIndirectAhead(
 			    *operation->state.context, *operation->state.shaders, operation->processor->IsAsyncComputeQueue());
 		}
+		if (StageStats::Enabled()) StageStats::g_resolve_working.store(false, std::memory_order_relaxed);
 		if (StageStats::Enabled() && !m_resolved.TryPush(*operation)) {
 			const auto start = std::chrono::steady_clock::now();
 			m_resolved.Push(std::move(*operation));
@@ -949,7 +960,10 @@ const T* CommandProcessor::Snapshot(SnapshotRing<T>& ring, const T& live, bool& 
 		auto& slot = ring.slots[ring.next];
 		// The execution thread publishes the sequence of an operation after it stops reading the
 		// operation's snapshots; the wait acquires that.
-		m_pipeline->WaitForExecution(ring.last_use[ring.next]);
+		{
+			StageStats::CpStateScope state(StageStats::CpState::WaitOther);
+			m_pipeline->WaitForExecution(ring.last_use[ring.next]);
+		}
 		slot.value   = live;
 		slot.id      = s_snapshot_ids.fetch_add(1, std::memory_order_relaxed) + 1;
 		ring.current = ring.next;
@@ -1632,6 +1646,7 @@ void GuestGpu::ThreadRun(void* data) {
 		bool                         has_submission = false;
 		bool                         should_stop    = false;
 		if (spin_blocked) {
+			StageStats::CpStateScope state(StageStats::CpState::Blocked);
 			spin_blocked      = false;
 			const auto epoch  = gpu->m_work_epoch.load(std::memory_order_acquire);
 			const auto target = std::chrono::steady_clock::now() + BlockedRetryInterval;
@@ -1651,6 +1666,7 @@ void GuestGpu::ThreadRun(void* data) {
 				          !gpu->m_stopping;
 			}
 			if (no_work) {
+				StageStats::CpStateScope state(StageStats::CpState::NoWork);
 				gpu->WaitForExecution();
 				bool arrived = false;
 				{
@@ -1704,6 +1720,7 @@ void GuestGpu::ThreadRun(void* data) {
 		}
 		{
 			Common::LockGuard lock(gpu->m_queue_mutex);
+			StageStats::CpStateScope idle_state(StageStats::CpState::NoWork);
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
@@ -1746,6 +1763,7 @@ void GuestGpu::ThreadRun(void* data) {
 						spin_blocked = true;
 					} else {
 						Common::Timeline::Mark("gpu-blocked");
+						StageStats::CpStateScope state(StageStats::CpState::Blocked);
 						gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
 						Common::Timeline::Mark("gpu-unblocked");
 					}
