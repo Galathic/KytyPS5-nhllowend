@@ -1543,7 +1543,11 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 		}
 	};
+	// KYTY_DBG_CHECK_SCALAR_READS=1: proves per draw that no scalar resource read overlaps a write
+	// of the same draw (it never fired in NHL 27; about 1% of the execution thread).
+	static const bool check_scalar_reads = std::getenv("KYTY_DBG_CHECK_SCALAR_READS") != nullptr;
 	for (const auto* reader: prepared_bindings) {
+		if (!check_scalar_reads) break;
 		const auto& reads = reader->runtime->resources->specialization_reads;
 		if (reads.empty()) continue;
 		if (!written_ready) {

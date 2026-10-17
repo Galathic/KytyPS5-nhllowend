@@ -347,6 +347,10 @@ is the limit again (about 95% busy in heavy play). Small backing reads (4/8/16/3
 copied inline. A resolve-side memo of whole materializations (four per program, validated by
 re-reading) hit only 10% of the time and cost more than it saved: dropped.
 
+The per-draw proof that no scalar resource read overlaps a write of the same draw (it exits the
+emulator when one does; it never fired in NHL 27) is opt-in now, `KYTY_DBG_CHECK_SCALAR_READS=1`:
+about 1% of the execution thread.
+
 The low-energy preset patch (`patches/nhl27_lowenergy.json`: resolution scale 0.5, no FSR3)
 changes nothing on the CPU side (same draws per second and thread load).
 
