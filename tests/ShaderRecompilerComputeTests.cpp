@@ -31,6 +31,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineRecord.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/nativeIndirect.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -5630,6 +5631,112 @@ public:
                 direct_offset, allocation_size) == 0,
             "direct-memory allocation release failed");
     std::printf("[host]    %-32s ok\n", name);
+  }
+
+  void CheckComputeResolveAhead() {
+    constexpr const char* name = "ComputeResolveAhead";
+    constexpr uint64_t base = 0x00000002fa000000ull;
+    constexpr uint64_t size = 0x10000;
+    EnsureRuntimeContext();
+    int64_t physical = -1;
+    Require(name, "allocate", LibKernel::Memory::KernelAllocateDirectMemory(
+        0, LibKernel::Memory::KernelGetDirectMemorySize(), size, size, 0, &physical) == 0,
+        "fixture allocation failed");
+    void* mapped = reinterpret_cast<void*>(base);
+    Require(name, "map", LibKernel::Memory::KernelMapDirectMemory(
+        &mapped, size, 0x3, 0x10, physical, size) == 0,
+        "fixture mapping failed");
+    std::memset(mapped, 0, size);
+    std::vector<u32> code{EncodeSmem0(0x02, 4), EncodeSmem1(0, 125), EncodeSopp(0x0c, 0)};
+    AppendVMovU32(&code, 1, 73);
+    code.push_back(EncodeMubuf0(0x1c, 0, false, false));
+    code.push_back(EncodeMubuf1(1, 1, 0));
+    AppendEnd(&code);
+    ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+        {.type = Prospero::ShaderBinaryType::kCs,
+         .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    const auto saved_flags = Common::RuntimeFlags::g_published.load();
+    auto flags = Common::RuntimeFlags::Current();
+    flags.compute_resolve_ahead = true;
+    Common::RuntimeFlags::g_published.store(Common::RuntimeFlags::Bits(flags));
+    context.GetGpu().SendCommandSync([&] {
+      context.MapMemory(base, size);
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(code.data()),
+                          .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1,
+                          .wave_size = 64, .user_sgpr = 2});
+      shaders.SetCsUserSgpr(0, static_cast<u32>(base), HW::UserSgprType::Unknown);
+      shaders.SetCsUserSgpr(1, static_cast<u32>(base >> 32u), HW::UserSgprType::Unknown);
+      auto& scheduler = context.GetCommandScheduler();
+      scheduler.Begin(registers, user_config, shaders);
+      auto& executor = context.GetRenderExecutor();
+      ShaderBufferResource descriptor{};
+      descriptor.UpdateAddress48(base + 0x4000);
+      descriptor.fields[2] = 4;
+      descriptor.fields[3] = DstSel(4, 5, 6, 7) |
+          (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+      LibKernel::Memory::WriteBacking(base, descriptor.fields, sizeof(descriptor.fields));
+
+      // Cold programs fall back to execution; never publish an incomplete resolution.
+      auto* cold = executor.ResolveDispatchAhead(registers, shaders, 1, 1, 1, 0x41, false, false);
+      Require(name, "cold fallback", cold == nullptr, "cold program was published");
+      ShaderComputeInputInfo inline_info{};
+      const auto warmed = context.GetPipelineCache().GetComputeProgram(
+          shaders.GetCs(), registers.GetShaderRegisters(), inline_info);
+      Require(name, "warm program", static_cast<bool>(warmed), "program did not compile");
+      ProgramResolution snapshot;
+      ShaderComputeInputInfo ahead_info{};
+      const auto ahead = context.GetPipelineCache().GetComputeProgram(
+          shaders.GetCs(), registers.GetShaderRegisters(), ahead_info, &snapshot);
+      Require(name, "snapshot", ahead.id == warmed.id && snapshot.stages == 1 &&
+          ahead_info.stage.resources == &snapshot.resources[0] && snapshot.reads.StillValid(),
+          "ahead program/snapshot did not match inline resolution");
+      auto* resolved = executor.ResolveDispatchAhead(registers, shaders, 1, 1, 1, 0x41, false, false);
+      Require(name, "warm resolution", resolved != nullptr, "warm resolution refused");
+      const auto hits = FrameBreakdown::g_counters.dc_ahead_hits.load();
+      executor.DispatchDirect(0, scheduler.Current(), 1, 1, 1, 0x41, false, resolved);
+      Require(name, "accepted resolution", FrameBreakdown::g_counters.dc_ahead_hits.load() == hits + 1,
+          "execution did not use the valid resolution");
+      RenderExecutor::ReleaseResolvedDispatch(resolved);
+      context.GetBufferCache().ReadMemory(base + 0x4000, 4);
+      Require(name, "resolved output", *reinterpret_cast<u32*>(base + 0x4000) == 73,
+          "resolved dispatch wrote the wrong value");
+
+      resolved = executor.ResolveDispatchAhead(registers, shaders, 1, 1, 1, 0x41, false, false);
+      Require(name, "second resolution", resolved != nullptr, "second resolution refused");
+      descriptor.UpdateAddress48(base + 0x8000);
+      LibKernel::Memory::WriteBacking(base, descriptor.fields, sizeof(descriptor.fields));
+      Require(name, "changed descriptor", !snapshot.reads.StillValid(),
+          "changed descriptor was accepted by the read log");
+      const auto invalid = FrameBreakdown::g_counters.dc_ahead_invalid.load();
+      executor.DispatchDirect(0, scheduler.Current(), 1, 1, 1, 0x41, false, resolved);
+      Require(name, "rejected resolution", FrameBreakdown::g_counters.dc_ahead_invalid.load() == invalid + 1,
+          "execution did not reject the stale resolution");
+      RenderExecutor::ReleaseResolvedDispatch(resolved);
+      context.GetBufferCache().ReadMemory(base + 0x8000, 4);
+      Require(name, "invalid resolution fallback", *reinterpret_cast<u32*>(base + 0x8000) == 73,
+          "dispatch used the stale output address");
+
+      auto* indirect = executor.ResolveDispatchAhead(registers, shaders, 0, 0, 0, 0x41, false, true);
+      Require(name, "indirect program", indirect != nullptr, "indirect program refused");
+      RenderExecutor::ReleaseResolvedDispatch(indirect);
+      Require(name, "late thread dimensions",
+          executor.ResolveDispatchAhead(registers, shaders, 0, 0, 0, 0x61, false, true) == nullptr,
+          "indirect thread dimensions resolved before argument execution");
+      Require(name, "empty dispatch",
+          executor.ResolveDispatchAhead(registers, shaders, 0, 1, 1, 0x41, false, false) == nullptr,
+          "empty dispatch was resolved");
+      context.UnmapMemory(base, size);
+    });
+    Common::RuntimeFlags::g_published.store(saved_flags);
+    Require(name, "unmap", LibKernel::Memory::KernelMunmap(base, size) == 0, "unmap failed");
+    Require(name, "free", LibKernel::Memory::KernelReleaseDirectMemory(physical, size) == 0, "free failed");
+    std::printf("[compute] ComputeResolveAhead ok\n");
   }
 
   void CheckComputeMetaClearClassification() {
@@ -45127,6 +45234,18 @@ int main(int argc, char **argv) {
     CheckPm4IndirectShaderRegisters(vulkan.RuntimeRenderer());
     CheckPm4DepthControlHighBits(vulkan.RuntimeRenderer());
     CheckPm4DepthRenderOverride(vulkan.RuntimeRenderer());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--compute-resolve-ahead-only") == 0) {
+#if defined(_WIN32)
+    _putenv_s("KYTY_COMPUTE_RESOLVE_AHEAD", "1");
+    _putenv_s("KYTY_PERF_STATS", "1");
+#else
+    setenv("KYTY_COMPUTE_RESOLVE_AHEAD", "1", 1);
+    setenv("KYTY_PERF_STATS", "1", 1);
+#endif
+    VulkanHarness vulkan;
+    vulkan.CheckComputeResolveAhead();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--inline-label-only") == 0) {

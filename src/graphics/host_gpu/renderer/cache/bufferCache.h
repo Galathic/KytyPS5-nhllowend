@@ -14,6 +14,9 @@
 #include <array>
 #include <chrono>
 #include <map>
+#include <atomic>
+#include <mutex>
+#include <shared_mutex>
 #include <span>
 #include <unordered_map>
 #include <utility>
@@ -102,6 +105,19 @@ public:
 	// KYTY_DBG_CP_READS: the shader whose resources the calling thread materializes, named by
 	// NHL27RBWAIT for the downloads of GPU-written bytes it waits for.
 	static void               NoteReadbackShader(uint64_t hash) noexcept;
+	// NHL27WRITEBACK: the emulator path behind a GPU-thread CPU-write readback, which has no guest
+	// instruction. Logged in place of the rip (rip=0 is a GPU-thread write nobody tagged).
+	enum class WriteTag : uint64_t { None = 0, EopLabel, WriteData, TextureKeys, Unmap, Fill, Count };
+	class WriteTagScope {
+	public:
+		explicit WriteTagScope(WriteTag tag) noexcept;
+		~WriteTagScope();
+		WriteTagScope(const WriteTagScope&)            = delete;
+		WriteTagScope& operator=(const WriteTagScope&) = delete;
+
+	private:
+		WriteTag m_saved;
+	};
 	[[nodiscard]] static uint64_t PerfFlipCount();
 	// KYTY_PERF_STATS: device memory use the texture/buffer collectors last saw.
 	static void PerfSetMemoryUsage(uint64_t used, uint64_t texture_trigger, uint64_t buffer_trigger);
@@ -215,6 +231,18 @@ public:
 		m_submit_requested   = false;
 		return requested;
 	}
+	// Any thread: HasGpuDirtyBytes under a shared lock (the GPU thread changes the ranges under an
+	// exclusive one). Used by experiment FalseShareAnyThread.
+	[[nodiscard]] bool HasGpuDirtyBytesShared(uint64_t vaddr, uint64_t size) const;
+	// Any thread: how many bytes of the range are GPU-dirty (diagnostics, KYTY_PERF_GPU_FAULT_STACKS).
+	[[nodiscard]] uint64_t GpuDirtyByteCount(uint64_t vaddr, uint64_t size) const;
+	// Experiment SpeculateDirtyReads (GPU thread): a small read of GPU-dirty bytes whose recent
+	// downloads all found the bytes the backing already held is served from the backing without
+	// waiting. A copy of the GPU's bytes is compared once the GPU gets there; a mismatch ends the
+	// guess for that address until its downloads are steady again.
+	[[nodiscard]] bool TrySpeculativeRead(uint64_t vaddr, void* data, uint64_t size);
+	// After a real download for such a read: whether the GPU changed the bytes, and the wait.
+	void NoteDirtyRead(uint64_t vaddr, uint64_t size, bool changed, const void* value, uint64_t wait_ns);
 	// Changes whenever new GPU-dirty bytes are recorded (GPU thread).
 	[[nodiscard]] uint64_t GpuDirtyGeneration() const noexcept { return m_gpu_dirty_generation; }
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
@@ -339,6 +367,8 @@ private:
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
+	// Guards m_gpu_modified_ranges against readers on other threads (HasGpuDirtyBytesShared).
+	mutable std::shared_mutex                         m_gpu_ranges_mutex;
 	uint64_t                                          m_gpu_dirty_generation = 0;
 	RangeSet                                          m_released_ranges;
 	bool                                              m_record_released = false;
@@ -360,6 +390,8 @@ private:
 		uint64_t end;
 		uint32_t value;
 	};
+	// The GPU thread records fills while guest write faults drop them, so the list is locked;
+	// m_gpu_fill_count lets the common no-fill case skip the lock.
 	std::vector<GpuFill>                              m_gpu_fills;
 	// Experiment AsyncGuestReads: downloads queued for a guest thread's read fault. Until the
 	// guest thread finishes one, its pages stay protected but m_gpu_modified_ranges no longer
@@ -373,9 +405,12 @@ private:
 		std::vector<std::pair<uint64_t, uint64_t>> bytes;
 	};
 	std::vector<PendingGuestRead>                     m_pending_guest_reads;
+	std::atomic<size_t>                               m_pending_guest_read_count {0};
 	// One bit per (64 KiB chunk % 256) that a recorded fill touches (a superset). DropGpuFills runs
 	// for every written buffer binding and nearly always misses; the filter skips the fill scan.
 	std::array<uint64_t, 4>                           m_gpu_fill_filter {};
+	mutable std::mutex                                m_gpu_fills_mutex;
+	std::atomic<size_t>                               m_gpu_fill_count {0};
 	struct WriterRecord {
 		uint64_t    begin;
 		uint64_t    end;

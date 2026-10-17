@@ -1044,11 +1044,94 @@ static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t
 }
 
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
+	NoteHostWrite(vaddr, size, HostWriteSource::Backing, data);
 	return g_guest_address_space != nullptr &&
 	       g_guest_address_space->TryWriteBacking(vaddr, data, size);
 }
 
+namespace {
+
+struct HostWriteEntry {
+	uint64_t        vaddr;
+	uint64_t        size;
+	uint64_t        first;
+	uint64_t        time_ms;
+	int             thread;
+	HostWriteSource source;
+	bool            all_ones; // some aligned qword of the data is 0xffffffffffffffff
+};
+
+// Two rings, so frequent label and command-processor dwords cannot push bulk writebacks out.
+constexpr uint64_t    HostWriteRingSize = uint64_t {1} << 18;
+HostWriteEntry        g_host_writes[2][HostWriteRingSize];
+std::atomic<uint64_t> g_host_write_next[2] {};
+
+uint64_t HostWriteNowMs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
+} // namespace
+
+void NoteHostWrite(uint64_t vaddr, uint64_t size, HostWriteSource source, const void* data) {
+	if (size == 0) return;
+	HostWriteEntry entry {};
+	entry.vaddr   = vaddr;
+	entry.size    = size;
+	entry.source  = source;
+	entry.thread  = Common::Thread::GetThreadIdUnique();
+	entry.time_ms = HostWriteNowMs();
+	if (data != nullptr) {
+		std::memcpy(&entry.first, data, std::min<uint64_t>(size, sizeof(entry.first)));
+		const auto* bytes = static_cast<const uint8_t*>(data);
+		const auto  scan  = std::min<uint64_t>(size, 4096) & ~uint64_t {7};
+		for (uint64_t i = 0; i < scan; i += 8) {
+			uint64_t q = 0;
+			std::memcpy(&q, bytes + i, sizeof(q));
+			if (q == ~uint64_t {0}) {
+				entry.all_ones = true;
+				break;
+			}
+		}
+	}
+	const int ring = size > 16 ? 1 : 0;
+	g_host_writes[ring][g_host_write_next[ring].fetch_add(1, std::memory_order_relaxed) &
+	                    (HostWriteRingSize - 1)] = entry;
+}
+
+void ReportHostWrites(const char* label, uint64_t vaddr, uint64_t window) {
+	static constexpr const char* Names[] = {"backing", "cp", "label", "dma"};
+	const uint64_t lo      = vaddr > window ? vaddr - window : 0;
+	const uint64_t hi      = vaddr + window;
+	const uint64_t now     = HostWriteNowMs();
+	uint64_t       count   = 0;
+	int            printed = 0;
+	// Bulk writebacks first, then label/command-processor dwords.
+	for (int ring = 1; ring >= 0; ring--) {
+		const uint64_t next   = g_host_write_next[ring].load(std::memory_order_relaxed);
+		const uint64_t logged = std::min(next, HostWriteRingSize);
+		count += logged;
+		for (uint64_t i = 0, shown = 0; i < logged && shown < 6; i++) {
+			const auto& e = g_host_writes[ring][(next - 1 - i) & (HostWriteRingSize - 1)];
+			if (e.size == 0 || e.vaddr >= hi || e.vaddr + e.size <= lo) continue;
+			std::printf("  %s 0x%016" PRIx64 ": host write %s vaddr=0x%016" PRIx64 " size=0x%" PRIx64
+			            " first=0x%016" PRIx64 " all_ones=%d age=%" PRIu64 "ms thread=%d\n",
+			            label, vaddr, Names[static_cast<int>(e.source)], e.vaddr, e.size, e.first,
+			            e.all_ones ? 1 : 0, now - e.time_ms, e.thread);
+			shown++;
+			printed++;
+		}
+	}
+	if (printed == 0) {
+		std::printf("  %s 0x%016" PRIx64 ": no host write within +-0x%" PRIx64
+		            " among the last %" PRIu64 " logged\n",
+		            label, vaddr, window, count);
+	}
+}
+
 bool TryMergeBacking(uint64_t vaddr, const void* data, const void* expected, uint64_t size) {
+	NoteHostWrite(vaddr, size, HostWriteSource::Backing, data);
 	return g_guest_address_space != nullptr &&
 	       g_guest_address_space->TryMergeBacking(vaddr, data, expected, size);
 }
@@ -1102,7 +1185,14 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 		auto& buffers = GetGpuResources().GetBufferCache();
 		if (buffers.HasGpuDirtyBytes(vaddr, size)) {
 			buffers.NoteDirtyRead(vaddr, size);
-			if (!BackingReadStatsEnabled()) {
+			// Experiment SpeculateDirtyReads: bytes the GPU keeps rewriting with the values the
+			// backing already holds are read from the backing without waiting; the GPU's bytes are
+			// checked when it gets there.
+			const bool speculate = Common::Experiments::Enabled(Common::Experiments::SpeculateDirtyReads);
+			if (speculate && buffers.TrySpeculativeRead(vaddr, data, size)) {
+				return true;
+			}
+			if (!BackingReadStatsEnabled() && !speculate) {
 				buffers.ReadMemory(vaddr, size);
 			} else {
 				auto&                 stats = g_backing_read_stats;
@@ -1118,7 +1208,13 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 					std::array<uint8_t, 256> after {};
 					if (TryReadBacking(vaddr, after.data(), size)) {
 						stats.compared++;
-						stats.unchanged += std::memcmp(before.data(), after.data(), size) == 0 ? 1 : 0;
+						const bool unchanged = std::memcmp(before.data(), after.data(), size) == 0;
+						stats.unchanged += unchanged ? 1 : 0;
+						if (speculate) {
+							buffers.NoteDirtyRead(vaddr, size, !unchanged, after.data(),
+							                      static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+							                          now - start).count()));
+						}
 					}
 				}
 				if (now - stats.last_print >= std::chrono::seconds(5)) {
@@ -1135,9 +1231,98 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
+bool TryReadCleanBackingAnyThread(uint64_t vaddr, void* data, uint64_t size) {
+	if (g_gpu_resources == nullptr || data == nullptr || size == 0 || Graphics::GuestGpu::IsGpuThread()) {
+		return false;
+	}
+	auto&          buffers = GetGpuResources().GetBufferCache();
+	const uint64_t page    = vaddr & ~uint64_t {0xfff};
+	// Only a page protected for other bytes the GPU wrote; the read itself must be clean. Those bytes
+	// are current in the backing, whereas the fault would download the page and wait for all
+	// queued GPU work.
+	if (!buffers.HasGpuDirtyBytesShared(page, 0x1000) || buffers.HasGpuDirtyBytesShared(vaddr, size)) {
+		return false;
+	}
+	// Each served read costs a fault and leaves the page protected. A page read over and over is
+	// cheaper to download once, so cap the reads per page per thread in each 10 ms window.
+	struct PageReads {
+		uint64_t page   = 0;
+		int64_t  window = 0;
+		uint32_t count  = 0;
+	};
+	thread_local std::array<PageReads, 64> recent {};
+	const auto window = std::chrono::duration_cast<std::chrono::milliseconds>(
+	                        std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+	auto& slot = recent[(page >> 12u) & (recent.size() - 1u)];
+	if (slot.page != page || slot.window != window) {
+		slot = {page, window, 0};
+	}
+	if (++slot.count > 256u) {
+		return false;
+	}
+	return TryReadBacking(vaddr, data, size);
+}
+
+bool TryReadCleanBackingShared(uint64_t vaddr, void* data, uint64_t size) {
+	if (g_gpu_resources == nullptr || data == nullptr || size == 0 || Graphics::GuestGpu::IsGpuThread() ||
+	    !Graphics::GuestRange {vaddr, size}.Valid() ||
+	    GetGpuResources().GetBufferCache().HasGpuDirtyBytesShared(vaddr, size)) {
+		return false;
+	}
+	return TryReadBacking(vaddr, data, size);
+}
+
+// KYTY_PERF_GPU_FAULT_STACKS: how this thread's last TryReadCleanBacking call ended (CleanReadResult).
+static thread_local int t_clean_read_result = 0;
+
+int TakeCleanReadResult() {
+	const int result    = t_clean_read_result;
+	t_clean_read_result = 0;
+	return result;
+}
+
+uint64_t GpuDirtyByteCount(uint64_t vaddr, uint64_t size) {
+	if (g_gpu_resources == nullptr || size == 0) {
+		return 0;
+	}
+	return GetGpuResources().GetBufferCache().GpuDirtyByteCount(vaddr, size);
+}
+
+static thread_local uint64_t t_read_context = 0;
+
+void SetReadContext(uint64_t context) {
+	t_read_context = context;
+}
+
+uint64_t ReadContext() {
+	return t_read_context;
+}
+
+int CaptureHostStack(uint64_t* frames, int max_frames) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (frames == nullptr || max_frames <= 0) {
+		return 0;
+	}
+	void* raw[32] {};
+	const auto count = RtlCaptureStackBackTrace(1, static_cast<DWORD>(std::min(max_frames, 32)), raw, nullptr);
+	for (USHORT i = 0; i < count; ++i) {
+		frames[i] = reinterpret_cast<uint64_t>(raw[i]);
+	}
+	return static_cast<int>(count);
+#else
+	(void)frames;
+	(void)max_frames;
+	return 0;
+#endif
+}
+
 bool TryReadCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
-	if (g_gpu_resources == nullptr || !Graphics::GuestGpu::IsGpuThread() ||
-	    GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size)) {
+	if (g_gpu_resources == nullptr || !Graphics::GuestGpu::IsGpuThread()) {
+		t_clean_read_result = CleanReadUnavailable;
+		return false;
+	}
+	if (GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size)) {
+		t_clean_read_result = CleanReadDirty;
 		return false;
 	}
 	// Each served read costs a fault. A page read over and over (a command stream, a table walk)
@@ -1156,9 +1341,12 @@ bool TryReadCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 		slot = {page, epoch, 0};
 	}
 	if (++slot.count > 64u) {
+		t_clean_read_result = CleanReadCapped;
 		return false;
 	}
-	return TryReadBacking(vaddr, data, size);
+	const bool read     = TryReadBacking(vaddr, data, size);
+	t_clean_read_result = read ? CleanReadServed : CleanReadFailed;
+	return read;
 }
 
 namespace {

@@ -274,11 +274,12 @@ public:
 	explicit RenderExecutor(RenderContext& context): m_context(context) {}
 	KYTY_CLASS_NO_COPY(RenderExecutor);
 
+	struct ResolvedDispatch;
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
-	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode, bool async_compute);
+	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode, bool async_compute,
+	                    ResolvedDispatch* resolved = nullptr);
 	void DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
-	                      uint32_t mode, bool async_compute);
-
+	                      uint32_t mode, bool async_compute, ResolvedDispatch* resolved = nullptr);
 	// Shader programs and resources of a draw resolved ahead of its execution.
 	struct ResolvedDraw;
 	// Resolve thread: resolves the shader programs of a draw with the given registers ahead of
@@ -293,9 +294,7 @@ public:
 	void UseResolvedDraw(ResolvedDraw* resolved) noexcept { m_resolved_draw = resolved; }
 	// Execution thread: the operation that carried `resolved` executed.
 	static void ReleaseResolvedDraw(ResolvedDraw* resolved) noexcept;
-	// The same for direct dispatches (experiment DispatchAhead): the compute program and its
-	// resources, resolved by the resolve thread with the dispatch's registers and group counts.
-	struct ResolvedDispatch;
+	// Direct and ordinary indirect dispatches resolved ahead of execution.
 	[[nodiscard]] ResolvedDispatch* ResolveDispatchAhead(const HW::Context& context, const HW::Shader& shaders,
 	                                                     uint32_t thread_group_x, uint32_t thread_group_y,
 	                                                     uint32_t thread_group_z, uint32_t mode, bool async_compute,
@@ -303,7 +302,6 @@ public:
 	// Indirect dispatches: their program does not depend on the group counts.
 	[[nodiscard]] ResolvedDispatch* ResolveDispatchIndirectAhead(const HW::Context& context, const HW::Shader& shaders,
 	                                                             bool async_compute);
-	void UseResolvedDispatch(ResolvedDispatch* resolved) noexcept { m_resolved_dispatch = resolved; }
 	static void ReleaseResolvedDispatch(ResolvedDispatch* resolved) noexcept;
 	// Execution thread: the context register snapshot of the operation about to execute (0 for
 	// live registers); operations with the same id see the same context registers.
@@ -540,7 +538,6 @@ private:
 	ResolvedDraw*                                                  m_resolved_draw = nullptr;
 	std::unique_ptr<ResolvedDispatchRing, void (*)(ResolvedDispatchRing*)> m_resolved_dispatch_ring {nullptr,
 	                                                                                                nullptr};
-	ResolvedDispatch* m_resolved_dispatch = nullptr;
 	uint64_t                                                       m_context_id    = 0;
 	// The context snapshot whose registers hw_check() last accepted.
 	uint64_t m_checked_context_id = 0;

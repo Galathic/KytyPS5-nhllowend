@@ -1864,6 +1864,12 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 	int32_t attribute = 0;
 	const bool hdr_allowed = !Loader::SystemContentParamSfoGetInt("ATTRIBUTE", &attribute) ||
 	                         (attribute & 0x20000000) != 0;
+	// KYTY_VIDEO_OUT_1080P=1: report a 1080p display (with a window smaller than 4K) even when
+	// param.json does not enable resolution detection, so the game sizes its output for 1080p.
+	static const bool force_1080p = [] {
+		const char* value = std::getenv("KYTY_VIDEO_OUT_1080P");
+		return value != nullptr && value[0] == '1';
+	}();
 	ctx->mutex.Lock();
 	// Primary output reports 4K unless param.json Video-out Info enables resolution detection.
 	// KYTY_OUTPUT_1080P=1 reports a 1080p output to the game whatever it declares (NHL 27 then
@@ -1873,7 +1879,14 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 		return value != nullptr && value[0] == '1';
 	}();
 	status->resolution =
-	    (output_1080p || ((attribute3 & 4) != 0 && ctx->width < 3840 && ctx->height < 2160) ? 1u : 2u);
+	    (output_1080p || ((force_1080p || (attribute3 & 4) != 0) && ctx->width < 3840 && ctx->height < 2160) ? 1u : 2u);
+	static std::atomic<int> reported {0};
+	if (reported.fetch_add(1, std::memory_order_relaxed) < 4) {
+		std::printf("NHL27VIDEO: output status resolution=%u attribute3=0x%x force_1080p=%d window=%ux%u\n",
+		            status->resolution, static_cast<unsigned>(attribute3), force_1080p ? 1 : 0, ctx->width,
+		            ctx->height);
+		std::fflush(stdout);
+	}
 	status->dynamicRange = hdr_allowed && DriverState().IsHdrSupported() ? 2u : 1u;
 	status->refreshRate =
 	    (ctx->output_mode == VIDEO_OUT_OUTPUT_MODE_119_88HZ || Config::GetVblankFrequency() >= 119

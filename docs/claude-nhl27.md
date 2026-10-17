@@ -1,5 +1,9 @@
 # NHL 27 performance switches (claude/nhl27-perf)
 
+The 2026-10-17 merge reconciles experiment-bit collisions and compute resolve-ahead
+controls; see [PR 8 merge resolution](pr8-merge-resolution.md) before using old decimal
+experiment masks from the base branch.
+
 There are two kinds of switches, and a key name belongs to exactly one of them.
 
 * **Runtime flags** (`src/common/runtimeFlags.h`): read from the environment at startup and from

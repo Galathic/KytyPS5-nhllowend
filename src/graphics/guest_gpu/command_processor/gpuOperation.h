@@ -100,6 +100,9 @@ struct GpuOperation {
 	bool after_wait = false;
 	// The write epoch when the command processor emitted the operation (see RegionManager).
 	uint32_t write_epoch = 0;
+	// KYTY_IDLE_TRACE: the PM4 packet that produced the operation (opcode | IT_NOP R code << 8,
+	// 0x4000 = the KYTY_BDA_BATCH boundary after the packet, 0 = outside a packet).
+	uint16_t trace_op = 0;
 	union {
 		DrawIndexArgs       draw_index;
 		DrawAutoArgs        draw_auto;

@@ -388,6 +388,7 @@ struct RenderExecutor::ResolvedDispatch {
 	ProgramResolution      programs;
 	ShaderComputeInputInfo input_info;
 	ShaderProgram          program;
+	uint64_t               flags = 0;
 	std::atomic_bool       busy {false};
 };
 
@@ -441,10 +442,14 @@ RenderExecutor::ResolvedDispatch* RenderExecutor::ResolveDispatchAhead(const HW:
                                                                        uint32_t thread_group_y,
                                                                        uint32_t thread_group_z, uint32_t mode,
                                                                        bool async_compute, bool indirect) {
-	if (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0 ||
-	    shaders.GetCs().cs_regs.data_addr == 0) {
+	if ((!indirect && (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0)) ||
+	    shaders.GetCs().cs_regs.data_addr == 0 ||
+	    (indirect && (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0)) {
 		return nullptr;
 	}
+	Common::RuntimeFlags::EvaluationScope flags_scope;
+	FrameBreakdown::Add(FrameBreakdown::g_counters.dc_ahead_attempts);
+	FrameBreakdown::Timer ahead_timer(FrameBreakdown::g_counters.dc_ahead_ns);
 	if (m_resolved_dispatch_ring == nullptr) {
 		m_resolved_dispatch_ring = {new ResolvedDispatchRing {}, [](ResolvedDispatchRing* ring) { delete ring; }};
 	}
@@ -466,6 +471,7 @@ RenderExecutor::ResolvedDispatch* RenderExecutor::ResolveDispatchAhead(const HW:
 		PrepareComputeInputInfo(shaders, thread_group_x, thread_group_y, thread_group_z, mode, async_compute,
 		                        dispatch.input_info);
 	}
+	dispatch.flags = Common::RuntimeFlags::g_evaluation_bits;
 	dispatch.program = m_context.GetPipelineCache().GetComputeProgramAhead(
 	    shaders.GetCs(), context.GetShaderRegisters(), dispatch.input_info, dispatch.programs);
 	if (!dispatch.program || dispatch.programs.reads.Failed()) {
@@ -473,14 +479,30 @@ RenderExecutor::ResolvedDispatch* RenderExecutor::ResolveDispatchAhead(const HW:
 		g_dispatch_ahead_misses[dispatch.programs.reads.Failed() ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
 		return nullptr;
 	}
+	FrameBreakdown::Add(FrameBreakdown::g_counters.dc_ahead_ready);
 	// Published to the execution thread with the operation that carries it.
 	dispatch.busy.store(true, std::memory_order_relaxed);
 	return &dispatch;
 }
 
+static bool ValidateResolvedDispatch(RenderExecutor::ResolvedDispatch* resolved) {
+	if (resolved == nullptr) {
+		return false;
+	}
+	FrameBreakdown::Timer timer(FrameBreakdown::g_counters.dc_ahead_validate_ns);
+	const auto& flags = Common::RuntimeFlags::Current();
+	const bool enabled = flags.compute_resolve_ahead ||
+	                     Common::Experiments::Enabled(Common::Experiments::DispatchAhead);
+	const bool valid = enabled && Common::RuntimeFlags::Bits(flags) == resolved->flags &&
+	                   resolved->programs.reads.StillValid(true);
+	FrameBreakdown::Add(valid ? FrameBreakdown::g_counters.dc_ahead_hits : FrameBreakdown::g_counters.dc_ahead_invalid);
+	return valid;
+}
+
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
-                                    uint32_t thread_group_z, uint32_t mode, bool async_compute) {
+                                    uint32_t thread_group_z, uint32_t mode, bool async_compute,
+                                    ResolvedDispatch* resolved) {
 	BufferCache::PerfTimerScope phase_timer(BufferCache::PerfTimer::Dispatch);
 	EXIT_IF(buffer.IsInvalid());
 	m_context.GetCommandScheduler().PopPendingOperations();
@@ -542,9 +564,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	BufferCache::PerfTimerScope program_timer(BufferCache::PerfTimer::DispatchProgram);
 	// Experiment DispatchAhead: the resolve thread may have resolved the program already; it
 	// holds when the guest memory it read still has the same bytes.
-	auto* resolved = std::exchange(m_resolved_dispatch, nullptr);
 	const auto compute_program = [&] {
-		const bool ahead = resolved != nullptr && resolved->programs.reads.StillValid(true);
+		const bool ahead = ValidateResolvedDispatch(resolved);
 		// KYTY_DBG_CP_READS=1: how many dispatches use the resolve thread's read-ahead (2 s).
 		if (Libs::Graphics::CpReadDebugEnabled() && Common::Experiments::Enabled(Common::Experiments::DispatchAhead)) {
 			static uint64_t counts[3] {};
@@ -927,7 +948,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 }
 
 void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
-                                      uint64_t args_addr, uint32_t mode, bool async_compute) {
+                                      uint64_t args_addr, uint32_t mode, bool async_compute,
+                                      ResolvedDispatch* resolved) {
 	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0 ||
 	        (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0);
 	BufferCache::PerfTimerScope phase_timer(BufferCache::PerfTimer::Dispatch);
@@ -946,15 +968,13 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	input_info.async_compute = async_compute;
 	// As for direct dispatches: the resolve thread may have resolved the program already (it
 	// holds while the guest memory it read has the same bytes).
-	auto* resolved = std::exchange(m_resolved_dispatch, nullptr);
 	const auto compute_program = [&] {
-		if (resolved != nullptr && resolved->programs.reads.StillValid(true)) {
+		if (ValidateResolvedDispatch(resolved)) {
 			input_info = resolved->input_info;
 			return resolved->program;
 		}
 		FrameBreakdown::Timer materialize_timer(FrameBreakdown::g_counters.dc_materialize_ns);
-		return m_context.GetPipelineCache().GetComputeProgram(
-		    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
+		return m_context.GetPipelineCache().GetComputeProgram(cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
 	}();
 	program_timer.Stop();
 	if (!compute_program) {

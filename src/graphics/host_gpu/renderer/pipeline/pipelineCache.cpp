@@ -810,6 +810,8 @@ struct PipelineCache::ProgramCache {
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
 		lookup_key.stage           = stage;
 		lookup_key.hash            = params.hash;
+		// Diagnostics (KYTY_SPECULATE_DIRTY_READS stats): which shader the following guest reads serve.
+		Libs::LibKernel::Memory::SetReadContext(params.hash);
 		lookup_key.user_data_count = params.user_data_count;
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
@@ -1237,7 +1239,7 @@ struct PipelineCache::ProgramCache {
 	// one match; compiled shaders and pipelines are kept.
 	void ApplyExperiments() {
 		constexpr uint32_t Bits = Common::Experiments::SrtBatchReads;
-		const uint32_t mask = Common::Experiments::Mask() & Bits;
+		const uint32_t mask = static_cast<uint32_t>(Common::Experiments::Mask() & Bits);
 		if (mask == applied_experiments) return;
 		applied_experiments = mask;
 		batch_reads = env_batch_reads || (mask & Common::Experiments::SrtBatchReads) != 0;
@@ -1621,6 +1623,8 @@ struct PipelineCache::ProgramCache {
 PipelineCache::PipelineCache(GraphicContext& graphics)
     : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	// LoadStore takes the program lock, so it must be set before the store is read.
+	m_program_cache->program_lock = &m_program_lock;
 	InitializeDriverCache();
 	InitializeShaderRecord();
 	const char* pregen = std::getenv("KYTY_SHADER_PREGEN");
@@ -2118,15 +2122,24 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                const HW::ShaderRegisters&   sh,
-                                               ShaderComputeInputInfo&      input_info) {
+                                               ShaderComputeInputInfo&      input_info,
+                                               ProgramResolution*          ahead) {
 	FrameBreakdown::Timer prep_timer(FrameBreakdown::g_counters.prep_compute_program_ns,
 	                                 FrameBreakdown::DetailEnabled());
+	const ShaderGuestReaderScope reader(ahead != nullptr ? ReadAheadShaderState : nullptr,
+	                                    ahead != nullptr ? &ahead->reads : nullptr);
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	const auto        params      = PrepareProgram(regs, sh, input_info);
+	if (ahead != nullptr && ahead->reads.Failed()) {
+		return {};
+	}
 	input_info.lds_storage = input_info.lds_size_dwords * 4u >
 	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
 	uint32_t          push_data_cursor = 0;
 	const ProgramLockGuard lock(m_program_lock);
+	if (ahead != nullptr) {
+		return m_program_cache->GetAhead(params, input_info, push_data_cursor, *ahead);
+	}
 	return m_program_cache->Get(params, input_info, push_data_cursor);
 }
 

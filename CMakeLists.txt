@@ -478,6 +478,15 @@ add_executable(memory_tracker_tests EXCLUDE_FROM_ALL
 target_link_libraries(memory_tracker_tests fmt::fmt common)
 target_include_directories(memory_tracker_tests PRIVATE ${inc_headers})
 
+add_executable(experiments_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ExperimentsTests.cpp"
+	"${KYTY_SOURCE_DIR}/common/experiments.cpp"
+)
+target_include_directories(experiments_tests PRIVATE "${KYTY_SOURCE_DIR}")
+if(LINUX OR APPLE)
+	target_link_libraries(experiments_tests PRIVATE Threads::Threads)
+endif()
+
 add_executable(gpu_pipeline_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/GpuPipelineTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/commandRecorder.cpp"
@@ -672,6 +681,13 @@ if(BUILD_TESTING)
 	add_test(NAME emulator_present_mode_invalid
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --present-mode Invalid)
 	set_tests_properties(emulator_present_mode_invalid PROPERTIES WILL_FAIL TRUE)
+	add_test(NAME experiments COMMAND $<TARGET_FILE:experiments_tests>)
+	add_test(NAME compute_resolve_ahead
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --compute-resolve-ahead-only)
+	# The perf branch initializes diagnostic gates before main(), so the counter-based
+	# assertions need the environment set by the launcher rather than by the test body.
+	set_tests_properties(compute_resolve_ahead PROPERTIES
+		ENVIRONMENT "KYTY_PERF_STATS=1;KYTY_SHADER_PREGEN=0;KYTY_DBG_LOOP_CAP=1024")
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
 	add_test(NAME shader_front_face COMMAND $<TARGET_FILE:shader_cfg_tests> --front-face-only)
@@ -751,6 +767,7 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-range-only)
 
 	add_custom_target(kyty_tests DEPENDS
+		experiments_tests
 		ime_dialog_tests
 		shader_cfg_tests
 		scalar_provenance_tests

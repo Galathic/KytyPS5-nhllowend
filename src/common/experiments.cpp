@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <string>
 #include <thread>
+#include <cinttypes>
 
 namespace Common::Experiments {
 
@@ -31,8 +32,8 @@ bool EnvSwitch(const char* name, bool on_by_default) {
 	return on_by_default;
 }
 
-uint32_t EnvironmentMask() {
-	uint32_t mask = 0;
+uint64_t EnvironmentMask() {
+	uint64_t mask = 0;
 	const auto set = [&mask](const char* name, Bit bit, bool on_by_default) {
 		if (EnvSwitch(name, on_by_default)) mask |= bit;
 	};
@@ -69,6 +70,12 @@ uint32_t EnvironmentMask() {
 	set("KYTY_COMPUTE_UNLOCKED", ComputeUnlocked, true);
 	set("KYTY_AHEAD_UNLOCKED", AheadUnlocked, true);
 	set("KYTY_BACKING_LOOKUP_CACHE", BackingLookupCache, true);
+	set("KYTY_PROTECT_SHARED_LOCK", ProtectSharedLock, false);
+	set("KYTY_CLOCK_WAIT_PREDICT", ClockWaitPredict, false);
+	set("KYTY_FALSE_SHARE_ANY_THREAD", FalseShareAnyThread, false);
+	set("KYTY_SPECULATE_DIRTY_READS", SpeculateDirtyReads, false);
+	set("KYTY_CP_CLEAN_REG_READS", CpCleanRegReads, false);
+	set("KYTY_CP_SKIP_IDLE_SPIN", CpSkipIdleSpin, false);
 	return mask;
 }
 
@@ -76,27 +83,27 @@ struct State {
 	std::atomic<uint64_t>& mask = Detail::g_mask;
 
 	State() {
-		const uint32_t defaults = EnvironmentMask();
+		const uint64_t defaults = EnvironmentMask();
 		mask.store(defaults, std::memory_order_relaxed);
 		const char* path_env = std::getenv("KYTY_EXPERIMENT_FILE");
 		if (path_env == nullptr || path_env[0] == '\0') {
 			return;
 		}
 		std::thread([this, path = std::string(path_env), defaults] {
-			uint32_t last = defaults;
+			uint64_t last = defaults;
 			for (;;) {
 				std::this_thread::sleep_for(std::chrono::milliseconds(500));
-				uint32_t value = defaults;
+				uint64_t value = defaults;
 				if (std::FILE* f = std::fopen(path.c_str(), "rb"); f != nullptr) {
-					unsigned parsed = 0;
-					if (std::fscanf(f, "%u", &parsed) == 1) {
+					uint64_t parsed = 0;
+					if (std::fscanf(f, "%" SCNu64, &parsed) == 1) {
 						value = parsed;
 					}
 					std::fclose(f);
 				}
 				if (value != last) {
 					mask.store(value, std::memory_order_relaxed);
-					std::printf("Experiments: mask %u -> %u\n", last, value);
+					std::printf("Experiments: mask %" PRIu64 " -> %" PRIu64 "\n", last, value);
 					std::fflush(stdout);
 					last = value;
 				}
