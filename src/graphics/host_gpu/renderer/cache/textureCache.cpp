@@ -1533,6 +1533,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 				// The expanded keys below replace the GPU's fill, so there is nothing to download.
 				m_buffer_cache.DiscardGpuModified(address, slice_size);
 			}
+			BufferCache::WriteTagScope tag(BufferCache::WriteTag::TextureKeys);
 			m_buffer_cache.InvalidateMemory(address, slice_size);
 			LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size());
 		}

@@ -38,6 +38,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -752,6 +753,180 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 	return true;
 }
 
+// KYTY_PERF_GPU_FAULT_STACKS=1 (diagnostic): the faults the GPU (execution) thread takes on GPU-tracked
+// memory, grouped by host call stack. Every 5 s the groups that spent the most time in the fault handler
+// print as NHL27GPUFAULT lines: count, time, the operation being executed, how many bytes of the faulting
+// page and of the load are GPU-dirty, whether the FalseShareReads load emulation can decode the
+// instruction (emul) and how its clean read ended (result), the instruction bytes, and the host stack as
+// module+offset (kyty_emulator.exe is linked at a fixed base, so the map file resolves the offsets).
+namespace GpuFaultStacks {
+
+static bool Enabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PERF_GPU_FAULT_STACKS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+constexpr int MaxFrames = 14;
+
+struct Sample {
+	uint64_t frames[MaxFrames] {};
+	int      depth      = 0;
+	uint8_t  code[12] {};
+	bool     emulable   = false;
+	uint64_t load_addr  = 0;
+	uint64_t load_size  = 0;
+	uint64_t load_dirty = 0;
+	uint64_t page_dirty = 0;
+	uint64_t vaddr      = 0;
+	uint64_t exec_op    = 0;
+	bool     read       = false;
+};
+
+struct Group {
+	Sample   first;
+	uint64_t count       = 0;
+	uint64_t ns          = 0;
+	uint64_t max_ns      = 0;
+	uint64_t results[6] {};
+	uint64_t emulable    = 0;
+	uint64_t dirty_loads = 0;
+};
+
+static thread_local bool     t_probe_called = false;
+static thread_local uint64_t t_probe_addr   = 0;
+static thread_local uint64_t t_probe_size   = 0;
+
+// A LoadReader that only records the load; TryEmulateLoad changes nothing when its reader fails.
+static bool ProbeReader(uint64_t address, void* /*out*/, uint64_t size) {
+	t_probe_called = true;
+	t_probe_addr   = address;
+	t_probe_size   = size;
+	return false;
+}
+
+static void Capture(Sample& sample, const Common::HostException::ExceptionInfo& info, bool read) {
+	sample.read    = read;
+	sample.vaddr   = info.access_violation_vaddr;
+	sample.exec_op = Libs::Graphics::GuestGpu::CurrentExecOp();
+	if (IsReadableRange(info.exception_address, sizeof(sample.code))) {
+		std::memcpy(sample.code, reinterpret_cast<const void*>(info.exception_address), sizeof(sample.code));
+	}
+	t_probe_called = false;
+	(void)Loader::X64InstructionEmulator::TryEmulateLoad(info.native_context, ProbeReader);
+	sample.emulable = t_probe_called;
+	if (sample.emulable) {
+		sample.load_addr  = t_probe_addr;
+		sample.load_size  = t_probe_size;
+		sample.load_dirty = Libs::LibKernel::Memory::GpuDirtyByteCount(t_probe_addr, t_probe_size);
+	}
+	sample.page_dirty = Libs::LibKernel::Memory::GpuDirtyByteCount(sample.vaddr & ~uint64_t {0xfff}, 0x1000);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (info.native_context == nullptr) {
+		return;
+	}
+	CONTEXT ctx = *static_cast<const CONTEXT*>(info.native_context);
+	while (sample.depth < MaxFrames && ctx.Rip != 0) {
+		sample.frames[sample.depth++] = ctx.Rip;
+		DWORD64 image_base = 0;
+		auto*   entry      = RtlLookupFunctionEntry(ctx.Rip, &image_base, nullptr);
+		if (entry == nullptr) {
+			// Leaf function: the return address is at [rsp].
+			if (!IsReadableRange(ctx.Rsp, sizeof(uint64_t))) {
+				break;
+			}
+			ctx.Rip = *reinterpret_cast<const DWORD64*>(ctx.Rsp);
+			ctx.Rsp += 8;
+			continue;
+		}
+		void*   handler_data      = nullptr;
+		DWORD64 establisher_frame = 0;
+		RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, ctx.Rip, entry, &ctx, &handler_data, &establisher_frame,
+		                 nullptr);
+	}
+#endif
+}
+
+static void FormatFrame(char* out, size_t out_size, uint64_t rip) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	HMODULE module                = nullptr;
+	char    module_name[MAX_PATH] = "?";
+	if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+	                       reinterpret_cast<LPCSTR>(rip), &module) &&
+	    module != nullptr) {
+		GetModuleFileNameA(module, module_name, MAX_PATH);
+		const char* short_name = std::strrchr(module_name, '\\');
+		short_name             = short_name != nullptr ? short_name + 1 : module_name;
+		std::snprintf(out, out_size, "%s+0x%" PRIx64, short_name, rip - reinterpret_cast<uint64_t>(module));
+		return;
+	}
+#endif
+	std::snprintf(out, out_size, "0x%" PRIx64, rip);
+}
+
+static void Record(const Sample& sample, int result, uint64_t ns) {
+	static std::mutex                 mutex;
+	static std::map<uint64_t, Group>  groups;
+	static auto                       last_print = std::chrono::steady_clock::now();
+	uint64_t                          key        = sample.read ? 0xcbf29ce484222325ull : 0x84222325cbf29ce4ull;
+	for (int i = 0; i < sample.depth; ++i) {
+		key = (key ^ sample.frames[i]) * 0x100000001b3ull;
+	}
+	std::scoped_lock lock {mutex};
+	auto&            group = groups[key];
+	if (group.count == 0) {
+		group.first = sample;
+	}
+	group.count++;
+	group.ns += ns;
+	group.max_ns = std::max(group.max_ns, ns);
+	group.results[std::clamp(result, 0, 5)]++;
+	group.emulable += sample.emulable ? 1 : 0;
+	group.dirty_loads += sample.load_dirty != 0 ? 1 : 0;
+	const auto now = std::chrono::steady_clock::now();
+	if (now - last_print < std::chrono::seconds(5)) {
+		return;
+	}
+	last_print = now;
+	std::vector<const Group*> top;
+	top.reserve(groups.size());
+	for (const auto& entry: groups) {
+		top.push_back(&entry.second);
+	}
+	std::sort(top.begin(), top.end(), [](const Group* a, const Group* b) { return a->ns > b->ns; });
+	for (size_t i = 0; i < top.size() && i < 10; ++i) {
+		const auto& g = *top[i];
+		const auto& s = g.first;
+		std::string stack;
+		for (int f = 0; f < s.depth; ++f) {
+			char frame[80] {};
+			FormatFrame(frame, sizeof(frame), s.frames[f]);
+			if (!stack.empty()) {
+				stack += ' ';
+			}
+			stack += frame;
+		}
+		char code[sizeof(s.code) * 3 + 1] {};
+		for (size_t b = 0; b < sizeof(s.code); ++b) {
+			std::snprintf(code + b * 2, 3, "%02x", s.code[b]);
+		}
+		std::printf("NHL27GPUFAULT: n=%" PRIu64 " ms=%.1f max=%.2fms access=%s op=0x%" PRIx64 " vaddr=0x%" PRIx64
+		            " page_dirty=%" PRIu64 " emul=%" PRIu64 " load=0x%" PRIx64 "+%" PRIu64 " load_dirty=%" PRIu64
+		            " dirty_loads=%" PRIu64 " result=none/served/dirty/cap/fail/na=%" PRIu64 "/%" PRIu64 "/%" PRIu64
+		            "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 " code=%s stack=%s\n",
+		            g.count, static_cast<double>(g.ns) / 1e6, static_cast<double>(g.max_ns) / 1e6,
+		            s.read ? "read" : "write", s.exec_op, s.vaddr, s.page_dirty, g.emulable, s.load_addr, s.load_size,
+		            s.load_dirty, g.dirty_loads, g.results[0], g.results[1], g.results[2], g.results[3], g.results[4],
+		            g.results[5], code, stack.c_str());
+	}
+	std::fflush(stdout);
+	groups.clear();
+}
+
+} // namespace GpuFaultStacks
+
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
@@ -832,6 +1007,19 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 				            static_cast<unsigned long long>(count));
 			}
 		}
+		// KYTY_PERF_GPU_FAULT_STACKS: describe the GPU thread's fault before anything resolves it.
+		const bool                            gpu_stacks = GpuFaultStacks::Enabled() && Libs::Graphics::GuestGpu::IsGpuThread();
+		GpuFaultStacks::Sample                gpu_sample;
+		std::chrono::steady_clock::time_point gpu_start {};
+		if (gpu_stacks) {
+			GpuFaultStacks::Capture(gpu_sample, *info, access == GpuAccess::Read);
+			(void)Libs::LibKernel::Memory::TakeCleanReadResult();
+			gpu_start = std::chrono::steady_clock::now();
+		}
+		const auto gpu_elapsed = [&gpu_start] {
+			return static_cast<uint64_t>(
+			    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - gpu_start).count());
+		};
 		// Experiment FalseShareReads: the GPU thread's own read of bytes the GPU never wrote, on a
 		// page protected for other GPU-written bytes, is served from the backing instead of
 		// downloading the page, which would wait for all queued GPU work.
@@ -841,10 +1029,29 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		                                                   Libs::LibKernel::Memory::TryReadCleanBacking)) {
 			Libs::Graphics::BufferCache::PerfCount(Libs::Graphics::BufferCache::PerfEvent::FalseShareRead);
 			Libs::LibKernel::Memory::NoteReadFaultPage(info->access_violation_vaddr);
+			if (gpu_stacks) {
+				GpuFaultStacks::Record(gpu_sample, Libs::LibKernel::Memory::TakeCleanReadResult(), gpu_elapsed());
+			}
+			return true;
+		}
+		const int gpu_result = gpu_stacks ? Libs::LibKernel::Memory::TakeCleanReadResult() : 0;
+		// Experiment FalseShareAnyThread: the same for the command processor and guest threads, which
+		// otherwise wait for all queued GPU work to read bytes the GPU never wrote.
+		if (access == GpuAccess::Read && !Libs::Graphics::GuestGpu::IsGpuThread() &&
+		    Common::Experiments::Enabled(Common::Experiments::FalseShareAnyThread) &&
+		    Loader::X64InstructionEmulator::TryEmulateLoad(info->native_context,
+		                                                   Libs::LibKernel::Memory::TryReadCleanBackingAnyThread)) {
+			Libs::Graphics::BufferCache::PerfCount(Libs::Graphics::BufferCache::PerfEvent::FalseShareRead);
 			return true;
 		}
 		Libs::Graphics::BufferCache::NoteFaultRip(info->exception_address);
-		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
+		const bool handled = Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr);
+		// Later invalidations on this thread outside a fault must not be billed to this instruction.
+		Libs::Graphics::BufferCache::NoteFaultRip(0);
+		if (gpu_stacks) {
+			GpuFaultStacks::Record(gpu_sample, gpu_result, gpu_elapsed());
+		}
+		if (handled) {
 			return true;
 		}
 	}
@@ -866,6 +1073,29 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		            info->rax, info->rbx, info->rcx, info->rdx, info->rsi, info->rdi, info->rbp,
 		            info->rsp, info->r8, info->r9, info->r10, info->r11, info->r12, info->r13,
 		            info->r14, info->r15);
+		{
+			// Which emulator (GPU / command processor) writes touched the memory this thread was
+			// using: a guest pointer that holds garbage written by the host points at the emulator.
+			const std::pair<const char*, uint64_t> regs[] = {
+			    {"fault", info->access_violation_vaddr}, {"rax", info->rax}, {"rbx", info->rbx},
+			    {"rcx", info->rcx}, {"rdx", info->rdx}, {"rsi", info->rsi}, {"rdi", info->rdi},
+			    {"rbp", info->rbp}, {"r8", info->r8}, {"r9", info->r9}, {"r10", info->r10},
+			    {"r11", info->r11}, {"r12", info->r12}, {"r13", info->r13}, {"r14", info->r14},
+			    {"r15", info->r15}};
+			std::printf("--- Host writes near guest pointers ---\n");
+			for (const auto& [name, value]: regs) {
+				if (value < 0x1000000000ull || value >= 0x4000000000ull) continue;
+				if (IsReadableRange(value & ~uint64_t {7}, 64)) {
+					const auto* words = reinterpret_cast<const uint64_t*>(value & ~uint64_t {7});
+					std::printf("  %s 0x%016" PRIx64 " =", name, value);
+					for (int i = 0; i < 8; i++) {
+						std::printf(" %016" PRIx64, words[i]);
+					}
+					std::printf("\n");
+				}
+				Libs::LibKernel::Memory::ReportHostWrites(name, value, 0x400);
+			}
+		}
 		if (IsReadableRange(info->exception_address - 48, 96)) {
 			const auto* code = reinterpret_cast<const uint8_t*>(info->exception_address - 48);
 			std::printf("code (pc-48 .. pc+48, fault at byte 48):");

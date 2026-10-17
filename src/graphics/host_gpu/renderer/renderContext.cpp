@@ -283,6 +283,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 				bytes = 0;
 			}
 		}
+		BufferCache::WriteTagScope tag(BufferCache::WriteTag::Unmap);
 		m_buffer_cache.InvalidateMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);

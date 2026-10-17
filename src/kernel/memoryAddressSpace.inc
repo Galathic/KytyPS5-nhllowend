@@ -1096,6 +1096,13 @@ public:
 			return false;
 		}
 
+		// Experiment ProtectSharedLock: GPU page tracking only reads the mapping table here, and the
+		// PageManager region lock already orders protections of the same page, so threads changing
+		// different pages need not queue behind each other.
+		if (Common::Experiments::Enabled(Common::Experiments::ProtectSharedLock)) {
+			std::shared_lock lock(m_mutex);
+			return ProtectMappedUnlocked(vaddr, size, mode);
+		}
 		std::lock_guard lock(m_mutex);
 		return ProtectMappedUnlocked(vaddr, size, mode);
 	}

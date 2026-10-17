@@ -3,6 +3,7 @@
 
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
+#include "graphics/shader/shader.h"
 
 #include <algorithm>
 #include <bit>
@@ -1533,7 +1534,7 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto element = Binary(
 	    state, spv::OpIAdd, TypeU32(state), index,
 	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), access.byte_offset, ConstantU32(state, 2)));
-	if (RobustLoad(state, mem.kind) && ShaderRobustConstReads()) {
+	if ((RobustLoad(state, mem.kind) && ShaderRobustConstReads()) || ShaderSkipBoundsChecks()) {
 		// As LoadWordPrepared: out of range reads zero on the device. A branch per constant kept
 		// each scalar load in a block of its own, so the compiler could neither batch nor hoist them
 		// (the heaviest NHL 27 compute shader had 189 such loads).

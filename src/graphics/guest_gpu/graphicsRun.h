@@ -62,6 +62,9 @@ public:
 	// urgent commands other threads queued, such as the readback of a page a compile worker
 	// faulted on, which would otherwise wait for this thread forever. No-op elsewhere.
 	static void ServiceUrgentCommands();
+	// Execution thread: the operation it is executing (GpuOperationKind | GpuOperation::trace_op << 8),
+	// or 0 between operations. Diagnostics only (KYTY_PERF_GPU_FAULT_STACKS).
+	[[nodiscard]] static uint64_t CurrentExecOp() noexcept;
 
 	// A pipelined GPU parses command buffers on its command processor thread and executes the
 	// operations they produce, in order, on its execution thread.
@@ -70,11 +73,19 @@ public:
 	[[nodiscard]] uint64_t NextSequence() const noexcept { return m_emitted + 1; }
 	// Returns the sequence of the operation.
 	uint64_t               EmitOperation(GpuOperation&& operation);
+	// What a pending write stores when its value is not known at emit time (NHL27DECISION).
+	static constexpr uint8_t WriteOriginOther = 0;
+	static constexpr uint8_t WriteOriginClock = 1; // the 64-bit reference clock, read when it executes
+	static constexpr uint8_t WriteOriginDma   = 2;
 	// The guest memory an emitted operation writes, and the value it writes when that is known
 	// when the operation is emitted (`value` null otherwise, or larger than 8 bytes).
 	// `kind` names the writer for KYTY_DBG_CP_READS (a static string).
 	void NoteGuestWrite(uint64_t sequence, uint64_t address, uint64_t size, const void* value,
-	                    const char* kind = "write");
+	                    const char* kind = "write", uint8_t origin = WriteOriginOther);
+	// Experiment ClockWaitPredict: when the newest pending write of exactly [address, address + size)
+	// stores the 64-bit reference clock, returns true with a value the write will not be below (the
+	// clock read now, while the write is still pending). The clock only grows.
+	[[nodiscard]] bool TryPredictClockWrite(const volatile void* address, size_t size, uint64_t& lower_bound);
 	// Reads guest memory the command processor decides on as a serial GPU would at this point
 	// of the stream: from the value of a pending write when it is known, otherwise from memory
 	// once the operations that write it executed.
@@ -182,6 +193,7 @@ private:
 		uint8_t     value[8] = {};
 		const char* kind     = nullptr;
 		uint32_t    queue    = 0; // the guest queue that wrote it
+		uint8_t     origin   = 0;
 	};
 
 	const bool                      m_pipelined;
