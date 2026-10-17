@@ -1,6 +1,7 @@
 #include "common/emulatorConfig.h"
 
 #include "common/assert.h"
+#include "common/experiments.h"
 #include "common/threads.h"
 
 #include <algorithm>
@@ -198,6 +199,9 @@ uint32_t ParseGpuPipelineStages(const char* value) {
 }
 
 void ConfigureGpuStageThread(GpuStageThread stage) {
+	// KYTY_PERF_SAMPLE=1: sample this GPU stage thread (NHL27SAMPLE lines).
+	static constexpr const char* stage_names[] = {"cp", "exec", "record", "resolve", "hostcopy"};
+	Common::Sampler::RegisterCurrentThread(stage_names[static_cast<uint32_t>(stage) % 5u]);
 	// Five physical cores of the first CCD of a Ryzen 9 5900X (SMT siblings are adjacent), away
 	// from core 0: the stages share its L3.
 	static const std::array<int, 5> cpus = [] {

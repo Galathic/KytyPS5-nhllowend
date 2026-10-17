@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <map>
 #include <mutex>
@@ -176,6 +177,14 @@ public:
 	// Remembers that the GPU filled [vaddr, vaddr + size) with one repeated dword. The record
 	// lives only until any other write, download or invalidation touches the range.
 	void RecordGpuFill(uint64_t vaddr, uint64_t size, uint32_t value);
+	// Experiment FillPatterns: the GPU wrote `words` at the start of every `stride` bytes of
+	// [vaddr, vaddr + size) (the bytes between are unknown).
+	void RecordGpuFillPattern(uint64_t vaddr, uint64_t size, uint32_t stride,
+	                          std::span<const uint32_t> words);
+	// Whether one recorded pattern covers [vaddr, vaddr + size), the range holds at least one whole
+	// written element, and that element's bytes are not all equal: the range cannot be one repeated
+	// byte (a uniform metadata clear).
+	[[nodiscard]] bool GpuFillCoversNonUniform(uint64_t vaddr, uint64_t size) const;
 	[[nodiscard]] bool TryGetGpuFill(uint64_t vaddr, uint64_t size, uint32_t& value) const;
 	// Drops GPU ownership of whole pages without a download. The caller must be about to
 	// overwrite the CPU backing of the range and mark it CPU-modified.
@@ -355,12 +364,34 @@ private:
 	vk::Fence                                         m_readback_fence  = nullptr;
 	bool ReadbackOnSecondQueue(const Buffer& source, const Buffer& destination,
 	                           std::span<const vk::BufferCopy> copies, uint64_t wait_tick);
+	// Experiment AsyncReadback (KYTY_ASYNC_READBACK): downloads requested by threads other than the
+	// execution thread are copied on the readback queue and waited for by the requesting thread.
+	struct AsyncReadback;
+	struct AsyncSlot {
+		vk::CommandBuffer command = nullptr;
+		vk::Fence         fence   = nullptr;
+	};
+	void ReadMemoryBody(uint64_t vaddr, uint64_t size, bool is_write, ReadCaller caller, bool on_gpu,
+	                    uint64_t tid, uint64_t fault_rip);
+	[[nodiscard]] bool StartAsyncReadback(AsyncReadback& readback);
+	void FinishAsyncReadback(AsyncReadback& readback, ReadCaller caller, uint64_t tid, uint64_t fault_rip);
+	void NoteAsyncReadbackWrite(uint64_t vaddr, uint64_t size);
+	void WaitAsyncReadbacksOf(BufferId id);
+	std::mutex                                        m_async_mutex;
+	std::vector<AsyncReadback*>                       m_async_readbacks;
+	std::atomic<uint32_t>                             m_async_count {0};
+	vk::CommandPool                                   m_async_pool = nullptr;
+	std::vector<AsyncSlot>                            m_async_free;
 	StreamBuffer                                      m_device_buffer;
 	TextureCache&                                     m_texture_cache;
 	struct GpuFill {
-		uint64_t begin;
-		uint64_t end;
-		uint32_t value;
+		uint64_t                begin;
+		uint64_t                end;
+		uint32_t                value;
+		uint32_t                words  = 1; // pattern: the written words of each element
+		uint32_t                stride = 0; // pattern: element stride (0 = uniform dword fill)
+		bool                    non_uniform = false; // pattern bytes are not all equal
+		std::array<uint32_t, 4> pattern {};
 	};
 	std::vector<GpuFill>                              m_gpu_fills;
 	struct WriterRecord {

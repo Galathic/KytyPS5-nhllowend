@@ -45,7 +45,9 @@
 #include <mutex>
 #include <tuple>
 #include <span>
+#include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -118,14 +120,78 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 	return false;
 }
 
+// Experiment FillPatterns: a proven fill (resources.uniform_pattern) whose element words differ.
+// Formatted stores write only the components of the V#'s format, at the V#'s stride: the written
+// bytes are the first min(words, components) words at the start of every record. Returns the
+// written range, its stride and the written words.
+static bool ResolveComputeBufferPattern(const ShaderComputeInputInfo& input, uint32_t group_x,
+                                        uint32_t group_y, uint32_t group_z, uint32_t mode,
+                                        uint64_t& address, uint64_t& size, uint32_t& stride,
+                                        uint32_t& written_words, const char*& why) {
+	const auto& resources = *input.stage.resources;
+	const auto& fill      = resources.uniform_pattern;
+	if (fill.kind != ShaderRecompiler::IR::UniformFillKind::Buffer || fill.words < 2 ||
+	    fill.words > 4 || fill.resource >= resources.buffers.size()) {
+		why = "no-pattern";
+		return false;
+	}
+	const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[fill.resource]);
+	constexpr std::array formats {
+	    Prospero::BufferFormat::k32UInt, Prospero::BufferFormat::k32_32UInt,
+	    Prospero::BufferFormat::k32_32_32UInt, Prospero::BufferFormat::k32_32_32_32UInt};
+	const auto format = std::ranges::find(formats, descriptor.Format());
+	if (format == formats.end()) {
+		why = "format";
+		return false;
+	}
+	written_words = std::min<uint32_t>(fill.words, static_cast<uint32_t>(format - formats.begin()) + 1u);
+	if (descriptor.Stride() < written_words * 4u || (descriptor.Stride() & 3u) != 0 ||
+	    descriptor.SwizzleEnabled() || descriptor.IndexStride() != 0 || descriptor.AddTid() ||
+	    descriptor.Base48() == 0 || (descriptor.Base48() & 3u) != 0) {
+		why = "descriptor-shape";
+		return false;
+	}
+	if (input.threads_num[0] == 0 || input.threads_num[0] != fill.group_stride[0] ||
+	    input.threads_num[1] != 1 || input.threads_num[2] != 1 || group_x == 0 || group_y != 1 ||
+	    group_z != 1 || mode != (input.dispatch_thread_dimensions ? 0x61u : 0x41u)) {
+		why = "dispatch-shape";
+		return false;
+	}
+	const uint64_t invocations = input.dispatch_thread_dimensions
+	                                 ? group_x
+	                                 : static_cast<uint64_t>(group_x) * input.threads_num[0];
+	const uint64_t bytes = descriptor.GetSize();
+	if (invocations != descriptor.NumRecords() || bytes == 0 || bytes > UINT32_MAX ||
+	    (input.dispatch_thread_dimensions &&
+	     (group_x % input.threads_num[0] != 0 || input.dispatch_threads_num[0] != group_x ||
+	      input.dispatch_threads_num[1] != 1 || input.dispatch_threads_num[2] != 1))) {
+		why = "invocations-vs-records";
+		return false;
+	}
+	if (!FillSourcesDisjoint(resources.buffers, {descriptor.Base48(), bytes}, fill.resource)) {
+		why = "sources-overlap";
+		return false;
+	}
+	address = descriptor.Base48();
+	size    = bytes;
+	stride  = descriptor.Stride();
+	return true;
+}
+
+// why (optional, KYTY_DBG_FILL_DIAG): the first check that failed.
 bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t group_x,
                               uint32_t group_y, uint32_t group_z, uint32_t mode,
                               ShaderBufferResource& resolved_descriptor, uint32_t& resolved_clear,
-                              uint64_t& resolved_size) {
+                              uint64_t& resolved_size, const char** why) {
+	const auto fail = [why](const char* reason) {
+		if (why != nullptr) *why = reason;
+		return false;
+	};
 	const auto& resources = *input.stage.resources;
 	const auto& fill      = resources.uniform_fill;
 	if (fill.kind != ShaderRecompiler::IR::UniformFillKind::Buffer) {
-		return false;
+		return fail(fill.kind == ShaderRecompiler::IR::UniformFillKind::Image ? "image-fill"
+		                                                                       : "no-fill-pattern");
 	}
 	const auto element_size = fill.words * sizeof(uint32_t);
 	const auto descriptor =
@@ -136,12 +202,12 @@ bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t grou
 	if (descriptor.Stride() != element_size || descriptor.Format() != formats[fill.words - 1] ||
 	    descriptor.SwizzleEnabled() || descriptor.IndexStride() != 0 || descriptor.AddTid() ||
 	    descriptor.Base48() == 0) {
-		return false;
+		return fail("descriptor-shape");
 	}
 	if (input.threads_num[0] == 0 || input.threads_num[0] != fill.group_stride[0] ||
 	    input.threads_num[1] != 1 || input.threads_num[2] != 1 || group_x == 0 || group_y != 1 ||
 	    group_z != 1 || mode != (input.dispatch_thread_dimensions ? 0x61u : 0x41u)) {
-		return false;
+		return fail("dispatch-shape");
 	}
 	const uint64_t invocations = input.dispatch_thread_dimensions
 	                                 ? group_x
@@ -151,14 +217,59 @@ bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t grou
 	    (input.dispatch_thread_dimensions &&
 	     (group_x % input.threads_num[0] != 0 || input.dispatch_threads_num[0] != group_x ||
 	      input.dispatch_threads_num[1] != 1 || input.dispatch_threads_num[2] != 1))) {
-		return false;
+		return fail("invocations-vs-records");
 	}
 	if (!FillSourcesDisjoint(resources.buffers, {descriptor.Base48(), size}, fill.resource))
-		return false;
+		return fail("sources-overlap");
 	resolved_descriptor = descriptor;
 	resolved_clear      = fill.value;
 	resolved_size       = size;
 	return true;
+}
+
+// KYTY_DBG_FILL_DIAG=1: why a compute dispatch that writes memory is not taken as a uniform fill.
+// NHL 27 clears DCC/CMASK metadata with compute shaders; color-clear decoding then reads the
+// metadata back (a full GPU drain) unless the fill was recognized. NHL27FILLDIAG, once per shader,
+// path and verdict (at most 512 lines).
+static bool FillDiagEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DBG_FILL_DIAG");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+static void FillDiag(const ShaderComputeInputInfo& input, const char* path, uint32_t group_x,
+                     uint32_t group_y, uint32_t group_z, uint32_t mode, const char* verdict) {
+	const auto& program   = *input.stage.program;
+	const auto& resources = *input.stage.resources;
+	uint32_t    written_buffers = 0;
+	uint32_t    written_images  = 0;
+	for (const auto& buffer: program.info.buffers) written_buffers += buffer.written ? 1u : 0u;
+	for (const auto& image: program.info.images) written_images += image.written ? 1u : 0u;
+	if (written_buffers == 0 && written_images == 0) {
+		return;
+	}
+	static std::mutex                      mutex;
+	static std::unordered_set<std::string> seen;
+	char                                   key[160];
+	std::snprintf(key, sizeof(key), "%016llx %s %s", static_cast<unsigned long long>(program.shader_hash),
+	              path, verdict);
+	{
+		std::scoped_lock lock {mutex};
+		if (seen.size() >= 512 || !seen.insert(key).second) {
+			return;
+		}
+	}
+	std::printf("NHL27FILLDIAG: shader=0x%016llx path=%s verdict=%s fill_kind=%d words=%u spec_reads=%zu "
+	            "buffers=%zu written_buffers=%u images=%zu written_images=%u groups=%ux%ux%u "
+	            "threads=%ux%ux%u mode=0x%x\n",
+	            static_cast<unsigned long long>(program.shader_hash), path, verdict,
+	            static_cast<int>(resources.uniform_fill.kind), resources.uniform_fill.words,
+	            resources.specialization_reads.size(), program.info.buffers.size(), written_buffers,
+	            program.info.images.size(), written_images, group_x, group_y, group_z, input.threads_num[0],
+	            input.threads_num[1], input.threads_num[2], mode);
+	std::fflush(stdout);
 }
 
 // KYTY_CPU_COPY_FORWARD=1: a proven dst[i] = src[i] copy dispatch (UniformCopy) over contiguous,
@@ -477,6 +588,19 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = *input_info.stage.resources;
+	if (FillDiagEnabled()) {
+		const char*          why = "fill";
+		ShaderBufferResource diag_descriptor;
+		uint32_t             diag_value = 0;
+		uint64_t             diag_size  = 0;
+		if (!resources.specialization_reads.empty()) {
+			why = "specialization-reads";
+		} else {
+			(void)ResolveComputeBufferFill(input_info, thread_group_x, thread_group_y, thread_group_z, mode,
+			                               diag_descriptor, diag_value, diag_size, &why);
+		}
+		FillDiag(input_info, "direct", thread_group_x, thread_group_y, thread_group_z, mode, why);
+	}
 	if (resources.specialization_reads.empty() &&
 	    (TryConsumeComputeMetaClear(input_info, buffer) ||
 	     TryConsumeComputeImageClear(input_info, buffer, thread_group_x, thread_group_y,
@@ -494,6 +618,49 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		if (ResolveComputeBufferFill(input_info, thread_group_x, thread_group_y, thread_group_z,
 		                             mode, fill_descriptor, known_fill_value, known_fill_size)) {
 			known_fill_address = fill_descriptor.Base48();
+		}
+	}
+	uint64_t known_pattern_address = 0;
+	uint64_t known_pattern_size    = 0;
+	uint32_t known_pattern_stride  = 0;
+	uint32_t known_pattern_words   = 0;
+	if (known_fill_size == 0 && BufferCache::PerfNoSyncReadback() &&
+	    resources.specialization_reads.empty() &&
+	    resources.uniform_pattern.kind == ShaderRecompiler::IR::UniformFillKind::Buffer &&
+	    Common::Experiments::Enabled(Common::Experiments::FillPatterns)) {
+		const char* pattern_why = "ok";
+		if (ResolveComputeBufferPattern(input_info, thread_group_x, thread_group_y, thread_group_z,
+		                                mode, known_pattern_address, known_pattern_size,
+		                                known_pattern_stride, known_pattern_words, pattern_why)) {
+		} else {
+			known_pattern_size = 0;
+			if (FrameBreakdown::Enabled()) {
+				// NHL27PATTERN reject: once per shader and reason (at most 64 lines).
+				static std::mutex                      reject_mutex;
+				static std::unordered_set<std::string> seen;
+				char key[128];
+				std::snprintf(key, sizeof(key), "%016llx %s",
+				              static_cast<unsigned long long>(program.shader_hash), pattern_why);
+				bool first = false;
+				{
+					std::scoped_lock lock {reject_mutex};
+					first = seen.size() < 64 && seen.insert(key).second;
+				}
+				if (first) {
+					const auto d = resources.uniform_pattern.resource < resources.buffers.size()
+					                   ? DecodeNativeDescriptor<ShaderBufferResource>(
+					                         resources.buffers[resources.uniform_pattern.resource])
+					                   : ShaderBufferResource {};
+					std::printf("NHL27PATTERN: reject shader=0x%016llx why=%s groups=%ux%ux%u threads=%ux%ux%u mode=0x%x "
+					            "words=%u stride=%u records=%u format=%u\n",
+					            static_cast<unsigned long long>(program.shader_hash), pattern_why,
+					            thread_group_x, thread_group_y, thread_group_z, input_info.threads_num[0],
+					            input_info.threads_num[1], input_info.threads_num[2], mode,
+					            resources.uniform_pattern.words, d.Stride(), d.NumRecords(),
+					            static_cast<unsigned>(d.Format()));
+					std::fflush(stdout);
+				}
+			}
 		}
 	}
 	uint64_t copy_source      = 0;
@@ -781,6 +948,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		m_context.GetBufferCache().RecordGpuFill(known_fill_address, known_fill_size,
 		                                         known_fill_value);
 	}
+	if (known_pattern_size != 0) {
+		m_context.GetBufferCache().RecordGpuFillPattern(
+		    known_pattern_address, known_pattern_size, known_pattern_stride,
+		    std::span(resources.uniform_pattern_values).first(known_pattern_words));
+	}
 	if (copy_size != 0) {
 		auto& cache = m_context.GetBufferCache();
 		// Only when the source bytes in guest memory are what the GPU reads: no pending GPU
@@ -845,6 +1017,13 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		// NHL debugging: the shader failed to build (KYTY_DBG_SKIP_BAD_SHADERS=1); skip the dispatch.
 		ResetBindings();
 		return;
+	}
+	if (FillDiagEnabled()) {
+		// Indirect dispatches are never taken as fills: their group counts are GPU data.
+		FillDiag(input_info, "indirect", 0, 0, 0, mode,
+		         input_info.stage.resources->uniform_fill.kind == ShaderRecompiler::IR::UniformFillKind::None
+		             ? "no-fill-pattern"
+		             : "fill-pattern-but-indirect");
 	}
 	buffer.EndRendering();
 	FrameBreakdown::Timer pipeline_timer(FrameBreakdown::g_counters.dc_pipeline_ns);

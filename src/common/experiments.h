@@ -21,6 +21,9 @@ enum Bit : uint32_t {
 	SkipRedundantBinds = 1u << 1u, // KYTY_SKIP_REDUNDANT_BINDS (default on)
 	CpuCopyForward     = 1u << 3u, // KYTY_CPU_COPY_FORWARD (default off)
 	SrtJit             = 1u << 4u, // KYTY_SRT_JIT (default off; upstream x64 flat walker for plans without control flow)
+	ProgramLockSplit   = 1u << 5u, // KYTY_PROGRAM_LOCK_SPLIT (default off; the resolve thread walks shader tables without holding the program lock)
+	FillPatterns       = 1u << 9u, // KYTY_FILL_PATTERNS (default off; a proven compute fill of a repeating 2-4 word pattern is remembered like a uniform fill, so color-clear decoding needs no readback)
+	UnmapBufferWait    = 1u << 8u, // KYTY_UNMAP_BUFFER_WAIT (default off; an unmap of GPU-written buffer bytes waits only for their writers, not for the whole GPU)
 	FalseShareReads    = 1u << 6u, // KYTY_FALSE_SHARE_READS (default off)
 	SrtBatchReads      = 1u << 7u, // KYTY_SRT_BATCH_READS (default on; also read by the program cache)
 	DirectSrtReads     = 1u << 10u, // KYTY_DIRECT_SRT_READS (default on; SRT reads without the IR walk)
@@ -34,6 +37,9 @@ enum Bit : uint32_t {
 	FalseShareAnyThread  = 1u << 29u, // KYTY_FALSE_SHARE_ANY_THREAD (default off; CP and guest reads of clean bytes on GPU-dirty pages use the backing)
 	CpCleanRegReads      = 1u << 25u, // KYTY_CP_CLEAN_REG_READS (default off; the command processor reads clean indirect register tables from the backing)
 	CpSkipIdleSpin       = 1u << 26u, // KYTY_CP_SKIP_IDLE_SPIN (default off; work queued while the command processor waited for the execution thread starts at once, not after a 2 ms spin)
+	DirectGpuReads       = 1u << 21u, // KYTY_DIRECT_GPU_READS (default off; downloads of bytes whose GPU writer already finished read the mapped game buffer, needs the same variable at startup)
+	AsyncReadback        = 1u << 28u, // KYTY_ASYNC_READBACK (default off; guest and command-processor downloads wait on their own thread, not the execution thread)
+	SpeculateStrict      = 1u << 27u, // KYTY_SPECULATE_STRICT (default off; with SpeculateDirtyReads, never guess bytes that changed twice or were guessed wrong once)
 	SpeculateDirtyReads  = 1u << 30u, // KYTY_SPECULATE_DIRTY_READS (default off; shader-table reads of GPU-written bytes the GPU keeps rewriting unchanged use the backing, checked later)
 	// A/B only (no environment variable): selects the code a pending change replaces.
 	AbLegacy = 1u << 31u,
@@ -41,6 +47,10 @@ enum Bit : uint32_t {
 
 [[nodiscard]] bool Enabled(Bit bit) noexcept;
 [[nodiscard]] uint32_t Mask() noexcept;
+// KYTY_DIRECT_GPU_READS=1 at startup: game buffers are allocated CPU-visible (Resizable BAR) and every
+// submission makes its writes visible to the CPU. Fixed for the whole run; the DirectGpuReads bit
+// only decides whether downloads use it.
+[[nodiscard]] bool DirectGpuReadsMemory() noexcept;
 
 } // namespace Common::Experiments
 
@@ -52,5 +62,15 @@ namespace Common::Timeline {
 void Mark(const char* what, uint64_t value = 0) noexcept;
 
 } // namespace Common::Timeline
+
+namespace Common::Sampler {
+
+// Diagnostics: KYTY_PERF_SAMPLE=1 samples the registered threads about 1000 times a second
+// (suspend, read the instruction pointer, unwind) and every 10 s prints the functions they were
+// in (NHL27SAMPLE self = innermost function, incl = anywhere on the stack). Addresses are
+// absolute; for the exe (fixed base 0x140000000) resolve them with the linker map.
+void RegisterCurrentThread(const char* name) noexcept;
+
+} // namespace Common::Sampler
 
 #endif // EMULATOR_SRC_COMMON_EXPERIMENTS_H_

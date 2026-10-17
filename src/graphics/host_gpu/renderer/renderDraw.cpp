@@ -757,6 +757,9 @@ DrawRenderState& RenderExecutor::AcquireDrawRenderState(bool tessellation, bool&
 	// The operations before this draw executed: the resolution holds when the guest memory it
 	// read still has the same bytes.
 	auto* resolved = std::exchange(m_resolved_draw, nullptr);
+	if (resolved == nullptr || tessellation) {
+		GuestReadLog::NoteNoResolution();
+	}
 	shaders_resolved =
 	    resolved != nullptr && !tessellation && resolved->programs.reads.StillValid();
 	if (shaders_resolved) {
@@ -1477,6 +1480,7 @@ RenderExecutor::ResolvedDraw* RenderExecutor::ResolveDrawAhead(const HW::Context
 	state.ps_active              = PixelShaderActive(context, shaders, color_output_mask);
 	RefreshShaderPrograms(m_context.GetPipelineCache(), context, shaders, user_config,
 	                      color_output_mask, state, &draw.programs);
+	GuestReadLog::NoteResolved(draw.programs.reads);
 	if (draw.programs.reads.Failed()) {
 		return nullptr;
 	}

@@ -2217,6 +2217,9 @@ KYTY_CP_OP_PARSER(CpOpMarker) {
 		case 0x0: break;
 		case 0x4: cp.SetUserDataMarker(HW::UserSgprType::Vsharp); break;
 		case 0xd: cp.SetUserDataMarker(HW::UserSgprType::Region); break;
+		// NHL 27 emits marker 0x11 on the team/side selection screens (KytyPS5/KytyPS5 PR #1486,
+		// fozter). Like its neighbours it only tags the next user-data write; skip it instead of exiting.
+		case 0x11: break;
 		case 0x777: {
 			cp.Flip();
 			break;

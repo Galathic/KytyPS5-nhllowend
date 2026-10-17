@@ -84,6 +84,11 @@ bool Translator::NativeScalarF16(const Decoder::Instruction& inst, IR::ValueOpco
 
 void Translator::PackedFloat16(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                                bool accumulator, bool quiet_snan) {
+	if (quiet_snan && ShaderFastMinMax()) {
+		// KYTY_FAST_MINMAX: like the f32 min/max path, v_pk_min/max_f16 skip the signaling-NaN
+		// quieting (games do not feed sNaN bit patterns to min/max).
+		quiet_snan = false;
+	}
 	if (ShaderNativeFp16() && !quiet_snan) {
 		// Native packed f16. Sources are packed into one u32 holding both halves exactly as the
 		// fallback reads them (op_sel/op_sel_hi, neg/neg_hi, abs, inline constants); omod falls back.

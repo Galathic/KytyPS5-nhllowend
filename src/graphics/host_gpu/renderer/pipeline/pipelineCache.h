@@ -31,15 +31,23 @@ public:
 	void Clear() {
 		m_entries.clear();
 		m_bytes.clear();
-		m_failed = false;
+		m_failed      = false;
+		m_fail_reason = 0;
 	}
 	// Reads the backing store without faulting. Strict reads are checked the way specialization
 	// memory is read (GPU-owned bytes fail), the others as plain loads.
 	bool               Read(uint64_t address, void* data, uint64_t size, bool strict);
-	void               Fail() { m_failed = true; }
+	void               Fail() {
+		if (!m_failed) m_fail_reason = 3;
+		m_failed = true;
+	}
 	[[nodiscard]] bool Failed() const { return m_failed; }
 	// Execution thread: whether every read still gives the recorded bytes.
 	[[nodiscard]] bool StillValid() const;
+	// NHL27AHEAD (KYTY_PERF_STATS): how ahead resolutions end. Resolve thread: a finished
+	// resolution (ok or why it failed). Execution thread: a draw without a resolution.
+	static void NoteResolved(const GuestReadLog& log);
+	static void NoteNoResolution();
 
 private:
 	static constexpr uint64_t StrictCheckBytes = 64;
@@ -51,7 +59,8 @@ private:
 	};
 	std::vector<Entry>   m_entries;
 	std::vector<uint8_t> m_bytes;
-	bool                 m_failed = false;
+	bool                 m_failed      = false;
+	uint8_t              m_fail_reason = 0; // 1 plain read, 2 strict read, 3 other (program/permutation)
 };
 
 // Storage of the shader programs a draw resolved ahead of its execution: the resource snapshots

@@ -264,7 +264,9 @@ class ResourceMemoEntry {
                left.samplers == right.samplers && left.flattened_srt == right.flattened_srt &&
                left.user_data == right.user_data &&
                SameReadCoverage(left.specialization_reads, right.specialization_reads) &&
-               left.uniform_fill == right.uniform_fill;
+               left.uniform_fill == right.uniform_fill &&
+               left.uniform_pattern == right.uniform_pattern &&
+               left.uniform_pattern_values == right.uniform_pattern_values;
     }
     bool VerifyCachedHit(const ShaderRecompiler::IR::ResourcePlan& plan, const Runtime& runtime,
                          const ShaderRecompiler::IR::ResourceSnapshot& cached_snapshot,

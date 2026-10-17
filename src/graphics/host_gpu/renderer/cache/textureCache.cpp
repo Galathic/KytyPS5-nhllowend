@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 
 #include "common/alignment.h"
+#include "common/experiments.h"
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
@@ -1439,6 +1440,29 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	                      m_buffer_cache.TryGetGpuFill(selected_address, selected_size, shadow_value);
 	if (shadowed) {
 		BufferCache::PerfCount(BufferCache::PerfEvent::ColorClearShadowHit);
+	}
+	// Experiment FillPatterns: the GPU filled every selected slice with a repeating element whose
+	// bytes differ, so no slice holds one repeated clear code: nothing to materialize, and no
+	// readback is needed to find that out.
+	if (!shadowed && selected_size != 0 && desc.type != BindingType::VideoOut &&
+	    Common::Experiments::Enabled(Common::Experiments::FillPatterns) &&
+	    BufferCache::PerfNoSyncReadback() &&
+	    m_buffer_cache.HasGpuDirtyBytes(selected_address, selected_size) &&
+	    m_buffer_cache.GpuFillCoversNonUniform(selected_address, selected_size)) {
+		if (FrameBreakdown::Enabled()) {
+			static std::atomic<uint64_t> hits {0};
+			static std::atomic<int64_t>  last_print {0};
+			const auto n = hits.fetch_add(1, std::memory_order_relaxed) + 1;
+			const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+			                        std::chrono::steady_clock::now().time_since_epoch()).count();
+			int64_t last = last_print.load(std::memory_order_relaxed);
+			if (now - last >= 5000 && last_print.compare_exchange_strong(last, now)) {
+				std::printf("NHL27PATTERN: color-clear readbacks skipped=%llu\n",
+				            static_cast<unsigned long long>(n));
+				std::fflush(stdout);
+			}
+		}
+		return;
 	}
 	// This may submit; never hold the texture lock across the readback.
 	if (!shadowed && selected_size != 0 &&

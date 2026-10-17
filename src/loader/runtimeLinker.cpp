@@ -1049,6 +1049,54 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			}
 			std::printf("\n");
 		}
+		{
+			// NHL27CODE: larger guest code windows for offline disassembly: the code before the fault,
+			// the functions called directly just before it, and the code before each guest return
+			// address on the stack.
+			const auto dump = [](const char* what, uint64_t addr, uint64_t len) {
+				if (!IsReadableRange(addr, len)) {
+					return;
+				}
+				const auto* code = reinterpret_cast<const uint8_t*>(addr);
+				std::printf("NHL27CODE %s addr=0x%016" PRIx64 " len=0x%" PRIx64, what, addr, len);
+				for (uint64_t i = 0; i < len; i++) {
+					std::printf("%s%02x", (i % 32 == 0) ? "\n " : "", code[i]);
+				}
+				std::printf("\n");
+			};
+			const uint64_t pc = info->exception_address;
+			dump("fault", pc - 0x400, 0x500);
+			uint64_t targets[16] = {};
+			size_t   target_count = 0;
+			if (IsReadableRange(pc - 0x100, 0x100)) {
+				const auto* code = reinterpret_cast<const uint8_t*>(pc - 0x100);
+				for (uint64_t i = 0; i + 5 <= 0x100 && target_count < 16; i++) {
+					if (code[i] != 0xe8) {
+						continue;
+					}
+					int32_t rel = 0;
+					std::memcpy(&rel, code + i + 1, sizeof(rel));
+					const uint64_t target = pc - 0x100 + i + 5 + static_cast<uint64_t>(static_cast<int64_t>(rel));
+					if (rel > -0x20000000 && rel < 0x20000000 &&
+					    std::find(targets, targets + target_count, target) == targets + target_count) {
+						targets[target_count++] = target;
+					}
+				}
+			}
+			for (size_t i = 0; i < target_count; i++) {
+				dump("callee", targets[i], 0x300);
+			}
+			if (IsReadableRange(info->rsp, 64 * sizeof(uint64_t))) {
+				const auto* stack  = reinterpret_cast<const uint64_t*>(info->rsp);
+				int         callers = 0;
+				for (int i = 0; i < 64 && callers < 8; i++) {
+					if (stack[i] >= 0x800000000ull && stack[i] < 0x1000000000ull) {
+						dump("caller", stack[i] - 0x200, 0x220);
+						callers++;
+					}
+				}
+			}
+		}
 		if (IsReadableRange(info->rsp, 32 * sizeof(uint64_t))) {
 			const auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
 			std::printf("stack:");

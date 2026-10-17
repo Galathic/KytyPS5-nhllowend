@@ -1843,10 +1843,20 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 		const char* value = std::getenv("KYTY_VIDEO_OUT_1080P");
 		return value != nullptr && value[0] == '1';
 	}();
+	// KYTY_VIDEO_OUT_4K_CALLS=N (with KYTY_VIDEO_OUT_1080P=1): the first N status queries still
+	// report 4K. NHL 27 picks its platform settings profile once from the first query; its 1080p
+	// profile has no entries and the game crashes, so it must see 4K there and 1080p afterwards.
+	static const int fake_4k_calls = [] {
+		const char* value = std::getenv("KYTY_VIDEO_OUT_4K_CALLS");
+		return value != nullptr ? std::atoi(value) : 0;
+	}();
+	static std::atomic<int> status_calls {0};
+	const bool fake_4k = status_calls.fetch_add(1, std::memory_order_relaxed) < fake_4k_calls;
 	ctx->mutex.Lock();
 	// Primary output reports 4K unless param.json Video-out Info enables resolution detection.
 	status->resolution =
-	    ((force_1080p || (attribute3 & 4) != 0) && ctx->width < 3840 && ctx->height < 2160 ? 1u : 2u);
+	    (!fake_4k && (force_1080p || (attribute3 & 4) != 0) && ctx->width < 3840 && ctx->height < 2160 ? 1u
+	                                                                                                   : 2u);
 	static std::atomic<int> reported {0};
 	if (reported.fetch_add(1, std::memory_order_relaxed) < 4) {
 		std::printf("NHL27VIDEO: output status resolution=%u attribute3=0x%x force_1080p=%d window=%ux%u\n",
