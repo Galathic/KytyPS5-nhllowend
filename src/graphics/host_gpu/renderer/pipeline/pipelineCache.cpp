@@ -713,9 +713,8 @@ struct PipelineCache::ProgramCache {
 		}
 		// Contiguous resource-table words are read with one call, as the execution thread reads them
 		// (the resolve thread read each dword with its own call chain, 25% of the thread; and each
-		// switch between the two rebuilt the plan's read runs). AbLegacy: one call per dword.
-		runtime.batch_reads = !Common::Experiments::Enabled(Common::Experiments::AbLegacy) &&
-		                      (env_batch_reads || Common::Experiments::Enabled(Common::Experiments::SrtBatchReads));
+		// switch between the two rebuilt the plan's read runs).
+		runtime.batch_reads = env_batch_reads || Common::Experiments::Enabled(Common::Experiments::SrtBatchReads);
 		auto& source = entry->second;
 		bool  materialized = false;
 		// Experiment AheadUnlocked: the execution thread may take the lock meanwhile; it keeps

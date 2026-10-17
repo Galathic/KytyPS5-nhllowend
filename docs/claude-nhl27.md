@@ -351,6 +351,11 @@ The per-draw proof that no scalar resource read overlaps a write of the same dra
 emulator when one does; it never fired in NHL 27) is opt-in now, `KYTY_DBG_CHECK_SCALAR_READS=1`:
 about 1% of the execution thread.
 
+Batch boundaries (`KYTY_BDA_BATCH`, after every indirect buffer, wait and event packet) are a
+third of the execution thread's operations, but cheap: carrying them on the next operation instead
+took ~110k callbacks/s off and changed nothing per draw (paused A/B: 4.70 vs 4.72 us per draw;
+fps 40 vs 41): dropped. In a paused scene the callbacks cost about 0.1 us each.
+
 The low-energy preset patch (`patches/nhl27_lowenergy.json`: resolution scale 0.5, no FSR3)
 changes nothing on the CPU side (same draws per second and thread load).
 
