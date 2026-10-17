@@ -356,6 +356,10 @@ third of the execution thread's operations, but cheap: carrying them on the next
 took ~110k callbacks/s off and changed nothing per draw (paused A/B: 4.70 vs 4.72 us per draw;
 fps 40 vs 41): dropped. In a paused scene the callbacks cost about 0.1 us each.
 
+The execution thread's checks of resolved reads look up the GPU-dirty state (buffer ranges and
+GPU-modified images) once per page instead of per read: execution time per dispatch -14%, draws
+per second +1.5% in a paused, execution-bound A/B (52 fps).
+
 The low-energy preset patch (`patches/nhl27_lowenergy.json`: resolution scale 0.5, no FSR3)
 changes nothing on the CPU side (same draws per second and thread load).
 

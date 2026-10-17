@@ -314,13 +314,12 @@ bool GuestReadLog::StillValid(bool without_faults) const {
 		return page_protected;
 	};
 	// The GPU-dirty checks of the entries too: once per page (two tree lookups per entry were a
-	// third of this check). AbLegacy: per entry.
-	const bool page_checks = !Common::Experiments::Enabled(Common::Experiments::AbLegacy);
+	// third of this check; execution time per dispatch -14% in a paused A/B).
 	std::array<uint64_t, 2> clean_page {~uint64_t {0}, ~uint64_t {0}};
 	std::array<bool, 2>     page_clean {};
 	const auto              known_clean = [&](uint64_t address, uint64_t size, bool gpu_images) {
 		const auto page = address & ~uint64_t {0xfff};
-		if (!page_checks || page != ((address + size - 1) & ~uint64_t {0xfff})) {
+		if (page != ((address + size - 1) & ~uint64_t {0xfff})) {
 			return false;
 		}
 		const auto kind = gpu_images ? 1 : 0;
