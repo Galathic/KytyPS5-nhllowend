@@ -243,6 +243,18 @@ public:
 	}
 
 	// fast: enables the lock-free single-mapping read cache (KYTY_SRT_SOURCE_REUSE).
+	// Resource reads are mostly a descriptor or a few dwords: those are copied without a call (the
+	// calls were 7% of the resolve thread).
+	static void CopyGuestBytes(uint8_t* destination, const uint8_t* source, uint64_t size) {
+		switch (size) {
+			case 4: std::memcpy(destination, source, 4); return;
+			case 8: std::memcpy(destination, source, 8); return;
+			case 16: std::memcpy(destination, source, 16); return;
+			case 32: std::memcpy(destination, source, 32); return;
+			default: std::memcpy(destination, source, size); return;
+		}
+	}
+
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size, bool fast = false) {
 		if (data == nullptr) {
 			return false;
@@ -257,7 +269,7 @@ public:
 			const auto g0 = m_map_gen.load(std::memory_order_acquire);
 			if (c.owner == this && c.gen == g0 && size != 0 && vaddr >= c.begin && vaddr - c.begin < c.length &&
 			    size <= c.length - (vaddr - c.begin)) {
-				std::memcpy(destination, c.host + (vaddr - c.begin), size);
+				CopyGuestBytes(destination, c.host + (vaddr - c.begin), size);
 				std::atomic_thread_fence(std::memory_order_acquire);
 				if (m_map_gen.load(std::memory_order_relaxed) == g0) return true;
 			}
@@ -268,7 +280,7 @@ public:
 				auto& p = t_read_cache_previous;
 				if (p.owner == this && p.gen == g0 && size != 0 && vaddr >= p.begin && vaddr - p.begin < p.length &&
 				    size <= p.length - (vaddr - p.begin)) {
-					std::memcpy(destination, p.host + (vaddr - p.begin), size);
+					CopyGuestBytes(destination, p.host + (vaddr - p.begin), size);
 					std::atomic_thread_fence(std::memory_order_acquire);
 					if (m_map_gen.load(std::memory_order_relaxed) == g0) {
 						std::swap(c, p);
@@ -279,7 +291,7 @@ public:
 			// Experiment BackingLookupCache: the per-block lookup cache before the map search.
 			if (Common::Experiments::Enabled(Common::Experiments::BackingLookupCache) &&
 			    TryCachedTransfer(vaddr, size, [destination](uint8_t* backing, size_t bytes) {
-				    std::memcpy(destination, backing, bytes);
+				    CopyGuestBytes(destination, backing, bytes);
 			    })) {
 				return true;
 			}
@@ -291,7 +303,7 @@ public:
 			    true);
 		}
 		if (TryCachedTransfer(vaddr, size, [destination](uint8_t* backing, size_t bytes) {
-			    std::memcpy(destination, backing, bytes);
+			    CopyGuestBytes(destination, backing, bytes);
 		    })) {
 			return true;
 		}

@@ -338,6 +338,18 @@ too (the EXEC branch stays; a read-modify-write of a containing dword keeps it, 
 compare-exchange cannot spin): GPU time -3.1 / -3.7% per frame in a paused A/B/A (pixel shaders
 with buffer stores -5 to -9%). Code-gen key bit 64.
 
+The resolve thread read resource-table words one dword per call (its SRT runtime never set
+`batch_reads`, which the execution thread's has on by default): every dword went through five
+calls down to a memcpy, and each switch between the two threads on one program rebuilt the
+program's read runs. It now reads contiguous words in one call as well: resolve-thread busy time
+-32% per operation in an in-boot A/B (2.8 -> 1.9 us; 740 -> 475 ms/s), so the execution thread
+is the limit again (about 95% busy in heavy play). Small backing reads (4/8/16/32 bytes) are
+copied inline. A resolve-side memo of whole materializations (four per program, validated by
+re-reading) hit only 10% of the time and cost more than it saved: dropped.
+
+The low-energy preset patch (`patches/nhl27_lowenergy.json`: resolution scale 0.5, no FSR3)
+changes nothing on the CPU side (same draws per second and thread load).
+
 ## Merged defaults (nhl27 + claude/nhl27-perf)
 
 Where both branches implemented the same feature, only one implementation is left and it is a
