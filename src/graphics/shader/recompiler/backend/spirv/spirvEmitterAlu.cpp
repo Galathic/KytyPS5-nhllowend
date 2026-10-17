@@ -357,8 +357,13 @@ uint32_t EmitFPMaxTri32(EmitterState& state, uint32_t arg0, uint32_t arg1, uint3
 	return EmitFMinMax3(state, arg0, arg1, arg2, true);
 }
 
+// KYTY_FAST_DENORM: skip the explicit input flush (see spirvHalfLanes.h).
+static uint32_t FlushInputDenorm(EmitterState& state, uint32_t value) {
+	return FastDenormEnabled() ? value : EmitFlushF32DenormToSignedZero(state, value);
+}
+
 uint32_t EmitFPRecip32(EmitterState& state, uint32_t arg0) {
-	const auto source = EmitFlushF32DenormToSignedZero(state, arg0);
+	const auto source = FlushInputDenorm(state, arg0);
 	return Binary(state, spv::OpFDiv, TypeF32(state), ConstantF32(state, 0x3f800000u), source);
 }
 
@@ -374,22 +379,22 @@ uint32_t EmitFPRecipIFlag32(EmitterState& state, uint32_t arg0) {
 
 uint32_t EmitFPRecipSqrt32(EmitterState& state, uint32_t arg0) {
 	return EmitExt(state, TypeF32(state), GLSLstd450InverseSqrt,
-	               {EmitFlushF32DenormToSignedZero(state, arg0)});
+	               {FlushInputDenorm(state, arg0)});
 }
 
 uint32_t EmitFPSqrt(EmitterState& state, uint32_t arg0) {
 	return EmitExt(state, TypeF32(state), GLSLstd450Sqrt,
-	               {EmitFlushF32DenormToSignedZero(state, arg0)});
+	               {FlushInputDenorm(state, arg0)});
 }
 
 uint32_t EmitFPExp2(EmitterState& state, uint32_t arg0) {
 	return EmitExt(state, TypeF32(state), GLSLstd450Exp2,
-	               {EmitFlushF32DenormToSignedZero(state, arg0)});
+	               {FlushInputDenorm(state, arg0)});
 }
 
 uint32_t EmitFPLog2(EmitterState& state, uint32_t arg0) {
 	return EmitExt(state, TypeF32(state), GLSLstd450Log2,
-	               {EmitFlushF32DenormToSignedZero(state, arg0)});
+	               {FlushInputDenorm(state, arg0)});
 }
 
 uint32_t EmitFPLdexp(EmitterState& state, uint32_t arg0, uint32_t arg1) {

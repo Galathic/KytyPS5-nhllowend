@@ -29,6 +29,11 @@ struct LaneDemandStats {
 };
 
 [[nodiscard]] bool LaneDemandEnabled();
+
+// KYTY_FAST_DENORM=1 (experiment, default off): float compares and rcp/rsq/sqrt/exp2/log2 no longer
+// flush f32 denormal inputs to zero by hand. f32 add/mul/fma results are not flushed either, so
+// this only differs for operands below ~1.2e-38.
+[[nodiscard]] bool FastDenormEnabled();
 uint32_t RewriteLaneDemand(std::vector<uint32_t>& spirv, LaneDemandStats* stats = nullptr);
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv

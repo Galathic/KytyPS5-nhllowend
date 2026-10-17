@@ -408,6 +408,14 @@ uint32_t RewriteHalfLanes(std::vector<uint32_t>& spirv, HalfLaneStats* stats) {
 	return count;
 }
 
+bool FastDenormEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_FAST_DENORM");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
 bool LaneDemandEnabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_LANE_DEMAND");
@@ -603,6 +611,15 @@ public:
 				with_cond.push_back(cond);
 				Add(m.Word(*def, 4), Simplify(with_cond));
 				if (!SetImplies(d, cond)) Add(m.Word(*def, 5), d);
+				continue;
+			}
+			if (def->op == spv::OpLogicalAnd && def->count == 5 && m.Word(*def, 1) == m_bool) {
+				// a && b: b only matters in lanes where a holds.
+				const uint32_t a = m.Word(*def, 3);
+				Add(a, d);
+				LaneSet with_a = d;
+				with_a.push_back(a);
+				Add(m.Word(*def, 4), Simplify(with_a));
 				continue;
 			}
 			ForOperands(*def, [&](uint32_t operand) { Add(operand, d); });
