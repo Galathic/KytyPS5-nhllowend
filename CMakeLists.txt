@@ -854,7 +854,7 @@ add_executable(fsr_upscaler_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/presentation/fsr/fsr3.cpp"
 	${gpu_blit_shader_headers})
 target_include_directories(fsr_upscaler_tests PRIVATE ${inc_headers})
-target_link_libraries(fsr_upscaler_tests PRIVATE Vulkan::Headers fmt::fmt ${kyty_fsr3_libraries})
+target_link_libraries(fsr_upscaler_tests PRIVATE common Vulkan::Headers fmt::fmt ${kyty_fsr3_libraries})
 if(KYTY_ENABLE_FSR3)
 	foreach(target kyty_emulator fsr_upscaler_tests)
 		foreach(dll IN LISTS kyty_fsr3_dlls)

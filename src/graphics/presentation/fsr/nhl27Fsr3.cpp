@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -74,10 +75,17 @@ struct Nhl27Fsr3::Impl {
 	void* mapped = nullptr;
 	uint64_t last_tick = 0, serial = 0, rejected = 0, recorded = 0;
 	unsigned stage = 0;
+	std::atomic<bool> last_recorded {false}, failed {false};
 	Nhl27Fsr3Constants captured;
 	std::array<Role, 8> prepare {}, reactive {};
 	Role luma;
-	explicit Impl(GraphicContext& gfx) : graphics(gfx) {}
+	explicit Impl(GraphicContext& gfx) : graphics(gfx) {
+		if (!gfx.physical_device.getFeatures().shaderInt16) {
+			failed.store(true, std::memory_order_release);
+			std::printf("NHL27FSR3GAME status=unsupported reason=shaderInt16\n");
+			std::fflush(stdout);
+		}
+	}
 	~Impl() {
 		// RenderContext shuts down/drains the scheduler before RenderExecutor's owner dies.
 		ReleaseImages();
@@ -146,6 +154,47 @@ struct Nhl27Fsr3::Impl {
 		std::memcpy(words.data(), mapped, 208);
 		return Nhl27Fsr3Constants::Decode(words);
 	}
+	void CheckOutput(RenderContext& context, CommandBuffer& command, uint32_t guest_frame) {
+		auto recorder = command.Handle();
+		auto& output = images[3].resource;
+		ImageBarrier(recorder, output.image, vk::ImageLayout::eGeneral, vk::ImageLayout::eTransferSrcOptimal);
+		vk::BufferImageCopy copy {};
+		copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+		copy.imageOffset = {int32_t(output.extent.width / 2), int32_t(output.extent.height / 2), 0};
+		copy.imageExtent = {2, 2, 1};
+		recorder.copyImageToBuffer(output.image, vk::ImageLayout::eTransferSrcOptimal, constants, 1, &copy);
+		ImageBarrier(recorder, output.image, vk::ImageLayout::eTransferSrcOptimal, vk::ImageLayout::eGeneral);
+		vk::MemoryBarrier2 host {};
+		host.srcStageMask = S::eTransfer; host.srcAccessMask = A::eTransferWrite;
+		host.dstStageMask = S::eHost; host.dstAccessMask = A::eHostRead;
+		vk::DependencyInfo dependency {};
+		dependency.memoryBarrierCount = 1; dependency.pMemoryBarriers = &host;
+		recorder.pipelineBarrier2(dependency);
+		context.GetCommandScheduler().Wait(last_tick);
+		InvalidateRedundantBinds();
+		if (!last_recorded.load(std::memory_order_acquire) ||
+			vmaInvalidateAllocation(graphics.allocator, constants_alloc, 0, 32) != VK_SUCCESS) {
+			failed.store(true, std::memory_order_release);
+			Reject("shadow-dispatch-or-readback");
+			return;
+		}
+		std::array<uint16_t, 16> pixels;
+		std::memcpy(pixels.data(), mapped, 32);
+		std::array<float, 16> decoded {};
+		bool finite = true;
+		for (size_t i = 0; i < pixels.size(); ++i) {
+			const unsigned exponent = (pixels[i] >> 10) & 31, mantissa = pixels[i] & 1023;
+			if (exponent == 31) { finite = false; continue; }
+			decoded[i] = exponent ? std::ldexp(1 + float(mantissa) / 1024, int(exponent) - 15)
+				: std::ldexp(float(mantissa), -24);
+			if (pixels[i] & 0x8000) decoded[i] = -decoded[i];
+		}
+		std::printf("NHL27FSR3GAME status=readback mode=reset-shadow guest_frame=%u "
+			"pixels=4 finite=%d rgba=%.9g,%.9g,%.9g,%.9g\n", guest_frame, int(finite),
+			decoded[0], decoded[1], decoded[2], decoded[3]);
+		std::fflush(stdout);
+		if (!finite) { failed.store(true, std::memory_order_release); Reject("nonfinite-shadow-output"); }
+	}
 	bool EnsureImages(const Nhl27Fsr3Constants& c) {
 		const vk::Extent2D input {c.Width(), c.Height()}, output {c.OutputWidth(), c.OutputHeight()};
 		if (images[0].resource.image && images[0].resource.extent == input &&
@@ -191,6 +240,8 @@ struct Nhl27Fsr3::Impl {
 			binding.desc.view_info.base_layer != 0) return false;
 		auto& source = context.GetTextureCache().GetImage(binding.image_id);
 		if (!source.backing.image || source.backing.samples != 1 ||
+			!(source.backing.usage & vk::ImageUsageFlagBits::eTransferSrc) ||
+			binding.layout == vk::ImageLayout::eUndefined ||
 			source.backing.extent != vk::Extent3D {owned.resource.extent.width,
 				owned.resource.extent.height, 1}) return false;
 		auto full = vk::ImageAspectFlags(vk::ImageAspectFlagBits::eColor), aspect = full;
@@ -243,12 +294,13 @@ bool Nhl27Fsr3::Enabled() {
 }
 void Nhl27Fsr3::OnDispatch(RenderContext& context, CommandBuffer& command, uint64_t hash,
 						  const PreparedBindings& bindings) {
-	if (!Enabled()) return;
+	if (!Enabled() || m->failed.load(std::memory_order_acquire)) return;
 	const auto& b = bindings.images;
 	const auto count = b.size();
 	if (hash == kPass[0]) {
 		m->stage = 0;
 		if (m->last_tick) context.GetCommandScheduler().Wait(m->last_tick);
+		if (m->failed.load(std::memory_order_acquire)) return;
 		const auto constants = m->ReadConstants(context, command, bindings);
 		if (!constants || count != 8) { m->Reject("prepare-constants-or-slots"); return; }
 		const auto& c = *constants;
@@ -325,8 +377,11 @@ void Nhl27Fsr3::OnDispatch(RenderContext& context, CommandBuffer& command, uint6
 		}
 		const auto guest_frame = c.Frame();
 		auto* state = m.get();
+		state->last_recorded.store(false, std::memory_order_release);
 		recorder.RecordExternal([state, frame, guest_frame](vk::CommandBuffer native) {
 			const bool ok = state->fsr->Record(native, frame);
+			state->last_recorded.store(ok, std::memory_order_release);
+			if (!ok) state->failed.store(true, std::memory_order_release);
 			if (++state->recorded <= 3 || state->recorded % 600 == 0 || !ok) {
 				std::printf("NHL27FSR3GAME status=%s mode=reset-shadow guest_frame=%u "
 					"render=%ux%u display=%ux%u detail=%s\n", ok ? "recorded" : "failed",
@@ -339,6 +394,8 @@ void Nhl27Fsr3::OnDispatch(RenderContext& context, CommandBuffer& command, uint6
 		g_compute_pipeline_epoch.fetch_add(1, std::memory_order_relaxed);
 		NoteShaderWork();
 		m->last_tick = context.GetCommandScheduler().CurrentTick();
+		if (m->serial <= 3 || m->serial % 600 == 0)
+			m->CheckOutput(context, command, guest_frame);
 	}
 }
 } // namespace Libs::Graphics

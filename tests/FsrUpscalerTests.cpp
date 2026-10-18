@@ -46,6 +46,11 @@ int main() {
 		changed = *captured;
 		changed.words[10]++;
 		Check(!Nhl27Fsr3Constants::Decode(changed.words), "reject unobserved dynamic resource layout");
+		for (size_t i = 20; i < 28; ++i) {
+			changed = *captured;
+			changed.words[i] = 0x7fc00000;
+			Check(!Nhl27Fsr3Constants::Decode(changed.words), "reject nonfinite reciprocal extent");
+		}
 		std::puts("NHL27 FSR3 constants PASS: captured GPU fixture and fail-closed checks");
 	}
 	{
@@ -266,8 +271,14 @@ int main() {
 				vk::ImageLayout::eShaderReadOnlyOptimal);
 		im.layout = vk::ImageLayout::eShaderReadOnlyOptimal;
 	};
+	const char* captured_size = std::getenv("KYTY_FSR3_TEST_CAPTURE_SIZE");
+	const bool large = captured_size && std::strcmp(captured_size, "1") == 0;
+	const vk::Extent2D input = large ? vk::Extent2D {2348, 1320} : vk::Extent2D {32, 24};
+	const vk::Extent2D output = large ? vk::Extent2D {3520, 1980} : vk::Extent2D {64, 48};
+	std::printf("FSR test sizes: %ux%u -> %ux%u\n", input.width, input.height,
+		output.width, output.height);
 	vk::BufferCreateInfo read_info {};
-	read_info.size = 128 * 96 * 4;
+	read_info.size = std::max<uint64_t>(128 * 96 * 4, uint64_t(output.width) * output.height * 8);
 	read_info.usage = vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eTransferSrc;
 	vk::Buffer readback;
 	Ok(device.createBuffer(&read_info, nullptr, &readback));
@@ -305,7 +316,6 @@ int main() {
 		}
 		device.unmapMemory(read_memory);
 	};
-	const vk::Extent2D input {32, 24}, output {64, 48};
 	auto color = image(vk::Format::eR8G8B8A8Unorm, input);
 	begin();
 	clear(color, {0.25f, 0.5f, 0.75f, 1});

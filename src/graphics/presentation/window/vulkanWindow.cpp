@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/presenter.h"
+#include "graphics/presentation/fsr/nhl27Fsr3.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
@@ -704,6 +705,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.vertexPipelineStoresAndAtomics != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.dualSrcBlend != VK_TRUE);
 	vk::PhysicalDeviceFeatures device_features {};
+	if (Nhl27Fsr3::Enabled()) {
+		device_features.shaderInt16 = supported_features2.features.shaderInt16;
+		std::printf("NHL27FSR3GAME feature=shaderInt16 enabled=%u\n",
+			unsigned(device_features.shaderInt16));
+		std::fflush(stdout);
+	}
 	device_features.fragmentStoresAndAtomics = VK_TRUE;
 	device_features.samplerAnisotropy        = VK_TRUE;
 	device_features.multiDrawIndirect = supported_features2.features.multiDrawIndirect;

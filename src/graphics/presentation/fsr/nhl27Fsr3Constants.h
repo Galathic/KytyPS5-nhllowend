@@ -42,7 +42,8 @@ struct Nhl27Fsr3Constants {
 		for (size_t i = 0; i < 4; ++i) {
 			const size_t offset = 12 + i * 2;
 			const float w = float(c.words[4 + i * 2]), h = float(c.words[5 + i * 2]);
-			if (c.Float(offset) != w || c.Float(offset + 1) != h ||
+			if (!std::isfinite(c.Float(offset + 8)) || !std::isfinite(c.Float(offset + 9)) ||
+				c.Float(offset) != w || c.Float(offset + 1) != h ||
 				std::abs(c.Float(offset + 8) * w - 1) > 1e-5f ||
 				std::abs(c.Float(offset + 9) * h - 1) > 1e-5f)
 				return std::nullopt;

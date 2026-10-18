@@ -1,5 +1,44 @@
 # FSR test branch — 2026-10-17
 
+## Update — 2026-10-18: hidden HDR game-input shadow provider
+
+This supersedes the earlier "no provider" status. KYTY_FSR3_NHL27_SHADOW=1 is
+an off-default startup diagnostic (no runtime bit). With the optional FSR3 build,
+KYTY_FSR3_HDR=1 and KYTY_FSR3_LUMA_FORMAT_FIX=1, it reads the actual 208-byte
+GPU constants and snapshots prepare-pass color/depth/raw motion into owned
+images before alias reuse. All nine graph edges and the matching accumulation
+constants are checked. Guest passes/history/display stay active. The host output
+is hidden and its history is reset every frame; this does not certify temporal
+motion direction, motion-jitter inclusion, camera units or reset handling.
+
+Supported shaderInt16 is enabled only for this mode; unsupported hardware stops
+the diagnostic. The first three dispatches and every 600th dispatch log SDK
+status and a synchronized center 2x2 FP16 finite check. Failure stops subsequent
+shadow work. These sparse checks are not a complete image-quality test. GPU
+constant readback uses synchronous submission waits; this mode is not a
+performance candidate and no gain is established.
+
+The normal-size isolated test passed at Medium integrity with Khronos validation
+and exit 0. KYTY_FSR3_TEST_CAPTURE_SIZE=1 optionally runs the GPU fixtures at
+2348x1320 -> 3520x1980; all named checks passed including packed HDR and FP16
+history, with zero validation stderr. The large-test parent timed out at 20s,
+while the test subsequently completed, so its exact exit code was not retained.
+Nonfinite reciprocal metadata is rejected in the captured-constant fixture.
+
+Live build 77ee25e6-dirty ran HDR shadow dispatches using game inputs with finite,
+nonblack readback. The initial run exposed missing shaderInt16; the rebuilt run
+logs enabled=1 with no pCode-08740 errors observed. Remaining validation reports
+concern 128x128 images requesting ten mip levels and out-of-bounds image copies;
+the standalone SDK test is clean at the same render/output size. This suggests
+the guest texture path, but does not establish a shadow-off baseline. A complete
+in-game validation pass and moving Free Skate output review remain outstanding.
+Do not claim validation clean or displayed FSR3 from these results.
+
+Workspace evidence prefixes: kyty-play-nhl27/fsr-shadow-resume-20261018-153602,
+fsr-shadow-check-20261018-154725 and fsr-shadow-feature-20261018-155534.
+An uncompiled experimental mip workaround was preserved outside this checkout in
+kyty-play-nhl27/fsr-mip-guard-uncompiled-20261018-155710, then removed from active
+source after recovery checks. It is not part of this change.
 ## Update — 2026-10-18: verified Free Skate bindings and opt-in HDR backend
 
 This section supersedes the older pending-capture and SDR-only backend status below.
