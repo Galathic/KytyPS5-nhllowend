@@ -14,29 +14,59 @@
 namespace Libs::Graphics::PageWriteSeq {
 
 namespace Detail {
-constexpr uint32_t PageBits = 12;
-constexpr uint32_t LeafBits = 16;
-constexpr uint32_t TopBits  = 44 - PageBits - LeafBits;
-using Leaf                  = std::atomic<uint64_t>[size_t {1} << LeafBits];
-inline std::atomic<std::atomic<uint64_t>*> g_top[size_t {1} << TopBits] {};
+constexpr uint32_t AddressBits = 44;
 
-inline std::atomic<uint64_t>* LeafFor(uint64_t page, bool create) {
-	auto& slot = g_top[(page >> LeafBits) & ((uint64_t {1} << TopBits) - 1)];
-	auto* leaf = slot.load(std::memory_order_acquire);
-	if (leaf != nullptr || !create) {
+// A two-level table of sequences for units of 2^UnitBits bytes.
+template <uint32_t UnitBits>
+struct Table {
+	static constexpr uint32_t LeafBits = 16;
+	static constexpr uint32_t TopBits  = AddressBits - UnitBits - LeafBits;
+	static constexpr uint64_t LeafMask = (uint64_t {1} << LeafBits) - 1;
+	std::atomic<std::atomic<uint64_t>*> top[size_t {1} << TopBits] {};
+
+	std::atomic<uint64_t>* Leaf(uint64_t unit, bool create) {
+		auto& slot = top[(unit >> LeafBits) & ((uint64_t {1} << TopBits) - 1)];
+		auto* leaf = slot.load(std::memory_order_acquire);
+		if (leaf != nullptr || !create) {
+			return leaf;
+		}
+		auto* fresh = new std::atomic<uint64_t>[size_t {1} << LeafBits] {};
+		if (slot.compare_exchange_strong(leaf, fresh, std::memory_order_acq_rel)) {
+			return fresh;
+		}
+		delete[] fresh;
 		return leaf;
 	}
-	auto* fresh = new std::atomic<uint64_t>[size_t {1} << LeafBits] {};
-	if (slot.compare_exchange_strong(leaf, fresh, std::memory_order_acq_rel)) {
-		return fresh;
+	void Raise(uint64_t first, uint64_t last, uint64_t sequence) {
+		for (uint64_t unit = first; unit <= last; unit++) {
+			auto& cell = Leaf(unit, true)[unit & LeafMask];
+			auto  seen = cell.load(std::memory_order_relaxed);
+			while (seen < sequence && !cell.compare_exchange_weak(seen, sequence, std::memory_order_release)) {
+			}
+		}
 	}
-	delete[] fresh;
-	return leaf;
-}
+	uint64_t Last(uint64_t first, uint64_t last) {
+		uint64_t result = 0;
+		for (uint64_t unit = first; unit <= last; unit++) {
+			const auto* leaf = Leaf(unit, false);
+			if (leaf != nullptr) {
+				const auto value = leaf[unit & LeafMask].load(std::memory_order_acquire);
+				result           = value > result ? value : result;
+			}
+		}
+		return result;
+	}
+};
+
+constexpr uint32_t PageBits  = 12;
+constexpr uint32_t ChunkBits = 20;
+// Small writes per page; writes of more than 16 pages (GPU-written buffers, every bind) per 1 MiB
+// chunk, which costs one entry per MiB instead of one per page.
+inline Table<PageBits>  g_pages;
+inline Table<ChunkBits> g_chunks;
 } // namespace Detail
 
-// The operation the calling thread executes (the execution thread sets it per operation; other
-// threads use the last one it published).
+// The operation the calling thread executes (the execution thread sets it per operation).
 inline thread_local uint64_t t_operation = 0;
 inline std::atomic<uint64_t> g_operation {0};
 
@@ -53,17 +83,14 @@ inline void SetOperation(uint64_t sequence) {
 
 // Records that operation `sequence` writes [vaddr, vaddr + size).
 inline void Raise(uint64_t vaddr, uint64_t size, uint64_t sequence) {
-	if (size == 0 || vaddr >= (uint64_t {1} << 44u)) {
+	if (size == 0 || vaddr >= (uint64_t {1} << Detail::AddressBits)) {
 		return;
 	}
-	const uint64_t first = vaddr >> Detail::PageBits;
-	const uint64_t last  = (vaddr + size - 1) >> Detail::PageBits;
-	for (uint64_t page = first; page <= last; page++) {
-		auto* leaf = Detail::LeafFor(page, true);
-		auto& cell = leaf[page & ((uint64_t {1} << Detail::LeafBits) - 1)];
-		auto  seen = cell.load(std::memory_order_relaxed);
-		while (seen < sequence && !cell.compare_exchange_weak(seen, sequence, std::memory_order_release)) {
-		}
+	const uint64_t end = vaddr + size - 1;
+	if ((end >> Detail::PageBits) - (vaddr >> Detail::PageBits) < 16) {
+		Detail::g_pages.Raise(vaddr >> Detail::PageBits, end >> Detail::PageBits, sequence);
+	} else {
+		Detail::g_chunks.Raise(vaddr >> Detail::ChunkBits, end >> Detail::ChunkBits, sequence);
 	}
 }
 
@@ -83,20 +110,13 @@ inline void ForceChecks() {
 
 // The last operation recorded writing any page of [vaddr, vaddr + size).
 [[nodiscard]] inline uint64_t Last(uint64_t vaddr, uint64_t size) {
-	if (size == 0 || vaddr >= (uint64_t {1} << 44u)) {
+	if (size == 0 || vaddr >= (uint64_t {1} << Detail::AddressBits)) {
 		return ~uint64_t {0};
 	}
-	const uint64_t first  = vaddr >> Detail::PageBits;
-	const uint64_t last   = (vaddr + size - 1) >> Detail::PageBits;
-	uint64_t       result = 0;
-	for (uint64_t page = first; page <= last; page++) {
-		const auto* leaf = Detail::LeafFor(page, false);
-		if (leaf != nullptr) {
-			const auto value = leaf[page & ((uint64_t {1} << Detail::LeafBits) - 1)].load(std::memory_order_acquire);
-			result           = value > result ? value : result;
-		}
-	}
-	return result;
+	const uint64_t end    = vaddr + size - 1;
+	const uint64_t pages  = Detail::g_pages.Last(vaddr >> Detail::PageBits, end >> Detail::PageBits);
+	const uint64_t chunks = Detail::g_chunks.Last(vaddr >> Detail::ChunkBits, end >> Detail::ChunkBits);
+	return pages > chunks ? pages : chunks;
 }
 
 } // namespace Libs::Graphics::PageWriteSeq
