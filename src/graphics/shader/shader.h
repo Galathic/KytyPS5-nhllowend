@@ -99,12 +99,25 @@ inline std::atomic<bool> g_shader_native_pkrtz {false};
 [[nodiscard]] inline bool ShaderNativeF16Sdwa() {
 	return ShaderNativeFp16();
 }
+// Codegen option: robust (branchless) storage-buffer loads, stores and constant reads also in
+// non-pixel shaders that spill guest VGPRs to LDS or scratch (key bit 512; d7cfa519 -3%).
+[[nodiscard]] inline bool ShaderRobustSpillLoads() {
+	return ShaderRobustLoads();
+}
+// Codegen option: formatted buffer loads under robust loads read unconditionally and select the
+// out-of-bounds value instead of branching (key bit 1024). The crowd vertex shaders had ~400 such
+// branches around 16-bit vertex loads: their draws -9.6%, GPU time per frame -4% with these two
+// options in a paused crowd scene (A/B/A).
+[[nodiscard]] inline bool ShaderBranchlessFormattedLoads() {
+	return ShaderRobustLoads();
+}
 [[nodiscard]] inline uint32_t ShaderFloatCodegenKey() {
 	return static_cast<uint32_t>(ShaderNativeFp16()) | (ShaderNativeMinMax() ? 2u : 0u) |
 	       (ShaderFusedMad() ? 4u : 0u) |
 	       (ShaderRobustLoads() ? (ShaderRobustLoadsKeepExec() ? 24u : 8u) : 0u) |
 	       (ShaderRobustConstReads() ? 32u : 0u) | (ShaderRobustStores() ? 64u : 0u) |
-	       (ShaderNativePkrtz() ? 128u : 0u) | (ShaderNativeF16Sdwa() ? 256u : 0u);
+	       (ShaderNativePkrtz() ? 128u : 0u) | (ShaderNativeF16Sdwa() ? 256u : 0u) |
+	       (ShaderRobustSpillLoads() ? 512u : 0u) | (ShaderBranchlessFormattedLoads() ? 1024u : 0u);
 }
 [[nodiscard]] inline uint32_t ShaderNativeFp16Modes() {
 	return g_shader_native_fp16_modes.load(std::memory_order_relaxed);

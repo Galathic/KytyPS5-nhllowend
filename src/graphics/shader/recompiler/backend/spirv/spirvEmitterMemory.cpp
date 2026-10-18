@@ -354,8 +354,9 @@ uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& 
 // Shaders that spill guest VGPRs (to LDS or scratch) keep their branches: unconditional loads made
 // the one such NHL 27 pixel shader 16-27% slower (more live values), the others 8-23% faster.
 bool RobustLoad(const EmitterState& state, IR::ResourceKind kind) {
-	return (kind == IR::ResourceKind::Buffer || kind == IR::ResourceKind::ScalarBuffer) &&
-	       ShaderRobustLoads() && !state.program.info.function_lds && state.program.scratch_dwords == 0;
+	const bool spills = state.program.info.function_lds || state.program.scratch_dwords != 0;
+	return (kind == IR::ResourceKind::Buffer || kind == IR::ResourceKind::ScalarBuffer) && ShaderRobustLoads() &&
+	       (!spills || (ShaderRobustSpillLoads() && state.program.stage != ShaderType::Pixel));
 }
 
 uint32_t LoadWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
@@ -802,7 +803,46 @@ uint32_t FormattedOutOfBoundsValue(ValueEmitContext& ctx, const IR::MemoryInfo& 
 	return ConstructU32Composite(ctx.state, components, values);
 }
 
+// Robust loads: a formatted load reads its components unconditionally (an out-of-range element
+// reads zeros on the device) and selects the out-of-bounds value instead of branching around the
+// loads (the crowd vertex shaders had ~400 such branches around 16-bit vertex loads). Lanes outside
+// EXEC load too; the register write discards their result.
+bool BranchlessFormattedLoad(const EmitterState& state, const IR::MemoryInfo& mem) {
+	return RobustLoad(state, mem.kind) && !ShaderRobustLoadsKeepExec() && ShaderBranchlessFormattedLoads();
+}
+
+uint32_t FormattedLoadSelect(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const PreparedFormattedMemory& plan,
+                             uint32_t components) {
+	std::array<uint32_t, 4> values {};
+	for (uint32_t component = 0; component < components; component++) {
+		const auto loaded = LoadFormattedInBounds(ctx, mem, plan, component);
+		const auto source = ResolveFormattedSource(ctx, mem, plan.info, component);
+		values[component] = Select(ctx.state, TypeU32(ctx.state), plan.in_bounds, loaded,
+		                           FormattedConstant(ctx, plan.info, source.kind));
+	}
+	return ConstructU32Composite(ctx.state, components, values);
+}
+
 uint32_t FormattedLoad(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
+	if (BranchlessFormattedLoad(ctx.state, mem)) {
+		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
+		const auto info     = Format::GetFormatInfo(BufferFormat(ctx, mem));
+		if (info.type != Format::ComponentType::Unknown) {
+			const auto plan  = PrepareFormattedMemory(ctx, inst, mem, resource, info);
+			const auto value = FormattedLoadSelect(ctx, mem, plan, 1u);
+			if (mem.data_bits != 16u) {
+				return value;
+			}
+			if (info.type == Format::ComponentType::Uint) {
+				return EmitUMin32(ctx.state, value, ConstantU32(ctx.state, 0xffffu));
+			}
+			if (info.type == Format::ComponentType::Sint) {
+				const auto lower = EmitSMax32(ctx.state, value, ConstantU32(ctx.state, 0xffff8000u));
+				return EmitSMin32(ctx.state, lower, ConstantU32(ctx.state, 0x7fffu));
+			}
+			return EmitConvertF16F32(ctx.state, EmitBitCastF32U32(ctx.state, value));
+		}
+	}
 	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
 		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
 		const auto info = Format::GetFormatInfo(BufferFormat(ctx, mem));
@@ -1196,6 +1236,14 @@ uint32_t LoadBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compon
 			    LoadWordPrepared(ctx, inst, RebaseRawComponent(mem, component), resource);
 		}
 		return ConstructU32Composite(state, components, values);
+	}
+	if (const auto mem = ctx.Memory(inst);
+	    mem.formatted && mem.kind != IR::ResourceKind::IndirectBuffer && BranchlessFormattedLoad(state, mem)) {
+		const auto resource = PrepareMemoryResourceAccess(state, mem);
+		const auto info     = Format::GetFormatInfo(BufferFormat(ctx, mem));
+		if (info.type != Format::ComponentType::Unknown) {
+			return FormattedLoadSelect(ctx, mem, PrepareFormattedMemory(ctx, inst, mem, resource, info), components);
+		}
 	}
 	return EmitValueOrDefaultIfCondition(
 	    state, ctx.Arg(inst, inst.NumArgs() - 1), TypeU32Composite(state, components),

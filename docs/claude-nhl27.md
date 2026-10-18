@@ -407,7 +407,18 @@ while any asynchronous guest download was pending (most of the time): the pendin
 are now a shared range set (`m_pending_read_ranges`, filled before their bytes leave the GPU-dirty
 ranges, emptied once they are in guest memory). Draw reads skipped: 19 of 35 -> 34 of 36;
 dispatch reads 7 of 15 -> 8.5 of 16. Execution time per draw -6.4%, per dispatch -4% in total
-(paused A/B; skipping every check would be -12% / -26%).
+(paused A/B; skipping every check would be -12% / -26%). Writes of more than 16 pages (every bind
+of a GPU-written buffer) are recorded per 1 MiB chunk: per page they were 2% of the thread.
+
+Crowd shots are GPU-bound (~30-37 ms GPU per frame paused): ~500 draws per frame use the crowd
+vertex shaders (0d41096a, 21d8131e), in depth, shadow and main passes. After native PKRTZ they still
+wrapped ~400 formatted 16-bit vertex loads in bounds branches (formatted loads were excluded from
+robust loads). Now formatted loads under robust loads read unconditionally (an out-of-range element
+reads zeros on the device) and select the format's out-of-bounds value (key bit 1024), and robust
+loads/stores/constant reads also apply to non-pixel shaders that spill guest VGPRs (key bit 512;
+pixel shaders keep their branches, one got slower without them). Crowd VS 21k -> 18.7k
+instructions, 408 -> 5 branches; paused crowd scene A/B/A: crowd draws -9.6%, d7cfa519 -3%, GPU
+time per frame -4% (36.9 -> 34.8-36.3 ms).
 
 The low-energy preset patch (`patches/nhl27_lowenergy.json`: resolution scale 0.5, no FSR3)
 changes nothing on the CPU side (same draws per second and thread load).
