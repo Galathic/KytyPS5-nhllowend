@@ -1,0 +1,25 @@
+#pragma once
+#include <cstdint>
+#include <memory>
+
+namespace Libs::Graphics {
+struct GraphicContext;
+struct PreparedBindings;
+class RenderContext;
+class CommandBuffer;
+
+// Off-default synchronous shadow provider. It snapshots actual bound GPU
+// constants/inputs, retains the guest's entire temporal chain, and resets host
+// history on every frame while temporal conventions remain uncertified.
+class Nhl27Fsr3 {
+public:
+	explicit Nhl27Fsr3(GraphicContext& graphics);
+	~Nhl27Fsr3(); // RenderContext drains the scheduler before releasing this owner.
+	static bool Enabled();
+	void OnDispatch(RenderContext& context, CommandBuffer& command, uint64_t hash,
+					const PreparedBindings& bindings);
+private:
+	struct Impl;
+	std::unique_ptr<Impl> m;
+};
+} // namespace Libs::Graphics

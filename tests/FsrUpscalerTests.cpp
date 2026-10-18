@@ -4,6 +4,8 @@
 #include "graphics/presentation/fsr/fsr1.h"
 #include "graphics/presentation/fsr/fsr2Constants.h"
 #include "graphics/presentation/fsr/fsr3.h"
+#include "graphics/presentation/fsr/nhl27Fsr3Constants.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 
 #include <array>
 #include <cmath>
@@ -25,6 +27,48 @@ static void Ok(vk::Result result) {
 }
 
 int main() {
+	{
+		// Captured Free Skate frame 62, not the embedded public FSR2 layout.
+		const std::array<uint32_t, 52> words {0xbcf0f0f1u,0x41a4b4b5u,0x3e898ec1u,0x3e1ac098u,0x0000092cu,0x00000528u,0x0000092cu,0x00000528u,0x00000dc0u,0x000007bcu,0x00000dc0u,0x000007bcu,0x4512c000u,0x44a50000u,0x4512c000u,0x44a50000u,0x455c0000u,0x44f78000u,0x455c0000u,0x44f78000u,0x39df4a93u,0x3a46980cu,0x39df4a93u,0x3a46980cu,0x3994f209u,0x3a04655eu,0x3994f209u,0x3a04655eu,0x3ea00000u,0xbeb425ecu,0xbea00000u,0x3e5097b4u,0xbf000000u,0x3f000000u,0x3f2ac37eu,0x3f2aaaabu,0x3d1ee852u,0x3f800000u,0x3f800000u,0x0000003eu,0x00000000u,0x41200000u,0xbdcccccdu,0x40000000u,0x00000000u,0x3d23d70au,0xbe4cccccu,0x3d4ccccdu,0x3ecccccdu,0xffffffffu,0xffffffffu,0xffffffffu};
+		const auto captured = Nhl27Fsr3Constants::Decode(words);
+		Check(captured && captured->Frame() == 62 && captured->Width() == 2348 &&
+			captured->OutputWidth() == 3520, "decode actual Frostbite GPU constant fixture");
+		Check(std::abs(captured->Near() - 20) < 0.001f &&
+			std::abs(captured->Far() - 700) < 0.01f, "captured depth coefficient conversion");
+		auto changed = *captured;
+		changed.words[49] ^= 1;
+		Check(captured->SameFrame(changed), "ignore pass-specific constant tail");
+		changed.words[39]++;
+		Check(!captured->SameFrame(changed), "reject mismatched temporal frame");
+		changed = *captured;
+		changed.words[3] = 0x7fc00000;
+		Check(!Nhl27Fsr3Constants::Decode(changed.words), "reject nonfinite captured camera");
+		changed = *captured;
+		changed.words[10]++;
+		Check(!Nhl27Fsr3Constants::Decode(changed.words), "reject unobserved dynamic resource layout");
+		std::puts("NHL27 FSR3 constants PASS: captured GPU fixture and fail-closed checks");
+	}
+	{
+		int observed = 0;
+		auto* destination = &observed;
+		CommandRecorder direct {vk::CommandBuffer {}};
+		direct.RecordExternal([destination](vk::CommandBuffer) { *destination = 1; });
+		Check(observed == 1, "external callback records immediately in direct mode");
+		CommandStream stream;
+		CommandRecorder deferred {&stream};
+		int captured_value = 7;
+		deferred.RecordExternal([destination, captured_value](vk::CommandBuffer) {
+			*destination += captured_value;
+		});
+		captured_value = 99;
+		Check(observed == 1, "external callback waits for replay in deferred mode");
+		auto chunks = stream.TakeChunks();
+		for (const auto& chunk : chunks)
+			CommandStream::Replay(*chunk, [] { return vk::CommandBuffer {}; },
+				[](const CommandStream::Entry&) {});
+		Check(observed == 8, "external callback retains copied payload until replay");
+		std::puts("External GPU callback PASS: direct/deferred order and payload lifetime");
+	}
 	std::setvbuf(stdout, nullptr, _IONBF, 0);
 	{
 		Fsr2ConstantsCandidate cb;

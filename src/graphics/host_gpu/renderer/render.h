@@ -269,6 +269,8 @@ private:
 class NativeIndirectPrep;
 };
 
+class Nhl27Fsr3;
+
 class RenderExecutor {
 public:
 	explicit RenderExecutor(RenderContext& context): m_context(context) {}
@@ -467,6 +469,7 @@ private:
 	GraphicsBindings                     m_graphics_bindings;
 	std::shared_ptr<NativeIndirectPrep> m_native_indirect_prep;
 	std::shared_ptr<DispatchArgsGuard>   m_dispatch_guard;
+	std::shared_ptr<Nhl27Fsr3>           m_nhl27_fsr3;
 	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;
 	// ResolveTexture: memoized pure descriptor -> ImageDesc decode (direct-mapped).

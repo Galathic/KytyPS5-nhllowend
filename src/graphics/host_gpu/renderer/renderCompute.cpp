@@ -26,6 +26,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/fsr/fsr2Constants.h"
+#include "graphics/presentation/fsr/nhl27Fsr3.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
@@ -987,6 +988,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		            thread_group_y, thread_group_z, gds_before[0], gds_before[1], gds_before[2],
 		            gds_before[3], gds_after[0], gds_after[1], gds_after[2], gds_after[3]);
 		std::fflush(stdout);
+	}
+	if (Nhl27Fsr3::Enabled()) {
+		if (!m_nhl27_fsr3)
+			m_nhl27_fsr3 = std::make_shared<Nhl27Fsr3>(m_context.GetGraphics());
+		m_nhl27_fsr3->OnDispatch(m_context, buffer, program.shader_hash, bindings);
 	}
 	ResetBindings();
 }

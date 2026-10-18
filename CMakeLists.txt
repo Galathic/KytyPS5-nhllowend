@@ -848,6 +848,7 @@ endif()
 add_executable(kyty_emulator "${KYTY_SOURCE_DIR}/main.cpp" ${kyty_emulator_src})
 
 add_executable(fsr_upscaler_tests EXCLUDE_FROM_ALL
+  "${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/commandRecorder.cpp"
 	"${KYTY_TESTS_DIR}/FsrUpscalerTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/presentation/fsr/fsr1.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/presentation/fsr/fsr3.cpp"
