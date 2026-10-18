@@ -7,6 +7,7 @@
 #include "common/logging/log.h"
 #include "common/runtimeFlags.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/guest_gpu/stageStats.h"
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -410,6 +411,9 @@ void RenderContext::PrepareBda() {
 				// Only the pages written before this operation was emitted: pages the game is still
 				// filling for later submissions are not uploaded and protected again just to fault
 				// once more (in-play A/B: protect calls and write faults -20%).
+				if (StageStats::Enabled()) {
+					StageStats::g_bda_syncs.fetch_add(1, std::memory_order_relaxed);
+				}
 				if (m_operation_epoch_valid) {
 					uint32_t first_left = 0;
 					m_bda_pages_left = m_buffer_cache.SynchronizeBuffersInRangesBefore(

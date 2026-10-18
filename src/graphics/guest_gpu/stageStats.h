@@ -36,6 +36,7 @@ inline std::atomic<CpState> g_cp_state {CpState::Processing};
 inline std::atomic<bool>    g_resolve_working {false};
 
 inline std::atomic<uint64_t> g_ns[CounterCount] {};
+inline std::atomic<uint64_t> g_bda_syncs {0}; // BDA synchronizations that scanned for CPU-dirty pages
 inline std::atomic<uint64_t> g_ops {0}; // operations the execution thread ran (written by it only)
 // Execution-thread time and count by operation kind (GpuOperationKind; execution thread only).
 inline std::atomic<uint64_t> g_kind_ns[8] {};
