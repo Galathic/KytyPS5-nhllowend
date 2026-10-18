@@ -79,10 +79,15 @@ and **zero candidates**. This covers intro/menu activity only and does not prove
 FSR2 is inactive in gameplay. Evidence: `fsr-run-menu-20261017.log` and screenshots
 in `fsr-nav/`, under the workspace run directory. Free skate was not reached.
 
-That binary's FSR1 status used the launcher's suppressed LOGF channel. The final
-rebuild now prints and flushes `NHL27FSR` to stdout. The rebuilt binary has passed
-the GPU tests but has not been boot-tested. A 4K guest image on the 1440p monitor
-should take the downscaling fallback; FSR1 activation was not verified in NHL.
+That binary's FSR1 status used the launcher's suppressed LOGF channel. The next
+rebuild prints and flushes `NHL27FSR` to stdout. A subsequent 1920x1080-window run
+reached screenshot-confirmed free skate with Hronek, and the status explicitly
+reported fallback. FSR1 activation remains unverified in NHL; 4K guest video-out
+is larger than the display. That run ended at 3,284,992 dispatches / 3,520,217
+clean reads / 8,823,212 refusals / zero candidates. Evidence:
+`fsr-run-free-skate-20261017.log` and `fsr-nav/001_after-load.png` in the workspace
+run directory. It closed normally before the compute-capture rebuild. Title-bar
+FPS was not a paired measurement and establishes no performance gain.
 
 The initial run with `KYTY_OUTPUT_1080P=1`, copied experiment flags and bulk warmup
 crashed on a guest null write after warmup, before presentation. It changed
@@ -95,6 +100,23 @@ Window size and guest/internal render resolution are separate. The workspace's
 `tools/kyty-step.ps1` now supports F11 and refuses to send keys unless the emulator
 has foreground focus. Navigation lost focus intermittently; do not assume a
 sent key changed the menu. No paired performance measurement or gain established.
+
+`KYTY_DBG_FRAME_DUMP_CS_CONSTANTS=1`, off by default, extends the existing F2
+frame dump to log all compute bindings and copy bound GPU buffers whose guest
+size and host range are at most 4096 bytes. This survey avoids the protected
+guest backing read used for specialization bytes in the full trace. Existing
+hash-selected compute tracing retains its original behavior. Dumps occur after
+each dispatch; they provide evidence, not a temporal provider or a guarantee
+that the captured block is cbFSR2. Larger buffers/other offsets can still be missed.
+The Release capture build passed (`fsr-capture-build.log`).
+
+The workspace `fsr-launch.cmd` now enables that survey, raw frame dump and
+`KYTY_DBG_FRAME_DUMP_DIR=F:\emuf\captures\fsr-free-skate`, keeping the guarded
+`nhl27.bat play` launch. It booted successfully as `a34c03f-dirty` and is waiting
+at sign-in; automatic foreground focus failed, though the user confirmed manual
+keyboard/controller input works. A requested manual free-skate/F2 capture is
+pending. The capture feature has not yet been exercised in game. Re-enumerate
+host processes before acting; do not reuse recorded PIDs.
 
 ## NHL temporal mapping still required
 
