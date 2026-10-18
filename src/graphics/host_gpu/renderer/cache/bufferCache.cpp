@@ -1205,12 +1205,33 @@ struct WriteBackStat {
 	uint64_t size   = 0;
 	uint64_t bytes  = 0;
 	bool     on_gpu = false;
+	// KYTY_DBG_WRITEBACK_DIFF: pages compared before/after the download, how many came back identical
+	// (the GPU had not changed them), total bytes that differed, and the last GPU writer of the page.
+	uint64_t    compared  = 0;
+	uint64_t    unchanged = 0;
+	uint64_t    diff_bytes = 0;
+	const char* writer     = "";
+	uint64_t    writer_hash = 0;
 };
+struct WriteBackDiff {
+	bool        valid      = false;
+	uint64_t    diff_bytes = 0;
+	const char* writer     = "unknown";
+	uint64_t    writer_hash = 0;
+};
+
+static bool WriteBackDiffEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DBG_WRITEBACK_DIFF");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
 static std::mutex                                g_writeback_mutex;
 static std::unordered_map<uint64_t, WriteBackStat> g_writeback;
 
 static void WriteBackRecord(uint64_t rip, bool on_gpu, uint64_t vaddr, uint64_t size, uint64_t bytes,
-                            uint64_t ns) {
+                            uint64_t ns, const WriteBackDiff& diff = {}) {
 	std::scoped_lock lock {g_writeback_mutex};
 	const uint64_t   key = rip != 0 ? rip
 	                                : (uint64_t {1} << 63u) | (on_gpu ? uint64_t {1} << 62u : 0u) |
@@ -1223,6 +1244,13 @@ static void WriteBackRecord(uint64_t rip, bool on_gpu, uint64_t vaddr, uint64_t 
 	stat.ns += ns;
 	stat.bytes += bytes;
 	stat.vaddr = vaddr;
+	if (diff.valid) {
+		stat.compared++;
+		stat.unchanged += diff.diff_bytes == 0 ? 1 : 0;
+		stat.diff_bytes += diff.diff_bytes;
+		stat.writer      = diff.writer;
+		stat.writer_hash = diff.writer_hash;
+	}
 	static auto last = std::chrono::steady_clock::now();
 	const auto  now  = std::chrono::steady_clock::now();
 	if (now - last < std::chrono::seconds(5)) {
@@ -1240,9 +1268,11 @@ static void WriteBackRecord(uint64_t rip, bool on_gpu, uint64_t vaddr, uint64_t 
 			std::snprintf(rip, sizeof(rip), "0x%016" PRIx64, stat.rip);
 		}
 		std::printf("NHL27WRITEBACK: rip=%s thread=%s size=0x%" PRIx64 " count=%" PRIu64
-		            " ms=%.1f downloaded_KiB=%.1f last_vaddr=0x%016" PRIx64 "\n",
+		            " ms=%.1f downloaded_KiB=%.1f last_vaddr=0x%016" PRIx64
+		            " compared=%" PRIu64 " unchanged=%" PRIu64 " diff_bytes=%" PRIu64 " writer=%s:%016" PRIx64 "\n",
 		            rip, stat.on_gpu ? "gpu" : "guest", stat.size, stat.count,
-		            static_cast<double>(stat.ns) / 1e6, static_cast<double>(stat.bytes) / 1024.0, stat.vaddr);
+		            static_cast<double>(stat.ns) / 1e6, static_cast<double>(stat.bytes) / 1024.0, stat.vaddr,
+		            stat.compared, stat.unchanged, stat.diff_bytes, stat.writer, stat.writer_hash);
 	}
 	std::fflush(stdout);
 }
@@ -1376,8 +1406,35 @@ void BufferCache::ReadMemoryBody(uint64_t vaddr, uint64_t size, bool is_write, R
 	const bool lazy = is_write && !on_gpu &&
 	                  Common::Experiments::Enabled(Common::Experiments::LazySharedWrites) &&
 	                  LazySharedWriteEligible(vaddr, size);
+	// KYTY_DBG_WRITEBACK_DIFF (with KYTY_PERF_STATS): for a CPU write, compare the page before and
+	// after the download to see whether the GPU actually changed it.
+	WriteBackDiff        diff;
+	std::vector<uint8_t> diff_before;
+	const uint64_t       diff_page = vaddr & ~(TRACKER_PAGE_SIZE - 1);
+	if (timed && is_write && !lazy && WriteBackDiffEnabled() && size <= TRACKER_PAGE_SIZE &&
+	    (vaddr + size) <= diff_page + TRACKER_PAGE_SIZE) {
+		diff_before.resize(TRACKER_PAGE_SIZE);
+		if (!Libs::LibKernel::Memory::TryReadBacking(diff_page, diff_before.data(), TRACKER_PAGE_SIZE)) {
+			diff_before.clear();
+		}
+		for (size_t n = 0; n < m_writer_log.size(); ++n) {
+			const auto& rec = m_writer_log[(m_writer_head + m_writer_log.size() - 1 - n) % m_writer_log.size()];
+			if (rec.begin < diff_page + TRACKER_PAGE_SIZE && diff_page < rec.end) {
+				diff.writer      = rec.kind;
+				diff.writer_hash = rec.hash;
+				break;
+			}
+		}
+	}
 	const bool downloaded = lazy ? DownloadBufferMemory<true, true>(buffer, vaddr, size)
 	                             : DownloadBufferMemory<false>(buffer, vaddr, size);
+	if (!diff_before.empty() && downloaded) {
+		std::vector<uint8_t> after(TRACKER_PAGE_SIZE);
+		if (Libs::LibKernel::Memory::TryReadBacking(diff_page, after.data(), TRACKER_PAGE_SIZE)) {
+			diff.valid = true;
+			for (size_t i = 0; i < after.size(); ++i) diff.diff_bytes += after[i] != diff_before[i] ? 1u : 0u;
+		}
+	}
 	if (lazy) {
 		Common::Timeline::Mark("lazy-shared-write", vaddr);
 	}
@@ -1419,7 +1476,7 @@ void BufferCache::ReadMemoryBody(uint64_t vaddr, uint64_t size, bool is_write, R
 			                    .count();
 			FrameBreakdown::AddReadback(static_cast<uint64_t>(ns));
 			if (is_write) {
-									WriteBackRecord(fault_rip, on_gpu, vaddr, size, m_last_download_bytes, static_cast<uint64_t>(ns));
+									WriteBackRecord(fault_rip, on_gpu, vaddr, size, m_last_download_bytes, static_cast<uint64_t>(ns), diff);
 			}
 			g_perf.waits[bucket].fetch_add(1, std::memory_order_relaxed);
 			g_perf.wait_ns[bucket].fetch_add(static_cast<uint64_t>(ns),

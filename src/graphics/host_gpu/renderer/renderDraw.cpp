@@ -1767,7 +1767,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		descriptor_stages[stage_count++] = &*bindings.pixel;
 	}
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
-	if (emit.indirect != nullptr && state.vertex_info[0].stage.program->info.native_draw) {
+	if (emit.indirect != nullptr && state.vertex_info[0].stage.program->info.native_draw &&
+	    emit.indirect->snapshot->HasDeviceAddress()) {
 		const auto dword = state.vertex_info[0].stage.program->bindings.native_draw_dword;
 		const auto address = emit.indirect->snapshot->BufferDeviceAddress();
 		bindings.vertex[0].shader_data[dword] = static_cast<uint32_t>(address);
@@ -2445,8 +2446,14 @@ bool RenderExecutor::DrawAutoIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	     state.vertex_info[0].stage.program->param_export_mask == 0 &&
 	     state.ps_input_info.input_num != 0)) { ResetBindings(); return false; }
 	auto& scheduler = m_context.GetCommandScheduler();
+	// The snapshot needs a device address whenever the draw path below reads it through one: indexed
+	// draws (NativeIndirectPrep) and vertex programs built with native draw parameters. The program can
+	// carry native_draw even when this draw's native_draw info is off (Oct 18 crash: Buffer without BDA).
+	const bool snapshot_bda = source.indexed || state.vertex_info[0].native_draw.Enabled() ||
+	                          (state.vertex_info[0].stage.program != nullptr &&
+	                           state.vertex_info[0].stage.program->info.native_draw);
 	source.snapshot = std::make_shared<Buffer>(m_context.GetGraphics(), scheduler,
-	    MemoryUsage::Download, 0, AllFlags | (source.indexed || state.vertex_info[0].native_draw.Enabled()
+	    MemoryUsage::Download, 0, AllFlags | (snapshot_bda
 	        ? vk::BufferUsageFlagBits::eShaderDeviceAddress : vk::BufferUsageFlags {}),
 	    source.ArgsSize() + sizeof(uint32_t));
 	// The scheduler retains ownership even if SET_NUM_INSTANCES discards the CPU snapshot early.
