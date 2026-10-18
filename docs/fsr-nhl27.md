@@ -25,14 +25,21 @@ history, with zero validation stderr. The large-test parent timed out at 20s,
 while the test subsequently completed, so its exact exit code was not retained.
 Nonfinite reciprocal metadata is rejected in the captured-constant fixture.
 
-Live build 77ee25e6-dirty ran HDR shadow dispatches using game inputs with finite,
-nonblack readback. The initial run exposed missing shaderInt16; the rebuilt run
-logs enabled=1 with no pCode-08740 errors observed. Remaining validation reports
-concern 128x128 images requesting ten mip levels and out-of-bounds image copies;
-the standalone SDK test is clean at the same render/output size. This suggests
-the guest texture path, but does not establish a shadow-off baseline. A complete
-in-game validation pass and moving Free Skate output review remain outstanding.
-Do not claim validation clean or displayed FSR3 from these results.
+Saved implementation commit 3983f3db. Live build 77ee25e6-dirty ran HDR shadow
+dispatches at 2348x1320 -> 3520x1980 in user-confirmed, screenshot-verified Free
+Skate (Pettersson, Vancouver). Readbacks at guest frames145/745/1345/1945 were
+finite and nonblack, with RGB near (1.85,1.90,1.98), preserving values above1.
+These checks establish successful SDK execution with actual scene inputs, not
+output quality or temporal reconstruction: each frame still resets history.
+
+The initial run exposed missing shaderInt16; the rebuilt run logs enabled=1
+with no pCode-08740 errors, SDK failure or device-lost observed. Thirty validation
+errors remain: ten each mipLevels-00958 and dstOffset-00150/00151, concerning
+128x128 images requesting ten mip levels and out-of-bounds image copies. The
+standalone SDK test is clean at the same render/output size. This suggests the
+guest texture path, but does not establish a shadow-off baseline. Do not claim
+full-game validation clean or displayed FSR3. Motion direction/jitter inclusion,
+camera units, history resets and visible output quality remain to be verified.
 
 Workspace evidence prefixes: kyty-play-nhl27/fsr-shadow-resume-20261018-153602,
 fsr-shadow-check-20261018-154725 and fsr-shadow-feature-20261018-155534.
