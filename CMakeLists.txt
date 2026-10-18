@@ -244,6 +244,8 @@ file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
 	"${KYTY_SOURCE_DIR}/graphics/presentation/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/presentation/window/*.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/presentation/window/*.h"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/fsr/*.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/fsr/*.h"
 	"${KYTY_SOURCE_DIR}/kernel/*.cpp"
 	"${KYTY_SOURCE_DIR}/kernel/*.h"
 	"${KYTY_SOURCE_DIR}/loader/*.cpp"
@@ -334,7 +336,7 @@ function(add_gpu_blit_shader shader_name shader_file)
 		        "-I${gpu_tiler_shader_dir}" -o "${shader_spv}" "${shader_source}"
 		COMMAND ${CMAKE_COMMAND} -DINPUT=${shader_spv} -DOUTPUT=${shader_header}
 		        -DSYMBOL=${shader_symbol} -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
-		DEPENDS "${shader_source}"
+		DEPENDS "${shader_source}" ${gpu_fsr1_includes}
 		VERBATIM
 	)
 	set(gpu_blit_shader_headers ${gpu_blit_shader_headers} "${shader_header}" PARENT_SCOPE)
@@ -343,6 +345,10 @@ add_gpu_blit_shader(gpu_blit_fs_triangle gpu_blit_fs_triangle.vert)
 add_gpu_blit_shader(gpu_blit_color_to_ms_depth gpu_blit_color_to_ms_depth.frag)
 add_gpu_blit_shader(gpu_video_out_overlay gpu_video_out_overlay.frag)
 add_gpu_blit_shader(gpu_imgui_hdr gpu_video_out_overlay.frag -DIMGUI_HDR=1)
+set(gpu_fsr1_include_dir "${KYTY_THIRD_PARTY_DIR}/fsr1")
+set(gpu_fsr1_includes "${gpu_fsr1_include_dir}/ffx_a.h" "${gpu_fsr1_include_dir}/ffx_fsr1.h")
+add_gpu_blit_shader(gpu_fsr1_easu gpu_fsr1.frag "-I${gpu_fsr1_include_dir}")
+add_gpu_blit_shader(gpu_fsr1_rcas gpu_fsr1.frag "-I${gpu_fsr1_include_dir}" -DFSR_RCAS=1)
 list(APPEND kyty_emulator_src ${gpu_blit_shader_headers})
 
 list(APPEND kyty_emulator_src
@@ -356,6 +362,28 @@ if (KYTY_CLANG_CL)
 endif()
 
 set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus)
+
+option(KYTY_ENABLE_FSR3 "Build experimental FSR 3.1 Vulkan backend (guest guides required)" OFF)
+set(FIDELITYFX_SDK_DIR "" CACHE PATH "FidelityFX SDK 1.1.4 with matching Vulkan libraries")
+if(KYTY_ENABLE_FSR3)
+	if(NOT WIN32)
+		message(FATAL_ERROR "The current FSR3 runtime package supports Windows x64 only")
+	endif()
+	foreach(component backend_vk fsr3upscaler)
+		set(ffx_base "${FIDELITYFX_SDK_DIR}/sdk/bin/ffx_sdk/ffx_${component}_x64")
+		if(NOT EXISTS "${ffx_base}.lib" OR NOT EXISTS "${ffx_base}.dll")
+			message(FATAL_ERROR "Missing matching FSR3 Vulkan library/runtime: ${ffx_base}")
+		endif()
+		list(APPEND kyty_fsr3_libraries "${ffx_base}.lib")
+		list(APPEND kyty_fsr3_dlls "${ffx_base}.dll")
+	endforeach()
+	include_directories(SYSTEM "${FIDELITYFX_SDK_DIR}/sdk/include")
+	add_compile_definitions(KYTY_ENABLE_FSR3=1)
+	list(APPEND kyty_emulator_link_libraries ${kyty_fsr3_libraries})
+	install(FILES ${kyty_fsr3_dlls} DESTINATION .)
+	install(FILES "${FIDELITYFX_SDK_DIR}/sdk/LICENSE.txt" DESTINATION licenses/FidelityFX-SDK)
+endif()
+install(FILES "${KYTY_THIRD_PARTY_DIR}/fsr1/LICENSE.txt" DESTINATION licenses/FSR1)
 
 # Linux system libraries.
 if(LINUX)
@@ -818,6 +846,22 @@ if(APPLE AND (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR
 endif()
 
 add_executable(kyty_emulator "${KYTY_SOURCE_DIR}/main.cpp" ${kyty_emulator_src})
+
+add_executable(fsr_upscaler_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/FsrUpscalerTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/fsr/fsr1.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/fsr/fsr3.cpp"
+	${gpu_blit_shader_headers})
+target_include_directories(fsr_upscaler_tests PRIVATE ${inc_headers})
+target_link_libraries(fsr_upscaler_tests PRIVATE Vulkan::Headers fmt::fmt ${kyty_fsr3_libraries})
+if(KYTY_ENABLE_FSR3)
+	foreach(target kyty_emulator fsr_upscaler_tests)
+		foreach(dll IN LISTS kyty_fsr3_dlls)
+			add_custom_command(TARGET ${target} POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
+				"${dll}" "$<TARGET_FILE_DIR:${target}>" VERBATIM)
+		endforeach()
+	endforeach()
+endif()
 configure_macos_guest_address_space(kyty_emulator)
 
 set(KYTY_TROPHY_UNLOCK_SOUND "${CMAKE_CURRENT_SOURCE_DIR}/assets/sounds/trophy-unlock.wav")

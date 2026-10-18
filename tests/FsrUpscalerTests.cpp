@@ -1,0 +1,383 @@
+// Exercises the production FSR implementations on the active Vulkan GPU. Synthetic guides are
+// confined to this test; passing this does not certify any game's motion or camera capture.
+#include "common/runtimeFlags.h"
+#include "graphics/presentation/fsr/fsr1.h"
+#include "graphics/presentation/fsr/fsr2Constants.h"
+#include "graphics/presentation/fsr/fsr3.h"
+
+#include <array>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE
+using namespace Libs::Graphics;
+
+static void Check(bool condition, const char* message) {
+	if (!condition) {
+		std::fprintf(stderr, "FSR test FAILED: %s\n", message);
+		std::exit(1);
+	}
+}
+static void Ok(vk::Result result) {
+	Check(result == vk::Result::eSuccess, vk::to_string(result).c_str());
+}
+
+int main() {
+	std::setvbuf(stdout, nullptr, _IONBF, 0);
+	{
+		Fsr2ConstantsCandidate cb;
+		for (unsigned i = 0; i < 8; ++i)
+			cb.words[i] = i == 4 || i == 5 ? 64 : 32;
+		auto set = [&](unsigned offset, float value) {
+			cb.words[offset / 4] = std::bit_cast<uint32_t>(value);
+		};
+		set(72, -1);
+		set(76, -1);
+		set(80, 0.5f);
+		set(84, 0.5f);
+		set(96, 1);
+		set(100, 1);
+		set(104, 1);
+		set(108, 8);
+		set(112, 0.016f);
+		set(120, 1);
+		Check(cb.Plausible(), "FSR2 reflected-layout candidate");
+		set(80, 0.75f);
+		Check(!cb.Plausible(), "FSR2 reject inconsistent downscale");
+		set(80, 0.5f);
+		cb.words[4] = 0;
+		Check(!cb.Plausible(), "FSR2 reject zero display size");
+		std::puts(
+			"FSR2 probe PASS: reflected-layout decoder and rejection checks (heuristic only)");
+	}
+	{
+		using namespace Common::RuntimeFlags;
+		Check(!FlagSet {}.fsr1, "FSR1 is off by default");
+		FlagSet flags {};
+		auto* field = FieldFor(flags, "KYTY_FSR1");
+		Check(field != nullptr, "FSR1 runtime parser mapping");
+		*field = true;
+		Check((Bits(flags) ^ Bits(FlagSet {})) == (uint64_t {1} << 36), "FSR1 uses bit 36 only");
+		const auto previous = g_published.load();
+		g_published.store(Bits(flags) | (uint64_t {7} << kRevisionShift));
+		Check(Current().fsr1 && Revision() == 7, "FSR1 decode preserves revision");
+		g_published.store(previous);
+	}
+	vk::detail::DynamicLoader loader;
+	VULKAN_HPP_DEFAULT_DISPATCHER.init(
+		loader.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr"));
+	vk::ApplicationInfo app {};
+	app.pApplicationName = "Kyty FSR backend tests";
+	app.apiVersion = VK_API_VERSION_1_3;
+	vk::InstanceCreateInfo instance_info {};
+	instance_info.pApplicationInfo = &app;
+	const char* instance_extensions[] = {VK_EXT_DEBUG_UTILS_EXTENSION_NAME};
+	instance_info.enabledExtensionCount = 1;
+	instance_info.ppEnabledExtensionNames = instance_extensions;
+	vk::Instance instance;
+	Ok(vk::createInstance(&instance_info, nullptr, &instance));
+	VULKAN_HPP_DEFAULT_DISPATCHER.init(instance);
+	uint32_t count = 0;
+	Ok(instance.enumeratePhysicalDevices(&count, nullptr));
+	Check(count > 0, "no GPU");
+	std::vector<vk::PhysicalDevice> devices(count);
+	Ok(instance.enumeratePhysicalDevices(&count, devices.data()));
+	auto physical = devices[0];
+	for (auto candidate : devices)
+		if (candidate.getProperties().deviceType == vk::PhysicalDeviceType::eDiscreteGpu) {
+			physical = candidate;
+			break;
+		}
+	std::printf("GPU: %s\n", physical.getProperties().deviceName.data());
+	const auto families = physical.getQueueFamilyProperties();
+	uint32_t family = 0;
+	for (; family < families.size(); ++family)
+		if ((families[family].queueFlags &
+			 (vk::QueueFlagBits::eGraphics | vk::QueueFlagBits::eCompute)) ==
+			(vk::QueueFlagBits::eGraphics | vk::QueueFlagBits::eCompute))
+			break;
+	Check(family < families.size(), "no graphics/compute queue");
+	const float priority = 1;
+	vk::DeviceQueueCreateInfo queue_info {};
+	queue_info.queueFamilyIndex = family;
+	queue_info.queueCount = 1;
+	queue_info.pQueuePriorities = &priority;
+	auto features =
+		physical.getFeatures2<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan12Features,
+							  vk::PhysicalDeviceVulkan13Features>();
+	auto f12 = features.get<vk::PhysicalDeviceVulkan12Features>();
+	auto f13 = features.get<vk::PhysicalDeviceVulkan13Features>();
+	Check(f13.dynamicRendering, "dynamic rendering unavailable");
+	f12.pNext = &f13;
+	f13.pNext = nullptr;
+	const char* extensions[] = {VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
+								VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME,
+								VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME};
+	vk::DeviceCreateInfo device_info {};
+	device_info.pNext = &f12;
+	device_info.queueCreateInfoCount = 1;
+	device_info.pQueueCreateInfos = &queue_info;
+	device_info.enabledExtensionCount = 3;
+	device_info.ppEnabledExtensionNames = extensions;
+	device_info.pEnabledFeatures = &features.get<vk::PhysicalDeviceFeatures2>().features;
+	vk::Device device;
+	Ok(physical.createDevice(&device_info, nullptr, &device));
+	VULKAN_HPP_DEFAULT_DISPATCHER.init(device);
+	const auto queue = device.getQueue(family, 0);
+	const auto memory_properties = physical.getMemoryProperties();
+	auto allocate = [&](vk::MemoryRequirements requirements, vk::MemoryPropertyFlags flags) {
+		uint32_t index = 0;
+		for (; index < memory_properties.memoryTypeCount; ++index)
+			if ((requirements.memoryTypeBits & (1u << index)) &&
+				(memory_properties.memoryTypes[index].propertyFlags & flags) == flags)
+				break;
+		Check(index < memory_properties.memoryTypeCount, "memory type");
+		vk::MemoryAllocateInfo info {};
+		info.allocationSize = requirements.size;
+		info.memoryTypeIndex = index;
+		vk::DeviceMemory memory;
+		Ok(device.allocateMemory(&info, nullptr, &memory));
+		return memory;
+	};
+	struct Image {
+		Fsr3Image resource;
+		vk::ImageView view;
+		vk::DeviceMemory memory;
+		vk::ImageLayout layout = vk::ImageLayout::eUndefined;
+	};
+	std::vector<Image> images;
+	auto image = [&](vk::Format format, vk::Extent2D extent) {
+		Image result {};
+		result.resource.format = format;
+		result.resource.extent = extent;
+		vk::ImageCreateInfo info {};
+		info.imageType = vk::ImageType::e2D;
+		info.format = format;
+		info.extent = {extent.width, extent.height, 1};
+		info.mipLevels = info.arrayLayers = 1;
+		info.samples = vk::SampleCountFlagBits::e1;
+		info.usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eStorage |
+					 vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
+		Ok(device.createImage(&info, nullptr, &result.resource.image));
+		result.memory = allocate(device.getImageMemoryRequirements(result.resource.image),
+								 vk::MemoryPropertyFlagBits::eDeviceLocal);
+		Ok(device.bindImageMemory(result.resource.image, result.memory, 0));
+		vk::ImageViewCreateInfo view {};
+		view.image = result.resource.image;
+		view.viewType = vk::ImageViewType::e2D;
+		view.format = format;
+		view.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+		Ok(device.createImageView(&view, nullptr, &result.view));
+		images.push_back(result);
+		return result;
+	};
+	vk::CommandPoolCreateInfo pool_info {};
+	pool_info.flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
+	pool_info.queueFamilyIndex = family;
+	vk::CommandPool pool;
+	Ok(device.createCommandPool(&pool_info, nullptr, &pool));
+	vk::CommandBufferAllocateInfo command_info {};
+	command_info.commandPool = pool;
+	command_info.level = vk::CommandBufferLevel::ePrimary;
+	command_info.commandBufferCount = 1;
+	vk::CommandBuffer command;
+	Ok(device.allocateCommandBuffers(&command_info, &command));
+	auto begin = [&] {
+		Ok(command.reset());
+		vk::CommandBufferBeginInfo info {};
+		Ok(command.begin(&info));
+	};
+	auto submit = [&] {
+		Ok(command.end());
+		vk::SubmitInfo info {};
+		info.commandBufferCount = 1;
+		info.pCommandBuffers = &command;
+		Ok(queue.submit(1, &info, nullptr));
+		Ok(queue.waitIdle());
+	};
+	auto barrier = [&](vk::Image handle, vk::ImageLayout before, vk::ImageLayout after) {
+		vk::ImageMemoryBarrier b {};
+		b.srcAccessMask = before == vk::ImageLayout::eUndefined
+							  ? vk::AccessFlags {}
+							  : vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+		b.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+		b.oldLayout = before;
+		b.newLayout = after;
+		b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		b.image = handle;
+		b.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+		command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+								vk::PipelineStageFlagBits::eAllCommands, {}, 0, nullptr, 0, nullptr,
+								1, &b);
+	};
+	auto clear = [&](Image& im, std::array<float, 4> value) {
+		barrier(im.resource.image, im.layout, vk::ImageLayout::eTransferDstOptimal);
+		const vk::ClearColorValue color {value};
+		const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+		command.clearColorImage(im.resource.image, vk::ImageLayout::eTransferDstOptimal, &color, 1,
+								&range);
+		barrier(im.resource.image, vk::ImageLayout::eTransferDstOptimal,
+				vk::ImageLayout::eShaderReadOnlyOptimal);
+		im.layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+	};
+	vk::BufferCreateInfo read_info {};
+	read_info.size = 128 * 96 * 4;
+	read_info.usage = vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eTransferSrc;
+	vk::Buffer readback;
+	Ok(device.createBuffer(&read_info, nullptr, &readback));
+	const auto read_memory = allocate(device.getBufferMemoryRequirements(readback),
+									  vk::MemoryPropertyFlagBits::eHostVisible |
+										  vk::MemoryPropertyFlagBits::eHostCoherent);
+	Ok(device.bindBufferMemory(readback, read_memory, 0));
+	auto verify = [&](vk::Image output, vk::Extent2D extent, vk::ImageLayout layout,
+					  bool quadrants = false) {
+		barrier(output, layout, vk::ImageLayout::eTransferSrcOptimal);
+		vk::BufferImageCopy copy {};
+		copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+		copy.imageExtent = {extent.width, extent.height, 1};
+		command.copyImageToBuffer(output, vk::ImageLayout::eTransferSrcOptimal, readback, 1, &copy);
+		barrier(output, vk::ImageLayout::eTransferSrcOptimal, layout);
+		submit();
+		void* mapped = nullptr;
+		Ok(device.mapMemory(read_memory, 0, VK_WHOLE_SIZE, {}, &mapped));
+		const auto* pixels = static_cast<const uint8_t*>(mapped);
+		for (uint32_t i = 0; i < extent.width * extent.height; ++i) {
+			const auto x = i % extent.width, y = i / extent.width;
+			if (quadrants && (std::abs(int(x) - int(extent.width / 2)) < 5 ||
+							  std::abs(int(y) - int(extent.height / 2)) < 5))
+				continue;
+			const unsigned quadrant =
+				(x >= extent.width / 2 ? 1 : 0) | (y >= extent.height / 2 ? 2 : 0);
+			const std::array<std::array<int, 3>, 4> corners {
+				{{255, 0, 0}, {0, 255, 0}, {0, 0, 255}, {255, 255, 255}}};
+			for (uint32_t c = 0; c < 3; ++c) {
+				const auto expected =
+					quadrants ? corners[quadrant][c] : std::array {64, 128, 191}[c];
+				Check(std::abs(int(pixels[i * 4 + c]) - expected) <= 4,
+					  "color reconstruction and orientation");
+			}
+		}
+		device.unmapMemory(read_memory);
+	};
+	const vk::Extent2D input {32, 24}, output {64, 48};
+	auto color = image(vk::Format::eR8G8B8A8Unorm, input);
+	begin();
+	clear(color, {0.25f, 0.5f, 0.75f, 1});
+	submit();
+	{
+		Fsr1 fsr(physical, device);
+		for (int i = 0; i < 3; ++i) {
+			begin();
+			const auto result = fsr.Record(command, color.view, input, output, 0.2f);
+			Check(bool(result), "FSR1 EASU+RCAS");
+			verify(result, output, vk::ImageLayout::eTransferSrcOptimal);
+		}
+		begin();
+		Check(!fsr.Record(command, color.view, output, input, 0.2f), "reject downscale");
+		const auto native = fsr.Record(command, color.view, input, input, 0.2f);
+		Check(bool(native), "native RCAS and resize");
+		verify(native, input, vk::ImageLayout::eTransferSrcOptimal);
+		void* mapped = nullptr;
+		Ok(device.mapMemory(read_memory, 0, VK_WHOLE_SIZE, {}, &mapped));
+		auto* pixels = static_cast<uint8_t*>(mapped);
+		for (uint32_t y = 0; y < input.height; ++y)
+			for (uint32_t x = 0; x < input.width; ++x) {
+				const unsigned quadrant =
+					(x >= input.width / 2 ? 1 : 0) | (y >= input.height / 2 ? 2 : 0);
+				const std::array<std::array<uint8_t, 4>, 4> corners {
+					{{255, 0, 0, 255}, {0, 255, 0, 255}, {0, 0, 255, 255}, {255, 255, 255, 255}}};
+				std::memcpy(pixels + (y * input.width + x) * 4, corners[quadrant].data(), 4);
+			}
+		device.unmapMemory(read_memory);
+		begin();
+		barrier(color.resource.image, color.layout, vk::ImageLayout::eTransferDstOptimal);
+		vk::BufferImageCopy upload {};
+		upload.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+		upload.imageExtent = {input.width, input.height, 1};
+		command.copyBufferToImage(readback, color.resource.image,
+								  vk::ImageLayout::eTransferDstOptimal, 1, &upload);
+		barrier(color.resource.image, vk::ImageLayout::eTransferDstOptimal, color.layout);
+		submit();
+		begin();
+		const auto patterned = fsr.Record(command, color.view, input, output, 0.0f);
+		Check(bool(patterned), "FSR1 patterned upscaling, zero sharpening");
+		verify(patterned, output, vk::ImageLayout::eTransferSrcOptimal, true);
+	}
+	begin();
+	clear(color, {0.25f, 0.5f, 0.75f, 1});
+	submit();
+	std::puts("FSR1 PASS: EASU+RCAS, reuse, native RCAS, resize, downscale rejection, quadrant "
+			  "orientation and zero sharpening");
+#if KYTY_ENABLE_FSR3
+	auto depth = image(vk::Format::eR32Sfloat, input);
+	auto motion = image(vk::Format::eR16G16Sfloat, input);
+	auto upscaled = image(vk::Format::eR8G8B8A8Unorm, output);
+	auto dilated_depth = image(vk::Format::eR32Sfloat, input);
+	auto dilated_motion = image(vk::Format::eR16G16Sfloat, input);
+	auto previous_depth = image(vk::Format::eR32Uint, input);
+	begin();
+	clear(depth, {0.5f, 0, 0, 0});
+	clear(motion, {0, 0, 0, 0});
+	for (auto* im : {&upscaled, &dilated_depth, &dilated_motion, &previous_depth})
+		barrier(im->resource.image, vk::ImageLayout::eUndefined, vk::ImageLayout::eGeneral);
+	submit();
+	{
+		Fsr3 fsr(physical, device);
+		Fsr3Frame frame {};
+		frame.color = color.resource;
+		frame.depth = depth.resource;
+		frame.motion = motion.resource;
+		frame.output = upscaled.resource;
+		frame.dilated_depth = dilated_depth.resource;
+		frame.dilated_motion = dilated_motion.resource;
+		frame.previous_depth = previous_depth.resource;
+		frame.render_size = input;
+		frame.output_size = output;
+		frame.near_plane = 0.1f;
+		frame.far_plane = 1000;
+		frame.vertical_fov = 1;
+		frame.delta_ms = 16.6667f;
+		frame.motion_scale_x = input.width;
+		frame.motion_scale_y = input.height;
+		begin();
+		Check(!fsr.Record(command, frame), "reject unverified inputs");
+		submit();
+		frame.verified = true;
+		for (uint64_t id = 1; id <= 3; ++id) {
+			frame.frame_id = id;
+			begin();
+			const bool recorded = fsr.Record(command, frame);
+			std::printf("%s\n", fsr.Status().c_str());
+			Check(recorded, "FSR3 dispatch");
+			verify(upscaled.resource.image, output, vk::ImageLayout::eGeneral);
+		}
+		begin();
+		Check(!fsr.Record(command, frame), "reject repeated frame");
+		frame.frame_id = 4;
+		frame.motion.extent.width = 1;
+		Check(!fsr.Record(command, frame), "reject mismatched motion");
+		submit();
+		frame.motion = motion.resource;
+		frame.frame_id = 5;
+		begin();
+		Check(fsr.Record(command, frame), "recover with reset after missing/rejected frame");
+		verify(upscaled.resource.image, output, vk::ImageLayout::eGeneral);
+	}
+	std::puts(
+		"FSR3 PASS: three history frames plus recovery, readback checked; invalid inputs rejected");
+#endif
+	Ok(device.waitIdle());
+	device.destroyBuffer(readback);
+	device.freeMemory(read_memory);
+	for (const auto& im : images) {
+		device.destroyImageView(im.view);
+		device.destroyImage(im.resource.image);
+		device.freeMemory(im.memory);
+	}
+	device.destroyCommandPool(pool);
+	device.destroy();
+	instance.destroy();
+	return 0;
+}

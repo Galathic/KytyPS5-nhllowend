@@ -25,6 +25,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/presentation/fsr/fsr2Constants.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
@@ -879,6 +880,49 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (!BufferCache::GuestSyncOnly()) {
 		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 		BufferCache::PerfCount(BufferCache::PerfEvent::AutoDispatchBarrier);
+	}
+	// Diagnostic only: inspect already-clean constant-buffer backing without GPU waits or
+	// protected guest reads. A plausible cbFSR2 match never enables reconstruction by itself.
+	static const bool fsr2_probe = [] {
+		const char* value = std::getenv("KYTY_FSR2_PROBE");
+		return value && std::strcmp(value, "1") == 0;
+	}();
+	if (fsr2_probe) {
+		static uint64_t dispatches = 0, clean = 0, refused = 0, candidates = 0;
+		++dispatches;
+		for (size_t slot = 0; slot < bindings.buffer_sources.size(); ++slot) {
+			const auto& source = bindings.buffer_sources[slot];
+			if (!source.address || source.size < 128) continue;
+			Fsr2ConstantsCandidate constants;
+			if (!LibKernel::Memory::TryReadCleanBufferBacking(source.address, constants.words.data(), 128)) {
+				++refused;
+				continue;
+			}
+			++clean;
+			if (!constants.Plausible()) continue;
+			if (++candidates > 64) continue;
+			std::printf("NHL27FSR2 candidate=%" PRIu64 " cs=%016" PRIx64 " buf=%zu addr=%" PRIx64
+			            " render=%ux%u display=%ux%u frame=%u jitter=%g,%g motion_scale=%g,%g tan_half_horizontal_fov=%g delta_seconds=%g\n",
+			            candidates, program.shader_hash, slot, source.address, constants.words[0], constants.words[1],
+			            constants.words[4], constants.words[5], constants.words[11], constants.Float(64), constants.Float(68),
+			            constants.Float(72), constants.Float(76), constants.Float(104), constants.Float(112));
+			std::printf("NHL27FSR2 words:");
+			for (auto word: constants.words) std::printf(" %08x", word);
+			std::printf("\n");
+			for (size_t i = 0; i < bindings.images.size(); ++i) {
+				const auto& image = bindings.images[i].desc.info;
+				std::printf("NHL27FSR2 img=%zu addr=%" PRIx64 " size=%ux%u format=%s written=%d\n",
+				            i, image.data.address, image.extent.width, image.extent.height,
+				            vk::to_string(image.pixel_format).c_str(),
+				            i < program.info.images.size() && program.info.images[i].written);
+			}
+			std::fflush(stdout);
+		}
+		if ((dispatches % 4096) == 0) {
+			std::printf("NHL27FSR2 probe dispatches=%" PRIu64 " clean=%" PRIu64 " refused=%" PRIu64 " candidates=%" PRIu64 "\n",
+			            dispatches, clean, refused, candidates);
+			std::fflush(stdout);
+		}
 	}
 	if (FrameDump::TraceEnabled()) {
 		for (size_t i = 0; i < bindings.images.size() && i < program.info.images.size(); i++) {
