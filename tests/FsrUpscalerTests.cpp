@@ -367,6 +367,99 @@ int main() {
 	}
 	std::puts(
 		"FSR3 PASS: three history frames plus recovery, readback checked; invalid inputs rejected");
+	// Game captures use packed floating-point color and FP16 temporal output. Keep
+	// this synthetic test separate from the game's still-unverified temporal provider.
+	auto hdr_output = image(vk::Format::eR16G16B16A16Sfloat, output);
+	begin();
+	barrier(hdr_output.resource.image, vk::ImageLayout::eUndefined, vk::ImageLayout::eGeneral);
+	submit();
+	auto set_hdr = [](const char* value) {
+#if defined(_WIN32)
+		Check(_putenv_s("KYTY_FSR3_HDR", value ? value : "") == 0, "set test HDR flag");
+#else
+		Check((value ? setenv("KYTY_FSR3_HDR", value, 1) : unsetenv("KYTY_FSR3_HDR")) == 0,
+			  "set test HDR flag");
+#endif
+	};
+	const char* old_hdr_value = std::getenv("KYTY_FSR3_HDR");
+	const std::string old_hdr = old_hdr_value ? old_hdr_value : "";
+	const bool had_hdr = old_hdr_value != nullptr;
+	auto verify_hdr = [&] {
+		barrier(hdr_output.resource.image, vk::ImageLayout::eGeneral,
+				vk::ImageLayout::eTransferSrcOptimal);
+		vk::BufferImageCopy copy {};
+		copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+		copy.imageExtent = {output.width, output.height, 1};
+		command.copyImageToBuffer(hdr_output.resource.image, vk::ImageLayout::eTransferSrcOptimal,
+								  readback, 1, &copy);
+		barrier(hdr_output.resource.image, vk::ImageLayout::eTransferSrcOptimal,
+				vk::ImageLayout::eGeneral);
+		submit();
+		void* mapped = nullptr;
+		Ok(device.mapMemory(read_memory, 0, VK_WHOLE_SIZE, {}, &mapped));
+		const auto* pixels = static_cast<const uint16_t*>(mapped);
+		for (uint32_t i = 0; i < output.width * output.height; ++i) {
+			for (uint32_t c = 0; c < 3; ++c) {
+				const uint16_t half = pixels[i * 4 + c];
+				const unsigned exponent = (half >> 10) & 31, mantissa = half & 1023;
+				Check(exponent != 31 && !(half & 0x8000), "finite positive HDR reconstruction");
+				const float value = exponent
+					? std::ldexp(1.0f + float(mantissa) / 1024.0f, int(exponent) - 15)
+					: std::ldexp(float(mantissa), -24);
+				const float expected = std::array {2.0f, 4.0f, 8.0f}[c];
+				if (std::abs(value - expected) > expected * 0.03f)
+					std::printf("HDR mismatch pixel=%u channel=%u got=%g expected=%g\n",
+								i, c, value, expected);
+				Check(std::abs(value - expected) <= expected * 0.03f,
+					  "HDR values above one survive reconstruction");
+			}
+		}
+		device.unmapMemory(read_memory);
+	};
+	for (const auto format : {vk::Format::eB10G11R11UfloatPack32,
+							  vk::Format::eR16G16B16A16Sfloat}) {
+		auto hdr_color = image(format, input);
+		begin();
+		clear(hdr_color, {2, 4, 8, 1});
+		submit();
+		Fsr3 fsr(physical, device);
+		Fsr3Frame frame {};
+		frame.color = hdr_color.resource;
+		frame.depth = depth.resource;
+		frame.motion = motion.resource;
+		frame.output = hdr_output.resource;
+		frame.dilated_depth = dilated_depth.resource;
+		frame.dilated_motion = dilated_motion.resource;
+		frame.previous_depth = previous_depth.resource;
+		frame.render_size = input;
+		frame.output_size = output;
+		frame.near_plane = 0.1f;
+		frame.far_plane = 1000;
+		frame.vertical_fov = 1;
+		frame.delta_ms = 16.6667f;
+		frame.motion_scale_x = -0.5f * input.width;
+		frame.motion_scale_y = 0.5f * input.height;
+		frame.hdr = true;
+		frame.verified = true;
+		frame.frame_id = 1;
+		set_hdr(nullptr);
+		begin();
+		Check(!fsr.Record(command, frame) && fsr.Status().find("KYTY_FSR3_HDR") != std::string::npos,
+			  "HDR requires explicit opt-in");
+		submit();
+		set_hdr("1");
+		for (uint64_t id = 1; id <= 3; ++id) {
+			frame.frame_id = id;
+			begin();
+			const bool recorded = fsr.Record(command, frame);
+			std::printf("%s input=%s\n", fsr.Status().c_str(), vk::to_string(format).c_str());
+			Check(recorded, "HDR FSR3 dispatch");
+			verify_hdr();
+		}
+	}
+	set_hdr(had_hdr ? old_hdr.c_str() : nullptr);
+	std::puts("FSR3 HDR PASS: opt-in enforced, packed-float and FP16 inputs preserve 2/4/8 "
+			  "through three history frames each into FP16 output");
 #endif
 	Ok(device.waitIdle());
 	device.destroyBuffer(readback);

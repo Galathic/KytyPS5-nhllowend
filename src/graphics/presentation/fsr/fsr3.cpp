@@ -111,11 +111,21 @@ bool Fsr3::Record(vk::CommandBuffer command, const Fsr3Frame& frame) {
 		frame.motion.format != vk::Format::eR16G16Sfloat ||
 		frame.dilated_depth.format != vk::Format::eR32Sfloat ||
 		frame.dilated_motion.format != vk::Format::eR16G16Sfloat ||
-		frame.previous_depth.format != vk::Format::eR32Uint ||
-		frame.output.format != vk::Format::eR8G8B8A8Unorm ||
-		(frame.color.format != vk::Format::eR8G8B8A8Unorm &&
-		 frame.color.format != vk::Format::eB8G8R8A8Unorm))
-		return reject("unsupported format (SDR snapshots required)");
+		frame.previous_depth.format != vk::Format::eR32Uint)
+		return reject("unsupported depth or motion format");
+	if (frame.hdr) {
+		const char* enabled = std::getenv("KYTY_FSR3_HDR");
+		if (!enabled || std::strcmp(enabled, "1") != 0)
+			return reject("HDR requires experimental KYTY_FSR3_HDR=1");
+		if (frame.output.format != vk::Format::eR16G16B16A16Sfloat ||
+			(frame.color.format != vk::Format::eB10G11R11UfloatPack32 &&
+			 frame.color.format != vk::Format::eR16G16B16A16Sfloat))
+			return reject("HDR requires float color and FP16 output");
+	} else if (frame.output.format != vk::Format::eR8G8B8A8Unorm ||
+			   (frame.color.format != vk::Format::eR8G8B8A8Unorm &&
+				frame.color.format != vk::Format::eB8G8R8A8Unorm)) {
+		return reject("unsupported SDR format");
+	}
 	const std::array values {frame.jitter_x,	   frame.jitter_y,	 frame.motion_scale_x,
 							 frame.motion_scale_y, frame.near_plane, frame.far_plane,
 							 frame.vertical_fov,   frame.delta_ms,	 frame.pre_exposure,
@@ -132,6 +142,7 @@ bool Fsr3::Record(vk::CommandBuffer command, const Fsr3Frame& frame) {
 		return reject("repeated or out-of-order frame");
 	const uint32_t flags =
 		FFX_FSR3UPSCALER_ENABLE_AUTO_EXPOSURE |
+		(frame.hdr ? FFX_FSR3UPSCALER_ENABLE_HIGH_DYNAMIC_RANGE : 0) |
 		(frame.inverted_depth ? FFX_FSR3UPSCALER_ENABLE_DEPTH_INVERTED : 0) |
 		(frame.infinite_depth ? FFX_FSR3UPSCALER_ENABLE_DEPTH_INFINITE : 0) |
 		(frame.jittered_motion ? FFX_FSR3UPSCALER_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION : 0);
@@ -191,7 +202,7 @@ bool Fsr3::Record(vk::CommandBuffer command, const Fsr3Frame& frame) {
 		return false;
 	m->history = true;
 	m->last_frame = frame.frame_id;
-	m->status = "FSR 3.1.4 Super Resolution";
+	m->status = frame.hdr ? "FSR 3.1.4 Super Resolution (HDR)" : "FSR 3.1.4 Super Resolution";
 	return true;
 #else
 	m->status = "FSR 3.1 unavailable: build with KYTY_ENABLE_FSR3";

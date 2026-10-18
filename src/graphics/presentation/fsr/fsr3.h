@@ -12,8 +12,9 @@ struct Fsr3Image {
 	vk::Extent2D extent {};
 };
 
-// Inputs must be snapshots from one guest frame, in shader-read layout. Color is linear SDR;
-// the provider owns color-space conversion before reconstruction and after the output.
+// Inputs must be snapshots from one guest frame, in shader-read layout. Color is linear;
+// SDR uses UNORM snapshots, HDR uses floating-point color/output and KYTY_FSR3_HDR=1.
+// The provider owns color-space conversion before reconstruction and after the output.
 // Outputs must be
 // non-aliasing storage images in GENERAL. The SDK returns them in those same states.
 // No synthetic camera or motion fallback is permitted in the game integration.
@@ -28,6 +29,7 @@ struct Fsr3Frame {
 	float delta_ms = 0, pre_exposure = 1, sharpness = 0.2f;
 	bool verified = false, reset = false;
 	bool inverted_depth = false, infinite_depth = false, jittered_motion = false;
+	bool hdr = false;
 };
 
 class Fsr3 final {

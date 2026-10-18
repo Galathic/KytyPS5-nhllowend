@@ -1,5 +1,59 @@
 # FSR test branch — 2026-10-17
 
+## Update — 2026-10-18: verified Free Skate bindings and opt-in HDR backend
+
+This section supersedes the older pending-capture and SDR-only backend status below.
+The user-triggered F2 dump completed at
+F:/emuf/captures/fsr-targeted-20261018-120423/frame_0. Its FP16 temporal output
+visually confirms Free Skate. Guest frame index 62 uses render 2348x1320 and
+temporal display 3520x1980, followed by 4K LUT/composite processing. Four captured
+208-byte GPU constant buffers agree in their first 49 DWORDs, and all nine
+inter-pass resource connections match the historical graph.
+
+PrepareInputs-like hash 4618098710b83f8f samples depth/motion/color at image slots
+0/1/3. Accumulation hash a36f0b4faa20493a writes UNORM history at slot 6 and the
+FP16 image consumed downstream at slot 7. Outputs are promptly aliased/reused.
+Keep role names provisional until linked to guest program names.
+
+Across 48,345 interior sample points, prepared depth matches the 3x3 maximum
+within 2e-7; prepared motion matches the maximum-depth neighbor's raw motion
+times (-0.5,+0.5), maximum error 1.1921e-7. Identity/opposite scaling fail all
+sampled nonzero-motion checks at 2e-6 tolerance. This establishes the local
+prepare transform, not temporal direction or motion-jitter cancellation.
+At this extent, the SDK dispatch motion scale for that transform is (-1174,+660).
+All 317 saved jitter records fit the width-derived 17-phase Halton cycle.
+
+Packed-float color has channels above 1 in 84.44% of pixels; FP16 temporal output
+reaches 967. Do not clamp these inputs through SDR. For this frame, the SDK-style
+depth equation gives candidate near 20 / far 700 in unknown game units; vertical
+FOV is 0.29998063 radians and delta is 38.7957767 ms. Validate physical units,
+temporal conventions and resets before certifying a provider.
+
+The host backend now supports HDR only when both Fsr3Frame::hdr is true and
+the off-by-default environment flag KYTY_FSR3_HDR=1 is set. It accepts packed
+B10G11R11 UFLOAT or RGBA16 SFLOAT input and requires RGBA16 SFLOAT output; the SDK
+HIGH_DYNAMIC_RANGE context flag preserves the linear HDR path. SDR behavior
+remains the default. Existing verified-frame, non-aliasing and luma-format-fix
+requirements still apply. There is still no game provider or automatic activation.
+
+The separate GPU test executable passed with FSR3 enabled and Khronos validation:
+HDR opt-in rejection, packed-float and FP16 inputs containing (2,4,8), three history
+frames per format with FP16 readback within 3%, plus existing FSR1/SDR FSR3 checks.
+No validation warnings/errors were reported. A preceding FSR3-disabled build
+also passed its FSR1/probe checks; it does not count as HDR validation.
+Only build-fsr3-tests was configured/relinked. The running emulator was neither
+rebuilt nor interrupted. Test executable and actual test token were Medium (8192);
+no security settings changed.
+
+Workspace evidence: kyty-play-nhl27/fsr-targeted-20261018-120423-analysis/analysis.json,
+jitter-checks.json in that same folder, and
+kyty-play-nhl27/fsr-hdr-enabled-gpu-tests-20261018.log / .err.log.
+The full capture hit the readback cap for 35 later image requests, including the
+final 4K composite; all recorded temporal raw files are complete. These are
+synthetic backend checks and one-frame capture analyses, not gameplay quality or
+performance results. No gain established.
+
+
 ## Implemented
 
 `KYTY_FSR1=1` enables AMD FSR 1 EASU + RCAS at presentation. It is **off by
