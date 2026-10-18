@@ -2325,6 +2325,11 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 	image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {},
 	              command.Handle());
 	auto native_range = range;
+	// Guest levels past the host chain alias its last (1x1) level.
+	const auto host_levels    = image.backing.mip_levels;
+	native_range.baseMipLevel = std::min(native_range.baseMipLevel, host_levels - 1);
+	native_range.levelCount =
+	    std::min(native_range.levelCount, host_levels - native_range.baseMipLevel);
 	if (image.info.IsVolume()) {
 		native_range.baseArrayLayer = 0;
 		native_range.layerCount     = 1;
