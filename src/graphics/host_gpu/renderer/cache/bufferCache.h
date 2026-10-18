@@ -349,6 +349,8 @@ private:
 	// Experiment AsyncGuestReads (GPU thread): waits for the asynchronous guest reads overlapping
 	// the range and releases their pages that hold no newer GPU-written bytes.
 	void FinishPendingGuestReads(uint64_t vaddr, uint64_t size);
+	// m_pending_read_ranges from m_pending_guest_reads (under m_gpu_ranges_mutex).
+	void RebuildPendingReadRanges();
 	[[nodiscard]] bool OverlapsPendingGuestRead(uint64_t vaddr, uint64_t size) const;
 	[[nodiscard]] bool OverlapsPendingGuestBytes(uint64_t vaddr, uint64_t size) const;
 
@@ -367,8 +369,12 @@ private:
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
-	// Guards m_gpu_modified_ranges against readers on other threads (HasGpuDirtyBytesShared).
+	// Guards m_gpu_modified_ranges and m_pending_read_ranges against readers on other threads
+	// (HasGpuDirtyBytesShared).
 	mutable std::shared_mutex                         m_gpu_ranges_mutex;
+	// The pages of pending guest reads (their bytes reach guest memory when they finish), from
+	// before their bytes leave m_gpu_modified_ranges until they are in guest memory.
+	RangeSet                                          m_pending_read_ranges;
 	uint64_t                                          m_gpu_dirty_generation = 0;
 	RangeSet                                          m_released_ranges;
 	bool                                              m_record_released = false;

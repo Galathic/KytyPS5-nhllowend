@@ -1101,7 +1101,23 @@ bool BufferCache::OverlapsPendingGuestRead(uint64_t vaddr, uint64_t size) const 
 	return false;
 }
 
+void BufferCache::RebuildPendingReadRanges() {
+	std::unique_lock ranges_lock(m_gpu_ranges_mutex);
+	m_pending_read_ranges.Clear();
+	for (const auto& read: m_pending_guest_reads) {
+		m_pending_read_ranges.Add(read.vaddr, read.size);
+	}
+}
+
 void BufferCache::FinishPendingGuestReads(uint64_t vaddr, uint64_t size) {
+	// Once their bytes are in guest memory, finished reads leave the shared set.
+	struct Rebuild {
+		BufferCache* cache;
+		bool         finished = false;
+		~Rebuild() {
+			if (finished) cache->RebuildPendingReadRanges();
+		}
+	} rebuild {this};
 	for (size_t i = 0; i < m_pending_guest_reads.size();) {
 		const auto read = m_pending_guest_reads[i];
 		if (!(read.vaddr < vaddr + size && vaddr < read.vaddr + read.size)) {
@@ -1113,6 +1129,7 @@ void BufferCache::FinishPendingGuestReads(uint64_t vaddr, uint64_t size) {
 		// keep their protection, like ForgetGpuWrite.
 		m_scheduler.WaitPriorityOperations(read.tick);
 		m_pending_guest_read_count.fetch_sub(1, std::memory_order_release);
+		rebuild.finished = true;
 		const auto first = read.vaddr & ~(TRACKER_PAGE_SIZE - 1);
 		const auto last  = (read.vaddr + read.size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
 		for (auto page = first; page < last; page += TRACKER_PAGE_SIZE) {
@@ -1263,6 +1280,10 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadC
 			// Shared queries stay conservative while downloads move bytes out of the ordinary
 			// dirty ranges. Publish before DownloadBufferMemory removes those ranges.
 			m_pending_guest_read_count.fetch_add(1, std::memory_order_release);
+			{
+				std::unique_lock ranges_lock(m_gpu_ranges_mutex);
+				m_pending_read_ranges.Add(first, last - first);
+			}
 			if (DownloadBufferMemory<true>(buffer, vaddr, size)) {
 				async_tick       = m_scheduler.CurrentTick();
 				m_pending_guest_reads.push_back({first, last - first, async_tick, std::move(bytes)});
@@ -1270,6 +1291,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadC
 				Common::Timeline::Mark("async-guest-read", vaddr);
 			} else {
 				m_pending_guest_read_count.fetch_sub(1, std::memory_order_release);
+				RebuildPendingReadRanges();
 			}
 			return;
 		}
@@ -1954,10 +1976,14 @@ bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 
 bool BufferCache::HasGpuDirtyBytesShared(uint64_t vaddr, uint64_t size) const {
 	std::shared_lock ranges_lock(m_gpu_ranges_mutex);
-	// Pending records are owned by the execution thread. Other threads conservatively
-	// refuse the clean-backing fast path until all asynchronous downloads finish.
-	return m_pending_guest_read_count.load(std::memory_order_acquire) != 0 ||
-	       m_gpu_modified_ranges.Intersects(vaddr, size);
+	// Pending records are owned by the execution thread. Other threads see the pages of pending
+	// asynchronous downloads as dirty until their bytes are in guest memory (AbLegacy: every range
+	// while any download is pending).
+	if (Common::Experiments::Enabled(Common::Experiments::AbLegacy)) {
+		return m_pending_guest_read_count.load(std::memory_order_acquire) != 0 ||
+		       m_gpu_modified_ranges.Intersects(vaddr, size);
+	}
+	return m_pending_read_ranges.Intersects(vaddr, size) || m_gpu_modified_ranges.Intersects(vaddr, size);
 }
 
 uint64_t BufferCache::GpuDirtyByteCount(uint64_t vaddr, uint64_t size) const {

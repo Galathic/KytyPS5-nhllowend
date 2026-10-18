@@ -398,11 +398,16 @@ then (`PageWriteSeq`: per 4 KiB page, the sequence of the last operation that wr
 the command processor's noted writes, by GPU-written buffer ranges, and by every backing write;
 writes from other threads mark the page as always checked; mapping changes force full checks).
 The game does not rewrite memory that submitted GPU work still reads before that work signals
-completion. Specialization (strict) reads are always checked. About 55% of draw reads and 40% of
-dispatch reads skip: execution time per draw -5% (paused A/B). `KYTY_DBG_VERIFY_SKIPS=1` still
-checks the skipped reads and reports any that changed (`NHL27SKIPBAD`); none in a 150 s match.
-`NHL27CHECKS` (stage stats) prints reads, bytes, page switches and skips per check. The resolve
-thread looks up the GPU-dirty state of each read's page (8 pages remembered per log).
+completion. Specialization (strict) reads are always checked. `KYTY_DBG_VERIFY_SKIPS=1` still
+checks the skipped reads and reports any that changed (`NHL27SKIPBAD`); none in 3 soak boots and
+two 2-minute matches. `NHL27CHECKS` (stage stats) prints reads, bytes, page switches, skips and why
+the others were checked. The resolve thread looks up the GPU-dirty state of each read's page
+(`HasGpuDirtyBytesShared`, 8 pages remembered per log). That query used to call every range dirty
+while any asynchronous guest download was pending (most of the time): the pending downloads' pages
+are now a shared range set (`m_pending_read_ranges`, filled before their bytes leave the GPU-dirty
+ranges, emptied once they are in guest memory). Draw reads skipped: 19 of 35 -> 34 of 36;
+dispatch reads 7 of 15 -> 8.5 of 16. Execution time per draw -6.4%, per dispatch -4% in total
+(paused A/B; skipping every check would be -12% / -26%).
 
 The low-energy preset patch (`patches/nhl27_lowenergy.json`: resolution scale 0.5, no FSR3)
 changes nothing on the CPU side (same draws per second and thread load).
