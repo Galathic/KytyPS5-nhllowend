@@ -2245,6 +2245,15 @@ void BufferCache::NoteDirtyRead(uint64_t vaddr, uint64_t size, bool changed, con
 	SpecMaybePrint();
 }
 
+bool BufferCache::IsStrictRefused(uint64_t vaddr, uint64_t size) {
+	if (size == 0 || size > SpecMaxBytes || !Common::Experiments::Enabled(Common::Experiments::SpeculateStrict)) {
+		return false;
+	}
+	std::scoped_lock lock(g_spec_mutex);
+	const auto       it = g_spec_reads.find(SpecKey(vaddr, size));
+	return it != g_spec_reads.end() && (it->second.changed >= 2 || it->second.mispredicts > 0);
+}
+
 bool BufferCache::TrySpeculativeRead(uint64_t vaddr, void* data, uint64_t size) {
 	if (size == 0 || size > SpecMaxBytes || data == nullptr || !GuestGpu::IsGpuThread()) {
 		return false;

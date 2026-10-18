@@ -119,6 +119,11 @@ bool DirectGpuReadsMemory() noexcept {
 	return enabled;
 }
 
+bool SrtUnionDirty() noexcept {
+	static const bool enabled = EnvSwitch("KYTY_SRT_UNION_DIRTY", false);
+	return enabled;
+}
+
 uint32_t Mask() noexcept {
 	return GetState().mask.load(std::memory_order_relaxed);
 }

@@ -52,6 +52,14 @@ enum Bit : uint32_t {
 // only decides whether downloads use it.
 [[nodiscard]] bool DirectGpuReadsMemory() noexcept;
 
+// KYTY_SRT_UNION_DIRTY=1 at startup (default off): when a shader-table branch condition would need
+// GPU-written bytes that are not downloaded yet, the walker does not wait for them. It treats the
+// branch as "could go either way" and keeps the resources of both sides (RefreshDirectControlFlow).
+[[nodiscard]] bool SrtUnionDirty() noexcept;
+// Set by the walker while it evaluates such a condition: strict reads of GPU-dirty bytes then fail
+// instead of downloading (TryReadBufferBacking).
+inline thread_local bool g_no_wait_dirty_reads = false;
+
 } // namespace Common::Experiments
 
 namespace Common::Timeline {

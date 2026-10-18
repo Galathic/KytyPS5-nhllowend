@@ -236,6 +236,9 @@ public:
 	// waiting. A copy of the GPU's bytes is compared once the GPU gets there; a mismatch ends the
 	// guess for that address until its downloads are steady again.
 	[[nodiscard]] bool TrySpeculativeRead(uint64_t vaddr, void* data, uint64_t size);
+	// True for bytes strict guessing refuses (seen changing twice or guessed wrong): their reads
+	// always download. KYTY_SRT_UNION_DIRTY skips only these.
+	[[nodiscard]] bool IsStrictRefused(uint64_t vaddr, uint64_t size);
 	// After a real download for such a read: whether the GPU changed the bytes, and the wait.
 	void NoteDirtyRead(uint64_t vaddr, uint64_t size, bool changed, const void* value, uint64_t wait_ns);
 	// Changes whenever new GPU-dirty bytes are recorded (GPU thread).

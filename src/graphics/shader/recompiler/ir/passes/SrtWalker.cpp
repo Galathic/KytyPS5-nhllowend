@@ -13,7 +13,9 @@
 #include <xbyak/xbyak.h>
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -2335,6 +2337,32 @@ bool SrtWalker::RefreshDirectFlat(std::vector<uint32_t>& flat) {
 	return true;
 }
 
+namespace {
+// KYTY_SRT_UNION_DIRTY + KYTY_PERF_STATS: how many direct-plan branch conditions were evaluated and
+// how many were left unknown (both sides kept) because their bytes were still GPU-dirty.
+std::atomic<uint64_t> g_union_conditions {0};
+std::atomic<uint64_t> g_union_unknown {0};
+std::atomic<int64_t>  g_union_last_print {0};
+
+void NoteUnionDirty(bool unknown) {
+	if (!FrameBreakdown::Enabled()) return;
+	g_union_conditions.fetch_add(1, std::memory_order_relaxed);
+	if (unknown) g_union_unknown.fetch_add(1, std::memory_order_relaxed);
+	const auto now  = std::chrono::duration_cast<std::chrono::milliseconds>(
+	                     std::chrono::steady_clock::now().time_since_epoch()).count();
+	auto       last = g_union_last_print.load(std::memory_order_relaxed);
+	if (last == 0) {
+		g_union_last_print.compare_exchange_strong(last, now, std::memory_order_relaxed);
+		return;
+	}
+	if (now - last < 5000 || !g_union_last_print.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+	std::printf("NHL27SRTUNION: window=%.1fs conditions=%llu unknown=%llu\n", static_cast<double>(now - last) / 1000.0,
+	            static_cast<unsigned long long>(g_union_conditions.exchange(0, std::memory_order_relaxed)),
+	            static_cast<unsigned long long>(g_union_unknown.exchange(0, std::memory_order_relaxed)));
+	std::fflush(stdout);
+}
+} // namespace
+
 // Direct plans with control flow: the blocks reached from the entry read their slots directly;
 // branch conditions are evaluated as before (strictly, through the clean evaluator).
 bool SrtWalker::RefreshDirectControlFlow(std::vector<uint32_t>& flat) {
@@ -2381,8 +2409,18 @@ bool SrtWalker::RefreshDirectControlFlow(std::vector<uint32_t>& flat) {
 		}
 		uint32_t condition = 0;
 		auto& predicate = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
-		if (!block.condition.IsEmpty() && m_runtime.read_specialization_memory != nullptr &&
-		    predicate.Evaluate(block.condition, condition)) {
+		bool  evaluated = false;
+		if (!block.condition.IsEmpty() && m_runtime.read_specialization_memory != nullptr) {
+			// KYTY_SRT_UNION_DIRTY: a condition that needs GPU-written bytes not downloaded yet is
+			// left unknown (both successors below) instead of waiting for the graphics card.
+			const bool union_dirty = Common::Experiments::SrtUnionDirty();
+			const bool previous    = Common::Experiments::g_no_wait_dirty_reads;
+			Common::Experiments::g_no_wait_dirty_reads = previous || union_dirty;
+			evaluated = predicate.Evaluate(block.condition, condition);
+			Common::Experiments::g_no_wait_dirty_reads = previous;
+			if (union_dirty) NoteUnionDirty(!evaluated);
+		}
+		if (evaluated) {
 			pending.push_back(block.successors[condition != 0u ? 0u : 1u]);
 		} else {
 			pending.insert(pending.end(), block.successors.begin(), block.successors.end());
