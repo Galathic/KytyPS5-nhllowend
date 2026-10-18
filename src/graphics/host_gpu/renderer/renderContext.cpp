@@ -87,6 +87,9 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		}
 	}
 	ProtectStats::CountFault(access == PageFaultAccess::Write);
+	if (access == PageFaultAccess::Write && CpReadDebugEnabled()) {
+		ProtectStats::NoteWriteFaultPage(fault_vaddr);
+	}
 	Common::Timeline::Mark(access == PageFaultAccess::Write ? "fault-write" : "fault-read", fault_vaddr);
 	// KYTY_PERF_STATS: fault time includes any synchronous readback it triggers (overlaps readback).
 	FrameBreakdown::Timer fault_timer(FrameBreakdown::g_counters.fault_ns);
@@ -125,19 +128,16 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		if (FrameBreakdown::Enabled()) {
 			FrameBreakdown::SpecNoteFault(fault_vaddr);
 		}
-		{
-			FrameBreakdown::FaultTimer t(FrameBreakdown::g_fault_cost.buf_inv_ns);
-			m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
-		}
-		{
-			FrameBreakdown::FaultTimer t(FrameBreakdown::g_fault_cost.tex_inv_ns);
-			m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
-		}
 		// KYTY_FAULT_COALESCE: release the clean neighbors of the faulting page's aligned window
 		// (KYTY_FAULT_COALESCE_PAGES tracker pages, default 16) in one protection change. Pages that
 		// are GPU-modified or already CPU-dirty are skipped; marking an unwritten page CPU-dirty
-		// only costs an upload.
-		if (Common::RuntimeFlags::Current().fault_coalesce) {
+		// only costs an upload. The window is released before the faulting page, with it when it
+		// is clean: one protection change instead of three (the page, then the neighbors on each
+		// side of it; in-play A/B: protect calls -41%, those of the faulting threads -56%).
+		const auto release_window = [&] {
+			if (!Common::RuntimeFlags::Current().fault_coalesce) {
+				return;
+			}
 			static const uint64_t wide_window = [] {
 				const char* value = std::getenv("KYTY_FAULT_COALESCE_PAGES");
 				const auto  pages = value != nullptr ? std::strtoull(value, nullptr, 10) : 16ull;
@@ -156,6 +156,15 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 					FrameBreakdown::Add(FrameBreakdown::g_counters.port_fault_pages, marked);
 				}
 			}
+		};
+		release_window();
+		{
+			FrameBreakdown::FaultTimer t(FrameBreakdown::g_fault_cost.buf_inv_ns);
+			m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
+		}
+		{
+			FrameBreakdown::FaultTimer t(FrameBreakdown::g_fault_cost.tex_inv_ns);
+			m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 		}
 		// KYTY_FAULT_AHEAD: streaming writers (ring buffers) fault on every page they touch
 		// each frame, and each page is re-protected after its upload. Unprotect the next
@@ -370,7 +379,11 @@ void RenderContext::PrepareBda() {
 	}
 	const auto cpu = m_buffer_cache.CpuModificationGeneration();
 	const auto registrations = m_buffer_cache.RegistrationGeneration();
-	const bool unchanged = cache_enabled && cpu == m_bda_cpu_generation &&
+	// Pages left by the last synchronization that this operation needs (their epoch passed).
+	const bool left_due = m_bda_pages_left &&
+	                      (!m_operation_epoch_valid ||
+	                       RegionManager::EpochBefore(m_bda_first_left, m_operation_write_epoch));
+	const bool unchanged = cache_enabled && !left_due && cpu == m_bda_cpu_generation &&
 	                       registrations == m_bda_registration_generation &&
 	                       m_mapping_generation == m_bda_mapping_generation;
 	if (unchanged) {
@@ -394,7 +407,18 @@ void RenderContext::PrepareBda() {
 				FrameBreakdown::Timer sync_timer(FrameBreakdown::g_counters.bda_sync_ns);
 				FrameBreakdown::BufScope buf_scope(2);
 				FrameBreakdown::VAdd(FrameBreakdown::g_buf.bda_syncs);
-				drained = m_buffer_cache.SynchronizeBuffersInRanges(m_mapped_ranges, full);
+				// Only the pages written before this operation was emitted: pages the game is still
+				// filling for later submissions are not uploaded and protected again just to fault
+				// once more (in-play A/B: protect calls and write faults -20%).
+				if (m_operation_epoch_valid) {
+					uint32_t first_left = 0;
+					m_bda_pages_left = m_buffer_cache.SynchronizeBuffersInRangesBefore(
+					    m_mapped_ranges, full, m_operation_write_epoch, first_left);
+					m_bda_first_left = first_left;
+				} else {
+					drained          = m_buffer_cache.SynchronizeBuffersInRanges(m_mapped_ranges, full);
+					m_bda_pages_left = false;
+				}
 			}
 		} else {
 			// Nothing to upload when no page became CPU dirty, no buffer was registered and no

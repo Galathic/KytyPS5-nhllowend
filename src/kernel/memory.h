@@ -168,6 +168,12 @@ CleanBackingCompare    TryValidateCleanBacking(uint64_t vaddr, const void* expec
 // pointer stays readable for the emulator's lifetime and reads what TryReadBacking() reads.
 [[nodiscard]] const void* FindBackingPointer(uint64_t vaddr, uint64_t size);
 bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
+// GPU thread: whether no byte of the range is GPU-dirty in the buffer cache (gpu_images: nor in a
+// GPU-modified image). False off the GPU thread. A range that passes passes for each sub-range, so
+// callers check a page once for the reads within it.
+bool                   IsGpuCleanRange(uint64_t vaddr, uint64_t size, bool gpu_images);
+// TryValidateCleanBacking for a range IsGpuCleanRange already passed (Dirty is never returned).
+CleanBackingCompare    CompareCleanBacking(uint64_t vaddr, const void* expected, uint64_t size);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 // Whether TryReadBacking or TryReadSparseBacking can read the whole range.
 bool                   IsBackingReadable(uint64_t vaddr, uint64_t size);

@@ -85,11 +85,26 @@ inline std::atomic<bool> g_shader_robust_buffer_access2 {false};
 [[nodiscard]] inline bool ShaderRobustStores() {
 	return ShaderRobustLoads();
 }
+// Codegen option: V_CVT_PKRTZ_F16_F32 through GLSL PackHalf2x16, which AMD drivers compile to the
+// same v_cvt_pk_rtz_f16_f32 (round toward zero), instead of about forty integer instructions per
+// half. Set for AMD devices (key bit 128). Paused A/B/A: GPU time per frame -5%; the crowd vertex
+// shaders behind PS f5a3c1b7 halve (46k -> 22k instructions).
+inline std::atomic<bool> g_shader_native_pkrtz {false};
+[[nodiscard]] inline bool ShaderNativePkrtz() {
+	return g_shader_native_pkrtz.load(std::memory_order_relaxed);
+}
+// Codegen option: native scalar f16 ops (ShaderNativeFp16) also for SDWA word-select sources
+// (key bit 256). GPU time unchanged in a paused A/B/A; rounds like the guest (the f32 fallback
+// packs its result with PackHalf2x16, which AMD compiles to round-toward-zero).
+[[nodiscard]] inline bool ShaderNativeF16Sdwa() {
+	return ShaderNativeFp16();
+}
 [[nodiscard]] inline uint32_t ShaderFloatCodegenKey() {
 	return static_cast<uint32_t>(ShaderNativeFp16()) | (ShaderNativeMinMax() ? 2u : 0u) |
 	       (ShaderFusedMad() ? 4u : 0u) |
 	       (ShaderRobustLoads() ? (ShaderRobustLoadsKeepExec() ? 24u : 8u) : 0u) |
-	       (ShaderRobustConstReads() ? 32u : 0u) | (ShaderRobustStores() ? 64u : 0u);
+	       (ShaderRobustConstReads() ? 32u : 0u) | (ShaderRobustStores() ? 64u : 0u) |
+	       (ShaderNativePkrtz() ? 128u : 0u) | (ShaderNativeF16Sdwa() ? 256u : 0u);
 }
 [[nodiscard]] inline uint32_t ShaderNativeFp16Modes() {
 	return g_shader_native_fp16_modes.load(std::memory_order_relaxed);

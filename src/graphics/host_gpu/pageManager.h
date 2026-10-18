@@ -14,6 +14,9 @@ enum class PageFaultAccess { Read, Write, Execute, Unknown };
 struct ProtectStats {
 	static void Count(uint64_t bytes) noexcept;
 	static void CountFault(bool write) noexcept;
+	// KYTY_DBG_CP_READS: write faults per page (PrintFaultPages, every 2 s with NHL27PROTECT).
+	static void NoteWriteFaultPage(uint64_t vaddr) noexcept;
+	static void PrintFaultPages() noexcept;
 	// Totals since start: protection calls, bytes, calls made on the GPU thread, read/write faults.
 	static void Read(uint64_t& calls, uint64_t& bytes, uint64_t& gpu_calls, uint64_t& read_faults,
 	                 uint64_t& write_faults) noexcept;

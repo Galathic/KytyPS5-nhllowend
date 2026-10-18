@@ -18,10 +18,22 @@ enum Counter : uint32_t {
 	ResolveProgramLock,
 	ResolveQueueFull, // resolve thread waiting for room in the execution queue
 	ResolveIdle,      // resolve thread waiting for operations from the command processor
+	// Execution-thread idle time by what the stage before it was doing when the queue ran dry:
+	ExecIdleResolve,  // the resolve thread was resolving the next operation
+	ExecIdleCp,       // the command processor was processing packets
+	ExecIdleNoWork,   // no guest submission was queued
+	ExecIdleBlocked,  // every queue waited on a WAIT_REG_MEM the guest had not satisfied
+	ExecIdleDecision, // the command processor waited for a write it decides on (clock, label)
+	ExecIdleOther,    // the command processor waited for the execution thread otherwise
 	CounterCount,
 };
 
 enum class Role : uint8_t { Other, Execution, Resolve };
+
+// What the command processor thread is doing (stats only).
+enum class CpState : uint8_t { Processing, NoWork, Blocked, WaitDecision, WaitOther };
+inline std::atomic<CpState> g_cp_state {CpState::Processing};
+inline std::atomic<bool>    g_resolve_working {false};
 
 inline std::atomic<uint64_t> g_ns[CounterCount] {};
 inline std::atomic<uint64_t> g_ops {0}; // operations the execution thread ran (written by it only)
@@ -43,6 +55,38 @@ inline void Add(Counter counter, std::chrono::steady_clock::time_point start) {
 	                                                  std::chrono::steady_clock::now() - start)
 	                                                  .count()),
 	                        std::memory_order_relaxed);
+}
+
+// Sets the command processor state for a scope (stats only).
+class CpStateScope {
+public:
+	explicit CpStateScope(CpState state) {
+		if (Enabled()) {
+			m_previous = g_cp_state.exchange(state, std::memory_order_relaxed);
+			m_active   = true;
+		}
+	}
+	~CpStateScope() {
+		if (m_active) g_cp_state.store(m_previous, std::memory_order_relaxed);
+	}
+	CpStateScope(const CpStateScope&)            = delete;
+	CpStateScope& operator=(const CpStateScope&) = delete;
+
+private:
+	CpState m_previous = CpState::Processing;
+	bool    m_active   = false;
+};
+
+// The execution-idle counter for what the earlier stages are doing now.
+[[nodiscard]] inline Counter ExecIdleCause() {
+	if (g_resolve_working.load(std::memory_order_relaxed)) return ExecIdleResolve;
+	switch (g_cp_state.load(std::memory_order_relaxed)) {
+		case CpState::Processing: return ExecIdleCp;
+		case CpState::NoWork: return ExecIdleNoWork;
+		case CpState::Blocked: return ExecIdleBlocked;
+		case CpState::WaitDecision: return ExecIdleDecision;
+		default: return ExecIdleOther;
+	}
 }
 
 // The program-lock counter of the calling stage thread, or CounterCount for other threads.

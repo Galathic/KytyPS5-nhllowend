@@ -219,6 +219,59 @@ public:
 		}
 	}
 
+	// ForEachCpuDirtySpan for the pages dirtied before write epoch `limit` (see RegionManager). A
+	// region whose later pages were left out is queued again for the next drain; returns whether
+	// any were, and lowers `first_left` to the earliest of their epochs.
+	template <typename Func>
+	bool ForEachCpuDirtySpanBefore(uint64_t vaddr, uint64_t size, uint32_t limit, uint32_t& first_left,
+	                               Func&& func) {
+		ValidateRange(vaddr, size);
+		CheckNotInUploadCallback();
+		const auto                                  end = vaddr + size;
+		std::vector<std::pair<uint64_t, uint64_t>> spans; // [begin, end)
+		const auto add = [&](uint64_t begin, uint64_t finish) {
+			begin  = std::max(begin, vaddr);
+			finish = std::min(finish, end);
+			if (begin >= finish) {
+				return;
+			}
+			if (!spans.empty() && spans.back().second == begin) {
+				spans.back().second = finish;
+			} else {
+				spans.emplace_back(begin, finish);
+			}
+		};
+		bool left = false;
+		for (uint64_t index = vaddr / TRACKER_REGION_SIZE; index * TRACKER_REGION_SIZE < end;
+		     index++) {
+			auto*      manager = m_regions[index].load(std::memory_order_acquire);
+			const auto start   = std::max(index * TRACKER_REGION_SIZE, vaddr);
+			const auto finish  = std::min((index + 1) * TRACKER_REGION_SIZE, end);
+			if (manager == nullptr) {
+				add(start, finish);
+				continue;
+			}
+			if (!manager->HasCpuDirty()) {
+				continue;
+			}
+			bool region_left = false;
+			{
+				std::scoped_lock lock(manager->lock);
+				region_left = manager->ForEachCpuDirtyRangeBefore(
+				    start, finish - start, limit, first_left,
+				    [&](uint64_t address, uint64_t bytes) { add(address, address + bytes); });
+			}
+			if (region_left) {
+				QueueCpuDirty(manager);
+				left = true;
+			}
+		}
+		for (const auto& [begin, finish]: spans) {
+			func(begin, finish - begin);
+		}
+		return left;
+	}
+
 	// Calls func(address, size) for the runs of pages of [vaddr, vaddr + size) that the CPU may
 	// have written since the previous call over them: pages that became CPU dirty since then, or
 	// are still CPU dirty. Untracked pages start tracking as written. A single consumer owns the

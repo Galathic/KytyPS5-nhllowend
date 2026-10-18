@@ -313,13 +313,31 @@ bool GuestReadLog::StillValid(bool without_faults) const {
 		}
 		return page_protected;
 	};
+	// The GPU-dirty checks of the entries too: once per page (two tree lookups per entry were a
+	// third of this check; execution time per dispatch -14% in a paused A/B).
+	std::array<uint64_t, 2> clean_page {~uint64_t {0}, ~uint64_t {0}};
+	std::array<bool, 2>     page_clean {};
+	const auto              known_clean = [&](uint64_t address, uint64_t size, bool gpu_images) {
+		const auto page = address & ~uint64_t {0xfff};
+		if (page != ((address + size - 1) & ~uint64_t {0xfff})) {
+			return false;
+		}
+		const auto kind = gpu_images ? 1 : 0;
+		if (page != clean_page[kind]) {
+			clean_page[kind] = page;
+			page_clean[kind] = Libs::LibKernel::Memory::IsGpuCleanRange(page, 0x1000, gpu_images);
+		}
+		return page_clean[kind];
+	};
 	for (const auto& entry: m_entries) {
 		const auto* recorded = m_bytes.data() + entry.offset;
 		if (entry.strict) {
 			// As specialization memory is read on the execution thread: GPU-owned bytes fail.
 			if (entry.size > buffer.size() ||
-			    !Libs::LibKernel::Memory::TryReadGpuCleanBacking(entry.address, buffer.data(),
-			                                                     entry.size) ||
+			    !(known_clean(entry.address, entry.size, true)
+			          ? Libs::LibKernel::Memory::TryReadBacking(entry.address, buffer.data(), entry.size)
+			          : Libs::LibKernel::Memory::TryReadGpuCleanBacking(entry.address, buffer.data(),
+			                                                            entry.size)) ||
 			    std::memcmp(buffer.data(), recorded, entry.size) != 0) {
 				return false;
 			}
@@ -334,7 +352,9 @@ bool GuestReadLog::StillValid(bool without_faults) const {
 			    (without_faults || Libs::LibKernel::Memory::IsReadFaultPage(entry.address, entry.size) ||
 			     read_protected(entry.address, entry.size))) {
 				const auto compare =
-				    Libs::LibKernel::Memory::TryValidateCleanBacking(entry.address, recorded, entry.size);
+				    known_clean(entry.address, entry.size, false)
+				        ? Libs::LibKernel::Memory::CompareCleanBacking(entry.address, recorded, entry.size)
+				        : Libs::LibKernel::Memory::TryValidateCleanBacking(entry.address, recorded, entry.size);
 				if (compare == Libs::LibKernel::Memory::CleanBackingCompare::Equal) {
 					continue;
 				}
@@ -713,9 +733,8 @@ struct PipelineCache::ProgramCache {
 		}
 		// Contiguous resource-table words are read with one call, as the execution thread reads them
 		// (the resolve thread read each dword with its own call chain, 25% of the thread; and each
-		// switch between the two rebuilt the plan's read runs). AbLegacy: one call per dword.
-		runtime.batch_reads = !Common::Experiments::Enabled(Common::Experiments::AbLegacy) &&
-		                      (env_batch_reads || Common::Experiments::Enabled(Common::Experiments::SrtBatchReads));
+		// switch between the two rebuilt the plan's read runs).
+		runtime.batch_reads = env_batch_reads || Common::Experiments::Enabled(Common::Experiments::SrtBatchReads);
 		auto& source = entry->second;
 		bool  materialized = false;
 		// Experiment AheadUnlocked: the execution thread may take the lock meanwhile; it keeps

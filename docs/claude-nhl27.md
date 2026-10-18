@@ -355,6 +355,39 @@ The per-draw proof that no scalar resource read overlaps a write of the same dra
 emulator when one does; it never fired in NHL 27) is opt-in now, `KYTY_DBG_CHECK_SCALAR_READS=1`:
 about 1% of the execution thread.
 
+Batch boundaries (`KYTY_BDA_BATCH`, after every indirect buffer, wait and event packet) are a
+third of the execution thread's operations, but cheap: carrying them on the next operation instead
+took ~110k callbacks/s off and changed nothing per draw (paused A/B: 4.70 vs 4.72 us per draw;
+fps 40 vs 41): dropped. In a paused scene the callbacks cost about 0.1 us each.
+
+The execution thread's checks of resolved reads look up the GPU-dirty state (buffer ranges and
+GPU-modified images) once per page instead of per read: execution time per dispatch -14%, draws
+per second +1.5% in a paused, execution-bound A/B (52 fps).
+
+Page protection churn (in play: ~45k protect calls/s, ~11k write faults/s; 87% of the execution
+thread's protect calls came from the BDA synchronization uploading every CPU-dirty page):
+- Write epochs (`RegionManager`): the command processor advances an epoch at each batch boundary
+  and stamps it on the operations it emits; a page that becomes CPU dirty takes the epoch of that
+  moment (0 when the execution or command processor thread writes it). The BDA synchronization of
+  an operation uploads (and protects again) only the pages of earlier epochs: a game writes a
+  submission's data before submitting it, and data the GPU waits for before the label. Pages the
+  game is still filling stay writable until an operation of a later epoch needs them. Protect
+  calls and write faults -20% (in-play A/B).
+- A write fault releases its 16-page window before the faulting page instead of after, so the
+  window, faulting page included, is one protection change instead of three: protect calls -41%,
+  those of the faulting (game) threads -56%.
+Together about 89k -> 30k protect calls per 2 s. Execution time per draw did not change
+measurably. `NHL27FAULTPAGES` (with `KYTY_DBG_CP_READS`) counts write faults per page every 2 s:
+about 1,800 pages fault 11k times, two thirds of them on ~470 pages rewritten every 2-8 frames.
+
+`V_CVT_PKRTZ_F16_F32` (pack two floats as halves, rounding toward zero) was emulated with about
+forty integer instructions per half; on AMD devices it is now GLSL `PackHalf2x16`, which the AMD
+compiler turns into the same `v_cvt_pk_rtz_f16_f32` (seen in the pipeline ISA, also in shaders that
+declare RTE for f16). The two vertex shaders drawn with PS f5a3c1b7 (crowd and players) shrink from
+46k to 22k and 24k to 12k ISA instructions; GPU time per frame -5% in a paused A/B/A (code-gen key
+bit 128). Native scalar f16 ops also take SDWA word-select sources (480 `V_SUB_F16` in each of those
+shaders; key bit 256): GPU time unchanged, but they round like the guest.
+
 The low-energy preset patch (`patches/nhl27_lowenergy.json`: resolution scale 0.5, no FSR3)
 changes nothing on the CPU side (same draws per second and thread load).
 

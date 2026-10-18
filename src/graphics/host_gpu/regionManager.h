@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
+#include <array>
 #include <atomic>
 #include <mutex>
 #include <utility>
@@ -93,6 +94,18 @@ public:
 		s_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel);
 	}
 
+	// Write epochs: the command processor advances the epoch at each batch boundary (submission,
+	// wait, event, indirect buffer...) and stamps it on the operations it emits after; a page that
+	// becomes CPU dirty takes the epoch of that moment. An operation needs the guest writes of
+	// earlier epochs only: a guest writes the data of a submission before submitting it, and data
+	// the GPU waits for before the label it waits on. Writes of the GPU-ordered threads (the
+	// execution thread's own) take epoch 0, needed by every later operation.
+	static uint32_t AdvanceWriteEpoch() { return s_write_epoch.fetch_add(1, std::memory_order_acq_rel) + 1; }
+	[[nodiscard]] static uint32_t CurrentWriteEpoch() { return s_write_epoch.load(std::memory_order_acquire); }
+	static void MarkGpuOrderedThread() { t_gpu_ordered = true; }
+	// Whether epoch a comes before epoch b (the counter wraps).
+	[[nodiscard]] static bool EpochBefore(uint32_t a, uint32_t b) { return static_cast<int32_t>(a - b) < 0; }
+
 	// Advances whenever pages of any region become CPU dirty: while it is unchanged, no page
 	// was dirtied since a synchronization that started after reading it.
 	[[nodiscard]] static uint64_t CpuDirtyEpoch() {
@@ -129,6 +142,13 @@ public:
 			}
 		}
 		auto& bits = GetBits<source>();
+		if constexpr (source == DirtySource::Cpu && enable) {
+			// Pages already dirty keep their (earlier) epoch.
+			const auto epoch = t_gpu_ordered ? 0u : s_write_epoch.load(std::memory_order_acquire);
+			for (size_t page = start; page < end; page++) {
+				if (!bits.Get(page)) m_page_epoch[page] = epoch;
+			}
+		}
 		if constexpr (enable) {
 			bits.SetRange(start, end);
 		} else {
@@ -167,6 +187,33 @@ public:
 		for (const auto [first, last]: mask) {
 			func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
 		}
+	}
+
+	// Calls func(address, size) for the runs of CPU-dirty pages of the range whose write epoch comes
+	// before `limit`; returns whether dirty pages of later epochs were left out, and lowers
+	// `first_left` to the earliest of their epochs. Callers hold the lock.
+	template <typename Func>
+	bool ForEachCpuDirtyRangeBefore(uint64_t vaddr, uint64_t size, uint32_t limit, uint32_t& first_left,
+	                                Func&& func) {
+		const auto [start, end] = GetPageRange(vaddr, size);
+		if (m_cpu_dirty.FirstRangeFrom(start).first >= end) {
+			return false;
+		}
+		bool       left = false;
+		RegionBits mask(m_cpu_dirty, start, end);
+		for (const auto [first, last]: mask) {
+			size_t run = first;
+			for (size_t page = first; page < last; page++) {
+				const auto epoch = m_page_epoch[page];
+				if (EpochBefore(epoch, limit)) continue;
+				if (run < page) func(m_cpu_addr + run * TRACKER_PAGE_SIZE, (page - run) * TRACKER_PAGE_SIZE);
+				if (!left || EpochBefore(epoch, first_left)) first_left = epoch;
+				left = true;
+				run  = page + 1;
+			}
+			if (run < last) func(m_cpu_addr + run * TRACKER_PAGE_SIZE, (last - run) * TRACKER_PAGE_SIZE);
+		}
+		return left;
 	}
 
 	// Calls func(address, size) for the runs of pages in the range that became CPU dirty since
@@ -276,6 +323,10 @@ private:
 	std::atomic<uint64_t> m_cpu_dirty_epoch {1};
 
 	inline static std::atomic<uint64_t> s_cpu_dirty_epoch {0};
+	// Write epoch of each CPU-dirty page (0 for the pages a new region starts dirty with).
+	std::array<uint32_t, TRACKER_REGION_PAGES> m_page_epoch {};
+	inline static std::atomic<uint32_t>        s_write_epoch {1};
+	inline static thread_local bool            t_gpu_ordered = false;
 };
 
 } // namespace Libs::Graphics

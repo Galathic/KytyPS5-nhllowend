@@ -1405,6 +1405,26 @@ bool TryReadCleanBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
+bool IsGpuCleanRange(uint64_t vaddr, uint64_t size, bool gpu_images) {
+	if (g_gpu_resources == nullptr || !Graphics::GuestGpu::IsGpuThread()) {
+		return false;
+	}
+	if (!IsGpuAddressRange(vaddr, size)) {
+		return true;
+	}
+	return !GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size) &&
+	       (!gpu_images || !GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size));
+}
+
+CleanBackingCompare CompareCleanBacking(uint64_t vaddr, const void* expected, uint64_t size) {
+	if (g_guest_address_space == nullptr || expected == nullptr || !Graphics::GuestRange {vaddr, size}.Valid()) {
+		return CleanBackingCompare::Unavailable;
+	}
+	bool equal = false;
+	if (!g_guest_address_space->TryCompareBacking(vaddr, expected, size, equal)) return CleanBackingCompare::Unavailable;
+	return equal ? CleanBackingCompare::Equal : CleanBackingCompare::Different;
+}
+
 CleanBackingCompare TryValidateCleanBacking(uint64_t vaddr, const void* expected, uint64_t size) {
 	if (g_gpu_resources == nullptr || g_guest_address_space == nullptr || !Graphics::GuestGpu::IsGpuThread() ||
 	    expected == nullptr || !Graphics::GuestRange {vaddr, size}.Valid()) {

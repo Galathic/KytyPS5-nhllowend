@@ -8,6 +8,13 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
+// Scalar f16 sources are read with Read16LaneBits, which also selects a word with SDWA (WORD_0,
+// WORD_1): those take the native path too (NHL 27's crowd vertex shaders: 480 V_SUB_F16 each).
+static bool NativeScalarF16Source(const Decoder::Operand& op) {
+	return (op.sdwa_sel == 6u || (ShaderNativeF16Sdwa() && (op.sdwa_sel == 4u || op.sdwa_sel == 5u))) &&
+	       !op.dpp && !op.dpp8;
+}
+
 bool Translator::NativeF16Eligible(const Decoder::Operand& op) const {
 	return op.sdwa_sel == 6u && !op.dpp && !op.dpp8;
 }
@@ -62,7 +69,7 @@ bool Translator::NativeScalarF16(const Decoder::Instruction& inst, IR::ValueOpco
 	if (three) srcs[2] = accumulator ? &inst.dst : &inst.src2;
 	if (reverse) std::swap(srcs[0], srcs[1]);
 	for (const auto* s: srcs) {
-		if (s != nullptr && !NativeF16Eligible(*s)) return false;
+		if (s != nullptr && !NativeScalarF16Source(*s)) return false;
 	}
 	const auto lane = [&](const Decoder::Operand& op) { return Read16LaneBits(op, false); };
 	const auto a    = lane(*srcs[0]);

@@ -794,6 +794,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 			}
 		}
 		g_shader_native_fp16_modes.store(fp16_modes, std::memory_order_relaxed);
+		g_shader_native_pkrtz.store(properties2.properties.vendorID == 0x1002u, std::memory_order_relaxed);
 		g_shader_native_fp16.store(fp16_ok, std::memory_order_relaxed);
 		LOGF("Vulkan shaderFloat16=%d gate=%d native_fp16=%d denormPreserve16=%d szinp16=%d rte16=%d\n",
 		     supported_features12.shaderFloat16 == VK_TRUE, fp16_gate, fp16_ok,
