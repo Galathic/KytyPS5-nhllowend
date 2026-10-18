@@ -172,6 +172,9 @@ bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64
 // GPU-modified image). False off the GPU thread. A range that passes passes for each sub-range, so
 // callers check a page once for the reads within it.
 bool                   IsGpuCleanRange(uint64_t vaddr, uint64_t size, bool gpu_images);
+// Any thread: whether bytes of the range may be GPU-dirty (conservatively true while any download
+// is pending; see BufferCache::HasGpuDirtyBytesShared).
+bool                   HasGpuDirtyBytesShared(uint64_t vaddr, uint64_t size);
 // TryValidateCleanBacking for a range IsGpuCleanRange already passed (Dirty is never returned).
 CleanBackingCompare    CompareCleanBacking(uint64_t vaddr, const void* expected, uint64_t size);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);

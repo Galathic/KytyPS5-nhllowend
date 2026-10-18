@@ -32,7 +32,16 @@ public:
 	void Clear() {
 		m_entries.clear();
 		m_bytes.clear();
-		m_failed = false;
+		m_failed     = false;
+		m_base       = t_resolve_base;
+		m_base_valid = t_resolve_base_valid;
+		m_unsafe_pages.fill(~uint64_t {0});
+	}
+	// Resolve thread, before each resolution: the last operation the execution thread finished.
+	// Reads of pages no operation after it writes (PageWriteSeq) need no check.
+	static void SetResolveBase(uint64_t executed) {
+		t_resolve_base       = executed;
+		t_resolve_base_valid = true;
 	}
 	// Reads the backing store without faulting. Strict reads are checked the way specialization
 	// memory is read (GPU-owned bytes fail), the others as plain loads.
@@ -51,10 +60,22 @@ private:
 		uint32_t size    = 0;
 		uint32_t offset  = 0;
 		bool     strict  = false;
+		// The bytes may have been GPU-dirty when read (read-protected page, pending download):
+		// always checked.
+		bool unsafe = false;
 	};
 	std::vector<Entry>   m_entries;
 	std::vector<uint8_t> m_bytes;
-	bool                 m_failed = false;
+	bool                 m_failed     = false;
+	uint64_t             m_base       = 0;
+	bool                 m_base_valid = false;
+	// The last pages Read() looked up and whether their bytes may be GPU-owned.
+	std::array<uint64_t, 8> m_unsafe_pages {~uint64_t {0}, ~uint64_t {0}, ~uint64_t {0}, ~uint64_t {0},
+	                                        ~uint64_t {0}, ~uint64_t {0}, ~uint64_t {0}, ~uint64_t {0}};
+	std::array<bool, 8>     m_unsafe_values {};
+	size_t                  m_unsafe_next = 0;
+	inline static thread_local uint64_t t_resolve_base       = 0;
+	inline static thread_local bool     t_resolve_base_valid = false;
 };
 
 // Storage of the shader programs a draw resolved ahead of its execution: the resource snapshots

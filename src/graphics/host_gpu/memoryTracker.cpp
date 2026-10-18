@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/memoryTracker.h"
+#include "graphics/host_gpu/pageWriteSeq.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -107,6 +108,7 @@ void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
 
 void MemoryTracker::MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
+	PageWriteSeq::RaiseCurrent(vaddr, size);
 	Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
 		manager->ChangeState<DirtySource::Gpu, true>(manager->GetCpuAddr() + offset, bytes);

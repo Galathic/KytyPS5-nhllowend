@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/pageWriteSeq.h"
 #include "common/experiments.h"
 
 #include "common/alignment.h"
@@ -1771,6 +1772,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		{
 			std::unique_lock ranges_lock(m_gpu_ranges_mutex);
 			m_gpu_modified_ranges.Add(vaddr, size);
+			PageWriteSeq::RaiseCurrent(vaddr, size);
 		}
 		++m_gpu_dirty_generation;
 		if (!m_watched_writes.empty() && !m_submit_requested &&
@@ -2246,6 +2248,7 @@ void BufferCache::NoteGpuWrites(uint64_t vaddr, uint64_t size) {
 			    const auto last  = std::min(page + bytes, finish);
 			    std::unique_lock ranges_lock(m_gpu_ranges_mutex);
 			    m_gpu_modified_ranges.Add(first, last - first);
+			    PageWriteSeq::RaiseCurrent(first, last - first);
 		    });
 	}
 }

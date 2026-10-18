@@ -8,6 +8,7 @@
 #include "common/virtualMemory.h"
 #include "common/experiments.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/pageWriteSeq.h"
 #include "graphics/host_gpu/renderer/bindEpoch.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "libs/errno.h"
@@ -1045,8 +1046,11 @@ static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t
 
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
 	NoteHostWrite(vaddr, size, HostWriteSource::Backing, data);
-	return g_guest_address_space != nullptr &&
-	       g_guest_address_space->TryWriteBacking(vaddr, data, size);
+	const bool written = g_guest_address_space != nullptr &&
+	                     g_guest_address_space->TryWriteBacking(vaddr, data, size);
+	// After the bytes: a resolve that saw this operation finished read them (see PageWriteSeq).
+	Graphics::PageWriteSeq::RaiseCurrent(vaddr, size);
+	return written;
 }
 
 namespace {
@@ -1132,8 +1136,10 @@ void ReportHostWrites(const char* label, uint64_t vaddr, uint64_t window) {
 
 bool TryMergeBacking(uint64_t vaddr, const void* data, const void* expected, uint64_t size) {
 	NoteHostWrite(vaddr, size, HostWriteSource::Backing, data);
-	return g_guest_address_space != nullptr &&
-	       g_guest_address_space->TryMergeBacking(vaddr, data, expected, size);
+	const bool merged = g_guest_address_space != nullptr &&
+	                    g_guest_address_space->TryMergeBacking(vaddr, data, expected, size);
+	Graphics::PageWriteSeq::RaiseCurrent(vaddr, size);
+	return merged;
 }
 
 bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
@@ -1414,6 +1420,13 @@ bool IsGpuCleanRange(uint64_t vaddr, uint64_t size, bool gpu_images) {
 	}
 	return !GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size) &&
 	       (!gpu_images || !GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size));
+}
+
+bool HasGpuDirtyBytesShared(uint64_t vaddr, uint64_t size) {
+	if (g_gpu_resources == nullptr) {
+		return true;
+	}
+	return IsGpuAddressRange(vaddr, size) && GetGpuResources().GetBufferCache().HasGpuDirtyBytesShared(vaddr, size);
 }
 
 CleanBackingCompare CompareCleanBacking(uint64_t vaddr, const void* expected, uint64_t size) {

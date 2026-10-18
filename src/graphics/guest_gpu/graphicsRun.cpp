@@ -1,4 +1,5 @@
 #include "graphics/guest_gpu/stageStats.h"
+#include "graphics/host_gpu/pageWriteSeq.h"
 #include "common/eventTrace.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/bindEpoch.h"
@@ -393,6 +394,7 @@ void GuestGpu::ForgetExecutedWrites() {
 
 void GuestGpu::NoteGuestWrite(uint64_t sequence, uint64_t address, uint64_t size,
                               const void* value, const char* kind, uint8_t origin) {
+	PageWriteSeq::Raise(address, size, sequence);
 	ForgetExecutedWrites();
 	if (sequence <= m_executed.Load()) {
 		return;
@@ -669,6 +671,21 @@ static void PrintStageStats() {
 	            ms[StageStats::ExecIdleResolve], ms[StageStats::ExecIdleCp], ms[StageStats::ExecIdleNoWork],
 	            ms[StageStats::ExecIdleBlocked], ms[StageStats::ExecIdleDecision], ms[StageStats::ExecIdleOther],
 	            static_cast<double>(StageStats::g_bda_syncs.exchange(0, std::memory_order_relaxed)) / seconds);
+	for (int kind = 0; kind < 2; kind++) {
+		const auto calls = StageStats::g_check_calls[kind].exchange(0, std::memory_order_relaxed);
+		const auto entries = StageStats::g_check_entries[kind].exchange(0, std::memory_order_relaxed);
+		const auto bytes   = StageStats::g_check_bytes[kind].exchange(0, std::memory_order_relaxed);
+		const auto pages   = StageStats::g_check_pages[kind].exchange(0, std::memory_order_relaxed);
+		const auto skipped = StageStats::g_check_skipped[kind].exchange(0, std::memory_order_relaxed);
+		const auto unsafe  = StageStats::g_check_unsafe[kind].exchange(0, std::memory_order_relaxed);
+		const auto later   = StageStats::g_check_later[kind].exchange(0, std::memory_order_relaxed);
+		if (calls == 0) continue;
+		const auto per = [calls](uint64_t value) { return static_cast<double>(value) / static_cast<double>(calls); };
+		std::printf("NHL27CHECKS %s: calls/s=%.0f entries/call=%.1f bytes/call=%.0f pages/call=%.1f skipped/call=%.1f"
+		            " checked: gpu-owned/call=%.1f written-later/call=%.1f\n",
+		            kind == 0 ? "draws" : "dispatches", static_cast<double>(calls) / seconds, per(entries), per(bytes),
+		            per(pages), per(skipped), per(unsafe), per(later));
+	}
 	// By operation kind: ms/s and us per operation.
 	static uint64_t last_kind_ns[8] {}, last_kind_count[8] {};
 	static const char* const kinds[] = {"draw", "draw-auto", "draw-indirect", "dispatch", "dispatch-indirect", "callback", "?", "?"};
@@ -781,6 +798,7 @@ void GuestGpu::ExecutionThread() {
 		const auto op_kind  = static_cast<uint64_t>(operation->kind) | (uint64_t {operation->trace_op} << 8u);
 		const auto op_start = traced ? Common::EventTrace::NowNs() : int64_t {0};
 		g_exec_op           = op_kind;
+		PageWriteSeq::SetOperation(operation->sequence);
 		if (StageStats::Enabled()) {
 			const auto kind  = static_cast<size_t>(operation->kind) & 7u;
 			const auto start = std::chrono::steady_clock::now();
@@ -804,6 +822,8 @@ void GuestGpu::ExecutionThread() {
 		// Destroy the callback before the command processor may reuse what it references.
 		operation.reset();
 		m_executed.Publish(sequence);
+		// Work between operations (urgent commands) writes after this one.
+		PageWriteSeq::SetOperation(sequence + 1);
 		if (++unnotified >= NotifyInterval) {
 			m_executed.Notify();
 			unnotified = 0;
@@ -832,6 +852,7 @@ void GuestGpu::ResolveThread() {
 			}
 		}
 		if (StageStats::Enabled()) StageStats::g_resolve_working.store(true, std::memory_order_relaxed);
+		GuestReadLog::SetResolveBase(m_executed.Load());
 		if (operation->kind == GpuOperationKind::DrawIndex ||
 		    operation->kind == GpuOperationKind::DrawAuto) {
 			// The register snapshots stay valid until the operation executed.

@@ -8,6 +8,7 @@
 #include "common/runtimeFlags.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/stageStats.h"
+#include "graphics/host_gpu/pageWriteSeq.h"
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -238,6 +239,7 @@ uint64_t RenderContext::MappedRangesVersion() const noexcept {
 
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	Common::Timeline::Mark("map", size);
+	PageWriteSeq::ForceChecks();
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
 	++m_mapping_generation;
@@ -246,6 +248,7 @@ void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	Common::Timeline::Mark("unmap", size);
+	PageWriteSeq::ForceChecks();
 	if (CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported memory unmap from an asynchronous GPU completion, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
@@ -300,6 +303,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		m_mapped_ranges.Subtract(vaddr, size);
 		++m_mapping_generation;
 		m_mapped_ranges_version++;
+		PageWriteSeq::ForceChecks();
 	};
 	// Shutdown still owns the GPU while queued rendering drains, but its command lane no
 	// longer accepts external work. Use the guest GPU's state for the teardown route.

@@ -388,6 +388,22 @@ declare RTE for f16). The two vertex shaders drawn with PS f5a3c1b7 (crowd and p
 bit 128). Native scalar f16 ops also take SDWA word-select sources (480 `V_SUB_F16` in each of those
 shaders; key bit 256): GPU time unchanged, but they round like the guest.
 
+The execution thread checks every guest read the resolve thread made for a draw or dispatch
+(`GuestReadLog::StillValid`): ~37 reads, ~590 bytes on ~17 pages per draw. Skipping every check
+(measurement only) cut execution time per draw 12% and per dispatch 26%; the cost is touching that
+memory, not the bookkeeping (remembering 8 pages instead of 1 changed nothing). Now a read needs no
+check when the resolve thread made it after the execution thread had finished operation `base`,
+no later operation writes its page from the emulator's side, and its bytes were not GPU-owned
+then (`PageWriteSeq`: per 4 KiB page, the sequence of the last operation that writes it; raised by
+the command processor's noted writes, by GPU-written buffer ranges, and by every backing write;
+writes from other threads mark the page as always checked; mapping changes force full checks).
+The game does not rewrite memory that submitted GPU work still reads before that work signals
+completion. Specialization (strict) reads are always checked. About 55% of draw reads and 40% of
+dispatch reads skip: execution time per draw -5% (paused A/B). `KYTY_DBG_VERIFY_SKIPS=1` still
+checks the skipped reads and reports any that changed (`NHL27SKIPBAD`); none in a 150 s match.
+`NHL27CHECKS` (stage stats) prints reads, bytes, page switches and skips per check. The resolve
+thread looks up the GPU-dirty state of each read's page (8 pages remembered per log).
+
 The low-energy preset patch (`patches/nhl27_lowenergy.json`: resolution scale 0.5, no FSR3)
 changes nothing on the CPU side (same draws per second and thread load).
 

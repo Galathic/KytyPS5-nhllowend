@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/regionManager.h"
+#include "graphics/host_gpu/pageWriteSeq.h"
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
 
 #include <algorithm>
@@ -307,6 +308,7 @@ public:
 	template <typename Func>
 	void MarkRegionAsGpuModifiedUnlessCpuDirty(uint64_t vaddr, uint64_t size, Func&& func) {
 		CheckNotInUploadCallback();
+		PageWriteSeq::RaiseCurrent(vaddr, size);
 		std::vector<std::pair<uint64_t, uint64_t>> runs;
 		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			std::scoped_lock lock(manager->lock);
@@ -341,6 +343,7 @@ public:
 		});
 		upload_func();
 		if (is_written) {
+			PageWriteSeq::RaiseCurrent(vaddr, size);
 			Iterate<false>(vaddr, size,
 			               [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 				               manager->template ChangeState<DirtySource::Gpu, true>(

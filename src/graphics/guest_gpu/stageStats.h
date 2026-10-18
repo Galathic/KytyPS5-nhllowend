@@ -36,6 +36,11 @@ inline std::atomic<CpState> g_cp_state {CpState::Processing};
 inline std::atomic<bool>    g_resolve_working {false};
 
 inline std::atomic<uint64_t> g_ns[CounterCount] {};
+// Resolved-read checks (GuestReadLog::StillValid) by kind (0 draws, 1 dispatches): calls, entries, bytes, pages.
+inline std::atomic<uint64_t> g_check_calls[2] {}, g_check_entries[2] {}, g_check_bytes[2] {}, g_check_pages[2] {};
+inline std::atomic<uint64_t> g_check_skipped[2] {}; // reads skipped (see GuestReadLog::StillValid)
+// Reads checked because their bytes may have been GPU-owned when read, or a later operation writes their page.
+inline std::atomic<uint64_t> g_check_unsafe[2] {}, g_check_later[2] {};
 inline std::atomic<uint64_t> g_bda_syncs {0}; // BDA synchronizations that scanned for CPU-dirty pages
 inline std::atomic<uint64_t> g_ops {0}; // operations the execution thread ran (written by it only)
 // Execution-thread time and count by operation kind (GpuOperationKind; execution thread only).

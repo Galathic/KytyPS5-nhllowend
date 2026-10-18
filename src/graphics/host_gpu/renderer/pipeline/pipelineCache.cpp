@@ -1,5 +1,6 @@
 #include "graphics/guest_gpu/stageStats.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/pageWriteSeq.h"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -258,6 +259,31 @@ bool GuestReadLog::Read(uint64_t address, void* data, uint64_t size, bool strict
 	const auto offset = static_cast<uint32_t>(m_bytes.size());
 	m_bytes.insert(m_bytes.end(), static_cast<const uint8_t*>(data),
 	               static_cast<const uint8_t*>(data) + size);
+	// Bytes the GPU may own (the backing holds older ones) are always checked; see StillValid. Looked
+	// up per page (a page answer covers every read in it), for the last few pages of this log.
+	bool       unsafe     = !m_base_valid;
+	const auto first_page = address & ~uint64_t {0xfff};
+	if (!unsafe && first_page == ((address + size - 1) & ~uint64_t {0xfff})) {
+		size_t found = m_unsafe_pages.size();
+		for (size_t i = 0; i < m_unsafe_pages.size(); i++) {
+			if (m_unsafe_pages[i] == first_page) {
+				found = i;
+				break;
+			}
+		}
+		if (found != m_unsafe_pages.size()) {
+			unsafe = m_unsafe_values[found];
+		} else {
+			unsafe = Libs::LibKernel::Memory::IsGpuReadProtected(first_page, 0x1000) ||
+			         Libs::LibKernel::Memory::HasGpuDirtyBytesShared(first_page, 0x1000);
+			m_unsafe_pages[m_unsafe_next]  = first_page;
+			m_unsafe_values[m_unsafe_next] = unsafe;
+			m_unsafe_next                  = (m_unsafe_next + 1) % m_unsafe_pages.size();
+		}
+	} else if (!unsafe) {
+		unsafe = Libs::LibKernel::Memory::IsGpuReadProtected(address, size) ||
+		         Libs::LibKernel::Memory::HasGpuDirtyBytesShared(address, size);
+	}
 	// Contiguous reads of the same kind are checked as one (strict reads up to the size the
 	// check reads at once).
 	if (!m_entries.empty()) {
@@ -266,10 +292,11 @@ bool GuestReadLog::Read(uint64_t address, void* data, uint64_t size, bool strict
 		    last.offset + last.size == offset &&
 		    (!strict || last.size + size <= StrictCheckBytes)) {
 			last.size += static_cast<uint32_t>(size);
+			last.unsafe = last.unsafe || unsafe;
 			return true;
 		}
 	}
-	m_entries.push_back({address, static_cast<uint32_t>(size), offset, strict});
+	m_entries.push_back({address, static_cast<uint32_t>(size), offset, strict, unsafe});
 	return true;
 }
 
@@ -329,6 +356,30 @@ bool GuestReadLog::StillValid(bool without_faults) const {
 		}
 		return page_clean[kind];
 	};
+	// Reads that need no check: the resolve thread read them after the execution thread had
+	// finished operation m_base, no later operation writes their pages from the emulator's side
+	// (PageWriteSeq: noted command-processor writes, GPU-written buffer ranges, GPU data written
+	// back), and their bytes were not GPU-owned then. The game itself does not rewrite memory
+	// that submitted GPU work still reads before that work signals completion. Checking each
+	// read was 12% of the execution thread's time per draw and 26% per dispatch. Specialization
+	// (strict) reads are always checked. AbLegacy: every read is checked.
+	// KYTY_DBG_VERIFY_SKIPS=1 checks the skipped reads too and reports any that changed.
+	static const bool verify_skips = std::getenv("KYTY_DBG_VERIFY_SKIPS") != nullptr;
+	const bool        skips        = m_base_valid && !Common::Experiments::Enabled(Common::Experiments::AbLegacy) &&
+	                    m_base >= PageWriteSeq::g_floor.load(std::memory_order_acquire);
+	// KYTY_DBG_STAGE_STATS: NHL27CHECKS (reads, bytes and page switches per check).
+	if (StageStats::Enabled()) {
+		const auto kind = without_faults ? 1 : 0;
+		uint64_t   pages = 0, last = ~uint64_t {0};
+		for (const auto& entry: m_entries) {
+			pages += (entry.address >> 12u) != last ? 1u : 0u;
+			last = (entry.address + entry.size - 1) >> 12u;
+		}
+		StageStats::g_check_calls[kind].fetch_add(1, std::memory_order_relaxed);
+		StageStats::g_check_entries[kind].fetch_add(m_entries.size(), std::memory_order_relaxed);
+		StageStats::g_check_bytes[kind].fetch_add(m_bytes.size(), std::memory_order_relaxed);
+		StageStats::g_check_pages[kind].fetch_add(pages, std::memory_order_relaxed);
+	}
 	for (const auto& entry: m_entries) {
 		const auto* recorded = m_bytes.data() + entry.offset;
 		if (entry.strict) {
@@ -342,6 +393,29 @@ bool GuestReadLog::StillValid(bool without_faults) const {
 				return false;
 			}
 		} else {
+			const bool later     = PageWriteSeq::Last(entry.address, entry.size) > m_base;
+			const bool skippable = skips && !entry.unsafe && !later;
+			if (StageStats::Enabled()) {
+				const auto kind = without_faults ? 1 : 0;
+				(skippable      ? StageStats::g_check_skipped[kind]
+				 : entry.unsafe ? StageStats::g_check_unsafe[kind]
+				                : StageStats::g_check_later[kind])
+				    .fetch_add(1, std::memory_order_relaxed);
+			}
+			if (skippable && !verify_skips) {
+				continue;
+			}
+			if (skippable && !SameGuestBytes(reinterpret_cast<const void*>(entry.address), recorded, entry.size)) {
+				static std::atomic<uint32_t> reported {0};
+				if (reported.fetch_add(1, std::memory_order_relaxed) < 32) {
+					std::printf("NHL27SKIPBAD: read 0x%016llx+%u changed after resolve (base %llu, page write %llu, %s)\n",
+					            static_cast<unsigned long long>(entry.address), entry.size,
+					            static_cast<unsigned long long>(m_base),
+					            static_cast<unsigned long long>(PageWriteSeq::Last(entry.address, entry.size)),
+					            without_faults ? "dispatch" : "draw");
+					std::fflush(stdout);
+				}
+			}
 			// Experiment FaultPageDirect: on a page that faulted before (the GPU wrote other
 			// bytes of it), clean bytes are compared in the backing instead of faulting again.
 			// Dispatch read-ahead checks never fault: their pages change every frame (ring
