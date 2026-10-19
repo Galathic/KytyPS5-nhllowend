@@ -31,6 +31,7 @@ class GuestReadLog {
 public:
 	void Clear() {
 		m_entries.clear();
+		m_runs.clear();
 		m_bytes.clear();
 		m_failed     = false;
 		m_base       = t_resolve_base;
@@ -65,6 +66,19 @@ private:
 		bool unsafe = false;
 	};
 	std::vector<Entry>   m_entries;
+	// Consecutive entries on one page (StillValid checks a clean run with one lookup). A run is
+	// clean while its entries are single-page, not strict and not possibly GPU-owned; an unclean
+	// run is checked entry by entry.
+	struct Run {
+		uint64_t page  = 0;
+		uint32_t first = 0;
+		uint32_t count = 0;
+		bool     clean = false;
+	};
+	std::vector<Run> m_runs;
+	[[nodiscard]] static bool RunClean(const Entry& entry) {
+		return !entry.strict && !entry.unsafe && (entry.address >> 12u) == ((entry.address + entry.size - 1) >> 12u);
+	}
 	std::vector<uint8_t> m_bytes;
 	bool                 m_failed     = false;
 	uint64_t             m_base       = 0;

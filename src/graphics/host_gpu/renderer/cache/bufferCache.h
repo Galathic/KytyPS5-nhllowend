@@ -375,6 +375,13 @@ private:
 	// The pages of pending guest reads (their bytes reach guest memory when they finish), from
 	// before their bytes leave m_gpu_modified_ranges until they are in guest memory.
 	RangeSet                                          m_pending_read_ranges;
+	// The versions of both sets added (under m_gpu_ranges_mutex, after each change):
+	// HasGpuDirtyBytesShared answers a page again from its thread's cache while it holds.
+	std::atomic<uint64_t> m_gpu_ranges_version {0};
+	void                  PublishGpuRangesVersion() {
+		m_gpu_ranges_version.store(m_gpu_modified_ranges.Version() + m_pending_read_ranges.Version(),
+		                           std::memory_order_release);
+	}
 	uint64_t                                          m_gpu_dirty_generation = 0;
 	RangeSet                                          m_released_ranges;
 	bool                                              m_record_released = false;

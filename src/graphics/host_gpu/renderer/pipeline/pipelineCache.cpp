@@ -293,10 +293,20 @@ bool GuestReadLog::Read(uint64_t address, void* data, uint64_t size, bool strict
 		    (!strict || last.size + size <= StrictCheckBytes)) {
 			last.size += static_cast<uint32_t>(size);
 			last.unsafe = last.unsafe || unsafe;
+			if (!m_runs.empty() && !RunClean(last)) {
+				m_runs.back().clean = false;
+			}
 			return true;
 		}
 	}
 	m_entries.push_back({address, static_cast<uint32_t>(size), offset, strict, unsafe});
+	const auto& entry = m_entries.back();
+	const auto  index = static_cast<uint32_t>(m_entries.size() - 1);
+	if (!m_runs.empty() && m_runs.back().page == (address >> 12u) && m_runs.back().clean && RunClean(entry)) {
+		m_runs.back().count++;
+	} else {
+		m_runs.push_back({address >> 12u, index, 1, RunClean(entry)});
+	}
 	return true;
 }
 
@@ -384,7 +394,7 @@ bool GuestReadLog::StillValid(bool without_faults) const {
 	uint64_t   seq_page       = ~uint64_t {0};
 	bool       seq_later      = false;
 	const auto legacy_lookups = Common::Experiments::Enabled(Common::Experiments::AbPending) ? 1 : 0;
-	for (const auto& entry: m_entries) {
+	const auto check_entry = [&](const Entry& entry) {
 		const auto* recorded = m_bytes.data() + entry.offset;
 		if (entry.strict) {
 			// As specialization memory is read on the execution thread: GPU-owned bytes fail.
@@ -418,7 +428,7 @@ bool GuestReadLog::StillValid(bool without_faults) const {
 				    .fetch_add(1, std::memory_order_relaxed);
 			}
 			if (skippable && !verify_skips) {
-				continue;
+				return true;
 			}
 			if (skippable && !SameGuestBytes(reinterpret_cast<const void*>(entry.address), recorded, entry.size)) {
 				static std::atomic<uint32_t> reported {0};
@@ -445,7 +455,7 @@ bool GuestReadLog::StillValid(bool without_faults) const {
 				        ? Libs::LibKernel::Memory::CompareCleanBacking(entry.address, recorded, entry.size)
 				        : Libs::LibKernel::Memory::TryValidateCleanBacking(entry.address, recorded, entry.size);
 				if (compare == Libs::LibKernel::Memory::CleanBackingCompare::Equal) {
-					continue;
+					return true;
 				}
 				if (compare == Libs::LibKernel::Memory::CleanBackingCompare::Different ||
 				    (without_faults && compare == Libs::LibKernel::Memory::CleanBackingCompare::Dirty)) {
@@ -457,6 +467,26 @@ bool GuestReadLog::StillValid(bool without_faults) const {
 			if (!SameGuestBytes(reinterpret_cast<const void*>(entry.address), recorded, entry.size)) {
 				return false;
 			}
+		}
+		return true;
+	};
+	if (legacy_lookups != 0) {
+		for (const auto& entry: m_entries) {
+			if (!check_entry(entry)) return false;
+		}
+		return true;
+	}
+	// A run of reads on one page that no later operation writes, none strict or possibly
+	// GPU-owned, needs no check at all: one lookup instead of a pass over its reads.
+	for (const auto& run: m_runs) {
+		if (run.clean && skips && !verify_skips && PageWriteSeq::Last(run.page << 12u, 1) <= m_base) {
+			if (stats) {
+				StageStats::g_check_skipped[without_faults ? 1 : 0].fetch_add(run.count, std::memory_order_relaxed);
+			}
+			continue;
+		}
+		for (uint32_t i = run.first; i < run.first + run.count; i++) {
+			if (!check_entry(m_entries[i])) return false;
 		}
 	}
 	return true;

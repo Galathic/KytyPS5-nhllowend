@@ -440,6 +440,7 @@ void BufferCache::DiscardGpuModified(uint64_t vaddr, uint64_t size) {
 	{
 		std::unique_lock ranges_lock(m_gpu_ranges_mutex);
 		m_gpu_modified_ranges.Subtract(vaddr, size);
+		PublishGpuRangesVersion();
 	}
 	m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
 }
@@ -452,6 +453,7 @@ void BufferCache::ForgetGpuWrite(uint64_t vaddr, uint64_t size) {
 	{
 		std::unique_lock ranges_lock(m_gpu_ranges_mutex);
 		m_gpu_modified_ranges.Subtract(vaddr, size);
+		PublishGpuRangesVersion();
 	}
 	const auto first = vaddr & ~(TRACKER_PAGE_SIZE - 1);
 	const auto last  = (vaddr + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
@@ -679,6 +681,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		    });
 		    std::unique_lock ranges_lock(m_gpu_ranges_mutex);
 		    m_gpu_modified_ranges.Subtract(address, bytes);
+		    PublishGpuRangesVersion();
 	    });
 	m_last_download_bytes = 0;
 	if (copies.empty()) {
@@ -1131,6 +1134,7 @@ void BufferCache::RebuildPendingReadRanges() {
 	for (const auto& read: m_pending_guest_reads) {
 		m_pending_read_ranges.Add(read.vaddr, read.size);
 	}
+	PublishGpuRangesVersion();
 }
 
 void BufferCache::FinishPendingGuestReads(uint64_t vaddr, uint64_t size) {
@@ -1307,6 +1311,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadC
 			{
 				std::unique_lock ranges_lock(m_gpu_ranges_mutex);
 				m_pending_read_ranges.Add(first, last - first);
+				PublishGpuRangesVersion();
 			}
 			if (DownloadBufferMemory<true>(buffer, vaddr, size)) {
 				async_tick       = m_scheduler.CurrentTick();
@@ -1818,6 +1823,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		{
 			std::unique_lock ranges_lock(m_gpu_ranges_mutex);
 			m_gpu_modified_ranges.Add(vaddr, size);
+			PublishGpuRangesVersion();
 			PageWriteSeq::RaiseCurrent(vaddr, size);
 		}
 		++m_gpu_dirty_generation;
@@ -1999,7 +2005,31 @@ bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 }
 
 bool BufferCache::HasGpuDirtyBytesShared(uint64_t vaddr, uint64_t size) const {
+	// The resolve thread asks per page for each read log: while neither set changed, a page's
+	// answer holds (written buffers are added again on every bind, which changes nothing).
+	struct PageAnswer {
+		uint64_t page    = ~uint64_t {0};
+		uint64_t version = 0;
+		bool     dirty   = false;
+	};
+	static thread_local std::array<PageAnswer, 64> answers {};
+	const bool page_query = (vaddr & 0xfffu) == 0 && size == 0x1000 &&
+	                        !Common::Experiments::Enabled(Common::Experiments::AbLegacy) &&
+	                        !Common::Experiments::Enabled(Common::Experiments::AbPending);
+	if (page_query) {
+		const auto& answer = answers[(vaddr >> 12u) & 63u];
+		if (answer.page == vaddr && answer.version == m_gpu_ranges_version.load(std::memory_order_acquire)) {
+			return answer.dirty;
+		}
+	}
 	std::shared_lock ranges_lock(m_gpu_ranges_mutex);
+	if (page_query) {
+		auto& answer   = answers[(vaddr >> 12u) & 63u];
+		answer.page    = vaddr;
+		answer.version = m_gpu_modified_ranges.Version() + m_pending_read_ranges.Version();
+		answer.dirty   = m_pending_read_ranges.Intersects(vaddr, size) || m_gpu_modified_ranges.Intersects(vaddr, size);
+		return answer.dirty;
+	}
 	// Pending records are owned by the execution thread. Other threads see the pages of pending
 	// asynchronous downloads as dirty until their bytes are in guest memory (AbLegacy: every range
 	// while any download is pending).
@@ -2298,6 +2328,7 @@ void BufferCache::NoteGpuWrites(uint64_t vaddr, uint64_t size) {
 			    const auto last  = std::min(page + bytes, finish);
 			    std::unique_lock ranges_lock(m_gpu_ranges_mutex);
 			    m_gpu_modified_ranges.Add(first, last - first);
+			    PublishGpuRangesVersion();
 			    PageWriteSeq::RaiseCurrent(first, last - first);
 		    });
 	}
