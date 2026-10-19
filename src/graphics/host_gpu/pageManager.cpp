@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/pageManager.h"
 
 #include "common/alignment.h"
+#include "common/experiments.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -299,6 +300,7 @@ struct PageManager::Impl {
 		uint64_t  range_begin           = 0;
 		uint64_t  range_bytes           = 0;
 		uint64_t  potential_range_bytes = 0;
+		bool      read_changed          = false;
 
 		const auto release_pending = [&] {
 			if (range_bytes != 0) {
@@ -330,6 +332,9 @@ struct PageManager::Impl {
 			}
 
 			const bool watcher_edge = (track && new_count == 1) || (!track && new_count == 0);
+			if constexpr (is_read) {
+				read_changed = read_changed || watcher_edge;
+			}
 			if (watcher_edge && old_perms != new_perms) {
 				if (range_bytes == 0) {
 					range_begin           = page_index;
@@ -340,6 +345,11 @@ struct PageManager::Impl {
 		}
 
 		release_pending();
+		if constexpr (is_read) {
+			if (read_changed) {
+				read_watch_version.fetch_add(1, std::memory_order_release);
+			}
+		}
 	}
 
 	template <bool track, bool is_read>
@@ -363,6 +373,8 @@ struct PageManager::Impl {
 
 	std::unique_ptr<std::atomic<Region*>[]> regions;
 	std::vector<std::unique_ptr<Region>>    region_storage;
+	// Advances after any page gains or loses its read watcher (IsReadWatched caches per thread).
+	std::atomic<uint64_t> read_watch_version {0};
 	std::mutex                              region_mutex;
 };
 
@@ -387,13 +399,31 @@ bool PageManager::IsWatched(uint64_t vaddr) const {
 }
 
 bool PageManager::IsReadWatched(uint64_t vaddr) const {
+	// Read checks ask about the same pages draw after draw, while read watchers change rarely.
+	struct Answer {
+		uint64_t page    = ~uint64_t {0};
+		uint64_t version = 0;
+		bool     watched = false;
+	};
+	static thread_local std::array<Answer, 64> answers {};
+	const auto page_address = vaddr & ~(PAGE_SIZE - 1);
+	auto&      answer       = answers[(page_address / PAGE_SIZE) & 63u];
+	const auto version      = m_impl->read_watch_version.load(std::memory_order_acquire);
+	const bool cached       = !Common::Experiments::Enabled(Common::Experiments::AbPending);
+	if (cached && answer.page == page_address && answer.version == version) {
+		return answer.watched;
+	}
 	auto* region = m_impl->FindRegion(vaddr);
 	if (region == nullptr) {
 		return false;
 	}
 	const auto page = static_cast<size_t>((vaddr % REGION_SIZE) / PAGE_SIZE);
 	SpinGuard  lock(region->lock);
-	return region->pages[page].access_watchers != 0;
+	const bool watched = region->pages[page].access_watchers != 0;
+	if (cached) {
+		answer = {page_address, version, watched};
+	}
+	return watched;
 }
 
 template <bool track>

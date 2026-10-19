@@ -655,6 +655,8 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		std::deque<Permutation>                    permutations;
+		// The permutation the last resolution ahead took (resolve thread, under the program lock).
+		size_t                                     ahead_permutation = 0;
 		ResourceMemo                               resource_memo;
 		ShaderRecompiler::IR::ResourceSpecializationCache specialization_cache;
 		ShaderRecompiler::IR::ResourceDelta               delta; // KYTY_SRT_COMPILED: this program's previous outputs
@@ -879,14 +881,24 @@ struct PipelineCache::ProgramCache {
 			ahead.reads.Fail();
 			return {};
 		}
-		const auto permutation =
-		    std::ranges::find_if(source.permutations, [&](const Permutation& candidate) {
-			    const auto& layout = candidate.program.bindings;
-			    return layout.push_data_start_dword ==
-			               ShaderRecompiler::IR::PushData::StartFor(push_data_cursor,
-			                                                        layout.ShaderDataDwords()) &&
-			           candidate.specialization == specialization;
-		    });
+		const auto matches = [&](const Permutation& candidate) {
+			const auto& layout = candidate.program.bindings;
+			return layout.push_data_start_dword ==
+			           ShaderRecompiler::IR::PushData::StartFor(push_data_cursor, layout.ShaderDataDwords()) &&
+			       candidate.specialization == specialization;
+		};
+		// Consecutive draws of a program mostly take the same permutation: try it first.
+		auto permutation = source.permutations.end();
+		if (source.ahead_permutation < source.permutations.size() &&
+		    !Common::Experiments::Enabled(Common::Experiments::AbPending) &&
+		    matches(source.permutations[source.ahead_permutation])) {
+			permutation = source.permutations.begin() + static_cast<ptrdiff_t>(source.ahead_permutation);
+		} else {
+			permutation = std::ranges::find_if(source.permutations, matches);
+			if (permutation != source.permutations.end()) {
+				source.ahead_permutation = static_cast<size_t>(permutation - source.permutations.begin());
+			}
+		}
 		if (permutation == source.permutations.end()) {
 			if constexpr (!compute) {
 				QueueCompile(stage, params, input_info, push_data_cursor, &specialization);

@@ -423,6 +423,37 @@ time per frame -4% (36.9 -> 34.8-36.3 ms).
 The low-energy preset patch (`patches/nhl27_lowenergy.json`: resolution scale 0.5, no FSR3)
 changes nothing on the CPU side (same draws per second and thread load).
 
+### Comparable runs and fps by flip rate (2026-10-19)
+
+Match-to-match fps varied 33-43 with the same build. Two causes: the game saves its profile
+every boot (Play Now remembers its setup), and it switches its flip rate itself: 60 Hz in play,
+30 Hz in menus, faceoff intros and replays (a quarter to a third of a 3-minute window). Now:
+
+* `KytyPS5-tools\play-nhl.ps1` restores a profile snapshot (`save-fixed`) before each boot
+  (`-KeepSave` skips it). Two boots then read the same assets (`gameio-diff.py` on consoles with
+  `KYTY_DBG_TRACE_GAMEFILES=1`: 291 of 295 reads common).
+* The emulator always prints `NHL27FPS` (every 5 s: flips so far and the rate the game asks for)
+  and `NHL27FLIPRATE` changes with flip counts; `fps-by-rate.py <console> [--last s]` splits a
+  run's fps by rate. Baseline (43eba5e4): 45-47 fps at 60 Hz, 27-28 fps in the 30 Hz scenes
+  (those are GPU-bound on the crowd), 41 overall.
+* `NHL27CALLBACKS` (stage stats) splits the execution thread's callback time by what the
+  callbacks do (BDA boundaries, flushes, flips, flip waits, EOP, events, barriers...). In play
+  they are about 3% of the thread; the draws (about 2,900 per frame) are three quarters.
+
+In heavy play both pipeline threads are near their limit: the execution thread about 95% busy,
+the resolve thread about 84%. The execution thread's time is spread thin: buffer binds and their
+synchronization about 20% (re-protecting pages after BDA uploads alone 4-5%), texture bindings
+12%, read checks 6-8%, descriptor commits 6%, compute dispatches 14%. Cuts so far (paused A/B
+against `AbPending`, experiment bit 38, A/B only): draw cost -6%, dispatch -3% (fps 43.5 -> 46):
+texture slots whose T# is unchanged keep their description; descriptions are copied once per
+recording (`Found::serial`); no page walk for texel buffer binds when no image starts at the
+address; the GPU-fill filter is tested a word at a time; read checks look up `PageWriteSeq` once
+per page run and skip clean page runs whole; the resolve thread's GPU-dirty page answers are
+cached per thread while the GPU-modified and pending-download sets keep their version.
+Measured and dropped: a memo of written buffer binds (skip the synchronization while no page of
+the range's tracking regions became CPU dirty or GPU-clean): no gain, the 4 MiB region epochs
+change too often.
+
 ## Merged defaults (nhl27 + claude/nhl27-perf)
 
 Where both branches implemented the same feature, only one implementation is left and it is a
