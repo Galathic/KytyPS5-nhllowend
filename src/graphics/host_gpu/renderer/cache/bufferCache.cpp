@@ -343,6 +343,25 @@ void MarkGpuFillChunks(std::array<uint64_t, 4>& filter, uint64_t begin, uint64_t
 		filter[(chunk >> 6u) & 3u] |= uint64_t {1} << (chunk & 63u);
 	}
 }
+
+// Whether any m_gpu_fill_filter bit of the 64 KiB chunks [begin, end) touches is set.
+bool TestGpuFillChunks(const std::array<uint64_t, 4>& filter, uint64_t begin, uint64_t end) {
+	const uint64_t first = begin >> GpuFillChunkShift;
+	const uint64_t last  = (end - 1) >> GpuFillChunkShift;
+	if (last - first >= 255u) {
+		return (filter[0] | filter[1] | filter[2] | filter[3]) != 0;
+	}
+	for (uint64_t chunk = first; chunk <= last;) {
+		const uint64_t bit   = chunk & 63u;
+		const uint64_t count = std::min<uint64_t>(64u - bit, last - chunk + 1u);
+		const uint64_t mask  = (count == 64u ? ~uint64_t {0} : (uint64_t {1} << count) - 1u) << bit;
+		if ((filter[(chunk >> 6u) & 3u] & mask) != 0) {
+			return true;
+		}
+		chunk += count;
+	}
+	return false;
+}
 } // namespace
 
 void BufferCache::DropGpuFills(uint64_t vaddr, uint64_t size) {
@@ -351,7 +370,12 @@ void BufferCache::DropGpuFills(uint64_t vaddr, uint64_t size) {
 	}
 	std::scoped_lock lock(m_gpu_fills_mutex);
 	const auto end = vaddr + size;
-	if (size != 0 && ((end - 1) >> GpuFillChunkShift) - (vaddr >> GpuFillChunkShift) < 8u) {
+	if (size != 0 && !Common::Experiments::Enabled(Common::Experiments::AbPending)) {
+		// Written buffers (bound by many draws, often megabytes) test the filter a word at a time.
+		if (!TestGpuFillChunks(m_gpu_fill_filter, vaddr, end)) {
+			return;
+		}
+	} else if (size != 0 && ((end - 1) >> GpuFillChunkShift) - (vaddr >> GpuFillChunkShift) < 8u) {
 		bool hit = false;
 		for (uint64_t chunk = vaddr >> GpuFillChunkShift; chunk <= (end - 1) >> GpuFillChunkShift; chunk++) {
 			hit = hit || (m_gpu_fill_filter[(chunk >> 6u) & 3u] & (uint64_t {1} << (chunk & 63u))) != 0;

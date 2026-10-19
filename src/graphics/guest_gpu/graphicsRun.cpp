@@ -702,6 +702,24 @@ static void PrintStageStats() {
 		                    static_cast<double>(ns) / 1e6 / seconds, static_cast<double>(ns) / 1e3 / static_cast<double>(count));
 	}
 	std::printf("%s\n", line.c_str());
+	// Callbacks by what they do (GpuCallbackTag).
+	static uint64_t    last_cb_ns[16] {}, last_cb_count[16] {};
+	static const char* const tags[] = {"other",   "bda",        "flush", "finish", "flip",
+	                                   "eop",     "event",      "barrier", "write-data", "dma",
+	                                   "clock",   "host",       "gc",    "flip-wait"};
+	line = "NHL27CALLBACKS:";
+	for (size_t k = 0; k < std::size(tags); k++) {
+		const auto total_ns    = StageStats::g_callback_ns[k].load(std::memory_order_relaxed);
+		const auto total_count = StageStats::g_callback_count[k].load(std::memory_order_relaxed);
+		const auto ns          = total_ns - last_cb_ns[k];
+		const auto count       = total_count - last_cb_count[k];
+		last_cb_ns[k]          = total_ns;
+		last_cb_count[k]       = total_count;
+		if (count == 0) continue;
+		line += fmt::format(" {}={:.0f}/s {:.1f}ms/s {:.2f}us", tags[k], static_cast<double>(count) / seconds,
+		                    static_cast<double>(ns) / 1e6 / seconds, static_cast<double>(ns) / 1e3 / static_cast<double>(count));
+	}
+	std::printf("%s\n", line.c_str());
 	std::fflush(stdout);
 }
 
@@ -807,6 +825,13 @@ void GuestGpu::ExecutionThread() {
 			    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
 			StageStats::g_kind_ns[kind].store(StageStats::g_kind_ns[kind].load(std::memory_order_relaxed) + ns, std::memory_order_relaxed);
 			StageStats::g_kind_count[kind].store(StageStats::g_kind_count[kind].load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+			if (operation->kind == GpuOperationKind::Callback) {
+				const auto tag = static_cast<size_t>(operation->callback_tag) & 15u;
+				StageStats::g_callback_ns[tag].store(StageStats::g_callback_ns[tag].load(std::memory_order_relaxed) + ns,
+				                                     std::memory_order_relaxed);
+				StageStats::g_callback_count[tag].store(
+				    StageStats::g_callback_count[tag].load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+			}
 			StageStats::g_ops.store(StageStats::g_ops.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
 		} else {
 			operation->processor->Execute(*operation);
@@ -1028,7 +1053,7 @@ void CommandProcessor::NoteGuestWrite(uint64_t sequence, uint64_t address, uint6
 }
 
 void CommandProcessor::EmitHostCommand(Common::UniqueFunction<void>&& command) {
-	EmitCallback(std::move(command));
+	EmitCallback(std::move(command), GpuCallbackTag::Host);
 }
 
 void CommandProcessor::ReadDecisionMemory(const volatile void* address, void* value,
@@ -1052,13 +1077,14 @@ void CommandProcessor::BdaBoundary(RenderContext::BdaBoundary kind) {
 	// KYTY_BDA_BATCH orders boundaries with the draws and dispatches that execute around them.
 	const auto saved_trace_op = g_trace_op;
 	g_trace_op                = static_cast<uint16_t>(g_trace_op | 0x4000u);
-	EmitCallback([this, kind] { m_renderer.BdaBatchBoundary(kind); });
+	EmitCallback([this, kind] { m_renderer.BdaBatchBoundary(kind); }, GpuCallbackTag::Bda);
 	g_trace_op = saved_trace_op;
 }
 
-uint64_t CommandProcessor::EmitCallback(GpuCallback&& callback) {
-	auto operation     = MakeOperation(GpuOperationKind::Callback);
-	operation.callback = std::move(callback);
+uint64_t CommandProcessor::EmitCallback(GpuCallback&& callback, GpuCallbackTag tag) {
+	auto operation         = MakeOperation(GpuOperationKind::Callback);
+	operation.callback     = std::move(callback);
+	operation.callback_tag = tag;
 	return Emit(std::move(operation));
 }
 
@@ -1137,7 +1163,7 @@ void CommandProcessor::BufferInit() {
 }
 
 void CommandProcessor::BufferFlush() {
-	EmitCallback([this] { GetScheduler().Flush(); });
+	EmitCallback([this] { GetScheduler().Flush(); }, GpuCallbackTag::Flush);
 }
 
 void CommandProcessor::NoteRecordedWork() {
@@ -1158,15 +1184,15 @@ void CommandProcessor::BufferFlushIfBatchReady() {
 		if (GetScheduler().CurrentTick() == m_batch_tick && m_batch_work >= MinBatchWork) {
 			GetScheduler().Flush();
 		}
-	});
+	}, GpuCallbackTag::Flush);
 }
 
 void CommandProcessor::BufferWait() {
-	EmitCallback([this] { GetScheduler().Finish(); });
+	EmitCallback([this] { GetScheduler().Finish(); }, GpuCallbackTag::Finish);
 }
 
 void CommandProcessor::RunGarbageCollector() {
-	EmitCallback([this] { m_renderer.RunGarbageCollector(); });
+	EmitCallback([this] { m_renderer.RunGarbageCollector(); }, GpuCallbackTag::Gc);
 }
 
 void CommandProcessor::ResetDeCe() {
@@ -1212,7 +1238,7 @@ void CommandProcessor::DumpConstRam(uint32_t* dst, uint32_t offset, uint32_t dw_
 	std::vector<uint32_t> words(m_const_ram + offset / 4, m_const_ram + offset / 4 + dw_num);
 	const auto            sequence = EmitCallback([dst, words = std::move(words)] {
 		memcpy(dst, words.data(), words.size() * sizeof(uint32_t));
-	});
+	}, GpuCallbackTag::WriteData);
 	NoteGuestWrite(sequence, reinterpret_cast<uint64_t>(dst), uint64_t {dw_num} * 4u,
 	               m_const_ram + offset / 4);
 }
@@ -1428,7 +1454,7 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		} else {
 			memcpy(dst, src, static_cast<size_t>(dw_num) * sizeof(uint32_t));
 		}
-	});
+	}, GpuCallbackTag::WriteData);
 	if (write_one_address) {
 		NoteGuestWrite(sequence, reinterpret_cast<uint64_t>(dst), sizeof(uint32_t),
 		               src + dw_num - 1);
@@ -1454,7 +1480,7 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 			     " size=%u\n",
 			     dst_address, value, num_bytes);
 		}
-	});
+	}, GpuCallbackTag::Clock);
 	NoteGuestWrite(sequence, dst_address, num_bytes, nullptr, "wait-clock-copy", num_bytes == sizeof(uint64_t) ? GuestGpu::WriteOriginClock : GuestGpu::WriteOriginOther);
 }
 
@@ -1507,7 +1533,7 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 	const auto sequence = EmitCallback([=, this] {
 		ExecuteDmaData(dst_gds, dst_address_or_offset, src_sel, src_gds,
 		               src_address_or_offset_or_immediate, num_bytes);
-	});
+	}, GpuCallbackTag::Dma);
 	if (!dst_gds) {
 		NoteGuestWrite(sequence, dst_address_or_offset, num_bytes, nullptr, "wait-dma-data", GuestGpu::WriteOriginDma);
 	}
@@ -3115,7 +3141,7 @@ void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_
 		GetScheduler().Flush();
 		m_renderer.GetVideoOut().WaitFlipDone(static_cast<int>(video_out_handle),
 		                                      static_cast<int>(display_buffer_index));
-	});
+	}, GpuCallbackTag::FlipWait);
 }
 
 template <typename T>
@@ -3153,7 +3179,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 		ExecuteWriteAtEndOfPipe(submit_id, eop_event_type, cache_action, event_index,
 		                        event_write_source, dst_gpu_addr, value, interrupt_selector,
 		                        interrupt_context_id);
-	});
+	}, GpuCallbackTag::Eop);
 	// What ExecuteWriteAtEndOfPipe() writes: nothing for a graphics end-of-pipe interrupt, GDS
 	// dwords or the clock (values known only then), the low dword of a 64-bit value from source
 	// 1, or the value.
@@ -3389,7 +3415,7 @@ void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_
 }
 
 void CommandProcessor::EmitGlobalBarrier() {
-	EmitCallback([this] { ExecuteGlobalBarrier(); });
+	EmitCallback([this] { ExecuteGlobalBarrier(); }, GpuCallbackTag::Barrier);
 }
 
 void CommandProcessor::ExecuteGlobalBarrier() {
@@ -3435,7 +3461,8 @@ void CommandProcessor::ExecuteGlobalBarrier() {
 }
 
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {
-	EmitCallback([this, interrupt_context_id] { DeferEopInterrupt(interrupt_context_id); });
+	EmitCallback([this, interrupt_context_id] { DeferEopInterrupt(interrupt_context_id); },
+	             GpuCallbackTag::Eop);
 }
 
 void CommandProcessor::DeferEopInterrupt(uint32_t interrupt_context_id) {
@@ -3474,7 +3501,7 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 
 	const auto sequence = EmitCallback([this, event_type, event_index, event_address] {
 		ExecuteTriggerEvent(event_type, event_index, event_address);
-	});
+	}, GpuCallbackTag::Event);
 	if (event_type == 0x00000039) {
 		// Occlusion counter pairs of 16 DBs.
 		NoteGuestWrite(sequence, event_address, 16u * 2u * sizeof(uint64_t), nullptr, "wait-occlusion");
@@ -3560,7 +3587,7 @@ void CommandProcessor::WriteLodStats(void* dst, uint32_t size) {
 			auto* label = static_cast<uint32_t*>(dst);
 			*label      = 1;
 		}
-	});
+	}, GpuCallbackTag::Other);
 	NoteGuestWrite(sequence, reinterpret_cast<uint64_t>(dst), size, nullptr, "wait-lod-stats");
 }
 
@@ -3578,7 +3605,7 @@ void CommandProcessor::Flip() {
 		    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); },
 		    true);
 		GetScheduler().Flush();
-	});
+	}, GpuCallbackTag::Flip);
 }
 
 void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
@@ -3599,7 +3626,7 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 		    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); },
 		    true);
 		GetScheduler().Flush();
-	});
+	}, GpuCallbackTag::Flip);
 	NoteGuestWrite(sequence, reinterpret_cast<uint64_t>(dst_gpu_addr), sizeof(value), &value);
 }
 
@@ -3633,7 +3660,7 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 		    },
 		    true);
 		GetScheduler().Flush();
-	});
+	}, GpuCallbackTag::Flip);
 	NoteGuestWrite(sequence, reinterpret_cast<uint64_t>(dst_gpu_addr), sizeof(value), &value);
 }
 
@@ -3654,11 +3681,11 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 		GetScheduler().DeferHostOperation(
 		    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); }, true);
 		GetScheduler().Flush();
-	});
+	}, GpuCallbackTag::Flip);
 }
 
 void CommandProcessor::SynchronizeGpu() {
-	EmitCallback([this] { GetScheduler().Finish(); });
+	EmitCallback([this] { GetScheduler().Finish(); }, GpuCallbackTag::Finish);
 }
 
 uint32_t GuestGpu::CurrentQueue() noexcept {

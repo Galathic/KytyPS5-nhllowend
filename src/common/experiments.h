@@ -62,6 +62,9 @@ enum Bit : uint64_t {
 	SpeculateDirtyReads  = uint64_t {1} << 37u, // KYTY_SPECULATE_DIRTY_READS (default off; shader-table reads of GPU-written bytes the GPU keeps rewriting unchanged use the backing, checked later)
 	// A/B only (no environment variable): selects the code a pending change replaces.
 	AbLegacy = 1u << 31u,
+	// A/B only, like AbLegacy, for the changes made after it was taken (AbLegacy also turns off
+	// the earlier changes it still selects).
+	AbPending = uint64_t {1} << 38u,
 };
 
 namespace Detail {

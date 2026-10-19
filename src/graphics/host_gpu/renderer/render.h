@@ -65,6 +65,9 @@ struct TextureDescDerivation {
 		uint64_t                image_set_epoch = 0;
 		ImageLookupState        state;
 		bool                    valid = false;
+		// Unique per recording (TextureBinding::desc_serial): a binding that already holds
+		// this `desc` need not copy it again.
+		uint64_t serial = 0;
 	};
 	Found found;
 };
@@ -384,6 +387,8 @@ private:
 	bool m_clear_texture_descs = false;
 	// Advances when m_texture_descs is cleared (bindings keep pointers into it).
 	uint64_t m_texture_descs_generation = 1;
+	// The last TextureDescDerivation::Found::serial given out.
+	uint64_t m_found_serial = 0;
 
 	// The host sampler for a sampler binding; see NativeSampler().
 	[[nodiscard]] vk::Sampler NativeSampler(const ShaderRecompiler::IR::CompiledShaderInfo& program,

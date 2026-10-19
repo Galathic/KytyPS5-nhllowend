@@ -64,6 +64,8 @@ struct TextureBinding {
 	// its view is acquired; see RenderExecutor::ResolveTexture().
 	TextureDescDerivation* lookup = nullptr;
 	bool                   reused = false;
+	// The Found::serial `desc` was copied from by RenderExecutor::ReuseTextureLookup (0: none).
+	uint64_t desc_serial = 0;
 };
 
 struct PreparedBindings {

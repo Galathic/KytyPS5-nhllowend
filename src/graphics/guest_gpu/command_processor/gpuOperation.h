@@ -80,6 +80,24 @@ enum class GpuOperationKind : uint8_t {
 	Callback,
 };
 
+enum class GpuCallbackTag : uint8_t {
+	Other,
+	Bda,
+	Flush,
+	Finish,
+	Flip,
+	Eop,
+	Event,
+	Barrier,
+	WriteData,
+	Dma,
+	Clock,
+	Host,
+	Gc,
+	FlipWait,
+	Count
+};
+
 // One unit of emulated GPU work produced by a command processor. Operations execute in the
 // order the command processors produce them; every guest-visible effect of a command buffer
 // (draws, dispatches, labels, interrupts, flips, DMA) is an operation.
@@ -103,6 +121,8 @@ struct GpuOperation {
 	// KYTY_IDLE_TRACE: the PM4 packet that produced the operation (opcode | IT_NOP R code << 8,
 	// 0x4000 = the KYTY_BDA_BATCH boundary after the packet, 0 = outside a packet).
 	uint16_t trace_op = 0;
+	// Callbacks: what they do (KYTY_DBG_STAGE_STATS, NHL27CALLBACKS).
+	GpuCallbackTag callback_tag = GpuCallbackTag::Other;
 	union {
 		DrawIndexArgs       draw_index;
 		DrawAutoArgs        draw_auto;

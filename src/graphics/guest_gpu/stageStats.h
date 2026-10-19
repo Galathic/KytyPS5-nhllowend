@@ -46,6 +46,9 @@ inline std::atomic<uint64_t> g_ops {0}; // operations the execution thread ran (
 // Execution-thread time and count by operation kind (GpuOperationKind; execution thread only).
 inline std::atomic<uint64_t> g_kind_ns[8] {};
 inline std::atomic<uint64_t> g_kind_count[8] {};
+// Callbacks by GpuCallbackTag (execution thread only).
+inline std::atomic<uint64_t> g_callback_ns[16] {};
+inline std::atomic<uint64_t> g_callback_count[16] {};
 inline thread_local Role     t_role = Role::Other;
 
 [[nodiscard]] inline bool Enabled() {

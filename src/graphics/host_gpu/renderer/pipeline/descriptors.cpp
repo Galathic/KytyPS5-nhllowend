@@ -23,6 +23,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
+#include "graphics/host_gpu/renderer/frameDump.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -771,7 +772,13 @@ bool RenderExecutor::ReuseTextureLookup(TextureDescDerivation& derived, TextureB
 	texture_cache.TouchImage(*image);
 	binding.image_id   = found.id;
 	binding.image_view = found.view;
-	binding.desc       = found.desc;
+	// The binding of a stage slot usually reuses the same lookup draw after draw: the description
+	// (a few hundred bytes) is copied once per recording.
+	if (binding.desc_serial != found.serial ||
+	    Common::Experiments::Enabled(Common::Experiments::AbPending)) {
+		binding.desc        = found.desc;
+		binding.desc_serial = found.serial;
+	}
 	binding.layout     = vk::ImageLayout::eUndefined;
 	binding.mip_views.clear();
 	binding.lookup = &derived;
@@ -1152,7 +1159,12 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	const bool same_program = prepared.last_program == &program &&
 	                          prepared.last_descs_generation == m_texture_descs_generation;
 	const bool same_images  = same_program && prepared.last_images == snapshot.images;
-	if (!same_images) {
+	// Draws of a program change some T#s and keep the others: a slot whose T# is unchanged keeps
+	// its description instead of looking it up again.
+	const bool slot_reuse = same_program && prepared.last_images.size() == snapshot.images.size() &&
+	                        prepared.image_descs.size() == program.info.images.size() &&
+	                        !Common::Experiments::Enabled(Common::Experiments::AbPending);
+	if (!same_images && !slot_reuse) {
 		prepared.image_descs.assign(program.info.images.size(), nullptr);
 	}
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
@@ -1161,7 +1173,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		if (!resource.written &&
 		    resource.mip_mode != ShaderRecompiler::IR::ImageMipMode::Dynamic) {
 			auto* derived = prepared.image_descs[i];
-			if (!same_images) {
+			if (!same_images && !(slot_reuse && prepared.last_images[i] == snapshot.images[i])) {
 				const auto cached =
 				    m_texture_descs.find(MakeTextureDescKey(resource, snapshot.images[i]));
 				derived = cached != m_texture_descs.end() ? &cached->second : nullptr;
@@ -1410,6 +1422,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			found.image_set_epoch = texture_cache.ImageSetEpoch();
 			found.state           = ImageLookupState::Of(binding.image_id, image);
 			found.valid           = true;
+			found.serial          = ++m_found_serial;
 		}
 		// The binding no longer refers to the description, which may be cleared.
 		binding.lookup = nullptr;
@@ -1769,6 +1782,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 
 	// Keep this draw's push-constant block on each stage for the frame dump (FrameDump::OnDraw).
 	for (auto* prepared: prepared_bindings) {
+		if (!FrameDump::Enabled()) break;
 		prepared->push_dwords       = push_data.dwords;
 		prepared->push_dwords_valid = has_push_data;
 	}

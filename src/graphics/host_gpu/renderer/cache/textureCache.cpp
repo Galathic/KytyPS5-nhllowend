@@ -1997,6 +1997,12 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 		return {};
 	}
 	std::scoped_lock lock {m_lock};
+	// Only images that start at `address` match. Texel buffer binds ask on every draw and nearly
+	// always find none: one hash lookup instead of walking the pages of the range.
+	if (!m_images_by_address.contains(address) &&
+	    !Common::Experiments::Enabled(Common::Experiments::AbPending)) {
+		return {};
+	}
 	ImageIds         matches;
 	for (const auto id: FindImagesInRegion(address, size, false)) {
 		auto owner = m_slot_images.try_get(id);

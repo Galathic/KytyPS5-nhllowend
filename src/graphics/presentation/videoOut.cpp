@@ -850,7 +850,16 @@ void VideoOutDriver::Impl::VblankEnd() {
 			TriggerVideoOutEvents(ctx, VideoOutEventKind::Vblank,
 			                      reinterpret_cast<void*>(ctx.vblank_status.count));
 			ctx.vblank_cond.SignalAll();
+			// Every 5 s: flips so far and the rate the game asks for (fps-by-rate.py).
+			const bool report = ctx.vblank_status.count % 300 == 0;
+			const auto flips  = static_cast<uint64_t>(ctx.flip_status.count);
+			const int  rate   = ctx.flip_rate;
 			ctx.mutex.Unlock();
+			if (report) {
+				std::printf("NHL27FPS: handle=%d t=%.1f s flips=%" PRIu64 " rate=%d\n", i,
+				            static_cast<double>(LibKernel::KernelGetProcessTime()) / 1e6, flips, rate);
+				std::fflush(stdout);
+			}
 		}
 	}
 }
@@ -1424,12 +1433,13 @@ KYTY_SYSV_ABI int VideoOutSetFlipRate(int handle, int rate) {
 	Common::LockGuard lock(ctx->mutex);
 	if (ctx->flip_rate != rate) {
 		Common::Timeline::Mark("flip-rate", static_cast<uint64_t>(rate));
-		if (std::getenv("KYTY_DBG_QUEUE_TIME") != nullptr) {
-			// With the queue-time diagnostic: the game picks its frame rate (0 = 60, 1 = 30, 2 = 20 Hz).
-			std::printf("NHL27FLIPRATE: handle=%d rate=%d -> %d at %.1f s\n", handle, ctx->flip_rate, rate,
-			            static_cast<double>(LibKernel::KernelGetProcessTime()) / 1e6);
-			std::fflush(stdout);
-		}
+		// The game picks its frame rate (0 = 60, 1 = 30, 2 = 20 Hz): 60 Hz in play, 30 Hz in menus
+		// and many presentation scenes. With the flip count, a run's fps splits by rate
+		// (KytyPS5-tools fps-by-rate.py); a few changes per minute.
+		std::printf("NHL27FLIPRATE: handle=%d rate=%d -> %d at %.1f s flips=%" PRIu64 "\n", handle,
+		            ctx->flip_rate, rate, static_cast<double>(LibKernel::KernelGetProcessTime()) / 1e6,
+		            static_cast<uint64_t>(ctx->flip_status.count));
+		std::fflush(stdout);
 	}
 	ctx->flip_rate = rate;
 

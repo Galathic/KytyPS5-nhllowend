@@ -368,7 +368,8 @@ bool GuestReadLog::StillValid(bool without_faults) const {
 	const bool        skips        = m_base_valid && !Common::Experiments::Enabled(Common::Experiments::AbLegacy) &&
 	                    m_base >= PageWriteSeq::g_floor.load(std::memory_order_acquire);
 	// KYTY_DBG_STAGE_STATS: NHL27CHECKS (reads, bytes and page switches per check).
-	if (StageStats::Enabled()) {
+	const bool stats = StageStats::Enabled();
+	if (stats) {
 		const auto kind = without_faults ? 1 : 0;
 		uint64_t   pages = 0, last = ~uint64_t {0};
 		for (const auto& entry: m_entries) {
@@ -380,6 +381,9 @@ bool GuestReadLog::StillValid(bool without_faults) const {
 		StageStats::g_check_bytes[kind].fetch_add(m_bytes.size(), std::memory_order_relaxed);
 		StageStats::g_check_pages[kind].fetch_add(pages, std::memory_order_relaxed);
 	}
+	uint64_t   seq_page       = ~uint64_t {0};
+	bool       seq_later      = false;
+	const auto legacy_lookups = Common::Experiments::Enabled(Common::Experiments::AbPending) ? 1 : 0;
 	for (const auto& entry: m_entries) {
 		const auto* recorded = m_bytes.data() + entry.offset;
 		if (entry.strict) {
@@ -393,9 +397,20 @@ bool GuestReadLog::StillValid(bool without_faults) const {
 				return false;
 			}
 		} else {
-			const bool later     = PageWriteSeq::Last(entry.address, entry.size) > m_base;
+			// Consecutive reads mostly lie on one page: its last write is looked up once.
+			bool later;
+			const auto page = entry.address >> 12u;
+			if (page == ((entry.address + entry.size - 1) >> 12u) && legacy_lookups == 0) {
+				if (page != seq_page) {
+					seq_page  = page;
+					seq_later = PageWriteSeq::Last(entry.address, entry.size) > m_base;
+				}
+				later = seq_later;
+			} else {
+				later = PageWriteSeq::Last(entry.address, entry.size) > m_base;
+			}
 			const bool skippable = skips && !entry.unsafe && !later;
-			if (StageStats::Enabled()) {
+			if (stats) {
 				const auto kind = without_faults ? 1 : 0;
 				(skippable      ? StageStats::g_check_skipped[kind]
 				 : entry.unsafe ? StageStats::g_check_unsafe[kind]
