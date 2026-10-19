@@ -654,9 +654,15 @@ ThinLTO; `tools/pgo/README.md` has the steps.
 
 Refresh the profile after larger changes: functions whose code changed get no profile data and
 are optimized as cold. Profile v5 (2026-10-19, recorded on 0cc673db; v4 predated the resolve and
-execution-thread rewrites): gameplay 45.6 -> 49.8 fps at 60 Hz in a fixed-profile match. A new
-profile file takes effect only after a reconfigure (its hash is a configure-time define):
-otherwise ninja rebuilds nothing.
+execution-thread rewrites): gameplay 45.6 -> 49.8 fps at 60 Hz in a fixed-profile match. Profile
+v6 (2026-10-19, recorded on ad057ab9: the binding memo work had changed the hottest functions,
+ObtainBuffer, FindBuffers, PrepareBindings, StillValid and the pipeline threads' loops): paused
+cross-build A/B (`exe-ab.sh`, two boots each) draw cost 4.27 -> 4.01 us, resolve busy 887 -> 846
+ms/s. A new profile file takes effect only after a reconfigure (its hash is a configure-time
+define): otherwise ninja rebuilds nothing.
+
+Single fixed-save matches of the same build differ by up to 5 fps at 60 Hz (52.2 and 57.1 within
+an hour): compare builds with `exe-ab.sh` (per-draw cost in paused boots), not one match each.
 
 Comparing builds needs separate boots, and scenes differ between boots, so compare the
 window-title fps over a few minutes of gameplay in several boots of each. `KYTY_PERF_STATS=1`
