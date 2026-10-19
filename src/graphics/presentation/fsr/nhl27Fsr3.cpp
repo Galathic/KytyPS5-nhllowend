@@ -7,10 +7,15 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "kernel/memory.h"
+#include "graphics/host_gpu/vulkanCommon.h"
+#include "gpu_tiler_shaders/gpu_tiler_fsr_color_clean_spv.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <cstdio>
+#include <vector>
 #include <cstdlib>
 #include <cstring>
 
@@ -84,6 +89,14 @@ struct Nhl27Fsr3::Impl {
 	Nhl27HistoryState last_state {};
 	bool have_last = false, missed = true;
 	uint64_t resets = 0, present_skips = 0, dirty_reads = 0, clean_mismatches = 0, replaced = 0;
+	uint64_t dumps = 0;
+	// KYTY_FSR3_CLEAN_COLOR=1: broken and lone over-bright colour pixels are repaired before FSR
+	// (gpu_tiler_fsr_color_clean.comp). `clean` receives the repaired copy of `transfer`.
+	vk::Buffer clean = nullptr;
+	VmaAllocation clean_alloc = nullptr;
+	vk::PipelineLayout clean_layout = nullptr;
+	vk::Pipeline clean_pipeline = nullptr;
+	uint64_t cleaned = 0;
 	std::atomic<uint64_t> presented {0};
 	explicit Impl(GraphicContext& gfx) : graphics(gfx) {
 		if (!gfx.physical_device.getFeatures().shaderInt16) {
@@ -96,6 +109,8 @@ struct Nhl27Fsr3::Impl {
 		// RenderContext shuts down/drains the scheduler before RenderExecutor's owner dies.
 		ReleaseImages();
 		if (constants) vmaDestroyBuffer(graphics.allocator, constants, constants_alloc);
+		if (clean_pipeline) graphics.device.destroyPipeline(clean_pipeline, nullptr);
+		if (clean_layout) graphics.device.destroyPipelineLayout(clean_layout, nullptr);
 	}
 	void Reject(const char* why) {
 		stage = 0;
@@ -116,12 +131,16 @@ struct Nhl27Fsr3::Impl {
 		if (transfer) vmaDestroyBuffer(graphics.allocator, transfer, transfer_alloc);
 		transfer = nullptr;
 		transfer_alloc = nullptr;
+		if (clean) vmaDestroyBuffer(graphics.allocator, clean, clean_alloc);
+		clean = nullptr;
+		clean_alloc = nullptr;
 	}
 	bool AllocateBuffer(uint64_t bytes, bool host, vk::Buffer& buffer,
 						VmaAllocation& allocation, void** pointer = nullptr) {
 		vk::BufferCreateInfo info {};
 		info.size = bytes;
-		info.usage = vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst;
+		info.usage = vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst |
+			vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eShaderDeviceAddress;
 		VmaAllocationCreateInfo alloc {};
 		alloc.usage = VMA_MEMORY_USAGE_AUTO;
 		if (host) alloc.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
@@ -215,6 +234,134 @@ struct Nhl27Fsr3::Impl {
 		std::fflush(stdout);
 		if (!finite) { failed.store(true, std::memory_order_release); Reject("nonfinite-shadow-output"); }
 	}
+	// KYTY_FSR3_NHL27_DUMP=N (debug, waits for the GPU): every N FSR frames, up to 4 times, read back
+	// FSR's colour input, motion input and output, print what they hold (NHL27FSR3DUMP lines: broken
+	// values, very bright pixels, isolated bright dots) and write the raw images next to the emulator
+	// (fsr_dump_<frame>_color.bin = B10G11R11, _motion.bin = RG16F, _output.bin = RGBA16F).
+	static uint64_t DumpEvery() {
+		static const uint64_t every = [] {
+			const char* value = std::getenv("KYTY_FSR3_NHL27_DUMP");
+			return value != nullptr ? static_cast<uint64_t>(std::strtoull(value, nullptr, 10)) : uint64_t {0};
+		}();
+		return every;
+	}
+	static float Half(uint16_t bits) {
+		const unsigned exponent = (bits >> 10) & 31, mantissa = bits & 1023;
+		float value = exponent == 31 ? (mantissa ? NAN : INFINITY)
+			: exponent ? std::ldexp(1 + float(mantissa) / 1024, int(exponent) - 15)
+			: std::ldexp(float(mantissa), -24);
+		return (bits & 0x8000) ? -value : value;
+	}
+	static float SmallFloat(uint32_t bits, unsigned mantissa_bits) {
+		const unsigned exponent = (bits >> mantissa_bits) & 31, mantissa = bits & ((1u << mantissa_bits) - 1);
+		if (exponent == 31) return mantissa ? NAN : INFINITY;
+		const float scale = float(1u << mantissa_bits);
+		return exponent ? std::ldexp(1 + float(mantissa) / scale, int(exponent) - 15)
+			: std::ldexp(float(mantissa) / scale, -14);
+	}
+	// rgb per pixel -> stats line; isolated = brighter than 1.0 and than 8x the brightest of its 4 neighbours.
+	static void DumpStats(const char* what, uint32_t frame, uint32_t width, uint32_t height,
+						  const std::vector<float>& luma, uint64_t nonfinite) {
+		uint64_t over16 = 0, over256 = 0, over4096 = 0, isolated = 0;
+		float    peak = 0;
+		double   sum = 0;
+		for (uint32_t y = 0; y < height; ++y) {
+			for (uint32_t x = 0; x < width; ++x) {
+				const float v = luma[size_t(y) * width + x];
+				if (!std::isfinite(v)) continue;
+				sum += v;
+				peak = std::max(peak, v);
+				over16 += v > 16 ? 1 : 0;
+				over256 += v > 256 ? 1 : 0;
+				over4096 += v > 4096 ? 1 : 0;
+				if (v > 1 && x > 0 && y > 0 && x + 1 < width && y + 1 < height) {
+					float around = 0;
+					for (const auto [dx, dy] : {std::pair {-1, 0}, {1, 0}, {0, -1}, {0, 1}}) {
+						const float n = luma[size_t(y + dy) * width + (x + dx)];
+						around = std::max(around, std::isfinite(n) ? n : 0.0f);
+					}
+					isolated += v > around * 8 ? 1 : 0;
+				}
+			}
+		}
+		std::printf("NHL27FSR3DUMP %s frame=%u size=%ux%u nonfinite=%llu over16=%llu over256=%llu "
+					"over4096=%llu isolated=%llu max=%g mean=%g\n", what, frame, width, height,
+					static_cast<unsigned long long>(nonfinite), static_cast<unsigned long long>(over16),
+					static_cast<unsigned long long>(over256), static_cast<unsigned long long>(over4096),
+					static_cast<unsigned long long>(isolated), double(peak),
+					sum / (double(width) * height));
+		std::fflush(stdout);
+	}
+	void DumpFrame(RenderContext& context, CommandBuffer& command, uint32_t guest_frame) {
+		struct Target {
+			Owned*        image;
+			uint32_t      bytes_per_pixel;
+			const char*   name;
+			vk::Buffer    buffer = nullptr;
+			VmaAllocation allocation = nullptr;
+			void*         data = nullptr;
+		};
+		std::array<Target, 3> targets {{{&images[0], 4, "color"}, {&images[2], 4, "motion"}, {&images[3], 8, "output"}}};
+		for (auto& t : targets) {
+			const auto& e = t.image->resource.extent;
+			if (!AllocateBuffer(uint64_t(e.width) * e.height * t.bytes_per_pixel, true, t.buffer, t.allocation, &t.data)) {
+				for (auto& f : targets) if (f.buffer) vmaDestroyBuffer(graphics.allocator, f.buffer, f.allocation);
+				return;
+			}
+		}
+		auto recorder = command.Handle();
+		for (auto& t : targets) {
+			auto& owned = *t.image;
+			ImageBarrier(recorder, owned.resource.image, owned.layout, vk::ImageLayout::eTransferSrcOptimal);
+			vk::BufferImageCopy copy {};
+			copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+			copy.imageExtent = {owned.resource.extent.width, owned.resource.extent.height, 1};
+			recorder.copyImageToBuffer(owned.resource.image, vk::ImageLayout::eTransferSrcOptimal, t.buffer, 1, &copy);
+			ImageBarrier(recorder, owned.resource.image, vk::ImageLayout::eTransferSrcOptimal, owned.layout);
+		}
+		vk::MemoryBarrier2 host {};
+		host.srcStageMask = S::eTransfer; host.srcAccessMask = A::eTransferWrite;
+		host.dstStageMask = S::eHost; host.dstAccessMask = A::eHostRead;
+		vk::DependencyInfo dependency {};
+		dependency.memoryBarrierCount = 1; dependency.pMemoryBarriers = &host;
+		recorder.pipelineBarrier2(dependency);
+		context.GetCommandScheduler().Wait(last_tick);
+		InvalidateRedundantBinds();
+		const bool recorded_ok = last_recorded.load(std::memory_order_acquire);
+		for (auto& t : targets) {
+			const auto& e = t.image->resource.extent;
+			const uint64_t pixels = uint64_t(e.width) * e.height;
+			if (vmaInvalidateAllocation(graphics.allocator, t.allocation, 0, VK_WHOLE_SIZE) == VK_SUCCESS) {
+				std::vector<float> luma(pixels);
+				uint64_t nonfinite = 0;
+				for (uint64_t i = 0; i < pixels; ++i) {
+					float r = 0, g = 0, b = 0;
+					if (t.bytes_per_pixel == 8) {
+						const auto* h = static_cast<const uint16_t*>(t.data) + i * 4;
+						r = Half(h[0]); g = Half(h[1]); b = Half(h[2]);
+					} else if (t.image == &images[0]) {
+						const uint32_t w = static_cast<const uint32_t*>(t.data)[i];
+						r = SmallFloat(w & 0x7ff, 6); g = SmallFloat((w >> 11) & 0x7ff, 6); b = SmallFloat(w >> 22, 5);
+					} else {
+						const auto* h = static_cast<const uint16_t*>(t.data) + i * 2;
+						r = std::fabs(Half(h[0])); g = std::fabs(Half(h[1]));
+					}
+					if (!std::isfinite(r) || !std::isfinite(g) || !std::isfinite(b)) ++nonfinite;
+					luma[i] = t.image == &images[2] ? std::sqrt(r * r + g * g) : 0.2126f * r + 0.7152f * g + 0.0722f * b;
+				}
+				DumpStats(t.name, guest_frame, e.width, e.height, luma, nonfinite);
+				char path[96];
+				std::snprintf(path, sizeof(path), "fsr_dump_%u_%s.bin", guest_frame, t.name);
+				if (std::FILE* f = std::fopen(path, "wb"); f != nullptr) {
+					std::fwrite(t.data, t.bytes_per_pixel, pixels, f);
+					std::fclose(f);
+				}
+			}
+			vmaDestroyBuffer(graphics.allocator, t.buffer, t.allocation);
+		}
+		std::printf("NHL27FSR3DUMP written frame=%u fsr_recorded=%d\n", guest_frame, recorded_ok ? 1 : 0);
+		std::fflush(stdout);
+	}
 	bool AccumulationEdges(const std::vector<TextureBinding>& b) const {
 		return stage == 3 && b.size() == 8 && reactive[6].Matches(b[0]) && prepare[4].Matches(b[1]) &&
 			prepare[3].Matches(b[4]) && reactive[7].Matches(b[5]) &&
@@ -267,11 +414,79 @@ struct Nhl27Fsr3::Impl {
 			ReleaseImages();
 			return false;
 		}
+		if (CleanColorEnabled() && EnsureCleanPipeline() &&
+			!AllocateBuffer(uint64_t(input.width) * input.height * 4, false, clean, clean_alloc)) {
+			clean = nullptr;
+			clean_alloc = nullptr;
+		}
 		fsr = std::make_unique<Fsr3>(graphics.physical_device, graphics.device);
 		return true;
 	}
+	static bool CleanColorEnabled() {
+		static const bool enabled = [] {
+			const char* value = std::getenv("KYTY_FSR3_CLEAN_COLOR");
+			return value != nullptr && std::strcmp(value, "1") == 0;
+		}();
+		return enabled;
+	}
+	static float EnvFloat(const char* name, float fallback) {
+		const char* value = std::getenv(name);
+		return value != nullptr && value[0] != '\0' ? std::strtof(value, nullptr) : fallback;
+	}
+	bool EnsureCleanPipeline() {
+		if (clean_pipeline) return true;
+		const vk::PushConstantRange range {vk::ShaderStageFlagBits::eCompute, 0, 40};
+		vk::PipelineLayoutCreateInfo layout {};
+		layout.pushConstantRangeCount = 1;
+		layout.pPushConstantRanges = &range;
+		if (graphics.device.createPipelineLayout(&layout, nullptr, &clean_layout) != vk::Result::eSuccess) {
+			clean_layout = nullptr;
+			return false;
+		}
+		const auto module = CompileSPV(GPU_TILER_FSR_COLOR_CLEAN_SPV, graphics.device);
+		vk::ComputePipelineCreateInfo info {};
+		info.layout = clean_layout;
+		info.stage.stage = vk::ShaderStageFlagBits::eCompute;
+		info.stage.module = module;
+		info.stage.pName = "main";
+		const auto result = graphics.device.createComputePipelines(nullptr, 1, &info, nullptr, &clean_pipeline);
+		graphics.device.destroyShaderModule(module, nullptr);
+		if (result != vk::Result::eSuccess) {
+			clean_pipeline = nullptr;
+			return false;
+		}
+		std::printf("NHL27FSR3 clean-color on ratio=%g floor=%g cap=%g\n",
+					double(EnvFloat("KYTY_FSR3_CLEAN_RATIO", 8.0f)), double(EnvFloat("KYTY_FSR3_CLEAN_FLOOR", 1.0f)),
+					double(EnvFloat("KYTY_FSR3_CLEAN_CAP", 1024.0f)));
+		std::fflush(stdout);
+		return true;
+	}
+	// transfer (as copied from the guest colour) -> clean, one thread per pixel.
+	void RecordClean(CommandRecorder recorder, vk::Extent2D extent) {
+		struct Params {
+			uint64_t src, dst;
+			uint32_t width, height;
+			float    ratio, floor_luma, cap;
+			uint32_t reserved;
+		};
+		static_assert(sizeof(Params) == 40);
+		static const float ratio = EnvFloat("KYTY_FSR3_CLEAN_RATIO", 8.0f);
+		static const float floor_luma = EnvFloat("KYTY_FSR3_CLEAN_FLOOR", 1.0f);
+		static const float cap = EnvFloat("KYTY_FSR3_CLEAN_CAP", 1024.0f);
+		vk::BufferDeviceAddressInfo source_info {}, clean_info {};
+		source_info.buffer = transfer;
+		clean_info.buffer = clean;
+		const Params params {graphics.device.getBufferAddress(source_info), graphics.device.getBufferAddress(clean_info),
+							 extent.width, extent.height, ratio, floor_luma, cap, 0};
+		g_compute_pipeline_epoch.fetch_add(1, std::memory_order_relaxed);
+		recorder.bindPipeline(vk::PipelineBindPoint::eCompute, clean_pipeline);
+		InvalidateRedundantBinds();
+		recorder.pushConstants(clean_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(params), &params);
+		recorder.dispatch((extent.width + 7) / 8, (extent.height + 7) / 8, 1);
+		++cleaned;
+	}
 	bool Snapshot(RenderContext& context, CommandBuffer& command, const TextureBinding& binding,
-				  Owned& owned) {
+				  Owned& owned, bool clean_color = false) {
 		if (!binding.image_id || binding.desc.view_info.base_level != 0 ||
 			binding.desc.view_info.base_layer != 0) return false;
 		auto& source = context.GetTextureCache().GetImage(binding.image_id);
@@ -304,8 +519,14 @@ struct Nhl27Fsr3::Impl {
 		recorder.copyImageToBuffer(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
 								   transfer, 1, &copy);
 		MemoryBarrier(recorder);
+		vk::Buffer upload = transfer;
+		if (clean_color && clean && clean_pipeline && format == vk::Format::eB10G11R11UfloatPack32) {
+			RecordClean(recorder, owned.resource.extent);
+			MemoryBarrier(recorder);
+			upload = clean;
+		}
 		copy.imageSubresource.aspectMask = vk::ImageAspectFlagBits::eColor;
-		recorder.copyBufferToImage(transfer, owned.resource.image, vk::ImageLayout::eTransferDstOptimal,
+		recorder.copyBufferToImage(upload, owned.resource.image, vk::ImageLayout::eTransferDstOptimal,
 								   1, &copy);
 		ImageBarrier(recorder, source.backing.image, vk::ImageLayout::eTransferSrcOptimal, binding.layout, full);
 		ImageBarrier(recorder, owned.resource.image, vk::ImageLayout::eTransferDstOptimal,
@@ -392,7 +613,7 @@ void Nhl27Fsr3::OnDispatch(RenderContext& context, CommandBuffer& command, uint6
 			b[3].desc.info.extent != extent || !m->EnsureImages(context, c)) {
 			m->Reject("prepare-layout-or-allocation"); return;
 		}
-		if (!m->Snapshot(context, command, b[3], m->images[0]) ||
+		if (!m->Snapshot(context, command, b[3], m->images[0], true) ||
 			!m->Snapshot(context, command, b[0], m->images[1]) ||
 			!m->Snapshot(context, command, b[1], m->images[2])) {
 			m->Reject("snapshot-layout"); return;
@@ -535,12 +756,17 @@ void Nhl27Fsr3::OnDispatch(RenderContext& context, CommandBuffer& command, uint6
 		m->last_tick = context.GetCommandScheduler().CurrentTick();
 		if (VerifyEnabled() && (m->serial <= 3 || m->serial % 600 == 0))
 			m->CheckOutput(context, command, guest_frame, history);
+		if (const auto every = Impl::DumpEvery(); every != 0 && m->serial % every == 0 && m->dumps < 4) {
+			++m->dumps;
+			m->DumpFrame(context, command, guest_frame);
+		}
 		if (m->serial % 600 == 0) {
 			std::printf("NHL27FSR3GAME status=stats frames=%llu dirty_reads=%llu mismatches=%llu "
-						"replaced=%llu\n", static_cast<unsigned long long>(m->serial),
+						"replaced=%llu cleaned=%llu\n", static_cast<unsigned long long>(m->serial),
 						static_cast<unsigned long long>(m->dirty_reads),
 						static_cast<unsigned long long>(m->clean_mismatches),
-						static_cast<unsigned long long>(m->replaced));
+						static_cast<unsigned long long>(m->replaced),
+						static_cast<unsigned long long>(m->cleaned));
 			std::fflush(stdout);
 		}
 	}

@@ -271,6 +271,7 @@ set(gpu_tiler_shader_names
 	dispatch_guard
 	color_transform
 	color_clear_check
+	fsr_color_clean
 )
 file(GLOB gpu_tiler_shader_includes CONFIGURE_DEPENDS "${gpu_tiler_shader_dir}/gpu_tiler_*.inc")
 foreach(shader_name IN LISTS gpu_tiler_shader_names)
