@@ -10,12 +10,14 @@ class CommandBuffer;
 
 // Off-default synchronous shadow provider. It snapshots actual bound GPU
 // constants/inputs, retains the guest's entire temporal chain, and resets host
-// history on every frame while temporal conventions remain uncertified.
+// history only on inferred discontinuities (KYTY_FSR3_NHL27_HISTORY=0: every frame).
 class Nhl27Fsr3 {
 public:
 	explicit Nhl27Fsr3(GraphicContext& graphics);
 	~Nhl27Fsr3(); // RenderContext drains the scheduler before releasing this owner.
 	static bool Enabled();
+	// KYTY_FSR3_NHL27_HISTORY=0 restores reset-every-frame; default on.
+	static bool HistoryEnabled();
 	void OnDispatch(RenderContext& context, CommandBuffer& command, uint64_t hash,
 					const PreparedBindings& bindings);
 private:

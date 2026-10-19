@@ -51,6 +51,40 @@ int main() {
 			changed.words[i] = 0x7fc00000;
 			Check(!Nhl27Fsr3Constants::Decode(changed.words), "reject nonfinite reciprocal extent");
 		}
+		{
+			const auto prev = Nhl27HistoryState::From(*captured);
+			auto next = *captured;
+			next.words[39]++;
+			next.words[30] = captured->words[28]; next.words[31] = captured->words[29];
+			auto cur = Nhl27HistoryState::From(next);
+			using R = Nhl27ResetReason;
+			Check(ShouldResetHistory(&prev, cur, false) == R::None, "history continues on consecutive frame");
+			Check(ShouldResetHistory(nullptr, cur, false) == R::First, "reset on first frame");
+			Check(ShouldResetHistory(&prev, cur, true) == R::MissedPass, "reset after missed pass");
+			Check(ShouldResetHistory(&prev, cur, false, false) == R::Disabled, "history switch off resets");
+			auto bad = cur; bad.frame += 1;
+			Check(ShouldResetHistory(&prev, bad, false) == R::FrameDiscontinuity, "reset on frame skip");
+			bad = cur; bad.frame = prev.frame;
+			Check(ShouldResetHistory(&prev, bad, false) == R::FrameDiscontinuity, "reset on repeated frame");
+			bad = cur; bad.frame = prev.frame - 5;
+			Check(ShouldResetHistory(&prev, bad, false) == R::FrameDiscontinuity, "reset on backwards frame");
+			bad = cur; bad.output_width += 2;
+			Check(ShouldResetHistory(&prev, bad, false) == R::SizeChange, "reset on output size change");
+			bad = cur; bad.height -= 8;
+			Check(ShouldResetHistory(&prev, bad, false) == R::SizeChange, "reset on render size change");
+			bad = cur; bad.far_plane *= 1.5f;
+			Check(ShouldResetHistory(&prev, bad, false) == R::CameraCut, "reset on far change");
+			bad = cur; bad.near_plane *= 2;
+			Check(ShouldResetHistory(&prev, bad, false) == R::CameraCut, "reset on near change");
+			bad = cur; bad.fov *= 1.1f;
+			Check(ShouldResetHistory(&prev, bad, false) == R::CameraCut, "reset on fov change");
+			bad = cur; bad.fov *= 1.001f;
+			Check(ShouldResetHistory(&prev, bad, false) == R::None, "tolerate tiny fov drift");
+			bad = cur; bad.prev_jitter_x += 0.01f;
+			Check(ShouldResetHistory(&prev, bad, false) == R::JitterMismatch, "reset on previous jitter mismatch");
+			bad = cur; bad.prev_jitter_y = std::nanf("");
+			Check(ShouldResetHistory(&prev, bad, false) == R::JitterMismatch, "reset on nonfinite jitter");
+		}
 		std::puts("NHL27 FSR3 constants PASS: captured GPU fixture and fail-closed checks");
 	}
 	{

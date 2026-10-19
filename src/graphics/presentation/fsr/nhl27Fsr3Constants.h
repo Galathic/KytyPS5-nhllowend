@@ -66,4 +66,54 @@ struct Nhl27Fsr3Constants {
 		return c;
 	}
 };
+
+// Per-dispatch temporal summary used to decide when FSR history is still valid.
+struct Nhl27HistoryState {
+	uint32_t frame = 0, width = 0, height = 0, output_width = 0, output_height = 0;
+	float near_plane = 0, far_plane = 0, fov = 0;
+	float jitter_x = 0, jitter_y = 0, prev_jitter_x = 0, prev_jitter_y = 0;
+	static Nhl27HistoryState From(const Nhl27Fsr3Constants& c) {
+		return {c.Frame(), c.Width(), c.Height(), c.OutputWidth(), c.OutputHeight(),
+				c.Near(), c.Far(), c.FovY(), c.Float(28), c.Float(29), c.Float(30), c.Float(31)};
+	}
+};
+enum class Nhl27ResetReason {
+	None, Disabled, First, MissedPass, FrameDiscontinuity, SizeChange, CameraCut, JitterMismatch
+};
+inline const char* Nhl27ResetReasonName(Nhl27ResetReason r) {
+	switch (r) {
+		case Nhl27ResetReason::None: return "none";
+		case Nhl27ResetReason::Disabled: return "history-disabled";
+		case Nhl27ResetReason::First: return "first-frame";
+		case Nhl27ResetReason::MissedPass: return "missed-pass";
+		case Nhl27ResetReason::FrameDiscontinuity: return "frame-counter-discontinuity";
+		case Nhl27ResetReason::SizeChange: return "size-change";
+		case Nhl27ResetReason::CameraCut: return "camera-cut";
+		case Nhl27ResetReason::JitterMismatch: return "previous-jitter-mismatch";
+	}
+	return "unknown";
+}
+// The captured cb carries no reset/cut flag (words 40..48 are constant across captures), so
+// continuity is inferred. `prev` is null when no frame was dispatched yet; `missed` is set when
+// any pass of the 4-pass chain was rejected/skipped since the last dispatch.
+inline Nhl27ResetReason ShouldResetHistory(const Nhl27HistoryState* prev, const Nhl27HistoryState& cur,
+										   bool missed, bool history_enabled = true) {
+	if (!history_enabled) return Nhl27ResetReason::Disabled;
+	if (!prev) return Nhl27ResetReason::First;
+	if (missed) return Nhl27ResetReason::MissedPass;
+	if (cur.frame - prev->frame != 1u) return Nhl27ResetReason::FrameDiscontinuity;
+	if (cur.width != prev->width || cur.height != prev->height ||
+		cur.output_width != prev->output_width || cur.output_height != prev->output_height)
+		return Nhl27ResetReason::SizeChange;
+	auto far_apart = [](float a, float b, float tolerance) {
+		return !(std::abs(a - b) <= tolerance * std::max(std::abs(a), std::abs(b)));
+	};
+	if (far_apart(cur.near_plane, prev->near_plane, 0.01f) ||
+		far_apart(cur.far_plane, prev->far_plane, 0.01f) || far_apart(cur.fov, prev->fov, 0.02f))
+		return Nhl27ResetReason::CameraCut;
+	if (!(std::abs(cur.prev_jitter_x - prev->jitter_x) <= 1e-4f) ||
+		!(std::abs(cur.prev_jitter_y - prev->jitter_y) <= 1e-4f))
+		return Nhl27ResetReason::JitterMismatch;
+	return Nhl27ResetReason::None;
+}
 } // namespace Libs::Graphics

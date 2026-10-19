@@ -79,6 +79,9 @@ struct Nhl27Fsr3::Impl {
 	Nhl27Fsr3Constants captured;
 	std::array<Role, 8> prepare {}, reactive {};
 	Role luma;
+	Nhl27HistoryState last_state {};
+	bool have_last = false, missed = true;
+	uint64_t resets = 0;
 	explicit Impl(GraphicContext& gfx) : graphics(gfx) {
 		if (!gfx.physical_device.getFeatures().shaderInt16) {
 			failed.store(true, std::memory_order_release);
@@ -93,6 +96,7 @@ struct Nhl27Fsr3::Impl {
 	}
 	void Reject(const char* why) {
 		stage = 0;
+		missed = true; // next dispatch must not trust history
 		if (++rejected <= 8 || rejected % 600 == 0) {
 			std::printf("NHL27FSR3GAME status=rejected reason=%s count=%llu\n", why,
 						static_cast<unsigned long long>(rejected));
@@ -154,7 +158,7 @@ struct Nhl27Fsr3::Impl {
 		std::memcpy(words.data(), mapped, 208);
 		return Nhl27Fsr3Constants::Decode(words);
 	}
-	void CheckOutput(RenderContext& context, CommandBuffer& command, uint32_t guest_frame) {
+	void CheckOutput(RenderContext& context, CommandBuffer& command, uint32_t guest_frame, bool history) {
 		auto recorder = command.Handle();
 		auto& output = images[3].resource;
 		ImageBarrier(recorder, output.image, vk::ImageLayout::eGeneral, vk::ImageLayout::eTransferSrcOptimal);
@@ -189,8 +193,9 @@ struct Nhl27Fsr3::Impl {
 				: std::ldexp(float(mantissa), -24);
 			if (pixels[i] & 0x8000) decoded[i] = -decoded[i];
 		}
-		std::printf("NHL27FSR3GAME status=readback mode=reset-shadow guest_frame=%u "
-			"pixels=4 finite=%d rgba=%.9g,%.9g,%.9g,%.9g\n", guest_frame, int(finite),
+		std::printf("NHL27FSR3GAME status=readback mode=%s guest_frame=%u "
+			"pixels=4 finite=%d rgba=%.9g,%.9g,%.9g,%.9g\n",
+			history ? "history-shadow" : "reset-shadow", guest_frame, int(finite),
 			decoded[0], decoded[1], decoded[2], decoded[3]);
 		std::fflush(stdout);
 		if (!finite) { failed.store(true, std::memory_order_release); Reject("nonfinite-shadow-output"); }
@@ -281,6 +286,13 @@ struct Nhl27Fsr3::Impl {
 };
 Nhl27Fsr3::Nhl27Fsr3(GraphicContext& graphics) : m(std::make_unique<Impl>(graphics)) {}
 Nhl27Fsr3::~Nhl27Fsr3() = default;
+bool Nhl27Fsr3::HistoryEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_FSR3_NHL27_HISTORY");
+		return !value || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
 bool Nhl27Fsr3::Enabled() {
 #if KYTY_ENABLE_FSR3
 	static const bool enabled = [] {
@@ -366,9 +378,24 @@ void Nhl27Fsr3::OnDispatch(RenderContext& context, CommandBuffer& command, uint6
 		frame.pre_exposure = c.Float(37);
 		frame.sharpness = 0;
 		frame.hdr = frame.inverted_depth = true;
-		// Actual same-frame GPU resources/coefficients are verified above. Reset-only
-		// shadow dispatch cannot validate temporal direction, units, or jitter inclusion.
-		frame.verified = frame.reset = true;
+		// Actual same-frame GPU resources/coefficients are verified above. Inputs were verified
+		// live (jitter-free MVs, SDK jitter sign, scale, camera); history continuity is inferred
+		// from the guest frame counter because the cb has no reset flag.
+		const bool history = HistoryEnabled();
+		const auto current = Nhl27HistoryState::From(c);
+		const auto reason = ShouldResetHistory(m->have_last ? &m->last_state : nullptr, current,
+											   m->missed, history);
+		m->last_state = current;
+		m->have_last = true;
+		m->missed = false;
+		frame.verified = true;
+		frame.reset = reason != Nhl27ResetReason::None;
+		const char* reason_name = Nhl27ResetReasonName(reason);
+		if (frame.reset && history && (++m->resets <= 16 || m->resets % 600 == 0)) {
+			std::printf("NHL27FSR3GAME status=history-reset reason=%s guest_frame=%u resets=%llu\n",
+						reason_name, c.Frame(), static_cast<unsigned long long>(m->resets));
+			std::fflush(stdout);
+		}
 		auto recorder = command.Handle();
 		for (size_t i = 3; i < m->images.size(); ++i) {
 			auto& owned = m->images[i];
@@ -378,14 +405,15 @@ void Nhl27Fsr3::OnDispatch(RenderContext& context, CommandBuffer& command, uint6
 		const auto guest_frame = c.Frame();
 		auto* state = m.get();
 		state->last_recorded.store(false, std::memory_order_release);
-		recorder.RecordExternal([state, frame, guest_frame](vk::CommandBuffer native) {
+		recorder.RecordExternal([state, frame, guest_frame, history, reason_name](vk::CommandBuffer native) {
 			const bool ok = state->fsr->Record(native, frame);
 			state->last_recorded.store(ok, std::memory_order_release);
 			if (!ok) state->failed.store(true, std::memory_order_release);
 			if (++state->recorded <= 3 || state->recorded % 600 == 0 || !ok) {
-				std::printf("NHL27FSR3GAME status=%s mode=reset-shadow guest_frame=%u "
+				std::printf("NHL27FSR3GAME status=%s mode=%s guest_frame=%u reset=%s reason=%s "
 					"render=%ux%u display=%ux%u detail=%s\n", ok ? "recorded" : "failed",
-					guest_frame, frame.render_size.width, frame.render_size.height,
+					history ? "history-shadow" : "reset-shadow", guest_frame,
+					frame.reset ? "yes" : "no", reason_name, frame.render_size.width, frame.render_size.height,
 					frame.output_size.width, frame.output_size.height, state->fsr->Status().c_str());
 				std::fflush(stdout);
 			}
@@ -395,7 +423,7 @@ void Nhl27Fsr3::OnDispatch(RenderContext& context, CommandBuffer& command, uint6
 		NoteShaderWork();
 		m->last_tick = context.GetCommandScheduler().CurrentTick();
 		if (m->serial <= 3 || m->serial % 600 == 0)
-			m->CheckOutput(context, command, guest_frame);
+			m->CheckOutput(context, command, guest_frame, history);
 	}
 }
 } // namespace Libs::Graphics
