@@ -16,6 +16,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/pageManager.h"
+#include "graphics/presentation/fsr/fsr2Constants.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
@@ -70,6 +71,23 @@ namespace {
 // renders below its 4K-display preset. The NHL preset applier rewrites both whenever a preset is
 // (re)selected, so the values are re-applied periodically. Offsets come from static analysis of
 // this eboot: the settings pointer slot is at eboot+0xf1ef808, the floats at +0x170 and +0xc0.
+// The eboot image (and some guest heap) is mapped at its guest address without a guest-memory
+// backing, so TryReadBacking/TryWriteBacking refuse it; fall back to the mapping itself once
+// VirtualQuery shows the range is readable (writable for writes).
+bool NhlReadGuest(uint64_t address, void* out, uint64_t size) {
+	if (Libs::LibKernel::Memory::TryReadBacking(address, out, size)) return true;
+	if (!Common::VirtualMemory::IsReadable(address, size)) return false;
+	std::memcpy(out, reinterpret_cast<const void*>(address), size);
+	return true;
+}
+
+bool NhlWriteGuest(uint64_t address, const void* data, uint64_t size) {
+	if (Libs::LibKernel::Memory::TryWriteBacking(address, data, size)) return true;
+	if (!Common::VirtualMemory::IsWritable(address, size)) return false;
+	std::memcpy(reinterpret_cast<void*>(address), data, size);
+	return true;
+}
+
 void StartNhlResolutionScale(uint64_t eboot_base) {
 	const char* env = std::getenv("KYTY_NHL_RES_SCALE");
 	if (env == nullptr || eboot_base == 0) {
@@ -89,16 +107,16 @@ void StartNhlResolutionScale(uint64_t eboot_base) {
 		for (;;) {
 			std::this_thread::sleep_for(std::chrono::milliseconds(50));
 			uint64_t settings = 0;
-			if (!Libs::LibKernel::Memory::TryReadBacking(eboot_base + SlotOffset, &settings,
+			if (!NhlReadGuest(eboot_base + SlotOffset, &settings,
 			                                            sizeof(settings)) ||
 			    settings == 0 || (settings & 0xfu) != 0) {
 				continue;
 			}
 			float current = 0.0f;
 			float current_min = 0.0f;
-			if (!Libs::LibKernel::Memory::TryReadBacking(settings + ScaleOffset, &current,
+			if (!NhlReadGuest(settings + ScaleOffset, &current,
 			                                            sizeof(current)) ||
-			    !Libs::LibKernel::Memory::TryReadBacking(settings + ScaleMinOffset, &current_min,
+			    !NhlReadGuest(settings + ScaleMinOffset, &current_min,
 			                                            sizeof(current_min))) {
 				continue;
 			}
@@ -117,19 +135,17 @@ void StartNhlResolutionScale(uint64_t eboot_base) {
 			if (announced != settings) {
 				announced = settings;
 				uint8_t drs = 0;
-				(void)Libs::LibKernel::Memory::TryReadBacking(settings + 0x211, &drs, 1);
+				(void)NhlReadGuest(settings + 0x211, &drs, 1);
 				::printf("NHL27RES: settings at 0x%016llx scale=%g min=%g drs=%u -> %g\n",
 				         static_cast<unsigned long long>(settings), current, current_min,
 				         static_cast<unsigned>(drs), scale);
 			}
 			if (current != scale || current_min != scale) {
-				(void)Libs::LibKernel::Memory::TryWriteBacking(settings + ScaleOffset, &scale,
-				                                              sizeof(scale));
-				(void)Libs::LibKernel::Memory::TryWriteBacking(settings + ScaleMinOffset, &scale,
-				                                              sizeof(scale));
+				const bool wrote = NhlWriteGuest(settings + ScaleOffset, &scale, sizeof(scale)) &&
+				                   NhlWriteGuest(settings + ScaleMinOffset, &scale, sizeof(scale));
 				if (++writes <= 8) {
-					::printf("NHL27RES: applied scale %g (was %g, min %g)\n", scale, current,
-					         current_min);
+					::printf("NHL27RES: %s scale %g (was %g, min %g)\n", wrote ? "applied" : "FAILED to write",
+					         scale, current, current_min);
 				}
 			}
 		}
@@ -278,6 +294,29 @@ static KYTY_SYSV_ABI uint64_t UnresolvedImportStub(uint64_t record_id) {
 		if (record_id < g_stubbed_imports.size()) {
 			const auto& record = g_stubbed_imports[record_id];
 			printf("Unresolved import stub called: %s\n", record.name.c_str());
+			// NHL 27 calls Coredump when it gives up (a hang at the match-load screen): which
+			// thread, and the guest code addresses on its stack (the first calls only).
+			static std::atomic<uint32_t> coredump_reports {0};
+			if (record.name.find("Coredump") != std::string::npos &&
+			    coredump_reports.fetch_add(1, std::memory_order_relaxed) < 4) {
+				char thread_name[64] = "(host thread)";
+				if (auto self = Libs::LibKernel::PthreadSelfOrNull(); self != nullptr) {
+					if (Libs::LibKernel::PthreadGetname(self, thread_name) != 0) {
+						std::snprintf(thread_name, sizeof(thread_name), "(unnamed guest thread)");
+					}
+				}
+				std::string frames;
+				const auto* stack = static_cast<const uint64_t*>(__builtin_frame_address(0));
+				for (int i = 0, found = 0; i < 1024 && found < 24; i++) {
+					const uint64_t word = stack[i];
+					if (word >= 0x900000000ull && word < 0xa00000000ull) {
+						frames += fmt::format(" {:x}", word);
+						found++;
+					}
+				}
+				printf("NHL27COREDUMP: thread=%s guest return addresses:%s\n", thread_name, frames.c_str());
+				std::fflush(stdout);
+			}
 			LOGF("Unresolved import stub called [%u]: patch_vaddr=0x%016" PRIx64
 			     " jmprela_index=%" PRIu32 " symbol=%s type=%s bind=%s program=%s\n",
 			     log_index, record.patch_vaddr, record.index, record.name.c_str(),
@@ -945,12 +984,43 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			if (count == 1 || count == 10 || count == 100 || count % 1000 == 0) {
 				const auto rip = info->exception_address;
 				const bool host = rip >= host_base && rip < host_base + 0x10000000u;
+				char       text[96];
+				if (!Loader::X64InstructionEmulator::DescribeInstruction(info->native_context, text,
+				                                                         sizeof(text))) {
+					std::snprintf(text, sizeof(text), "?");
+				}
 				std::printf("NHL27FAULTRIP: %s rip=0x%016llx host+0x%llx vaddr=0x%016llx access=%d "
-				            "count=%llu\n",
+				            "count=%llu insn=%s\n",
 				            host ? "host" : "other", static_cast<unsigned long long>(rip),
 				            static_cast<unsigned long long>(host ? rip - host_base : 0),
 				            static_cast<unsigned long long>(info->access_violation_vaddr),
-				            static_cast<int>(access), static_cast<unsigned long long>(count));
+				            static_cast<int>(access), static_cast<unsigned long long>(count), text);
+			}
+		}
+		// KYTY_DBG_SHARED_WRITES=1 (diagnostic): the instruction behind each guest write fault,
+		// first time per instruction address, then at counts 10, 100, 1000, ... (NHL27SHW).
+		static const bool shared_writes = [] {
+			const char* value = std::getenv("KYTY_DBG_SHARED_WRITES");
+			return value != nullptr && value[0] == '1';
+		}();
+		if (shared_writes && access == GpuAccess::Write && !Libs::Graphics::GuestGpu::IsGpuThread()) {
+			static std::mutex                    mutex;
+			static std::map<uint64_t, uint64_t> counts;
+			uint64_t                             count = 0;
+			{
+				std::scoped_lock lock {mutex};
+				count = ++counts[info->exception_address];
+			}
+			if (count == 1 || count == 10 || count == 100 || count % 1000 == 0) {
+				char text[96];
+				if (!Loader::X64InstructionEmulator::DescribeInstruction(info->native_context, text,
+				                                                         sizeof(text))) {
+					std::snprintf(text, sizeof(text), "?");
+				}
+				std::printf("NHL27SHW: rip=0x%016llx vaddr=0x%016llx insn=%s count=%llu\n",
+				            static_cast<unsigned long long>(info->exception_address),
+				            static_cast<unsigned long long>(info->access_violation_vaddr), text,
+				            static_cast<unsigned long long>(count));
 			}
 		}
 		// KYTY_PERF_GPU_FAULT_STACKS: describe the GPU thread's fault before anything resolves it.
@@ -970,10 +1040,11 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		// page protected for other GPU-written bytes, is served from the backing instead of
 		// downloading the page, which would wait for all queued GPU work.
 		if (access == GpuAccess::Read && Libs::Graphics::GuestGpu::IsGpuThread() &&
-		    Common::Experiments::Enabled(Common::Experiments::FalseShareReads) &&
+		    Common::Experiments::FalseShareReads() &&
 		    Loader::X64InstructionEmulator::TryEmulateLoad(info->native_context,
 		                                                   Libs::LibKernel::Memory::TryReadCleanBacking)) {
 			Libs::Graphics::BufferCache::PerfCount(Libs::Graphics::BufferCache::PerfEvent::FalseShareRead);
+			Libs::LibKernel::Memory::NoteReadFaultPage(info->access_violation_vaddr);
 			if (gpu_stacks) {
 				GpuFaultStacks::Record(gpu_sample, Libs::LibKernel::Memory::TakeCleanReadResult(), gpu_elapsed());
 			}
@@ -1706,6 +1777,7 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 		}
 	}
 	StartNhlResolutionScale(m_programs.empty() ? 0 : m_programs.front()->base_vaddr);
+	Libs::Graphics::Fsr2Capture::SetEbootBase(m_programs.empty() ? 0 : m_programs.front()->base_vaddr);
 	if (libc != nullptr && libc->dynamic_info->init_vaddr != 0) {
 		StartModule(libc, 0, nullptr, nullptr);
 	}

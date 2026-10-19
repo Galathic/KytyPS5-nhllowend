@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <unordered_map>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -53,6 +54,47 @@ void ProtectStats::Count(uint64_t bytes) noexcept {
 
 void ProtectStats::CountFault(bool write) noexcept {
 	(write ? g_write_faults : g_read_faults).fetch_add(1, std::memory_order_relaxed);
+}
+
+namespace {
+std::mutex                             g_fault_pages_mutex;
+std::unordered_map<uint64_t, uint32_t> g_fault_pages;
+} // namespace
+
+void ProtectStats::NoteWriteFaultPage(uint64_t vaddr) noexcept {
+	std::lock_guard lock(g_fault_pages_mutex);
+	++g_fault_pages[vaddr & ~uint64_t {0xfff}];
+}
+
+void ProtectStats::PrintFaultPages() noexcept {
+	std::vector<std::pair<uint64_t, uint32_t>> pages;
+	{
+		std::lock_guard lock(g_fault_pages_mutex);
+		pages.assign(g_fault_pages.begin(), g_fault_pages.end());
+		g_fault_pages.clear();
+	}
+	std::array<uint64_t, 5> buckets {}; // 1, 2-9, 10-49, 50-99, 100+
+	std::array<uint64_t, 5> faults {};
+	uint64_t                total = 0;
+	for (const auto& [page, count]: pages) {
+		const size_t b = count == 1 ? 0 : count < 10 ? 1 : count < 50 ? 2 : count < 100 ? 3 : 4;
+		++buckets[b];
+		faults[b] += count;
+		total += count;
+	}
+	std::sort(pages.begin(), pages.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+	std::printf("NHL27FAULTPAGES: faults=%llu pages=%zu | pages(faults) 1:%llu(%llu) 2-9:%llu(%llu) "
+	            "10-49:%llu(%llu) 50-99:%llu(%llu) 100+:%llu(%llu) | top",
+	            static_cast<unsigned long long>(total), pages.size(),
+	            static_cast<unsigned long long>(buckets[0]), static_cast<unsigned long long>(faults[0]),
+	            static_cast<unsigned long long>(buckets[1]), static_cast<unsigned long long>(faults[1]),
+	            static_cast<unsigned long long>(buckets[2]), static_cast<unsigned long long>(faults[2]),
+	            static_cast<unsigned long long>(buckets[3]), static_cast<unsigned long long>(faults[3]),
+	            static_cast<unsigned long long>(buckets[4]), static_cast<unsigned long long>(faults[4]));
+	for (size_t i = 0; i < pages.size() && i < 6; ++i) {
+		std::printf(" %llx:%u", static_cast<unsigned long long>(pages[i].first), pages[i].second);
+	}
+	std::printf("\n");
 }
 
 void ProtectStats::Read(uint64_t& calls, uint64_t& bytes, uint64_t& gpu_calls,
@@ -342,6 +384,16 @@ bool PageManager::IsWatched(uint64_t vaddr) const {
 	const auto page = static_cast<size_t>((vaddr % REGION_SIZE) / PAGE_SIZE);
 	SpinGuard  lock(region->lock);
 	return region->pages[page].write_watchers != 0 || region->pages[page].access_watchers != 0;
+}
+
+bool PageManager::IsReadWatched(uint64_t vaddr) const {
+	auto* region = m_impl->FindRegion(vaddr);
+	if (region == nullptr) {
+		return false;
+	}
+	const auto page = static_cast<size_t>((vaddr % REGION_SIZE) / PAGE_SIZE);
+	SpinGuard  lock(region->lock);
+	return region->pages[page].access_watchers != 0;
 }
 
 template <bool track>

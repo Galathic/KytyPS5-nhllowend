@@ -1,6 +1,7 @@
 #ifndef EMULATOR_SRC_COMMON_EXPERIMENTS_H_
 #define EMULATOR_SRC_COMMON_EXPERIMENTS_H_
 
+#include <atomic>
 #include <cstdint>
 
 namespace Common::Experiments {
@@ -15,38 +16,84 @@ namespace Common::Experiments {
 // Features that also have a live runtime flag (common/runtimeFlags.h, flags.ctl) are NOT here:
 // KYTY_GUEST_SYNC, KYTY_LONG_BUFFER_GC_AGE, KYTY_RENDER_TARGET_MEMO (flag KYTY_RT_DECODE_MEMO),
 // KYTY_FAULT_COALESCE, KYTY_SPARSE_BUFFER_GC, KYTY_DIRECT_EOP_INTERRUPTS, KYTY_READBACK_QUEUE.
-// Their bit numbers (0, 13, 14, 16, 17, 19, 20) and the unused ones (2, 8, 9) are retired.
+// Their bit numbers are reused: 13 ClockWaitAhead (now env-only KYTY_CLOCK_WAIT_AHEAD, bit 13 is GpuConditionsBothPaths), 14 ComputeUnlocked, 16 AheadUnlocked, 17 BackingReadMru, 19
+// DispatchAhead, 20 BackingLookupCache. Bit 4 (once SrtJit, now env-only KYTY_SRT_JIT) is CpBackingReads,
+// bit 6 (once FalseShareReads, now env-only KYTY_FALSE_SHARE_READS) is WideWriteDownloads. Bit 0 (once GuestSync) is
+// EarlySubmitWriters, bit 8 (once GpuThreadPriority, then ReadbackTransfer) is RobustLoads and bit 9 (once
+// ImageRecycle, unconditional since the GTA port, then ReadbackSpin) is FusedMad.
 // KYTY_RESOURCE_MULTI_CACHE (16-state resource memo) is read only by the resource memo itself.
-enum Bit : uint32_t {
+enum Bit : uint64_t {
+	EarlySubmitWriters = 1u << 0u, // KYTY_EARLY_SUBMIT_WRITERS (default off; a draw/dispatch writing bytes resource reads waited for is submitted at once)
 	SkipRedundantBinds = 1u << 1u, // KYTY_SKIP_REDUNDANT_BINDS (default on)
+	ReadbackCompute    = 1u << 2u, // KYTY_READBACK_COMPUTE (default on; second-queue readbacks on a compute-only queue family)
 	CpuCopyForward     = 1u << 3u, // KYTY_CPU_COPY_FORWARD (default off)
-	SrtJit             = 1u << 4u, // KYTY_SRT_JIT (default off; upstream x64 flat walker for plans without control flow)
-	ProgramLockSplit   = 1u << 5u, // KYTY_PROGRAM_LOCK_SPLIT (default off; the resolve thread walks shader tables without holding the program lock)
-	FillPatterns       = 1u << 9u, // KYTY_FILL_PATTERNS (default off; a proven compute fill of a repeating 2-4 word pattern is remembered like a uniform fill, so color-clear decoding needs no readback)
-	UnmapBufferWait    = 1u << 8u, // KYTY_UNMAP_BUFFER_WAIT (default off; an unmap of GPU-written buffer bytes waits only for their writers, not for the whole GPU)
-	FalseShareReads    = 1u << 6u, // KYTY_FALSE_SHARE_READS (default off)
+	RobustLoads        = 1u << 8u, // KYTY_ROBUST_LOADS (default on; storage-buffer loads without per-load exec and bounds branches, relying on robustBufferAccess2; part of shader keys; was ReadbackTransfer)
+	FusedMad           = 1u << 9u, // KYTY_FUSED_MAD (default off; V_MAD/V_MAC_F32 as one fused multiply-add, part of shader keys; was ReadbackSpin)
+	CpBackingReads     = 1u << 4u, // KYTY_CP_BACKING_READS (default on; command-processor reads of read-protected pages go through the execution thread and the backing store instead of faulting; was SrtJit, now env-only KYTY_SRT_JIT)
+	FaultPageDirect    = 1u << 5u, // KYTY_FAULT_PAGE_DIRECT (default on; direct SRT reads and read-ahead checks of pages that faulted before use the backing)
+	WideWriteDownloads = 1u << 6u, // KYTY_WIDE_WRITE_DOWNLOADS (default on; a guest store into a GPU-written page downloads the GPU-written bytes of its 64 KiB window at once; was FalseShareReads, now env-only KYTY_FALSE_SHARE_READS)
+	ProgramLockSplit   = uint64_t {1} << 38u, // KYTY_PROGRAM_LOCK_SPLIT (default off; the resolve thread walks shader tables without holding the program lock)
+	FillPatterns       = uint64_t {1} << 39u, // KYTY_FILL_PATTERNS (default off; a proven compute fill of a repeating 2-4 word pattern is remembered like a uniform fill, so color-clear decoding needs no readback)
+	UnmapBufferWait    = uint64_t {1} << 40u, // KYTY_UNMAP_BUFFER_WAIT (default off; an unmap of GPU-written buffer bytes waits only for their writers, not for the whole GPU)
 	SrtBatchReads      = 1u << 7u, // KYTY_SRT_BATCH_READS (default on; also read by the program cache)
 	DirectSrtReads     = 1u << 10u, // KYTY_DIRECT_SRT_READS (default on; SRT reads without the IR walk)
-	TextureDescCache   = 1u << 11u, // KYTY_TEXTURE_DESC_CACHE (default on; superseded by the draw-prep delta, no consumer)
+	GpuConditionsBothPaths = 1u << 13u, // KYTY_GPU_CONDITIONS_BOTH_PATHS (default on; a resource walk takes both paths of a branch on GPU-written bytes instead of waiting for them; was ClockWaitAhead, now env-only)
+	ComputeUnlocked    = 1u << 14u, // KYTY_COMPUTE_UNLOCKED (default on; the execution thread materializes compute resources without the program lock)
+	AheadUnlocked      = 1u << 16u, // KYTY_AHEAD_UNLOCKED (default on; the resolve thread materializes resources ahead without the program lock)
+	BackingLookupCache = 1u << 20u, // KYTY_BACKING_LOOKUP_CACHE (default on; backing reads of another mapping use a per-64 KiB lookup cache)
+	DispatchAhead      = 1u << 19u, // KYTY_DISPATCH_AHEAD (default on; the resolve thread resolves direct dispatches' programs ahead, as for draws)
+	BackingReadMru     = 1u << 17u, // KYTY_BACKING_READ_MRU (default on; backing reads remember the thread's last two mappings, not one)
+	NativeMinMax       = 1u << 11u, // KYTY_NATIVE_MINMAX (default on; f32 min/max as GLSL NMin/NMax, part of shader keys; was TextureDescCache)
 	ImageLookupHint    = 1u << 12u, // KYTY_IMAGE_LOOKUP_HINT (default on; skip the region scan for known images)
-	AdaptiveResourceMemo = 1u << 15u, // KYTY_ADAPTIVE_RESOURCE_MEMO (default on; superseded by KYTY_RESOURCE_MEMO_BYPASS, no consumer)
+	WideFaultWindows     = 1u << 15u, // KYTY_WIDE_FAULT_WINDOWS (default on; a CPU write fault releases KYTY_FAULT_COALESCE_PAGES pages, else 4; was AdaptiveResourceMemo)
 	CleanFromDirect      = 1u << 18u, // KYTY_CLEAN_FROM_DIRECT (default on; strict evaluator reuses direct SRT words)
+	AsyncSubmit          = 1u << 21u, // KYTY_ASYNC_SUBMIT (no consumer: the GPU pipeline's recording thread submits)
 	LazySharedWrites     = 1u << 22u, // KYTY_LAZY_SHARED_WRITES (default off; CPU stores next to few GPU-written bytes do not wait)
-	ProtectSharedLock    = 1u << 23u, // KYTY_PROTECT_SHARED_LOCK (default off; page-tracking protections of different pages run in parallel)
-	ClockWaitPredict     = 1u << 24u, // KYTY_CLOCK_WAIT_PREDICT (default off; WAIT_REG_MEM on a pending clock write need not wait for it)
-	FalseShareAnyThread  = 1u << 29u, // KYTY_FALSE_SHARE_ANY_THREAD (default off; CP and guest reads of clean bytes on GPU-dirty pages use the backing)
-	CpCleanRegReads      = 1u << 25u, // KYTY_CP_CLEAN_REG_READS (default off; the command processor reads clean indirect register tables from the backing)
-	CpSkipIdleSpin       = 1u << 26u, // KYTY_CP_SKIP_IDLE_SPIN (default off; work queued while the command processor waited for the execution thread starts at once, not after a 2 ms spin)
-	DirectGpuReads       = 1u << 21u, // KYTY_DIRECT_GPU_READS (default off; downloads of bytes whose GPU writer already finished read the mapped game buffer, needs the same variable at startup)
-	AsyncReadback        = 1u << 28u, // KYTY_ASYNC_READBACK (default off; guest and command-processor downloads wait on their own thread, not the execution thread)
-	SpeculateStrict      = 1u << 27u, // KYTY_SPECULATE_STRICT (default off; with SpeculateDirtyReads, never guess bytes that changed twice or were guessed wrong once)
-	SpeculateDirtyReads  = 1u << 30u, // KYTY_SPECULATE_DIRTY_READS (default off; shader-table reads of GPU-written bytes the GPU keeps rewriting unchanged use the backing, checked later)
+	NativeFp16           = 1u << 23u, // KYTY_NATIVE_FP16 (default off; f16vec2 math for packed f16 ops, needs shaderFloat16)
+	FaultPageReads       = 1u << 24u, // KYTY_FAULT_PAGE_READS (default off; SRT reads of pages that faulted before use the backing)
+	GpuColorClear        = 1u << 26u, // KYTY_GPU_COLOR_CLEAR (default off; fast-clear checks of GPU-written metadata on the GPU)
+	ExecSelects          = 1u << 25u, // KYTY_EXEC_SELECTS (default off; drop EXEC-mask selects nobody observes, part of shader keys)
+	PooledBdaBuffers     = 1u << 27u, // KYTY_POOLED_BDA_BUFFERS (default off; small device-address buffers share VMA blocks)
+	AsyncGuestReads      = 1u << 28u, // KYTY_ASYNC_GUEST_READS (default off; a guest thread waits for its own readback)
+	BdaDirtyRegions      = 1u << 29u, // KYTY_BDA_DIRTY_REGIONS (default off; BDA preparation syncs only CPU-written regions)
+	LdsLaneSlots         = 1u << 30u, // KYTY_LDS_LANE_SLOTS (default on; per-lane LDS slots of non-compute stages as a small array, part of shader keys)
+	ProtectSharedLock    = uint64_t {1} << 32u, // KYTY_PROTECT_SHARED_LOCK (default off; page-tracking protections of different pages run in parallel)
+	ClockWaitPredict     = uint64_t {1} << 33u, // KYTY_CLOCK_WAIT_PREDICT (default off; WAIT_REG_MEM on a pending clock write need not wait for it)
+	FalseShareAnyThread  = uint64_t {1} << 34u, // KYTY_FALSE_SHARE_ANY_THREAD (default off; CP and guest reads of clean bytes on GPU-dirty pages use the backing)
+	CpCleanRegReads      = uint64_t {1} << 35u, // KYTY_CP_CLEAN_REG_READS (default off; the command processor reads clean indirect register tables from the backing)
+	CpSkipIdleSpin       = uint64_t {1} << 36u, // KYTY_CP_SKIP_IDLE_SPIN (default off; work queued while the command processor waited for the execution thread starts at once, not after a 2 ms spin)
+	SpeculateDirtyReads  = uint64_t {1} << 37u, // KYTY_SPECULATE_DIRTY_READS (default off; shader-table reads of GPU-written bytes the GPU keeps rewriting unchanged use the backing, checked later)
+	DirectGpuReads       = uint64_t {1} << 41u, // KYTY_DIRECT_GPU_READS (default off; downloads of bytes whose GPU writer already finished read the mapped game buffer, needs the same variable at startup)
+	AsyncReadback        = uint64_t {1} << 42u, // KYTY_ASYNC_READBACK (default off; guest and command-processor downloads wait on their own thread, not the execution thread)
+	SpeculateStrict      = uint64_t {1} << 43u, // KYTY_SPECULATE_STRICT (default off; with SpeculateDirtyReads, never guess bytes that changed twice or were guessed wrong once)
 	// A/B only (no environment variable): selects the code a pending change replaces.
 	AbLegacy = 1u << 31u,
 };
 
-[[nodiscard]] bool Enabled(Bit bit) noexcept;
-[[nodiscard]] uint32_t Mask() noexcept;
+namespace Detail {
+// The live mask; bit 63 stays set until the first use reads the environment. Enabled() runs
+// millions of times per second on the GPU thread, so its fast path is inline.
+inline constexpr uint64_t Uninitialized = uint64_t {1} << 63u;
+extern std::atomic<uint64_t> g_mask;
+[[nodiscard]] uint64_t InitMask() noexcept;
+} // namespace Detail
+
+[[nodiscard]] inline uint64_t Mask() noexcept {
+	uint64_t mask = Detail::g_mask.load(std::memory_order_relaxed);
+	if ((mask & Detail::Uninitialized) != 0) [[unlikely]] {
+		mask = Detail::InitMask();
+	}
+	return mask;
+}
+
+[[nodiscard]] inline bool Enabled(Bit bit) noexcept {
+	return (Mask() & bit) != 0;
+}
+
+// KYTY_FALSE_SHARE_READS=1 (env only; was experiment bit 6): the old single-GPU-thread design's
+// reads of clean bytes on GPU-written pages through the backing.
+[[nodiscard]] bool FalseShareReads() noexcept;
+
 // KYTY_DIRECT_GPU_READS=1 at startup: game buffers are allocated CPU-visible (Resizable BAR) and every
 // submission makes its writes visible to the CPU. Fixed for the whole run; the DirectGpuReads bit
 // only decides whether downloads use it.
@@ -64,10 +111,14 @@ inline thread_local bool g_no_wait_dirty_reads = false;
 
 namespace Common::Timeline {
 
-// Debugging: KYTY_DBG_TIMELINE=<seconds> records marks from every thread for 1.5 s after that
-// delay, then prints them once in time order (NHL27TL lines): who waits on whom in a frame.
+// Debugging: KYTY_DBG_TIMELINE=<seconds> records marks from every thread for 1.5 s
+// (KYTY_DBG_TIMELINE_MS) after that delay, then prints them once in time order (NHL27TL lines):
+// who waits on whom in a frame.
 [[nodiscard]] bool Enabled() noexcept;
 void Mark(const char* what, uint64_t value = 0) noexcept;
+// While recording: one "ra" mark per return address of the calling stack (up to 10 frames, the
+// caller first), so a wait can be traced to its call site (symbolize with the image base).
+void MarkStack() noexcept;
 
 } // namespace Common::Timeline
 

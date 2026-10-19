@@ -346,6 +346,22 @@ void CommandRecorder::clearColorImage(vk::Image image, vk::ImageLayout layout,
 	});
 }
 
+void CommandRecorder::clearAttachments(uint32_t attachment_count,
+                                       const vk::ClearAttachment* attachments,
+                                       uint32_t rect_count, const vk::ClearRect* rects) const {
+	if (m_stream == nullptr) {
+		m_direct.clearAttachments(attachment_count, attachments, rect_count, rects);
+		return;
+	}
+	m_stream->Reserve(CommandStream::RoundUp(sizeof(vk::ClearAttachment) * attachment_count) +
+	                  CommandStream::RoundUp(sizeof(vk::ClearRect) * rect_count) + 128);
+	const auto* attachments_copy = m_stream->Copy(attachments, attachment_count);
+	const auto* rects_copy       = m_stream->Copy(rects, rect_count);
+	m_stream->Record([=](vk::CommandBuffer c) {
+		c.clearAttachments(attachment_count, attachments_copy, rect_count, rects_copy);
+	});
+}
+
 void CommandRecorder::clearDepthStencilImage(vk::Image image, vk::ImageLayout layout,
                                              const vk::ClearDepthStencilValue* value,
                                              uint32_t                          range_count,

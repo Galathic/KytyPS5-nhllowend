@@ -244,6 +244,8 @@ file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
 	"${KYTY_SOURCE_DIR}/graphics/presentation/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/presentation/window/*.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/presentation/window/*.h"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/fsr/*.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/fsr/*.h"
 	"${KYTY_SOURCE_DIR}/kernel/*.cpp"
 	"${KYTY_SOURCE_DIR}/kernel/*.h"
 	"${KYTY_SOURCE_DIR}/loader/*.cpp"
@@ -268,6 +270,7 @@ set(gpu_tiler_shader_names
 	native_indirect
 	dispatch_guard
 	color_transform
+	color_clear_check
 )
 file(GLOB gpu_tiler_shader_includes CONFIGURE_DEPENDS "${gpu_tiler_shader_dir}/gpu_tiler_*.inc")
 foreach(shader_name IN LISTS gpu_tiler_shader_names)
@@ -333,7 +336,7 @@ function(add_gpu_blit_shader shader_name shader_file)
 		        "-I${gpu_tiler_shader_dir}" -o "${shader_spv}" "${shader_source}"
 		COMMAND ${CMAKE_COMMAND} -DINPUT=${shader_spv} -DOUTPUT=${shader_header}
 		        -DSYMBOL=${shader_symbol} -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
-		DEPENDS "${shader_source}"
+		DEPENDS "${shader_source}" ${gpu_fsr1_includes}
 		VERBATIM
 	)
 	set(gpu_blit_shader_headers ${gpu_blit_shader_headers} "${shader_header}" PARENT_SCOPE)
@@ -342,6 +345,10 @@ add_gpu_blit_shader(gpu_blit_fs_triangle gpu_blit_fs_triangle.vert)
 add_gpu_blit_shader(gpu_blit_color_to_ms_depth gpu_blit_color_to_ms_depth.frag)
 add_gpu_blit_shader(gpu_video_out_overlay gpu_video_out_overlay.frag)
 add_gpu_blit_shader(gpu_imgui_hdr gpu_video_out_overlay.frag -DIMGUI_HDR=1)
+set(gpu_fsr1_include_dir "${KYTY_THIRD_PARTY_DIR}/fsr1")
+set(gpu_fsr1_includes "${gpu_fsr1_include_dir}/ffx_a.h" "${gpu_fsr1_include_dir}/ffx_fsr1.h")
+add_gpu_blit_shader(gpu_fsr1_easu gpu_fsr1.frag "-I${gpu_fsr1_include_dir}")
+add_gpu_blit_shader(gpu_fsr1_rcas gpu_fsr1.frag "-I${gpu_fsr1_include_dir}" -DFSR_RCAS=1)
 list(APPEND kyty_emulator_src ${gpu_blit_shader_headers})
 
 list(APPEND kyty_emulator_src
@@ -356,9 +363,33 @@ endif()
 
 set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus)
 
-# Linux system libraries.
-if(LINUX)
+option(KYTY_ENABLE_FSR3 "Build experimental FSR 3.1 Vulkan backend (guest guides required)" OFF)
+set(FIDELITYFX_SDK_DIR "" CACHE PATH "FidelityFX SDK 1.1.4 with matching Vulkan libraries")
+if(KYTY_ENABLE_FSR3)
+	if(NOT WIN32)
+		message(FATAL_ERROR "The current FSR3 runtime package supports Windows x64 only")
+	endif()
+	foreach(component backend_vk fsr3upscaler)
+		set(ffx_base "${FIDELITYFX_SDK_DIR}/sdk/bin/ffx_sdk/ffx_${component}_x64")
+		if(NOT EXISTS "${ffx_base}.lib" OR NOT EXISTS "${ffx_base}.dll")
+			message(FATAL_ERROR "Missing matching FSR3 Vulkan library/runtime: ${ffx_base}")
+		endif()
+		list(APPEND kyty_fsr3_libraries "${ffx_base}.lib")
+		list(APPEND kyty_fsr3_dlls "${ffx_base}.dll")
+	endforeach()
+	include_directories(SYSTEM "${FIDELITYFX_SDK_DIR}/sdk/include")
+	add_compile_definitions(KYTY_ENABLE_FSR3=1)
+	list(APPEND kyty_emulator_link_libraries ${kyty_fsr3_libraries})
+	install(FILES ${kyty_fsr3_dlls} DESTINATION .)
+	install(FILES "${FIDELITYFX_SDK_DIR}/sdk/LICENSE.txt" DESTINATION licenses/FidelityFX-SDK)
+endif()
+install(FILES "${KYTY_THIRD_PARTY_DIR}/fsr1/LICENSE.txt" DESTINATION licenses/FSR1)
+
+# Linux system libraries. Threads is also needed on macOS by experiments_tests.
+if(LINUX OR APPLE)
 	find_package(Threads REQUIRED)
+endif()
+if(LINUX)
 	list(APPEND kyty_emulator_link_libraries m ${CMAKE_DL_LIBS} Threads::Threads)
 endif()
 
@@ -476,6 +507,15 @@ add_executable(memory_tracker_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(memory_tracker_tests fmt::fmt common)
 target_include_directories(memory_tracker_tests PRIVATE ${inc_headers})
+
+add_executable(experiments_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ExperimentsTests.cpp"
+	"${KYTY_SOURCE_DIR}/common/experiments.cpp"
+)
+target_include_directories(experiments_tests PRIVATE "${KYTY_SOURCE_DIR}")
+if(LINUX OR APPLE)
+	target_link_libraries(experiments_tests PRIVATE Threads::Threads)
+endif()
 
 add_executable(gpu_pipeline_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/GpuPipelineTests.cpp"
@@ -671,6 +711,13 @@ if(BUILD_TESTING)
 	add_test(NAME emulator_present_mode_invalid
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --present-mode Invalid)
 	set_tests_properties(emulator_present_mode_invalid PROPERTIES WILL_FAIL TRUE)
+	add_test(NAME experiments COMMAND $<TARGET_FILE:experiments_tests>)
+	add_test(NAME compute_resolve_ahead
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --compute-resolve-ahead-only)
+	# The perf branch initializes diagnostic gates before main(), so the counter-based
+	# assertions need the environment set by the launcher rather than by the test body.
+	set_tests_properties(compute_resolve_ahead PROPERTIES
+		ENVIRONMENT "KYTY_PERF_STATS=1;KYTY_SHADER_PREGEN=0;KYTY_DBG_LOOP_CAP=1024")
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
 	add_test(NAME shader_front_face COMMAND $<TARGET_FILE:shader_cfg_tests> --front-face-only)
@@ -750,6 +797,7 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-range-only)
 
 	add_custom_target(kyty_tests DEPENDS
+		experiments_tests
 		ime_dialog_tests
 		shader_cfg_tests
 		scalar_provenance_tests
@@ -800,6 +848,23 @@ if(APPLE AND (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR
 endif()
 
 add_executable(kyty_emulator "${KYTY_SOURCE_DIR}/main.cpp" ${kyty_emulator_src})
+
+add_executable(fsr_upscaler_tests EXCLUDE_FROM_ALL
+  "${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/commandRecorder.cpp"
+	"${KYTY_TESTS_DIR}/FsrUpscalerTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/fsr/fsr1.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/fsr/fsr3.cpp"
+	${gpu_blit_shader_headers})
+target_include_directories(fsr_upscaler_tests PRIVATE ${inc_headers})
+target_link_libraries(fsr_upscaler_tests PRIVATE common Vulkan::Headers fmt::fmt ${kyty_fsr3_libraries})
+if(KYTY_ENABLE_FSR3)
+	foreach(target kyty_emulator fsr_upscaler_tests)
+		foreach(dll IN LISTS kyty_fsr3_dlls)
+			add_custom_command(TARGET ${target} POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
+				"${dll}" "$<TARGET_FILE_DIR:${target}>" VERBATIM)
+		endforeach()
+	endforeach()
+endif()
 configure_macos_guest_address_space(kyty_emulator)
 
 set(KYTY_TROPHY_UNLOCK_SOUND "${CMAKE_CURRENT_SOURCE_DIR}/assets/sounds/trophy-unlock.wav")
@@ -820,6 +885,56 @@ if (WIN32)
 endif()
 if (KYTY_CLANG_CL)
 	target_link_libraries(kyty_emulator onecore)
+endif()
+# Profiling: source lines and inline frames in the PDB for tools/profiling/sampler.exe.
+option(KYTY_LINE_TABLES "Emit line tables for the emulator (profiling; no codegen change)" OFF)
+if (KYTY_LINE_TABLES AND KYTY_CLANG_CL)
+	target_compile_options(kyty_emulator PRIVATE "-gline-tables-only")
+endif()
+# Profile-guided optimization of the emulator and common (clang-cl). KYTY_PGO=generate builds an
+# instrumented emulator that writes LLVM_PROFILE_FILE every 30 s (creating "pgo.reset" in the
+# working directory drops the counts so far, e.g. the boot); merge the .profraw with
+# llvm-profdata, then build with KYTY_PGO=use (KYTY_PGO_PROFILE defaults to the NHL 27 gameplay
+# profile in tools/pgo, see tools/pgo/README.md). A profile only matches the clang that made it.
+set(KYTY_PGO "" CACHE STRING "Profile-guided optimization (clang-cl): generate or use")
+set(KYTY_PGO_PROFILE "${CMAKE_CURRENT_SOURCE_DIR}/tools/pgo/nhl27.profdata" CACHE FILEPATH
+	"Merged .profdata for KYTY_PGO=use")
+set(KYTY_PGO_PROFILE_COMPILER "22.1.8" CACHE STRING "clang version that recorded KYTY_PGO_PROFILE")
+option(KYTY_THIN_LTO "ThinLTO for the emulator and common (clang-cl)" OFF)
+if (KYTY_CLANG_CL AND KYTY_PGO STREQUAL "generate")
+	execute_process(COMMAND "${CMAKE_CXX_COMPILER}" /clang:-print-resource-dir
+		OUTPUT_VARIABLE KYTY_CLANG_RESOURCE_DIR OUTPUT_STRIP_TRAILING_WHITESPACE)
+	foreach(target kyty_emulator common)
+		target_compile_options(${target} PRIVATE "-fprofile-generate")
+	endforeach()
+	target_compile_definitions(kyty_emulator PRIVATE KYTY_PGO_GENERATE=1)
+	target_link_libraries(kyty_emulator "${KYTY_CLANG_RESOURCE_DIR}/lib/windows/clang_rt.profile-x86_64.lib")
+	target_link_options(kyty_emulator PRIVATE "/INCLUDE:__llvm_profile_runtime")
+elseif (KYTY_CLANG_CL AND KYTY_PGO STREQUAL "use")
+	if (NOT EXISTS "${KYTY_PGO_PROFILE}")
+		message(FATAL_ERROR "KYTY_PGO=use needs KYTY_PGO_PROFILE=<merged .profdata>")
+	endif()
+	if (NOT CMAKE_CXX_COMPILER_VERSION VERSION_EQUAL KYTY_PGO_PROFILE_COMPILER)
+		message(WARNING "KYTY_PGO=use ignored: the profile was recorded with clang "
+			"${KYTY_PGO_PROFILE_COMPILER}, this is ${CMAKE_CXX_COMPILER_VERSION}")
+	else()
+		# The hash changes every command line when the profile changes, so compiler caches
+		# (sccache) cannot serve objects built from an older profile.
+		file(SHA256 "${KYTY_PGO_PROFILE}" KYTY_PGO_PROFILE_HASH)
+		string(SUBSTRING "${KYTY_PGO_PROFILE_HASH}" 0 16 KYTY_PGO_PROFILE_HASH)
+		foreach(target kyty_emulator common)
+			target_compile_options(${target} PRIVATE "-fprofile-use=${KYTY_PGO_PROFILE}"
+				"-Wno-profile-instr-unprofiled" "-Wno-profile-instr-out-of-date" "-Wno-profile-instr-missing")
+			target_compile_definitions(${target} PRIVATE KYTY_PGO_PROFILE_HASH=0x${KYTY_PGO_PROFILE_HASH})
+		endforeach()
+		message(STATUS "PGO: ${KYTY_PGO_PROFILE} (${KYTY_PGO_PROFILE_HASH})")
+	endif()
+endif()
+if (KYTY_CLANG_CL AND KYTY_THIN_LTO)
+	foreach(target kyty_emulator common)
+		target_compile_options(${target} PRIVATE "-flto=thin")
+	endforeach()
+	target_link_options(kyty_emulator PRIVATE "/lldltocache:${CMAKE_CURRENT_BINARY_DIR}/lto.cache")
 endif()
 if (CLANG AND NOT KYTY_CLANG_CL)
 	target_link_libraries(kyty_emulator pthread)

@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
+#include "graphics/shader/shader.h"
 
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
@@ -311,6 +312,14 @@ uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memo
 		              Binary(ctx.state, spv::OpUGreaterThanEqual, TypeBool(ctx.state), address, prefix),
 		              address, ConstantU32(ctx.state, UINT32_MAX));
 	}
+	if (mem.kind == IR::ResourceKind::Lds && ctx.state.program.info.function_lds_lane_slots) {
+		// Per-lane slots: drop the LaneId * 4 every access shares (see SpirvRequirements).
+		uint32_t constant = 0;
+		if (!MatchLaneSlotLdsAddress(inst.Arg(0), constant)) {
+			EXIT("LDS lane slot address no longer matches\n");
+		}
+		return ConstantU32(ctx.state, (constant + mem.offset) & 0xffffu);
+	}
 	if (mem.kind == IR::ResourceKind::Lds || mem.kind == IR::ResourceKind::Gds) {
 		if (mem.offset == 0u) {
 			return ctx.Arg(inst, 0);
@@ -341,15 +350,31 @@ uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& res
 uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
                              uint32_t address, uint32_t index, uint32_t bits, bool sign_extend);
 
+// Experiment RobustLoads: storage-buffer reads out of range return zero on the device itself.
+// Shaders that spill guest VGPRs (to LDS or scratch) keep their branches: unconditional loads made
+// the one such NHL 27 pixel shader 16-27% slower (more live values), the others 8-23% faster.
+bool RobustLoad(const EmitterState& state, IR::ResourceKind kind) {
+	return (kind == IR::ResourceKind::Buffer || kind == IR::ResourceKind::ScalarBuffer) &&
+	       ShaderRobustLoads() && !state.program.info.function_lds && state.program.scratch_dwords == 0;
+}
+
 uint32_t LoadWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                           const MemoryResourceAccess& resource) {
 	const auto index = DwordIndex(ctx, inst, mem);
+	if (RobustLoad(ctx.state, resource.kind)) {
+		return LoadWordInBounds(ctx, resource, index);
+	}
 	return EmitValueOrZeroIfCondition(
 	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index),
 	    [&]() { return LoadWordInBounds(ctx, resource, index); });
 }
 
 uint32_t LoadWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) {
+	if (RobustLoad(ctx.state, mem.kind) && !ShaderRobustLoadsKeepExec()) {
+		// Lanes outside EXEC load too; their result is discarded where the register is written.
+		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
+		return LoadWordPrepared(ctx, inst, mem, resource);
+	}
 	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
 		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
 		return LoadWordPrepared(ctx, inst, mem, resource);
@@ -363,6 +388,9 @@ uint32_t LoadSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const 
 	const auto index = Binary(
 	    ctx.state, spv::OpShiftRightLogical, TypeU32(ctx.state), address,
 	    ConstantU32(ctx.state, std::countr_zero(resource.element_bits / 8u)));
+	if (RobustLoad(ctx.state, resource.kind)) {
+		return LoadSubwordInBounds(ctx, resource, address, index, bits, sign_extend);
+	}
 	return EmitValueOrZeroIfCondition(
 	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index), [&]() {
 		    return LoadSubwordInBounds(ctx, resource, address, index, bits, sign_extend);
@@ -407,6 +435,10 @@ uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& 
 
 uint32_t LoadSubword(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem, uint32_t bits,
                      bool sign_extend) {
+	if (RobustLoad(ctx.state, mem.kind) && !ShaderRobustLoadsKeepExec()) {
+		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
+		return LoadSubwordPrepared(ctx, inst, mem, resource, bits, sign_extend);
+	}
 	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
 		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
 		return LoadSubwordPrepared(ctx, inst, mem, resource, bits, sign_extend);
@@ -525,6 +557,12 @@ void StoreSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR:
 	const auto index = Binary(
 	    ctx.state, spv::OpShiftRightLogical, TypeU32(ctx.state), address,
 	    ConstantU32(ctx.state, std::countr_zero(resource.element_bits / 8u)));
+	// Only plain 8/16-bit stores: a read-modify-write of the containing dword out of range must not
+	// spin on a compare-exchange.
+	if (RobustLoad(ctx.state, resource.kind) && ShaderRobustStores() && resource.element_bits < 32u) {
+		StoreSubwordInBounds(ctx, mem, resource, address, index, bits, data);
+		return;
+	}
 	EmitIfCondition(
 	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index), [&]() {
 		    StoreSubwordInBounds(ctx, mem, resource, address, index, bits, data);
@@ -592,6 +630,10 @@ void StoreLocalFlat(ValueEmitContext& ctx, const IR::Inst& inst) {
 void StoreWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                        const MemoryResourceAccess& resource, uint32_t data) {
 	const auto index = DwordIndex(ctx, inst, mem);
+	if (RobustLoad(ctx.state, resource.kind) && ShaderRobustStores()) {
+		StoreWordInBounds(ctx, resource, index, data);
+		return;
+	}
 	EmitIfCondition(ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index), [&]() {
 		StoreWordInBounds(ctx, resource, index, data);
 	});
@@ -1145,6 +1187,16 @@ uint32_t LoadIndirectFormattedX(ValueEmitContext& ctx, const IR::Inst& inst) {
 
 uint32_t LoadBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
 	auto& state = ctx.state;
+	if (const auto mem = ctx.Memory(inst);
+	    RobustLoad(state, mem.kind) && !mem.formatted && !ShaderRobustLoadsKeepExec()) {
+		const auto resource = PrepareMemoryResourceAccess(state, mem);
+		std::array<uint32_t, 4> values {};
+		for (uint32_t component = 0; component < components; component++) {
+			values[component] =
+			    LoadWordPrepared(ctx, inst, RebaseRawComponent(mem, component), resource);
+		}
+		return ConstructU32Composite(state, components, values);
+	}
 	return EmitValueOrDefaultIfCondition(
 	    state, ctx.Arg(inst, inst.NumArgs() - 1), TypeU32Composite(state, components),
 	    ConstantU32CompositeZero(state, components), [&]() {
@@ -1482,10 +1534,11 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto element = Binary(
 	    state, spv::OpIAdd, TypeU32(state), index,
 	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), access.byte_offset, ConstantU32(state, 2)));
-	if (ShaderSkipBoundsChecks()) {
-		// KYTY_SKIP_BOUNDS_CHECKS: robustBufferAccess2 already returns zero for out-of-range dwords.
-		ctx.Define(inst, EmitNative<spv::OpLoad, IR::Type::U32>(
-		                     state, EmitMemoryElementPointer(state, access, element)));
+	if ((RobustLoad(state, mem.kind) && ShaderRobustConstReads()) || ShaderSkipBoundsChecks()) {
+		// As LoadWordPrepared: out of range reads zero on the device. A branch per constant kept
+		// each scalar load in a block of its own, so the compiler could neither batch nor hoist them
+		// (the heaviest NHL 27 compute shader had 189 such loads).
+		ctx.Define(inst, EmitNative<spv::OpLoad, IR::Type::U32>(state, EmitMemoryElementPointer(state, access, element)));
 		return;
 	}
 	const auto condition = EmitMemoryElementInBounds(state, access, element);

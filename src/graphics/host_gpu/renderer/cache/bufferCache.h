@@ -15,6 +15,7 @@
 #include <atomic>
 #include <chrono>
 #include <map>
+#include <atomic>
 #include <mutex>
 #include <shared_mutex>
 #include <span>
@@ -102,6 +103,9 @@ public:
 	// KYTY_PERF_STATS=1: the faulting guest instruction of the calling thread, so CPU-write
 	// readbacks can be attributed to the code that caused them (NHL27WRITEBACK).
 	static void               NoteFaultRip(uint64_t rip);
+	// KYTY_DBG_CP_READS: the shader whose resources the calling thread materializes, named by
+	// NHL27RBWAIT for the downloads of GPU-written bytes it waits for.
+	static void               NoteReadbackShader(uint64_t hash) noexcept;
 	// NHL27WRITEBACK: the emulator path behind a GPU-thread CPU-write readback, which has no guest
 	// instruction. Logged in place of the rip (rip=0 is a GPU-thread write nobody tagged).
 	enum class WriteTag : uint64_t { None = 0, EopLabel, WriteData, TextureKeys, Unmap, Fill, Count };
@@ -217,8 +221,8 @@ public:
 	                                                              bool is_written, bool is_texel_buffer,
 	                                                              BufferId id = {});
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
-	// Copies guest memory into the mapped stream buffer, possibly on the host copy thread (see
-	// CommandScheduler::HostCopies()).
+	// Copies guest memory into coherent mapped memory (the stream buffer, staging), possibly on the
+	// host copy thread (see CommandScheduler::HostCopies()).
 	void StreamGuestData(uint8_t* destination, uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
@@ -226,6 +230,16 @@ public:
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	// Experiment EarlySubmitWriters (GPU execution thread): a strict resource read had to download
+	// these GPU-written bytes; later writes to them ask for an early submit (TakeSubmitRequest).
+	void NoteDirtyRead(uint64_t vaddr, uint64_t size);
+	// True once after a draw or dispatch wrote bytes a strict resource read downloaded before: the
+	// caller ends the host command buffer, so the next read waits for that work only.
+	[[nodiscard]] bool TakeSubmitRequest() {
+		const bool requested = m_submit_requested;
+		m_submit_requested   = false;
+		return requested;
+	}
 	// Any thread: HasGpuDirtyBytes under a shared lock (the GPU thread changes the ranges under an
 	// exclusive one). Used by experiment FalseShareAnyThread.
 	[[nodiscard]] bool HasGpuDirtyBytesShared(uint64_t vaddr, uint64_t size) const;
@@ -271,6 +285,10 @@ public:
 	}
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	uint64_t           SynchronizeBuffersInRanges(const RangeSet& ranges, bool full);
+	// Synchronizes only the pages dirtied before write epoch `limit` (see RegionManager); returns
+	// whether later ones were left (first_left: the earliest of their epochs).
+	bool               SynchronizeBuffersInRangesBefore(const RangeSet& ranges, bool full, uint32_t limit,
+	                                                    uint32_t& first_left);
 	[[nodiscard]] uint64_t CpuModificationGeneration() const noexcept {
 		return m_memory_tracker.CpuModificationGeneration();
 	}
@@ -340,7 +358,17 @@ private:
 	template <bool async, bool merge = false>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool LazySharedWriteEligible(uint64_t vaddr, uint64_t size);
+	// Experiment AsyncGuestReads (GPU thread): waits for the asynchronous guest reads overlapping
+	// the range and releases their pages that hold no newer GPU-written bytes.
+	void FinishPendingGuestReads(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool OverlapsPendingGuestRead(uint64_t vaddr, uint64_t size) const;
+	[[nodiscard]] bool OverlapsPendingGuestBytes(uint64_t vaddr, uint64_t size) const;
 
+	// Experiment EarlySubmitWriters: GPU-written ranges strict resource reads downloaded (oldest
+	// replaced first), and whether a write to one of them asks for a submit.
+	std::vector<std::pair<uint64_t, uint64_t>>        m_watched_writes;
+	size_t                                            m_watched_next     = 0;
+	bool                                              m_submit_requested = false;
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
 	FaultManager                                      m_fault_manager;
@@ -362,22 +390,18 @@ private:
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;
 	// KYTY_READBACK_QUEUE: copies downloads on GraphicContext::readback_queue.
-	vk::CommandPool                                   m_readback_pool   = nullptr;
-	vk::CommandBuffer                                 m_readback_buffer = nullptr;
-	vk::Fence                                         m_readback_fence  = nullptr;
+	vk::CommandPool                                   m_readback_pool[3] {};
+	vk::CommandBuffer                                 m_readback_buffer[3] {};
+	vk::Fence                                         m_readback_fence[3] {};
 	bool ReadbackOnSecondQueue(const Buffer& source, const Buffer& destination,
 	                           std::span<const vk::BufferCopy> copies, uint64_t wait_tick);
-	// Experiment AsyncReadback (KYTY_ASYNC_READBACK): downloads requested by threads other than the
-	// execution thread are copied on the readback queue and waited for by the requesting thread.
+	// Experiment AsyncReadback (KYTY_ASYNC_READBACK, measured slower, not wired since the Oct 18 sync with
+	// nhl27-eadb): the bookkeeping of downloads waited for by the requesting thread.
 	struct AsyncReadback;
 	struct AsyncSlot {
 		vk::CommandBuffer command = nullptr;
 		vk::Fence         fence   = nullptr;
 	};
-	void ReadMemoryBody(uint64_t vaddr, uint64_t size, bool is_write, ReadCaller caller, bool on_gpu,
-	                    uint64_t tid, uint64_t fault_rip);
-	[[nodiscard]] bool StartAsyncReadback(AsyncReadback& readback);
-	void FinishAsyncReadback(AsyncReadback& readback, ReadCaller caller, uint64_t tid, uint64_t fault_rip);
 	void NoteAsyncReadbackWrite(uint64_t vaddr, uint64_t size);
 	void WaitAsyncReadbacksOf(BufferId id);
 	std::mutex                                        m_async_mutex;
@@ -396,7 +420,27 @@ private:
 		bool                    non_uniform = false; // pattern bytes are not all equal
 		std::array<uint32_t, 4> pattern {};
 	};
+	// The GPU thread records fills while guest write faults drop them, so the list is locked;
+	// m_gpu_fill_count lets the common no-fill case skip the lock.
 	std::vector<GpuFill>                              m_gpu_fills;
+	// Experiment AsyncGuestReads: downloads queued for a guest thread's read fault. Until the
+	// guest thread finishes one, its pages stay protected but m_gpu_modified_ranges no longer
+	// lists their bytes, so HasGpuDirtyBytes reports them and readers finish the read first.
+	// `bytes` are the GPU-written ranges the download carries: other bytes of the pages are
+	// current in guest memory already (HasGpuDirtyBytes looks at these).
+	struct PendingGuestRead {
+		uint64_t                                     vaddr;
+		uint64_t                                     size;
+		uint64_t                                     tick;
+		std::vector<std::pair<uint64_t, uint64_t>> bytes;
+	};
+	std::vector<PendingGuestRead>                     m_pending_guest_reads;
+	std::atomic<size_t>                               m_pending_guest_read_count {0};
+	// One bit per (64 KiB chunk % 256) that a recorded fill touches (a superset). DropGpuFills runs
+	// for every written buffer binding and nearly always misses; the filter skips the fill scan.
+	std::array<uint64_t, 4>                           m_gpu_fill_filter {};
+	mutable std::mutex                                m_gpu_fills_mutex;
+	std::atomic<size_t>                               m_gpu_fill_count {0};
 	struct WriterRecord {
 		uint64_t    begin;
 		uint64_t    end;

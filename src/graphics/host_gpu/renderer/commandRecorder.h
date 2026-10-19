@@ -226,6 +226,18 @@ public:
 		return m_direct;
 	}
 
+	// The caller retains pointer captures through GPU completion and invalidates
+	// pipeline/descriptor memoization for any state the external library changes.
+	template <typename F>
+	void RecordExternal(F function) const {
+		static_assert(std::is_trivially_copyable_v<F> && std::is_trivially_destructible_v<F>);
+		if (m_stream == nullptr) {
+			function(m_direct);
+		} else {
+			m_stream->Record(function);
+		}
+	}
+
 	void pipelineBarrier(vk::PipelineStageFlags src_stages, vk::PipelineStageFlags dst_stages,
 	                     vk::DependencyFlags dependency, uint32_t memory_count,
 	                     const vk::MemoryBarrier* memory, uint32_t buffer_count,
@@ -439,6 +451,25 @@ public:
 	                            const vk::ClearDepthStencilValue& value,
 	                            const vk::ImageSubresourceRange& range) const {
 		clearDepthStencilImage(image, layout, &value, 1, &range);
+	}
+
+	// Experiment GpuColorClear: predicated clears of a render pass's attachments.
+	void clearAttachments(uint32_t attachment_count, const vk::ClearAttachment* attachments,
+	                      uint32_t rect_count, const vk::ClearRect* rects) const;
+	void beginConditionalRenderingEXT(const vk::ConditionalRenderingBeginInfoEXT* begin) const {
+		if (m_stream == nullptr) {
+			m_direct.beginConditionalRenderingEXT(begin);
+			return;
+		}
+		const auto info = *begin;
+		m_stream->Record([=](vk::CommandBuffer c) { c.beginConditionalRenderingEXT(&info); });
+	}
+	void endConditionalRenderingEXT() const {
+		if (m_stream == nullptr) {
+			m_direct.endConditionalRenderingEXT();
+			return;
+		}
+		m_stream->Record([](vk::CommandBuffer c) { c.endConditionalRenderingEXT(); });
 	}
 
 	void setViewport(uint32_t first, uint32_t count, const vk::Viewport* viewports) const;

@@ -54,6 +54,14 @@ public:
 
 	// The thread that owns the renderer: the execution thread of a pipelined GPU.
 	[[nodiscard]] static bool IsGpuThread() noexcept;
+	// The pipelined command processor's thread (it parses PM4; the execution thread owns caches).
+	[[nodiscard]] static bool IsCommandProcessorThread() noexcept;
+	// The guest queue the GPU thread is processing (0 = graphics ring, 1.. = compute rings).
+	[[nodiscard]] static uint32_t CurrentQueue() noexcept;
+	// Execution thread, while it waits inside an operation (a shader compile worker): runs the
+	// urgent commands other threads queued, such as the readback of a page a compile worker
+	// faulted on, which would otherwise wait for this thread forever. No-op elsewhere.
+	static void ServiceUrgentCommands();
 	// Execution thread: the operation it is executing (GpuOperationKind | GpuOperation::trace_op << 8),
 	// or 0 between operations. Diagnostics only (KYTY_PERF_GPU_FAULT_STACKS).
 	[[nodiscard]] static uint64_t CurrentExecOp() noexcept;
@@ -71,8 +79,9 @@ public:
 	static constexpr uint8_t WriteOriginDma   = 2;
 	// The guest memory an emitted operation writes, and the value it writes when that is known
 	// when the operation is emitted (`value` null otherwise, or larger than 8 bytes).
+	// `kind` names the writer for KYTY_DBG_CP_READS (a static string).
 	void NoteGuestWrite(uint64_t sequence, uint64_t address, uint64_t size, const void* value,
-	                    uint8_t origin = WriteOriginOther);
+	                    const char* kind = "write", uint8_t origin = WriteOriginOther);
 	// Experiment ClockWaitPredict: when the newest pending write of exactly [address, address + size)
 	// stores the 64-bit reference clock, returns true with a value the write will not be below (the
 	// clock read now, while the write is still pending). The clock only grows.
@@ -81,6 +90,27 @@ public:
 	// of the stream: from the value of a pending write when it is known, otherwise from memory
 	// once the operations that write it executed.
 	void ReadDecisionMemory(const volatile void* address, void* value, size_t size);
+	// Command processor thread, experiment CpBackingReads: reads guest memory on a page whose reads
+	// fault (the GPU wrote other bytes of it) through the execution thread, in order after the
+	// operations emitted so far, without downloading the page unless the bytes read are
+	// GPU-written themselves. False when the range is not read-protected or the backing cannot
+	// serve it: the caller then reads it directly.
+	[[nodiscard]] bool TryReadProtectedForCp(uint64_t address, void* value, size_t size);
+	// Command processor thread: whether CpBackingReads is on (and no check found it wrong).
+	[[nodiscard]] bool CpBackingReadsOn() const;
+	// Command processor thread: `cp` used `size` bytes at `address` read from the backing of a
+	// read-protected page; the execution thread checks in order that no earlier operation wrote
+	// them (when one did, it compares them with what it wrote; a difference turns the reads off).
+	void CheckCpBackingRead(CommandProcessor& cp, uint64_t address, const void* bytes, size_t size);
+	[[nodiscard]] size_t PendingWriteCount() const { return m_pending_count; }
+	// Execution thread: an end-of-pipe clock write ran with this value. Command processor: takes the
+	// newest such value covering the range (once).
+	void NoteExecutedWrite(uint64_t address, const void* value, uint64_t size);
+	bool TakeExecutedWrite(uint64_t address, void* value, uint64_t size);
+	// True when the newest pending write over [address, address + size) is an end-of-pipe clock
+	// write of the current guest queue covering it (its value is the reference clock when it
+	// executes).
+	[[nodiscard]] bool PendingClockWrite(uint64_t address, uint64_t size);
 	void                   WaitForExecution(uint64_t sequence) { m_executed.WaitFor(sequence); }
 	// Waits until every operation emitted so far executed.
 	void WaitForExecution() { m_executed.WaitFor(m_emitted); }
@@ -146,13 +176,24 @@ private:
 	std::atomic_int m_done_num  = 0;
 
 	// Pipelined execution. m_emitted is only used by the command processor thread.
+	struct ExecutedWrite {
+		uint64_t address  = 0;
+		uint64_t size     = 0;
+		uint8_t  value[8] = {};
+	};
+	std::mutex                     m_executed_writes_mutex;
+	std::array<ExecutedWrite, 16> m_executed_writes {};
+	size_t                         m_executed_writes_next = 0;
+
 	struct GuestWrite {
 		uint64_t sequence = 0;
 		uint64_t address  = 0;
 		uint64_t size     = 0;
-		bool     known    = false;
-		uint8_t  origin   = 0;
-		uint8_t  value[8] = {};
+		bool        known    = false;
+		uint8_t     value[8] = {};
+		const char* kind     = nullptr;
+		uint32_t    queue    = 0; // the guest queue that wrote it
+		uint8_t     origin   = 0;
 	};
 
 	const bool                      m_pipelined;
@@ -189,6 +230,16 @@ private:
 
 	friend class CommandProcessor;
 };
+
+// The kind of pending guest writes of end-of-pipe clock values (GuestGpu::PendingClockWrite).
+extern const char kEopClockWrite[];
+
+// KYTY_DBG_CP_READS=1: guest memory reads of the command processor (indirect register pairs,
+// WAIT_REG_MEM values), timed so the ones that fault and wait for the GPU show up. Printed as
+// NHL27CPREAD every 2 s, by time spent. One thread at a time (the command processor).
+[[nodiscard]] bool CpReadDebugEnabled() noexcept;
+void               NoteCpRead(const char* kind, uint64_t address, const uint32_t* pairs, uint32_t pair_count,
+                              uint64_t ns);
 } // namespace Libs::Graphics
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_GRAPHICSRUN_H_ */

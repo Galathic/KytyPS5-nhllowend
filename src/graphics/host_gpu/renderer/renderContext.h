@@ -57,6 +57,8 @@ public:
 	void PrepareGpuWrite(const void* destination, uint64_t size) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
+	// Whether a read of the range would fault on a page holding GPU-written bytes. Any thread.
+	[[nodiscard]] bool IsReadProtected(uint64_t vaddr, uint64_t size) const noexcept;
 	// Advances whenever a range is mapped or unmapped.
 	[[nodiscard]] uint64_t MappedRangesVersion() const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
@@ -67,6 +69,12 @@ public:
 	// syncs again. GPU command thread only.
 	enum class BdaBoundary : uint8_t { Submit, Wait, Event, Acquire, Dma, Sync, Ib, Flip, Other, Count };
 	void               BdaBatchBoundary(BdaBoundary kind);
+	// The write epoch of the operation being executed (BDA synchronization uploads the guest
+	// writes of earlier epochs).
+	void               SetOperationWriteEpoch(uint32_t epoch) {
+		m_operation_write_epoch = epoch;
+		m_operation_epoch_valid = true;
+	}
 	struct BdaPreparationStats {
 		uint64_t scans = 0; uint64_t reused = 0;
 		uint64_t full_scans = 0; uint64_t dirty_regions = 0;
@@ -111,6 +119,12 @@ private:
 	uint64_t                  m_bda_registration_generation = 0;
 	uint64_t                  m_bda_mapping_generation = 0;
 	bool                      m_bda_batch_synced = false;  // KYTY_BDA_BATCH: this batch already synchronized
+	// Write epochs (RegionManager): the operation being executed, and whether the last BDA
+	// synchronization left pages of later epochs (and the earliest of those).
+	uint32_t                  m_operation_write_epoch = 0;
+	bool                      m_operation_epoch_valid = false;
+	bool                      m_bda_pages_left        = false;
+	uint32_t                  m_bda_first_left        = 0;
 	BdaPreparationStats       m_bda_stats;
 
 	Common::Mutex                        m_interrupt_mutex;

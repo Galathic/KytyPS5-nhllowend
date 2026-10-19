@@ -34,33 +34,38 @@ namespace Libs::Graphics::FrameBreakdown {
 
 using Clock = std::chrono::steady_clock;
 
+// The gates are read millions of times per second; namespace-scope constants avoid the
+// thread-safe-static guard check a function-local static costs on every call.
+inline const bool g_enabled = [] {
+	const char* value = std::getenv("KYTY_PERF_STATS");
+	return value != nullptr && value[0] == '1';
+}();
+
 inline bool Enabled() {
-	static const bool enabled = [] {
-		const char* value = std::getenv("KYTY_PERF_STATS");
-		return value != nullptr && value[0] == '1';
-	}();
-	return enabled;
+	return g_enabled;
 }
 
 // KYTY_PERF_STATS_VERBOSE=1 (with KYTY_PERF_STATS=1): the heavy sub-timers and per-slot counters
 // (NHL27TEXTURES, NHL27PIPELINE, NHL27BUFFERS2, NHL27DELTA, NHL27DELTAREUSE_SPLIT, NHL27DELTAGEN,
 // NHL27SPECULATE). They run thousands of times per frame, so they are off unless asked for; when off the
 // hot paths take no timestamps and touch none of those atomics.
+inline const bool g_verbose = [] {
+	const char* value = std::getenv("KYTY_PERF_STATS_VERBOSE");
+	return g_enabled && value != nullptr && value[0] == '1';
+}();
+
 inline bool Verbose() {
-	static const bool verbose = [] {
-		const char* value = std::getenv("KYTY_PERF_STATS_VERBOSE");
-		return Enabled() && value != nullptr && value[0] == '1';
-	}();
-	return verbose;
+	return g_verbose;
 }
 
 // Fine-grained CPU preparation timing is intentionally opt-in; it can perturb hot paths.
+inline const bool g_detail_enabled = [] {
+	const char* value = std::getenv("KYTY_PERF_DRAW_DETAIL");
+	return g_enabled && value != nullptr && value[0] == '1';
+}();
+
 inline bool DetailEnabled() {
-	static const bool enabled = [] {
-		const char* value = std::getenv("KYTY_PERF_DRAW_DETAIL");
-		return Enabled() && value != nullptr && value[0] == '1';
-	}();
-	return enabled;
+	return g_detail_enabled;
 }
 
 struct Counters {
@@ -151,6 +156,12 @@ struct Counters {
 	std::atomic<uint64_t> dc_record_ns {0};       // breadcrumb + vkCmdDispatch
 	std::atomic<uint64_t> dc_handled {0};         // handler invocations
 	std::atomic<uint64_t> dc_bind_skipped {0};    // vkCmdBindPipeline calls elided (KYTY_DISPATCH_FAST)
+	std::atomic<uint64_t> dc_ahead_attempts {0};
+	std::atomic<uint64_t> dc_ahead_ready {0};
+	std::atomic<uint64_t> dc_ahead_hits {0};
+	std::atomic<uint64_t> dc_ahead_invalid {0};
+	std::atomic<uint64_t> dc_ahead_ns {0};
+	std::atomic<uint64_t> dc_ahead_validate_ns {0};
 	// NHL27FAULTPARSE: BDA fault-parser pass counters (FaultManager::ProcessFaultBuffer).
 	std::atomic<uint64_t> fault_parse_passes {0};
 	std::atomic<uint64_t> fault_parse_zero {0};   // passes whose count word was 0
@@ -916,6 +927,12 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 	const uint64_t dc_barrier_ns     = Take(c.dc_barrier_ns);
 	const uint64_t dc_record_ns      = Take(c.dc_record_ns);
 	const uint64_t dc_handled        = Take(c.dc_handled);
+	const auto dc_ahead_attempts = Take(c.dc_ahead_attempts);
+	const auto dc_ahead_ready = Take(c.dc_ahead_ready);
+	const auto dc_ahead_hits = Take(c.dc_ahead_hits);
+	const auto dc_ahead_invalid = Take(c.dc_ahead_invalid);
+	const auto dc_ahead_ns = Take(c.dc_ahead_ns);
+	const auto dc_ahead_validate_ns = Take(c.dc_ahead_validate_ns);
 	const uint64_t dc_bind_skipped   = Take(c.dc_bind_skipped);
 	const uint64_t fp_passes         = Take(c.fault_parse_passes);
 	const uint64_t fp_zero           = Take(c.fault_parse_zero);
@@ -1111,6 +1128,11 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 			            ms(dc_bda_ns), ms(dc_descriptors_ns), ms(dc_pipeline_ns), ms(dc_barrier_ns),
 			            ms(dc_record_ns), std::max(0.0, ms(dc_total_ns) - dc_named), per(dc_handled),
 			            per(dc_bind_skipped));
+			if (dc_ahead_attempts || dc_ahead_hits || dc_ahead_invalid) {
+				std::printf("NHL27COMPUTEAHEAD attempts=%.1f ready=%.1f hits=%.1f invalid=%.1f "
+				            "resolve=%.2fms validate=%.2fms\n", per(dc_ahead_attempts), per(dc_ahead_ready),
+				            per(dc_ahead_hits), per(dc_ahead_invalid), ms(dc_ahead_ns), ms(dc_ahead_validate_ns));
+			}
 			{
 				auto&          dl   = g_delta;
 				const uint64_t d_calls = Take(dl.calls), d_first = Take(dl.first), d_cmp = Take(dl.cmp_calls);

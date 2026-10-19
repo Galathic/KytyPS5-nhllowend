@@ -14,7 +14,7 @@
 
 namespace Common::RuntimeFlags {
 inline constexpr int64_t kIntervalMs = 250;
-inline constexpr unsigned kRevisionShift = 33;
+inline constexpr unsigned kRevisionShift = 37;
 inline constexpr uint64_t kFlagMask = (uint64_t{1} << kRevisionShift) - 1;
 inline constexpr uint64_t kUnpinnedBits = uint64_t{1} << kRevisionShift;
 static_assert(kRevisionShift <= 48, "flag bits and the unpinned sentinel must fit uint64_t and leave revision bits");
@@ -54,6 +54,10 @@ struct FlagSet {
  bool direct_eop_interrupts = false;
  bool fault_coalesce = true;
  bool sparse_buffer_gc = false;
+ bool write_cover_skip = false;
+ bool aged_writeback = false;
+ bool compute_resolve_ahead = false;
+ bool fsr1 = false;
 };
 inline constexpr const char* kSwitchableFlags[] = {
  "KYTY_RESOURCE_DYNAMIC_DEPS",
@@ -88,7 +92,11 @@ inline constexpr const char* kSwitchableFlags[] = {
  "KYTY_READBACK_QUEUE",
  "KYTY_DIRECT_EOP_INTERRUPTS",
  "KYTY_FAULT_COALESCE",
- "KYTY_SPARSE_BUFFER_GC"
+ "KYTY_SPARSE_BUFFER_GC",
+ "KYTY_WRITE_COVER_SKIP",
+ "KYTY_AGED_WRITEBACK",
+ "KYTY_COMPUTE_RESOLVE_AHEAD",
+ "KYTY_FSR1"
 };
 static_assert(sizeof(kSwitchableFlags) / sizeof(kSwitchableFlags[0]) == kRevisionShift, "one bit per switchable flag");
 inline constexpr uint64_t Bits(const FlagSet& f) {
@@ -124,7 +132,11 @@ inline constexpr uint64_t Bits(const FlagSet& f) {
   (uint64_t(f.readback_queue)<<29) |
   (uint64_t(f.direct_eop_interrupts)<<30) |
   (uint64_t(f.fault_coalesce)<<31) |
-  (uint64_t(f.sparse_buffer_gc)<<32);
+  (uint64_t(f.sparse_buffer_gc)<<32) |
+  (uint64_t(f.write_cover_skip)<<33) |
+  (uint64_t(f.aged_writeback)<<34) |
+  (uint64_t(f.compute_resolve_ahead)<<35) |
+  (uint64_t(f.fsr1)<<36);
 }
 // Bit positions for the few call sites that test g_published directly without decoding a FlagSet.
 inline constexpr unsigned kBitIdleTrace = 15;
@@ -136,6 +148,7 @@ inline constexpr unsigned kBitReadbackQueue = 29;
 inline constexpr unsigned kBitDirectEopInterrupts = 30;
 inline constexpr unsigned kBitFaultCoalesce = 31;
 inline constexpr unsigned kBitSparseBufferGc = 32;
+inline constexpr unsigned kBitWriteCoverSkip = 33;
 static_assert(Bits(FlagSet{.idle_trace=true}) >> kBitIdleTrace & 1, "kBitIdleTrace");
 static_assert(Bits(FlagSet{.srt_source_reuse=true}) >> kBitSrtSourceReuse & 1, "kBitSrtSourceReuse");
 static_assert(Bits(FlagSet{.srt_compiled=true}) >> kBitSrtCompiled & 1, "kBitSrtCompiled");
@@ -145,6 +158,7 @@ static_assert(Bits(FlagSet{.readback_queue=true}) >> kBitReadbackQueue & 1, "kBi
 static_assert(Bits(FlagSet{.direct_eop_interrupts=true}) >> kBitDirectEopInterrupts & 1, "kBitDirectEopInterrupts");
 static_assert(Bits(FlagSet{.fault_coalesce=true}) >> kBitFaultCoalesce & 1, "kBitFaultCoalesce");
 static_assert(Bits(FlagSet{.sparse_buffer_gc=true}) >> kBitSparseBufferGc & 1, "kBitSparseBufferGc");
+static_assert(Bits(FlagSet{.write_cover_skip=true}) >> kBitWriteCoverSkip & 1, "kBitWriteCoverSkip");
 // Low kRevisionShift bits flags; remaining bits revision. One atomic publication.
 // Starts at the defaults (revision 0) so a reader that runs before the first Refresh sees them.
 inline std::atomic<uint64_t> g_published{Bits(FlagSet{})};
@@ -201,6 +215,10 @@ inline FlagSet Current() {
  f.direct_eop_interrupts=(bits>>30&1u)!=0;
  f.fault_coalesce=(bits>>31&1u)!=0;
  f.sparse_buffer_gc=(bits>>32&1u)!=0;
+ f.write_cover_skip=(bits>>33&1u)!=0;
+ f.aged_writeback=(bits>>34&1u)!=0;
+ f.compute_resolve_ahead=(bits>>35&1u)!=0;
+ f.fsr1=(bits>>36&1u)!=0;
  return f;
 }
 inline uint64_t Revision() { return g_published.load(std::memory_order_relaxed)>>kRevisionShift; }
@@ -249,6 +267,10 @@ inline bool* FieldFor(FlagSet& f,const char* name) {
  if (!std::strcmp(name,kSwitchableFlags[30])) return &f.direct_eop_interrupts;
  if (!std::strcmp(name,kSwitchableFlags[31])) return &f.fault_coalesce;
  if (!std::strcmp(name,kSwitchableFlags[32])) return &f.sparse_buffer_gc;
+ if (!std::strcmp(name,kSwitchableFlags[33])) return &f.write_cover_skip;
+ if (!std::strcmp(name,kSwitchableFlags[34])) return &f.aged_writeback;
+ if (!std::strcmp(name,kSwitchableFlags[35])) return &f.compute_resolve_ahead;
+ if (!std::strcmp(name,kSwitchableFlags[36])) return &f.fsr1;
  return nullptr;
 }
 inline void Trim(std::string& s) {

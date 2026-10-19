@@ -549,6 +549,12 @@ struct ShaderInfo {
 	bool                            compute_derivatives           = false;
 	bool                            image_gather_extended         = false;
 	bool                            function_lds                  = false;
+	// Every LDS access of a non-compute stage is LaneId * 4 plus constants (guest VGPR spills to
+	// per-lane LDS slots; experiment LdsLaneSlots). The per-invocation array is then indexed by
+	// the constants alone: a shift by LaneId * 4 for every access, which keeps all aliasing,
+	// makes the array small (function_lds_dwords) and lets the host compiler keep it in registers.
+	bool                            function_lds_lane_slots       = false;
+	uint32_t                        function_lds_dwords           = 0;
 	bool                            function_scratch              = false;
 	bool                            pixel_valid_mask              = false;
 	bool                            buffer_int64_atomics          = false;
@@ -730,6 +736,33 @@ struct ResourcePlan {
 	mutable std::vector<int32_t>       direct_descriptor_offsets;
 	// Flat slots a direct refresh filled (plans with control flow skip unreached blocks).
 	mutable std::vector<uint8_t>       direct_filled;
+	// Direct plans with control flow: each block's read runs (direct_cf_run_begin has one entry
+	// per block plus an end), built for one batching mode, and the sources active on entry.
+	struct DirectCfRun {
+		uint32_t slot  = 0;
+		uint32_t count = 0;
+	};
+	mutable std::vector<DirectCfRun> direct_cf_runs;
+	mutable std::vector<uint32_t>    direct_cf_run_begin;
+	mutable std::vector<uint8_t>     direct_cf_active;
+	mutable int8_t                   direct_cf_batch = -1; // -1 = not built
+	mutable bool                     direct_cf_valid = false;
+	// Per block: the inputs its branch condition depends on (user data, flat words, shader base)
+	// when it depends on nothing else, and the result for the inputs seen last.
+	struct DirectCfCondition {
+		enum class Kind : uint8_t { UserData, Flat, ShaderBase };
+		struct Leaf {
+			Kind     kind  = Kind::UserData;
+			uint32_t index = 0;
+		};
+		static constexpr size_t MaxLeaves = 16;
+		std::vector<Leaf>     leaves;
+		std::vector<uint64_t> last_values;
+		uint32_t              last_result = 0;
+		bool                  cacheable   = false;
+		bool                  has_last    = false;
+	};
+	mutable std::vector<DirectCfCondition> direct_cf_conditions;
 	// Linearized SRT read expressions (KYTY_SRT_TAPE=1). Built lazily on the GPU thread,
 	// one per variant: [0] = no clean evaluator, [1] = with clean evaluator. Ops are in the
 	// exact order the recursive walker would evaluate them, so captured reads and failure

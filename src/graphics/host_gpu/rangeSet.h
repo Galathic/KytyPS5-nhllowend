@@ -4,6 +4,7 @@
 #include "common/assert.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <map>
 
@@ -13,6 +14,8 @@ class RangeSet final {
 public:
 	void Add(uint64_t address, uint64_t size) {
 		const auto end = End(address, size);
+		// Every path below covers [address, end) and keeps ranges already marked.
+		FilterMark(address, end);
 		// Written ranges are added again for every draw that binds them: extend a range that
 		// begins at or before the address in place, and allocate a node only for a new range.
 		auto it = m_ranges.upper_bound(address);
@@ -57,9 +60,21 @@ public:
 				break;
 			}
 		}
+		// The filter stays a superset; refresh it once enough removals made it loose.
+		if (++m_filter_stale >= 256) {
+			m_filter = {};
+			for (const auto& [begin, last]: m_ranges) {
+				FilterMark(begin, last);
+			}
+			m_filter_stale = 0;
+		}
 	}
 
-	void Clear() { m_ranges.clear(); }
+	void Clear() {
+		m_ranges.clear();
+		m_filter       = {};
+		m_filter_stale = 0;
+	}
 
 	template <typename Func>
 	void ForEach(Func&& func) const {
@@ -72,6 +87,9 @@ public:
 		const auto end = End(address, size);
 		// O(1) reject outside the overall span (stored ranges are disjoint and ordered).
 		if (m_ranges.empty() || end <= m_ranges.begin()->first || address >= m_ranges.rbegin()->second) {
+			return false;
+		}
+		if (!FilterMayIntersect(address, end)) {
 			return false;
 		}
 		auto       it  = m_ranges.lower_bound(address);
@@ -117,7 +135,41 @@ private:
 		return address + size;
 	}
 
-	std::map<uint64_t, uint64_t> m_ranges;
+	// Intersects() runs for nearly every resource read and download check: one bit per 64 KiB
+	// chunk (chunk number % 1024) that any range touches answers most misses without the tree
+	// walk. Add() sets bits, Subtract() leaves them until the periodic rebuild.
+	static constexpr uint32_t FilterShift = 16;
+	static constexpr uint64_t FilterBits  = 1024;
+
+	void FilterMark(uint64_t begin, uint64_t end) {
+		const uint64_t first = begin >> FilterShift;
+		const uint64_t last  = (end - 1) >> FilterShift;
+		if (last - first >= FilterBits - 1) {
+			m_filter.fill(~uint64_t {0});
+			return;
+		}
+		for (uint64_t chunk = first; chunk <= last; chunk++) {
+			m_filter[(chunk % FilterBits) / 64] |= uint64_t {1} << (chunk % 64);
+		}
+	}
+
+	[[nodiscard]] bool FilterMayIntersect(uint64_t address, uint64_t end) const {
+		const uint64_t first = address >> FilterShift;
+		const uint64_t last  = (end - 1) >> FilterShift;
+		if (last - first >= 8) {
+			return true;
+		}
+		for (uint64_t chunk = first; chunk <= last; chunk++) {
+			if (((m_filter[(chunk % FilterBits) / 64] >> (chunk % 64)) & 1u) != 0) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	std::map<uint64_t, uint64_t>           m_ranges;
+	std::array<uint64_t, FilterBits / 64> m_filter {};
+	uint32_t                               m_filter_stale = 0;
 };
 
 } // namespace Libs::Graphics

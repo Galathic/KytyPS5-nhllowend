@@ -10,6 +10,19 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
+// Ordinary (non-strict) resource-table reads dereference guest memory. When set, this reader is
+// tried first; it returns false to keep the plain read (experiment FaultPageReads).
+using FaultPageReader = bool (*)(uint64_t address, void* data, uint64_t size);
+void SetFaultPageReader(FaultPageReader reader);
+// Experiment GpuConditionsBothPaths: set while a direct resource walk evaluates a branch condition.
+// Strict reads then decline GPU-written bytes instead of waiting for the GPU to write them back;
+// the walk takes both successors (the union of the resources of both paths).
+[[nodiscard]] bool ConditionReadsNonBlocking() noexcept;
+void               SetConditionReadsNonBlocking(bool value) noexcept;
+// The reader, when set; false when the plain read must be used.
+[[nodiscard]] bool TryFaultPageRead(uint64_t address, void* data, uint64_t size);
+
+
 // Canonical module-affecting resource state. Runtime addresses and descriptor payloads remain in
 // ResourceSnapshot and therefore do not create shader permutations.
 struct ResourceSpecialization {

@@ -9,6 +9,8 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/presentation/videoOut.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "kernel/memory.h"
 #include "libs/errno.h"
 
 #include <algorithm>
@@ -28,6 +30,14 @@ RenderContext::RenderContext(GraphicContext& graphics)
       m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache),
       m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	// Experiment FaultPageReads: resource-table reads of a page the GPU thread took a read fault on
+	// (the GPU wrote other bytes of it) read clean bytes through the backing instead of faulting
+	// again; GPU-written bytes still fault and download.
+	ShaderRecompiler::IR::SetFaultPageReader([](uint64_t address, void* data, uint64_t size) {
+		return Common::Experiments::Enabled(Common::Experiments::FaultPageReads) &&
+		       LibKernel::Memory::IsReadFaultPage(address, size) &&
+		       LibKernel::Memory::TryReadCleanBufferBacking(address, data, size);
+	});
 }
 
 RenderContext::~RenderContext() {
@@ -77,6 +87,9 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		}
 	}
 	ProtectStats::CountFault(access == PageFaultAccess::Write);
+	if (access == PageFaultAccess::Write && CpReadDebugEnabled()) {
+		ProtectStats::NoteWriteFaultPage(fault_vaddr);
+	}
 	Common::Timeline::Mark(access == PageFaultAccess::Write ? "fault-write" : "fault-read", fault_vaddr);
 	// KYTY_PERF_STATS: fault time includes any synchronous readback it triggers (overlaps readback).
 	FrameBreakdown::Timer fault_timer(FrameBreakdown::g_counters.fault_ns);
@@ -115,24 +128,26 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		if (FrameBreakdown::Enabled()) {
 			FrameBreakdown::SpecNoteFault(fault_vaddr);
 		}
-		{
-			FrameBreakdown::FaultTimer t(FrameBreakdown::g_fault_cost.buf_inv_ns);
-			m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
-		}
-		{
-			FrameBreakdown::FaultTimer t(FrameBreakdown::g_fault_cost.tex_inv_ns);
-			m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
-		}
 		// KYTY_FAULT_COALESCE: release the clean neighbors of the faulting page's aligned window
 		// (KYTY_FAULT_COALESCE_PAGES tracker pages, default 16) in one protection change. Pages that
 		// are GPU-modified or already CPU-dirty are skipped; marking an unwritten page CPU-dirty
-		// only costs an upload.
-		if (Common::RuntimeFlags::Current().fault_coalesce) {
-			static const uint64_t window = [] {
+		// only costs an upload. The window is released before the faulting page, with it when it
+		// is clean: one protection change instead of three (the page, then the neighbors on each
+		// side of it; in-play A/B: protect calls -41%, those of the faulting threads -56%).
+		const auto release_window = [&] {
+			if (!Common::RuntimeFlags::Current().fault_coalesce) {
+				return;
+			}
+			static const uint64_t wide_window = [] {
 				const char* value = std::getenv("KYTY_FAULT_COALESCE_PAGES");
 				const auto  pages = value != nullptr ? std::strtoull(value, nullptr, 10) : 16ull;
 				return std::bit_ceil(std::clamp<uint64_t>(pages, 1, 256)) * TRACKER_PAGE_SIZE;
 			}();
+			// Experiment WideFaultWindows off: 4-page windows. NHL 27 faults ~200 times per frame and
+			// the 16-page windows upload ~11 MB per frame, mostly unwritten neighbors.
+			const uint64_t window = Common::Experiments::Enabled(Common::Experiments::WideFaultWindows)
+			                            ? wide_window
+			                            : std::min<uint64_t>(wide_window, 4 * TRACKER_PAGE_SIZE);
 			const uint64_t begin = fault_vaddr & ~(window - 1);
 			if (window > TRACKER_PAGE_SIZE && IsMapped(begin, window)) {
 				const uint64_t marked = m_buffer_cache.MarkCpuDirtyAhead(begin, window);
@@ -141,6 +156,15 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 					FrameBreakdown::Add(FrameBreakdown::g_counters.port_fault_pages, marked);
 				}
 			}
+		};
+		release_window();
+		{
+			FrameBreakdown::FaultTimer t(FrameBreakdown::g_fault_cost.buf_inv_ns);
+			m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
+		}
+		{
+			FrameBreakdown::FaultTimer t(FrameBreakdown::g_fault_cost.tex_inv_ns);
+			m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 		}
 		// KYTY_FAULT_AHEAD: streaming writers (ring buffers) fault on every page they touch
 		// each frame, and each page is re-protected after its upload. Unprotect the next
@@ -154,6 +178,9 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		}
 	} else {
 		FrameBreakdown::FaultTimer t(FrameBreakdown::g_fault_cost.rd_readmem_ns);
+		if (GuestGpu::IsGpuThread()) {
+			LibKernel::Memory::NoteReadFaultPage(fault_vaddr);
+		}
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size, false, BufferCache::ReadCaller::Fault);
 	}
 	return true;
@@ -190,6 +217,19 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 	return m_mapped_ranges.Contains(vaddr, size);
 }
 
+bool RenderContext::IsReadProtected(uint64_t vaddr, uint64_t size) const noexcept {
+	if (size == 0 || !GuestRange {vaddr, size}.Valid()) {
+		return false;
+	}
+	const auto page_size = m_page_manager.GetPageSize();
+	for (auto page = vaddr & ~(page_size - 1); page < vaddr + size; page += page_size) {
+		if (m_page_manager.IsReadWatched(page)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 uint64_t RenderContext::MappedRangesVersion() const noexcept {
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	return m_mapped_ranges_version;
@@ -219,26 +259,50 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		if (m_command_scheduler.Active()) {
 			m_command_scheduler.PopPendingOperations();
 		}
-		const bool active       = m_command_scheduler.Active();
-		const bool gpu_modified = active && m_buffer_cache.IsRegionGpuModified(vaddr, size);
-		const bool images       = active && m_texture_cache.HasImagesInRegion(vaddr, size);
-		const bool guest_ops    = active && m_command_scheduler.HasPendingGuestOperations(vaddr, size);
-		bool       drain        = gpu_modified || images || guest_ops;
+		const bool active  = m_command_scheduler.Active();
+		const bool gpu     = active && m_buffer_cache.IsRegionGpuModified(vaddr, size);
+		const bool images  = active && !gpu && m_texture_cache.HasImagesInRegion(vaddr, size);
+		const bool pending = active && !gpu && !images && m_command_scheduler.HasPendingGuestOperations(vaddr, size);
+		bool       drain   = gpu || images || pending;
 		// Experiment UnmapBufferWait: when only GPU-written buffer bytes are in the range, the
 		// write-back below downloads them, and a download already waits for the submission that
 		// last wrote the buffer (or flushes and waits when the writer is still being recorded).
 		// Draining the whole GPU first only adds the latency of the work queued after it.
-		const bool buffer_wait = drain && !images && !guest_ops &&
-		                         Common::Experiments::Enabled(Common::Experiments::UnmapBufferWait);
+		const bool buffer_wait = gpu && Common::Experiments::Enabled(Common::Experiments::UnmapBufferWait) &&
+		                         !m_texture_cache.HasImagesInRegion(vaddr, size) &&
+		                         !m_command_scheduler.HasPendingGuestOperations(vaddr, size);
 		if (buffer_wait) {
 			drain = false;
 		}
+		const auto start   = CpReadDebugEnabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 		const auto unmap_start = FrameBreakdown::Enabled() ? std::chrono::steady_clock::now()
 		                                                   : std::chrono::steady_clock::time_point {};
 		if (drain) {
 			const auto tick = m_command_scheduler.CurrentTick();
 			m_command_scheduler.Finish();
 			m_command_scheduler.WaitPriorityOperations(tick);
+		}
+		if (CpReadDebugEnabled()) {
+			// KYTY_DBG_CP_READS: unmaps by why they drained the GPU, NHL27UNMAP every 2 s (execution thread).
+			static uint64_t counts[4] {}, ns[4] {}, bytes = 0;
+			static auto     last  = std::chrono::steady_clock::now();
+			const auto      now   = std::chrono::steady_clock::now();
+			const size_t    why   = gpu ? 1 : images ? 2 : pending ? 3 : 0;
+			counts[why]++;
+			ns[why] += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count());
+			bytes += size;
+			if (now - last >= std::chrono::seconds(2)) {
+				last = now;
+				std::printf("NHL27UNMAP: none=%llu gpu-modified=%llu (%.1f ms) images=%llu (%.1f ms) pending=%llu (%.1f ms) MiB=%.1f\n",
+				            static_cast<unsigned long long>(counts[0]), static_cast<unsigned long long>(counts[1]),
+				            static_cast<double>(ns[1]) / 1e6, static_cast<unsigned long long>(counts[2]),
+				            static_cast<double>(ns[2]) / 1e6, static_cast<unsigned long long>(counts[3]),
+				            static_cast<double>(ns[3]) / 1e6, static_cast<double>(bytes) / (1024.0 * 1024.0));
+				std::fflush(stdout);
+				std::fill(std::begin(counts), std::end(counts), 0);
+				std::fill(std::begin(ns), std::end(ns), 0);
+				bytes = 0;
+			}
 		}
 		BufferCache::WriteTagScope tag(BufferCache::WriteTag::Unmap);
 		m_buffer_cache.InvalidateMemory(vaddr, size);
@@ -324,10 +388,9 @@ void RenderContext::PrepareBda() {
 		const char* value = std::getenv("KYTY_PERF_STATS");
 		return value != nullptr && value[0] == '1';
 	}();
-	static const bool dirty_regions = [] {
-		const char* value = std::getenv("KYTY_BDA_DIRTY_REGIONS");
-		return value != nullptr && value[0] == '1' && value[1] == '\0';
-	}();
+	// KYTY_BDA_DIRTY_REGIONS (experiment bit, switchable while running: the dirty-region queue
+	// fills either way, and a full scan covers whatever it holds).
+	const bool dirty_regions = Common::Experiments::Enabled(Common::Experiments::BdaDirtyRegions);
 	FrameBreakdown::Add(FrameBreakdown::g_counters.bda_calls);
 	FrameBreakdown::Timer total_timer(FrameBreakdown::g_counters.bda_total_ns);
 	std::shared_lock<decltype(m_mapped_ranges_mutex)> lock;
@@ -352,7 +415,11 @@ void RenderContext::PrepareBda() {
 	}
 	const auto cpu = m_buffer_cache.CpuModificationGeneration();
 	const auto registrations = m_buffer_cache.RegistrationGeneration();
-	const bool unchanged = cache_enabled && cpu == m_bda_cpu_generation &&
+	// Pages left by the last synchronization that this operation needs (their epoch passed).
+	const bool left_due = m_bda_pages_left &&
+	                      (!m_operation_epoch_valid ||
+	                       RegionManager::EpochBefore(m_bda_first_left, m_operation_write_epoch));
+	const bool unchanged = cache_enabled && !left_due && cpu == m_bda_cpu_generation &&
 	                       registrations == m_bda_registration_generation &&
 	                       m_mapping_generation == m_bda_mapping_generation;
 	if (unchanged) {
@@ -376,7 +443,18 @@ void RenderContext::PrepareBda() {
 				FrameBreakdown::Timer sync_timer(FrameBreakdown::g_counters.bda_sync_ns);
 				FrameBreakdown::BufScope buf_scope(2);
 				FrameBreakdown::VAdd(FrameBreakdown::g_buf.bda_syncs);
-				drained = m_buffer_cache.SynchronizeBuffersInRanges(m_mapped_ranges, full);
+				// Only the pages written before this operation was emitted: pages the game is still
+				// filling for later submissions are not uploaded and protected again just to fault
+				// once more (in-play A/B: protect calls and write faults -20%).
+				if (m_operation_epoch_valid) {
+					uint32_t first_left = 0;
+					m_bda_pages_left = m_buffer_cache.SynchronizeBuffersInRangesBefore(
+					    m_mapped_ranges, full, m_operation_write_epoch, first_left);
+					m_bda_first_left = first_left;
+				} else {
+					drained          = m_buffer_cache.SynchronizeBuffersInRanges(m_mapped_ranges, full);
+					m_bda_pages_left = false;
+				}
 			}
 		} else {
 			// Nothing to upload when no page became CPU dirty, no buffer was registered and no

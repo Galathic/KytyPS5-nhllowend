@@ -22,29 +22,26 @@ A private working fork of [KytyPS5](https://github.com/KytyPS5/KytyPS5) focused 
 
 FPS ranges in normal play mode (no profiler or debug logging), measured after the lighting fix.
 
-| Scene | RX 6800 XT, Ryzen 5 5600 32 GB DDR4-3200| RTX 3070, Ryzen 7 3800XT, 16 GB DDR4-3600 |
+| Scene | RX 6800 XT, Ryzen 5 5600 32 GB DDR4-3200| RX 9060 XT, Ryzen 5 9600x|
 |---|---|---|
-| Main menu | 14-19 | 10-13 |
-| Franchise menus (game caps at 30) | 26-29 | 19-21 |
-| Team select / versus (players shown) | 7-12 | 8-9 |
-| In match | 4-6 | 1-5 |
+| Main menu (game caps at 30) | 26-30| 30 |
+| Franchise menus (game caps at 30) | 30 | 30 |
+| Team select | 18-26 | ? |
+| In match | 12-19 | 22-28 |
+| Free skate | 34-39 | 49-56 |
 
-The menus are mostly limited by CPU-side per-draw preparation (descriptor/resource setup).
-Gameplay also has heavy GPU passes. The goal for menus is a stable 30 fps.
+Fps is mainly limited by CPU-side per-draw preparation (descriptor/resource setup). Newer CPU's will preform better due to
+greater single thread performance.
 
 ## Known bugs
 
-- **Jersey cloth glitches** in menus when jerseys move or flow quickly.
-- **Some skin tones look wrong** (seen on a camera pan to the bench).
-- **Wrong player model on the Franchise jersey-select screen**: with VAN vs EDM, the EDM side shows a
-  Vancouver player (#17 Hronek, VAN home jersey) instead of an Edmonton player.
-- **Black band above the bottom ticker** on the Franchise hub: the final composite pass
-  (cs `40d1ee8b401c8219`) cuts the backdrop off below ~88% of the screen height. Not yet compared with the real console.
-- **Occasional host crash** while navigating Franchise menus (access violation in a `memcpy`; the caller isn't identified yet).
-- **Some commentary lines garbled**: the Opus decoder rejects valid packets with more than 6 frames and 40/60 ms frames.
-- **RenderDoc capture mode** (`--rd`) currently ends in `VK_ERROR_DEVICE_LOST`.
-- NHL 26: two GPU persistent-thread compute shaders (`3b25cdb347182b6d`, `613d940c02920148`) hang the GPU and are
-  skipped (`KYTY_DBG_SKIP_CS`). The likely cause is GDS ops ignoring the M0 base.
+- **Jersey cloth glitches**
+- **Some skin tones look wrong in cut-scenes**
+- **Occasional crashes**
+- **Blurry facial hair**
+- **Bright pixels**
+- **Scrambled team logos**
+- **Volume normalization issues**
 
 ## Notable fixes in this fork
 
@@ -99,6 +96,27 @@ KYTY_PROGRAM_RESOURCE_CACHE=1
 KYTY_PERF_NO_SYNC_READBACK=1
 ```
 
+Performance switches measured on NHL 27 (`docs/claude-nhl27.md` has what each does):
+
+```
+KYTY_READBACK_QUEUE=1
+KYTY_DIRECT_EOP_INTERRUPTS=1
+KYTY_LONG_BUFFER_GC_AGE=1
+KYTY_SPARSE_BUFFER_GC=1
+KYTY_PM4_WRITE_DATA_FAST=1
+KYTY_FALSE_SHARE_READS=1
+KYTY_ASYNC_SUBMIT=1
+KYTY_LAZY_SHARED_WRITES=1
+KYTY_FAULT_PAGE_READS=1
+KYTY_GPU_COLOR_CLEAR=1
+KYTY_ASYNC_GUEST_READS=1
+KYTY_BDA_DIRTY_REGIONS=1
+KYTY_NATIVE_FP16=1
+```
+
+Building with `-DKYTY_PGO=use` (clang-cl 22.1.8) adds about 15% from the NHL 27 gameplay profile in
+`tools/pgo`.
+
 Useful debug options:
 
 | Variable | What it does |
@@ -117,6 +135,8 @@ Useful debug options:
 
 - [KytyPS5](https://github.com/KytyPS5/KytyPS5) and the original [Kyty](https://github.com/InoriRus/Kyty).
 - Cryan ([GitColeS](https://github.com/GitColeS)): front-face lighting fix and testing.
+- Petr ([petrmolek]https://github.com/petrmolek): Performance development
+- Toucann ([MrToucann]https://github.com/MrToucann): Performance development
 - AnyPS5 developers, for comparison data on the lighting defect.
 
 ## Building

@@ -1,6 +1,7 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 
+#include "common/experiments.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -15,6 +16,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/presenter.h"
+#include "graphics/presentation/fsr/nhl27Fsr3.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
@@ -477,11 +479,46 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	queue_create_info.queueFamilyIndex = queue_family;
 	queue_create_info.queueCount       = 1;
 	queue_create_info.pQueuePriorities = queue_priority;
+	std::vector<vk::DeviceQueueCreateInfo> queue_create_infos;
 	{
 		const auto families = physical_device.getQueueFamilyProperties();
 		if (queue_family < families.size() && families[queue_family].queueCount >= 2) {
 			queue_create_info.queueCount = 2;
 		}
+		queue_create_infos.push_back(queue_create_info);
+		graphics.buffer_families = {queue_family};
+		// Readback queues beside the graphics engine (experiments ReadbackCompute/Transfer).
+		const char* extra = std::getenv("KYTY_READBACK_FAMILIES");
+		if (extra == nullptr || extra[0] != '0') {
+			const auto find = [&](vk::QueueFlags want, vk::QueueFlags reject) {
+				for (uint32_t i = 0; i < families.size(); i++) {
+					if (i != queue_family && families[i].queueCount != 0 && (families[i].queueFlags & want) == want &&
+					    !(families[i].queueFlags & reject)) {
+						return i;
+					}
+				}
+				return static_cast<uint32_t>(-1);
+			};
+			const uint32_t compute  = find(vk::QueueFlagBits::eCompute, vk::QueueFlagBits::eGraphics);
+			const uint32_t transfer = find(vk::QueueFlagBits::eTransfer,
+			                               vk::QueueFlagBits::eGraphics | vk::QueueFlagBits::eCompute);
+			for (const auto family: {compute, transfer}) {
+				if (family == static_cast<uint32_t>(-1)) {
+					continue;
+				}
+				vk::DeviceQueueCreateInfo info {};
+				info.queueFamilyIndex = family;
+				info.queueCount       = 1;
+				info.pQueuePriorities = queue_priority;
+				queue_create_infos.push_back(info);
+				graphics.buffer_families.push_back(family);
+			}
+			graphics.readback_families[1] = compute;
+			graphics.readback_families[2] = transfer;
+		} else {
+			graphics.readback_families[1] = graphics.readback_families[2] = static_cast<uint32_t>(-1);
+		}
+		graphics.readback_families[0] = queue_family;
 	}
 
 	vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write_ext {};
@@ -668,6 +705,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.vertexPipelineStoresAndAtomics != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.dualSrcBlend != VK_TRUE);
 	vk::PhysicalDeviceFeatures device_features {};
+	if (Nhl27Fsr3::Enabled()) {
+		device_features.shaderInt16 = supported_features2.features.shaderInt16;
+		std::printf("NHL27FSR3GAME feature=shaderInt16 enabled=%u\n",
+			unsigned(device_features.shaderInt16));
+		std::fflush(stdout);
+	}
 	device_features.fragmentStoresAndAtomics = VK_TRUE;
 	device_features.samplerAnisotropy        = VK_TRUE;
 	device_features.multiDrawIndirect = supported_features2.features.multiDrawIndirect;
@@ -714,6 +757,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 #endif
 	if (robustness2_ext_enabled) {
 		robustness2.robustBufferAccess2 = supported_robustness2.robustBufferAccess2;
+		g_shader_robust_buffer_access2.store(supported_robustness2.robustBufferAccess2 == VK_TRUE,
+		                                     std::memory_order_relaxed);
 		robustness2.robustImageAccess2  = supported_robustness2.robustImageAccess2;
 		robustness2.nullDescriptor      = supported_robustness2.nullDescriptor;
 	}
@@ -731,10 +776,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	    graphics.compute_subgroup_size_control_enabled ? VK_TRUE : VK_FALSE;
 
 	{
-		// KYTY_NATIVE_FP16=1: native f16 arithmetic for plain V_PK_{ADD,MUL,FMA,FMAC}_F16.
-		const char* fp16_env   = std::getenv("KYTY_NATIVE_FP16");
-		const bool  fp16_gate  = fp16_env != nullptr && fp16_env[0] == '1';
-		const bool  fp16_ok    = fp16_gate && supported_features12.shaderFloat16 == VK_TRUE;
+		// Native f16 arithmetic for plain V_PK_{ADD,MUL,FMA,FMAC}_F16: the feature is enabled whenever
+		// the device has it; experiment NativeFp16 (KYTY_NATIVE_FP16=1) selects the codegen.
+		const bool  fp16_gate  = Common::Experiments::Enabled(Common::Experiments::NativeFp16);
+		const bool  fp16_ok    = supported_features12.shaderFloat16 == VK_TRUE;
 		uint32_t    fp16_modes = 0;
 		if (fp16_ok) {
 			features12.shaderFloat16 = VK_TRUE;
@@ -756,13 +801,14 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 			}
 		}
 		g_shader_native_fp16_modes.store(fp16_modes, std::memory_order_relaxed);
+		g_shader_native_pkrtz.store(properties2.properties.vendorID == 0x1002u, std::memory_order_relaxed);
 		g_shader_native_fp16.store(fp16_ok, std::memory_order_relaxed);
 		LOGF("Vulkan shaderFloat16=%d gate=%d native_fp16=%d denormPreserve16=%d szinp16=%d rte16=%d\n",
 		     supported_features12.shaderFloat16 == VK_TRUE, fp16_gate, fp16_ok,
 		     float_controls.shaderDenormPreserveFloat16 == VK_TRUE,
 		     float_controls.shaderSignedZeroInfNanPreserveFloat16 == VK_TRUE,
 		     float_controls.shaderRoundingModeRTEFloat16 == VK_TRUE);
-		std::printf("NHL27CODEGEN native_fp16=%d\n",
+		std::printf("NHL27CODEGEN native_fp16=%d (device %d)\n", fp16_ok && fp16_gate ? 1 : 0,
 		            fp16_ok ? 1 : 0);
 		std::fflush(stdout);
 	}
@@ -799,6 +845,18 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		image_atomic_int64.sparseImageInt64Atomics = VK_FALSE;
 		create_info.pNext = &image_atomic_int64;
 	}
+	vk::PhysicalDeviceConditionalRenderingFeaturesEXT conditional_rendering {};
+	if (graphics.conditional_rendering_enabled) {
+		conditional_rendering.pNext                = const_cast<void*>(create_info.pNext);
+		conditional_rendering.conditionalRendering = VK_TRUE;
+		create_info.pNext                          = &conditional_rendering;
+	}
+	vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR pipeline_executable {};
+	if (graphics.pipeline_stats_enabled) {
+		pipeline_executable.pNext                  = const_cast<void*>(create_info.pNext);
+		pipeline_executable.pipelineExecutableInfo = VK_TRUE;
+		create_info.pNext                          = &pipeline_executable;
+	}
 	// VK_EXT_device_fault: lets a device loss report the faulting GPU address.
 	vk::PhysicalDeviceFaultFeaturesEXT device_fault {};
 	if (HasExtension(device_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
@@ -810,8 +868,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		maintenance8.pNext = const_cast<void*>(create_info.pNext);
 		create_info.pNext = &maintenance8;
 	}
-	create_info.pQueueCreateInfos       = &queue_create_info;
-	create_info.queueCreateInfoCount    = 1;
+	create_info.pQueueCreateInfos       = queue_create_infos.data();
+	create_info.queueCreateInfoCount    = static_cast<uint32_t>(queue_create_infos.size());
 	create_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
 	create_info.ppEnabledExtensionNames = device_extensions.data();
 	create_info.pEnabledFeatures        = &device_features;
@@ -1165,6 +1223,11 @@ void WindowContext::CreateVulkan() {
 	    VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
 	    VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
 	    "VK_KHR_maintenance1"};
+#if KYTY_ENABLE_FSR3
+	// SDK 1.1.4 resolves these KHR aliases even on Vulkan 1.3 devices.
+	device_extensions.push_back(VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME);
+	device_extensions.push_back(VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME);
+#endif
 
 #if defined(__APPLE__)
 	// MoltenVK lacks VK_EXT_depth_clip_enable and VK_EXT_color_write_enable; the renderer
@@ -1244,6 +1307,16 @@ void WindowContext::CreateVulkan() {
 				device_extensions.push_back(extension);
 			}
 		}
+		if (HasExtension(available_extensions, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
+			graphic_ctx.conditional_rendering_enabled = true;
+		}
+		// KYTY_DBG_PIPELINE_STATS=<hex hash>[,...]: driver statistics and ISA of those shaders' pipelines.
+		if (std::getenv("KYTY_DBG_PIPELINE_STATS") != nullptr &&
+		    HasExtension(available_extensions, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+			graphic_ctx.pipeline_stats_enabled = true;
+		}
 		// Used only by the KYTY_IDLE_TRACE GPU timeline (GPU -> CPU clock conversion).
 		if (HasExtension(available_extensions, VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
@@ -1269,6 +1342,15 @@ void WindowContext::CreateVulkan() {
 		    families[graphic_ctx.queue_family].queueCount >= 2) {
 			graphic_ctx.device.getQueue(graphic_ctx.queue_family, 1, &graphic_ctx.readback_queue);
 		}
+		graphic_ctx.readback_queues[0] = graphic_ctx.readback_queue;
+		for (uint32_t kind = 1; kind < 3; kind++) {
+			if (graphic_ctx.readback_families[kind] != static_cast<uint32_t>(-1)) {
+				graphic_ctx.device.getQueue(graphic_ctx.readback_families[kind], 0,
+				                            &graphic_ctx.readback_queues[kind]);
+			}
+		}
+		std::printf("NHL27READBACK: queue families graphics=%u compute=%d transfer=%d\n", graphic_ctx.queue_family,
+		            static_cast<int>(graphic_ctx.readback_families[1]), static_cast<int>(graphic_ctx.readback_families[2]));
 	}
 
 	if (!graphic_ctx.CreateAllocator()) {

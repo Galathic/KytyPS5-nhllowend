@@ -151,6 +151,14 @@ bool                   TryReadCleanBackingAnyThread(uint64_t vaddr, void* data, 
 bool                   TryReadCleanBackingShared(uint64_t vaddr, void* data, uint64_t size);
 // Optional GPU-thread clean peek: refusal never downloads, faults or changes output.
 bool                   TryReadCleanBufferBacking(uint64_t vaddr, void* data, uint64_t size);
+// The last 16 pages on which this thread took a GPU-tracking read fault (they are protected because
+// the GPU wrote some of their bytes). Readers of guest memory can read such pages through the
+// backing when their bytes are clean instead of faulting again.
+void                   NoteReadFaultPage(uint64_t vaddr) noexcept;
+[[nodiscard]] bool     IsReadFaultPage(uint64_t vaddr, uint64_t size) noexcept;
+// Whether a plain read of the range would fault on a page the GPU tracking read-protects (one that
+// holds GPU-written bytes not downloaded yet). Any thread.
+[[nodiscard]] bool     IsGpuReadProtected(uint64_t vaddr, uint64_t size) noexcept;
 // GPU-thread clean validation (DRAWPREP prefetch): Equal = the backing bytes are not GPU-dirty and equal `expected`;
 // Different = clean but unequal; Dirty = GPU-dirty bytes (never downloaded); Unavailable = preconditions or mapping failed.
 // Never copies, downloads, faults or changes any state.
@@ -160,6 +168,12 @@ CleanBackingCompare    TryValidateCleanBacking(uint64_t vaddr, const void* expec
 // pointer stays readable for the emulator's lifetime and reads what TryReadBacking() reads.
 [[nodiscard]] const void* FindBackingPointer(uint64_t vaddr, uint64_t size);
 bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
+// GPU thread: whether no byte of the range is GPU-dirty in the buffer cache (gpu_images: nor in a
+// GPU-modified image). False off the GPU thread. A range that passes passes for each sub-range, so
+// callers check a page once for the reads within it.
+bool                   IsGpuCleanRange(uint64_t vaddr, uint64_t size, bool gpu_images);
+// TryValidateCleanBacking for a range IsGpuCleanRange already passed (Dirty is never returned).
+CleanBackingCompare    CompareCleanBacking(uint64_t vaddr, const void* expected, uint64_t size);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 // Whether TryReadBacking or TryReadSparseBacking can read the whole range.
 bool                   IsBackingReadable(uint64_t vaddr, uint64_t size);
@@ -167,6 +181,8 @@ bool                   IsBackingReadable(uint64_t vaddr, uint64_t size);
 // means IsBackingReadable still answers as before.
 [[nodiscard]] uint64_t BackingEpoch() noexcept;
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
+// As ClampRangeSize, but 0 (instead of a fatal error) when no byte of the range is mapped.
+[[nodiscard]] uint64_t ClampRangeSizeOrZero(uint64_t vaddr, uint64_t size);
 // Not noexcept: under a Common::SoftExitScope its failure throws to the scope's owner.
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);

@@ -72,6 +72,9 @@ struct ImageDefinition {
 	uint32_t sampled_type = 0;
 };
 
+// True when an LDS address is LaneId * 4 plus a constant; the constant is returned.
+bool MatchLaneSlotLdsAddress(IR::Value address, uint32_t& constant);
+
 struct EmitterState {
 	EmitterState(IR::Program& program_, ShaderStageInputInfo input_info_)
 	    : builder(program_.stage == ShaderType::Mesh ? 0x00010400u : 0x00010300u),

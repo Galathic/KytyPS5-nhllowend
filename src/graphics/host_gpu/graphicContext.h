@@ -40,6 +40,10 @@ struct GraphicContext {
 	bool native_draw_parameters_enabled = false;
 	bool                                      host_query_reset_enabled              = false;
 	bool                                      calibrated_timestamps_enabled         = false;
+	// KYTY_DBG_PIPELINE_STATS: VK_KHR_pipeline_executable_properties is enabled.
+	bool                                      pipeline_stats_enabled                = false;
+	// VK_EXT_conditional_rendering: GPU-side fast-clear checks (experiment GpuColorClear).
+	bool                                      conditional_rendering_enabled         = false;
 	bool                                      mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
 	uint32_t                           subgroup_size                         = 0;
@@ -53,6 +57,14 @@ struct GraphicContext {
 	// Second queue of the same family (null when the family has one): GPU-to-CPU readbacks that
 	// only need to wait for an earlier submission instead of all recorded work.
 	vk::Queue                          readback_queue = nullptr;
+	// Readback queues by kind: 0 = readback_queue, 1 = a compute-only family, 2 = a transfer-only
+	// family (experiments ReadbackCompute / ReadbackTransfer). A second queue of the graphics
+	// family waits for the graphics work running on the same engine; the others run beside it.
+	// Null when the device has no such family, or with KYTY_READBACK_FAMILIES=0.
+	vk::Queue                          readback_queues[3] {};
+	uint32_t                           readback_families[3] {};
+	// Queue families every buffer is shared with (concurrent sharing) when there are several.
+	std::vector<uint32_t>              buffer_families;
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;
@@ -145,8 +157,9 @@ struct VulkanImage {
 	VulkanImageState              state;
 	std::vector<VulkanImageState> subresource_states;
 	VmaAllocation                allocation = nullptr;
-	// Created with parameters DeleteImage can describe again: kept for reuse when deleted.
-	bool recyclable = false;
+	// Created by GraphicContext::CreateImage from parameters it can match again (no pNext, optimal
+	// tiling, exclusive, undefined initial layout): DeleteImage may recycle it.
+	bool                         recyclable = false;
 };
 
 

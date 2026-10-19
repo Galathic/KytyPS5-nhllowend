@@ -49,7 +49,9 @@ public:
 	[[nodiscard]] MemoryUsage        Usage() const noexcept { return m_usage; }
 	[[nodiscard]] uint64_t           CpuAddress() const noexcept { return m_cpu_address; }
 	[[nodiscard]] vk::DeviceAddress BufferDeviceAddress() const noexcept;
-	[[nodiscard]] bool              HasDeviceAddress() const noexcept { return m_device_address != 0; }
+	// False for buffers made without device addresses (the stream buffer that small CPU-written
+	// ranges come from).
+	[[nodiscard]] bool               HasDeviceAddress() const noexcept { return m_device_address != 0; }
 	[[nodiscard]] uint64_t           Offset(uint64_t address) const noexcept {
 		return address - m_cpu_address;
 	}
@@ -73,6 +75,8 @@ public:
 	bool   is_deleted   = false;
 	int    stream_score = 0;
 	size_t lru_id       = 0;
+	// GC tick of the last LRU touch: touching again within a tick changes nothing.
+	mutable uint64_t lru_tick = ~uint64_t {0};
 	// Tick of the last command buffer that wrote this buffer on the GPU (shader write, copy,
 	// fill); a download needs nothing later (KYTY_READBACK_QUEUE).
 	uint64_t last_write_tick = 0;
