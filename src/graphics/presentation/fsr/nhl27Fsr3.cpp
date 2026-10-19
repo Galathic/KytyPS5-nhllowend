@@ -81,7 +81,8 @@ struct Nhl27Fsr3::Impl {
 	Role luma;
 	Nhl27HistoryState last_state {};
 	bool have_last = false, missed = true;
-	uint64_t resets = 0;
+	uint64_t resets = 0, present_skips = 0;
+	std::atomic<uint64_t> presented {0};
 	explicit Impl(GraphicContext& gfx) : graphics(gfx) {
 		if (!gfx.physical_device.getFeatures().shaderInt16) {
 			failed.store(true, std::memory_order_release);
@@ -293,6 +294,13 @@ bool Nhl27Fsr3::HistoryEnabled() {
 	}();
 	return enabled;
 }
+bool Nhl27Fsr3::PresentEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_FSR3_NHL27_PRESENT");
+		return value && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
 bool Nhl27Fsr3::Enabled() {
 #if KYTY_ENABLE_FSR3
 	static const bool enabled = [] {
@@ -418,6 +426,58 @@ void Nhl27Fsr3::OnDispatch(RenderContext& context, CommandBuffer& command, uint6
 				std::fflush(stdout);
 			}
 		});
+		if (PresentEnabled()) {
+			// The guest accumulation dispatch is already recorded; the next guest draw reads this
+			// image and the one after reuses its memory as depth, so the copy must land here.
+			const auto& target = b[7];
+			const auto& guest = context.GetTextureCache().GetImage(target.image_id);
+			const vk::Extent3D extent {frame.output_size.width, frame.output_size.height, 1};
+			if (target.image_id && target.desc.view_info.base_level == 0 &&
+				target.desc.view_info.base_layer == 0 && guest.backing.image &&
+				guest.backing.samples == 1 && guest.backing.format == vk::Format::eR16G16B16A16Sfloat &&
+				guest.backing.extent == extent && (guest.backing.usage & vk::ImageUsageFlagBits::eTransferDst) &&
+				target.layout != vk::ImageLayout::eUndefined) {
+				const vk::Image source = m->images[3].resource.image, destination = guest.backing.image;
+				const vk::ImageLayout layout = target.layout;
+				recorder.RecordExternal([state, source, destination, layout, extent](vk::CommandBuffer native) {
+					// Record() failing leaves the output undefined; keep the guest's own image then.
+					if (!state->last_recorded.load(std::memory_order_acquire)) return;
+					const auto barrier = [native](vk::Image image, vk::ImageLayout from, vk::ImageLayout to) {
+						vk::ImageMemoryBarrier2 b {};
+						b.srcStageMask = b.dstStageMask = S::eAllCommands;
+						b.srcAccessMask = b.dstAccessMask = A::eMemoryRead | A::eMemoryWrite;
+						b.oldLayout = from;
+						b.newLayout = to;
+						b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+						b.image = image;
+						b.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+						vk::DependencyInfo dependency {};
+						dependency.imageMemoryBarrierCount = 1;
+						dependency.pImageMemoryBarriers = &b;
+						native.pipelineBarrier2(dependency);
+					};
+					barrier(source, vk::ImageLayout::eGeneral, vk::ImageLayout::eTransferSrcOptimal);
+					barrier(destination, layout, vk::ImageLayout::eTransferDstOptimal);
+					vk::ImageCopy copy {};
+					copy.srcSubresource = copy.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+					copy.extent = extent;
+					native.copyImage(source, vk::ImageLayout::eTransferSrcOptimal, destination,
+									 vk::ImageLayout::eTransferDstOptimal, 1, &copy);
+					barrier(source, vk::ImageLayout::eTransferSrcOptimal, vk::ImageLayout::eGeneral);
+					barrier(destination, vk::ImageLayout::eTransferDstOptimal, layout);
+					const auto count = state->presented.fetch_add(1, std::memory_order_relaxed) + 1;
+					if (count <= 3 || count % 600 == 0) {
+						std::printf("NHL27FSR3GAME status=presented count=%llu\n",
+									static_cast<unsigned long long>(count));
+						std::fflush(stdout);
+					}
+				});
+			} else if (++m->present_skips <= 8 || m->present_skips % 600 == 0) {
+				std::printf("NHL27FSR3GAME status=present-skip reason=guest-output-layout count=%llu\n",
+							static_cast<unsigned long long>(m->present_skips));
+				std::fflush(stdout);
+			}
+		}
 		InvalidateRedundantBinds();
 		g_compute_pipeline_epoch.fetch_add(1, std::memory_order_relaxed);
 		NoteShaderWork();

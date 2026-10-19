@@ -18,6 +18,9 @@ public:
 	static bool Enabled();
 	// KYTY_FSR3_NHL27_HISTORY=0 restores reset-every-frame; default on.
 	static bool HistoryEnabled();
+	// KYTY_FSR3_NHL27_PRESENT=1 copies the FSR output over the guest's accumulation output, so the
+	// game's later LUT/UI/composite passes run on it; frames FSR rejects keep the guest image.
+	static bool PresentEnabled();
 	void OnDispatch(RenderContext& context, CommandBuffer& command, uint64_t hash,
 					const PreparedBindings& bindings);
 private:
