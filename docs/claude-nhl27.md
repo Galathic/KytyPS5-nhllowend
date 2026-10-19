@@ -452,7 +452,12 @@ per page run and skip clean page runs whole; the resolve thread's GPU-dirty page
 cached per thread while the GPU-modified and pending-download sets keep their version.
 Measured and dropped: a memo of written buffer binds (skip the synchronization while no page of
 the range's tracking regions became CPU dirty or GPU-clean): no gain, the 4 MiB region epochs
-change too often.
+change too often. Protecting all of a BDA synchronization's ranges with one update per tracking
+region (merging runs across already protected pages): the execution thread's protect calls -23%
+but protected bytes +57%, draw cost unchanged: dropped. On the resolve thread, the permutation
+the last resolution of a program took is tried first, and read-watch answers are cached per
+thread while no page gains or loses its read watcher: resolve time per operation -7% (paused
+A/B, with the GPU-dirty page cache).
 
 ## Merged defaults (nhl27 + claude/nhl27-perf)
 
