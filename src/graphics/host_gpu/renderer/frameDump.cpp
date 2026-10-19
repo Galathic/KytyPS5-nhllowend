@@ -941,6 +941,13 @@ void RecordReadback(GraphicContext& gfx, const CommandRecorder& cmd, const Targe
                     uint32_t seq) {
 	char line[256];
 	if (t.w < kMinSize || (t.h < kMinSize && !t.img3d)) return;
+	// KYTY_DBG_FRAME_DUMP_FROM=<seq>: images of the draws and dispatches from that one on only (the
+	// last passes of a frame, which the readback cap otherwise skips).
+	static const uint32_t from = [] {
+		const char* v = std::getenv("KYTY_DBG_FRAME_DUMP_FROM");
+		return v != nullptr ? static_cast<uint32_t>(std::strtoul(v, nullptr, 0)) : 0u;
+	}();
+	if (seq < from) return;
 	if (t.samples > 1) {
 		std::snprintf(line, sizeof(line), "IMG seq=%u %s addr=0x%s %ux%u SKIPPED (multisampled)\n", seq,
 		              label, Hex(t.addr).c_str(), t.w, t.h);
@@ -1148,6 +1155,15 @@ void Request() {
 void OnGuestFlip(CommandBuffer& buffer) {
 	g_trace_frame.fetch_add(1, std::memory_order_relaxed);
 	if (!Enabled()) return;
+	// Scripts request a capture too: a file named framedump.trigger in the working directory
+	// (looked for every 30 flips, removed when found).
+	static uint32_t flips = 0;
+	if (++flips % 30 == 0) {
+		std::error_code ec;
+		if (std::filesystem::remove("framedump.trigger", ec)) {
+			g_request.store(true);
+		}
+	}
 	std::lock_guard lock(g_mutex);
 	if (g_capturing) {
 		FinishCapture(buffer);

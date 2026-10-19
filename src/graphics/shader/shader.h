@@ -111,13 +111,21 @@ inline std::atomic<bool> g_shader_native_pkrtz {false};
 [[nodiscard]] inline bool ShaderBranchlessFormattedLoads() {
 	return ShaderRobustLoads();
 }
+// Codegen option: experiment ExecBranches (key bit 2048). A guest VGPR write under a partial EXEC
+// selects the new value per lane; runs of lane-wise instructions under one EXEC value run in a
+// divergent branch instead, their selects becoming phis where the run's results are used after it
+// (the host compiler masks the writes, as the guest's hardware does).
+[[nodiscard]] inline bool ShaderExecBranches() {
+	return Common::Experiments::Enabled(Common::Experiments::ExecBranches);
+}
 [[nodiscard]] inline uint32_t ShaderFloatCodegenKey() {
 	return static_cast<uint32_t>(ShaderNativeFp16()) | (ShaderNativeMinMax() ? 2u : 0u) |
 	       (ShaderFusedMad() ? 4u : 0u) |
 	       (ShaderRobustLoads() ? (ShaderRobustLoadsKeepExec() ? 24u : 8u) : 0u) |
 	       (ShaderRobustConstReads() ? 32u : 0u) | (ShaderRobustStores() ? 64u : 0u) |
 	       (ShaderNativePkrtz() ? 128u : 0u) | (ShaderNativeF16Sdwa() ? 256u : 0u) |
-	       (ShaderRobustSpillLoads() ? 512u : 0u) | (ShaderBranchlessFormattedLoads() ? 1024u : 0u);
+	       (ShaderRobustSpillLoads() ? 512u : 0u) | (ShaderBranchlessFormattedLoads() ? 1024u : 0u) |
+	       (ShaderExecBranches() ? 2048u : 0u);
 }
 [[nodiscard]] inline uint32_t ShaderNativeFp16Modes() {
 	return g_shader_native_fp16_modes.load(std::memory_order_relaxed);

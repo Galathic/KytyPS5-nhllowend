@@ -1,9 +1,12 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 #include "common/assert.h"
+#include "graphics/shader/recompiler/ir/passes/ExecSelectElimination.h"
+#include "graphics/shader/shader.h"
 
 #include <algorithm>
 #include <bit>
+#include <cstdio>
 #include <cstdlib>
 #include <functional>
 #include <optional>
@@ -409,6 +412,249 @@ void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& 
 	}
 }
 
+// Experiment ExecBranches: a run of instructions of a block that are lane-wise or select a guest
+// VGPR's new value under one EXEC value (Select(exec, new, old)) is emitted inside
+// "if (exec) { ... }": the selects inside it are their new values, and those used after the run
+// become phis of the new value (from the branch) and the old one (from before it). Instructions of
+// the run used outside it that depend on nothing in it are emitted before the branch.
+struct ExecRun {
+	const IR::Inst*              begin = nullptr;
+	const IR::Inst*              end   = nullptr; // nullptr: the run ends the block
+	IR::Value                    exec;
+	std::vector<const IR::Inst*> hoisted;
+	std::vector<const IR::Inst*> branch;
+	std::vector<const IR::Inst*> live_out;
+};
+
+bool IsSelectOpcode(IR::ValueOpcode op) {
+	return op == IR::ValueOpcode::SelectU1 || op == IR::ValueOpcode::SelectU32 || op == IR::ValueOpcode::SelectF32;
+}
+
+// A value that is `new` where EXEC is set and `old` where it is clear: Select(exec, new, old), and
+// LogicalAnd(exec, new) (a V_CMP result under EXEC, false where it is clear). `new_operand` is the
+// argument index of the new value.
+bool ExecPredicated(const IR::Inst& inst, IR::Value exec, IR::Value& new_value, IR::Value& old_value,
+                    size_t& new_operand) {
+	if (IsSelectOpcode(inst.GetOpcode()) && inst.NumArgs() == 3 && inst.Arg(0).Resolve() == exec) {
+		new_value   = inst.Arg(1);
+		old_value   = inst.Arg(2).Resolve();
+		new_operand = 1;
+		return true;
+	}
+	if (inst.GetOpcode() == IR::ValueOpcode::LogicalAnd && inst.NumArgs() == 2) {
+		for (size_t arg = 0; arg < 2; arg++) {
+			if (inst.Arg(arg).Resolve() == exec) {
+				new_value   = inst.Arg(1 - arg);
+				old_value   = IR::Value(false);
+				new_operand = 1 - arg;
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+bool IsExecSelect(const IR::Inst& inst, IR::Value exec) {
+	IR::Value new_value, old_value;
+	size_t    new_operand = 0;
+	return ExecPredicated(inst, exec, new_value, old_value, new_operand);
+}
+
+// The value of an exec-predicated instruction where EXEC is clear, through chains of them inside
+// the run (`inside` decides which producers belong to it).
+template <typename Inside>
+IR::Value ExecOldValue(const IR::Inst& inst, IR::Value exec, Inside&& inside) {
+	IR::Value new_value, old_value;
+	size_t    new_operand = 0;
+	(void)ExecPredicated(inst, exec, new_value, old_value, new_operand);
+	while (const auto* producer = old_value.IsImmediate() ? nullptr : old_value.TryInstruction()) {
+		IR::Value next_new, next_old;
+		if (!inside(producer) || !ExecPredicated(*producer, exec, next_new, next_old, new_operand)) break;
+		old_value = next_old;
+	}
+	return old_value;
+}
+
+uint32_t ExecRunMinSelects() {
+	static const uint32_t minimum = [] {
+		const char* v = std::getenv("KYTY_DBG_EXEC_BRANCH_MIN");
+		return v != nullptr ? static_cast<uint32_t>(std::strtoul(v, nullptr, 0)) : 6u;
+	}();
+	return minimum;
+}
+
+std::vector<ExecRun> FindExecRuns(const IR::Block& block) {
+	std::vector<const IR::Inst*> insts;
+	for (const auto& inst: block) insts.push_back(&inst);
+	const auto* condition_inst = block.condition.IsEmpty() || block.condition.IsImmediate()
+	                                 ? nullptr
+	                                 : block.condition.TryInstruction();
+	const auto* target_inst = block.indirect_target.IsEmpty() || block.indirect_target.IsImmediate()
+	                              ? nullptr
+	                              : block.indirect_target.TryInstruction();
+	const auto  candidate      = [](const IR::Inst& inst) {
+		const auto op = inst.GetOpcode();
+		return (IR::IsLaneWiseOpcode(op) || IsSelectOpcode(op)) && op != IR::ValueOpcode::Phi && !inst.MayHaveSideEffects();
+	};
+	std::vector<ExecRun> runs;
+	size_t               start = 0;
+	while (start < insts.size()) {
+		if (!candidate(*insts[start])) {
+			start++;
+			continue;
+		}
+		size_t end = start;
+		while (end < insts.size() && candidate(*insts[end])) end++;
+		// The run's EXEC value: the condition of its first select whose condition is an
+		// instruction defined before the run.
+		std::unordered_set<const IR::Inst*> in_run(insts.begin() + start, insts.begin() + end);
+		IR::Value exec;
+		for (size_t i = start; i < end && exec.IsEmpty(); i++) {
+			const auto& inst = *insts[i];
+			if (!IsSelectOpcode(inst.GetOpcode()) || inst.NumArgs() != 3) continue;
+			const auto cond = inst.Arg(0).Resolve();
+			if (!cond.IsImmediate() && cond.TryInstruction() != nullptr && !in_run.contains(cond.TryInstruction())) {
+				exec = cond;
+			}
+		}
+		if (exec.IsEmpty()) {
+			start = end;
+			continue;
+		}
+		// Shrink the run until everything it computes is used inside it, is a select under the
+		// EXEC value (a phi after it), or can be computed before the branch.
+		for (;;) {
+			in_run = std::unordered_set<const IR::Inst*>(insts.begin() + start, insts.begin() + end);
+			ExecRun run;
+			run.exec = exec;
+			std::unordered_set<const IR::Inst*> hoisted;
+			size_t                              violation = end;
+			uint32_t                            selects   = 0;
+			for (size_t i = start; i < end && violation == end; i++) {
+				const auto& inst    = *insts[i];
+				bool        outside = &inst == condition_inst || &inst == target_inst;
+				for (const auto& use: inst.Uses()) {
+					IR::Value user_new, user_old;
+					size_t    user_new_operand = 0;
+					if (!in_run.contains(use.user) || hoisted.contains(use.user)) {
+						outside = true;
+					} else if (ExecPredicated(*use.user, exec, user_new, user_old, user_new_operand) &&
+					           use.operand != user_new_operand) {
+						// As an old value or a condition the value is read where EXEC is clear.
+						outside = true;
+					}
+				}
+				if (IsExecSelect(inst, exec)) {
+					const IR::Value old = ExecOldValue(inst, exec, [&](const IR::Inst* producer) {
+						return in_run.contains(producer) && !hoisted.contains(producer);
+					});
+					const auto* producer = old.IsImmediate() ? nullptr : old.TryInstruction();
+					if (producer != nullptr && in_run.contains(producer) && !hoisted.contains(producer)) {
+						violation = i;
+						break;
+					}
+					run.branch.push_back(&inst);
+					if (outside) run.live_out.push_back(&inst);
+					selects++;
+					continue;
+				}
+				if (!outside) {
+					run.branch.push_back(&inst);
+					continue;
+				}
+				bool independent = true;
+				for (size_t arg = 0; arg < inst.NumArgs(); arg++) {
+					const auto value    = inst.Arg(arg).Resolve();
+					const auto* producer = value.IsImmediate() ? nullptr : value.TryInstruction();
+					if (producer != nullptr && in_run.contains(producer) && !hoisted.contains(producer)) {
+						independent = false;
+					}
+				}
+				if (!independent) {
+					violation = i;
+					break;
+				}
+				hoisted.insert(&inst);
+				run.hoisted.push_back(&inst);
+			}
+			if (violation == end) {
+				if (selects >= ExecRunMinSelects() && !run.branch.empty()) {
+					run.begin = insts[start];
+					run.end   = end < insts.size() ? insts[end] : nullptr;
+					runs.push_back(std::move(run));
+				}
+				break;
+			}
+			end = violation;
+			if (end <= start) break;
+		}
+		start = std::max(end, start + 1);
+	}
+	return runs;
+}
+
+void EmitExecRun(ValueEmitContext& ctx, StructuredFunctionState& structured, const ExecRun& run) {
+	auto& state   = ctx.state;
+	auto& builder = state.builder;
+	for (const auto* inst: run.hoisted) {
+		EmitStructuredInstruction(ctx, structured, *inst);
+	}
+	const auto condition   = ctx.Def(run.exec);
+	const auto then_label  = builder.AllocateId();
+	const auto merge_label = builder.AllocateId();
+	const auto pre_label   = state.current_label;
+	builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
+	builder.AddFunction(spv::OpBranchConditional, condition, then_label, merge_label);
+	EmitLabel(state, then_label);
+	std::vector<std::pair<const IR::Inst*, uint32_t>> saved;
+	std::unordered_set<const IR::Inst*>                in_branch(run.branch.begin(), run.branch.end());
+	for (const auto* inst: run.branch) {
+		IR::Value new_value, old_value;
+		size_t    new_operand = 0;
+		if (ExecPredicated(*inst, run.exec, new_value, old_value, new_operand)) {
+			// Inside the branch EXEC is set: the instruction is its new value.
+			const auto value = ctx.Def(new_value);
+			saved.emplace_back(inst, inst->Definition(0));
+			inst->SetDefinition(0, value);
+		} else {
+			EmitStructuredInstruction(ctx, structured, *inst);
+		}
+	}
+	const auto then_exit = state.current_label;
+	builder.AddFunction(spv::OpBranch, merge_label);
+	EmitLabel(state, merge_label);
+	std::vector<std::pair<const IR::Inst*, uint32_t>> new_values;
+	for (const auto* inst: run.live_out) new_values.emplace_back(inst, inst->Definition(0));
+	for (const auto& [inst, previous]: saved) inst->SetDefinition(0, previous);
+	for (const auto& [inst, value]: new_values) {
+		const auto old = ExecOldValue(*inst, run.exec, [&](const IR::Inst* producer) {
+			return in_branch.contains(producer);
+		});
+		const auto old_value = ctx.Def(old);
+		builder.AddFunction(spv::OpPhi, TypeId(state, inst->GetType()), ctx.Result(*inst), value, then_exit,
+		                    old_value, pre_label);
+	}
+}
+
+void EmitBlockWithExecRuns(ValueEmitContext& ctx, StructuredFunctionState& structured, const IR::Block* block,
+                           const std::vector<ExecRun>& runs) {
+	ctx.state.current_block = block;
+	EmitLabel(ctx.state, block->Definition());
+	size_t      next = 0;
+	const auto& insts = block->Instructions();
+	for (auto it = insts.begin(); it != insts.end();) {
+		if (next < runs.size() && &*it == runs[next].begin) {
+			EmitExecRun(ctx, structured, runs[next]);
+			const auto* end = runs[next].end;
+			while (it != insts.end() && &*it != end) ++it;
+			next++;
+			continue;
+		}
+		EmitStructuredInstruction(ctx, structured, *it);
+		++it;
+	}
+}
+
 void PatchStructuredPhis(ValueEmitContext& ctx, StructuredFunctionState& structured) {
 	for (const auto& deferred: structured.deferred_phis) {
 		auto& lane = deferred.half == 0 ? ctx : *ctx.other_half;
@@ -428,8 +674,38 @@ void EmitStructuredFunction(ValueEmitContext& ctx) {
 	const auto& program = ctx.state.program;
 	StructuredFunctionState structured;
 	ctx.state.builder.AddFunction(spv::OpBranch, program.blocks.front()->Definition());
+	// Experiment ExecBranches: not in loop headers and continue targets (their structure must stay
+	// as it is) nor with wave64 emulation (each instruction is emitted per half).
+	const bool exec_branches = ShaderExecBranches() && ctx.state.lane_count == 1;
+	std::unordered_set<const IR::Block*> loop_blocks;
+	if (exec_branches) {
+		for (const auto* block: program.blocks) {
+			if (block->terminator.loop_header) {
+				loop_blocks.insert(block);
+				if (block->terminator.continue_block != nullptr) loop_blocks.insert(block->terminator.continue_block);
+			}
+		}
+	}
+	// KYTY_DBG_EXEC_BRANCH=1: runs, selects (and LogicalAnds) under EXEC turned into branch code,
+	// phis and hoisted instructions per shader (NHL27EXECBR).
+	static const bool exec_branch_debug = std::getenv("KYTY_DBG_EXEC_BRANCH") != nullptr;
+	size_t            stat_runs = 0, stat_branch = 0, stat_phis = 0, stat_hoisted = 0;
 	for (size_t index = 0; index < program.blocks.size(); index++) {
 		const auto* block = program.blocks[index];
+		if (exec_branches && !loop_blocks.contains(block)) {
+			if (const auto runs = FindExecRuns(*block); !runs.empty()) {
+				for (const auto& run: runs) {
+					stat_runs++;
+					stat_branch += run.branch.size();
+					stat_phis += run.live_out.size();
+					stat_hoisted += run.hoisted.size();
+				}
+				EmitBlockWithExecRuns(ctx, structured, block, runs);
+				structured.block_exit_labels.emplace(block, ctx.state.current_label);
+				EmitStructuredTerminator(ctx, block);
+				continue;
+			}
+		}
 		EmitBlock(ctx, block, [&](ValueEmitContext& lane, const IR::Inst& inst) {
 			EmitStructuredInstruction(lane, structured, inst);
 		});
@@ -437,6 +713,12 @@ void EmitStructuredFunction(ValueEmitContext& ctx) {
 		EmitStructuredTerminator(ctx, block);
 	}
 	PatchStructuredPhis(ctx, structured);
+	if (exec_branch_debug && exec_branches) {
+		std::printf("NHL27EXECBR: hash=0x%016llx stage=%u runs=%zu branch_insts=%zu phis=%zu hoisted=%zu\n",
+		            static_cast<unsigned long long>(program.shader_hash), static_cast<unsigned>(program.stage), stat_runs,
+		            stat_branch, stat_phis, stat_hoisted);
+		std::fflush(stdout);
+	}
 }
 
 void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState& dispatcher) {

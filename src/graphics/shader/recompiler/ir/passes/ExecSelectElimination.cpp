@@ -230,6 +230,10 @@ bool ReadsNeighborLanes(ValueOpcode op) {
 
 } // namespace
 
+bool IsLaneWiseOpcode(ValueOpcode op) {
+	return IsLaneWise(op);
+}
+
 uint32_t EliminateExecSelects(const BlockList& blocks) {
 	std::vector<Inst*>                       insts;
 	std::unordered_map<const Inst*, uint32_t> index;

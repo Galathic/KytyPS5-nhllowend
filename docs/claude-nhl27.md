@@ -420,6 +420,25 @@ pixel shaders keep their branches, one got slower without them). Crowd VS 21k ->
 instructions, 408 -> 5 branches; paused crowd scene A/B/A: crowd draws -9.6%, d7cfa519 -3%, GPU
 time per frame -4% (36.9 -> 34.8-36.3 ms).
 
+EXEC as branches (experiment bit 39 `KYTY_EXEC_BRANCHES`, default on; code-gen key bit 2048): every
+guest VGPR write under a partial EXEC selects the new value per lane, and the heavy compute
+shaders are mostly such code (d7cfa519: 2,900 `v_cndmask` among 11,600 host instructions, against
+112 `V_CNDMASK` in the guest's 4,600). The emitter now puts runs of a block's lane-wise
+instructions under one EXEC value inside `if (exec) { ... }`: their selects (and V_CMP results
+`exec && cmp`) are their new values inside, and those used after the run become phis of the new
+and the old value, so the host compiler masks the writes as the guest's hardware does. Pure
+instructions of the run that are needed outside it and depend on nothing in it are emitted
+before the branch; a run ends at memory operations, cross-lane operations and anything with
+side effects; loop headers and continue targets, and wave64 emulation, are left alone.
+`KYTY_DBG_EXEC_BRANCH=1` prints runs, branch instructions, phis and hoisted instructions per
+shader (`NHL27EXECBR`), `KYTY_DBG_EXEC_BRANCH_MIN` the selects a run needs (default 6). Paused
+A/B/A in two scenes: top shaders -8% and -6.4% (c556aaf3 -17%, a36f0b4f -16%, 9380d724 -19%,
+33037c60 -8%), GPU time per frame -4%; the final image differs from the old build's as much as two
+consecutive frames of the old build differ (TAA), and looks the same.
+`KYTY_DBG_FRAME_DUMP_FROM=<seq>` keeps a frame dump to the last passes (the readback cap skipped
+the final images), and a file named `framedump.trigger` in the working directory requests a dump
+(KytyPS5-tools `gpu-abd.sh` takes one per phase, `dump-diff.ps1`/`img-diff.ps1` compare them).
+
 The low-energy preset patch (`patches/nhl27_lowenergy.json`: resolution scale 0.5, no FSR3)
 changes nothing on the CPU side (same draws per second and thread load).
 
