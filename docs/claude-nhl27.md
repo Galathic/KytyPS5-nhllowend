@@ -434,7 +434,12 @@ side effects; loop headers and continue targets, and wave64 emulation, are left 
 shader (`NHL27EXECBR`), `KYTY_DBG_EXEC_BRANCH_MIN` the selects a run needs (default 6). Paused
 A/B/A in two scenes: top shaders -8% and -6.4% (c556aaf3 -17%, a36f0b4f -16%, 9380d724 -19%,
 33037c60 -8%), GPU time per frame -4%; the final image differs from the old build's as much as two
-consecutive frames of the old build differ (TAA), and looks the same.
+consecutive frames of the old build differ (TAA), and looks the same. Gameplay 49.8 -> 51-52 fps
+(two fixed-profile matches). Bit 40 `KYTY_EXEC_BRANCH_MEMORY` (default on; key bit 4096): runs also
+take the memory operations predicated by their EXEC (or by `exec && cmp` inside them), in order;
+inside the branch their EXEC operand is the constant true. Paused A/B/A: top shaders -4.9% more
+(drift -1.6%; PS 9eaaf80c, 136eed67, 90706b3b -4.5 to -5.4%, c556aaf3 -5.9%), GPU time per
+frame 23.0 -> 21.9 ms; image unchanged.
 `KYTY_DBG_FRAME_DUMP_FROM=<seq>` keeps a frame dump to the last passes (the readback cap skipped
 the final images), and a file named `framedump.trigger` in the working directory requests a dump
 (KytyPS5-tools `gpu-abd.sh` takes one per phase, `dump-diff.ps1`/`img-diff.ps1` compare them).

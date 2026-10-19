@@ -424,7 +424,13 @@ struct ExecRun {
 	std::vector<const IR::Inst*> hoisted;
 	std::vector<const IR::Inst*> branch;
 	std::vector<const IR::Inst*> live_out;
+	bool                         memory = false;
 };
+
+// Experiment ExecBranchMemory: memory operations under the run's EXEC join it.
+bool ExecRunMemoryOps() {
+	return ShaderExecBranchMemory();
+}
 
 bool IsSelectOpcode(IR::ValueOpcode op) {
 	return op == IR::ValueOpcode::SelectU1 || op == IR::ValueOpcode::SelectU32 || op == IR::ValueOpcode::SelectF32;
@@ -492,9 +498,14 @@ std::vector<ExecRun> FindExecRuns(const IR::Block& block) {
 	const auto* target_inst = block.indirect_target.IsEmpty() || block.indirect_target.IsImmediate()
 	                              ? nullptr
 	                              : block.indirect_target.TryInstruction();
-	const auto  candidate      = [](const IR::Inst& inst) {
+	const bool  memory_ops     = ExecRunMemoryOps();
+	const auto  is_memory      = [memory_ops](const IR::Inst& inst) {
+		return memory_ops && IR::IsExecPredicatedMemoryOp(inst) && !IR::ReadsNeighborLanesOpcode(inst.GetOpcode());
+	};
+	const auto candidate = [&](const IR::Inst& inst) {
 		const auto op = inst.GetOpcode();
-		return (IR::IsLaneWiseOpcode(op) || IsSelectOpcode(op)) && op != IR::ValueOpcode::Phi && !inst.MayHaveSideEffects();
+		return is_memory(inst) ||
+		       ((IR::IsLaneWiseOpcode(op) || IsSelectOpcode(op)) && op != IR::ValueOpcode::Phi && !inst.MayHaveSideEffects());
 	};
 	std::vector<ExecRun> runs;
 	size_t               start = 0;
@@ -558,6 +569,21 @@ std::vector<ExecRun> FindExecRuns(const IR::Block& block) {
 					selects++;
 					continue;
 				}
+				if (is_memory(inst)) {
+					// Only where EXEC is set (itself or a value under it), in program order.
+					const auto predicate = inst.Arg(inst.NumArgs() - 1).Resolve();
+					const auto* producer = predicate.IsImmediate() ? nullptr : predicate.TryInstruction();
+					const bool  under    = predicate == exec ||
+					                   (producer != nullptr && in_run.contains(producer) && !hoisted.contains(producer) &&
+					                    IsExecSelect(*producer, exec));
+					if (!under || outside) {
+						violation = i;
+						break;
+					}
+					run.branch.push_back(&inst);
+					run.memory = true;
+					continue;
+				}
 				if (!outside) {
 					run.branch.push_back(&inst);
 					continue;
@@ -606,6 +632,11 @@ void EmitExecRun(ValueEmitContext& ctx, StructuredFunctionState& structured, con
 	builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
 	builder.AddFunction(spv::OpBranchConditional, condition, then_label, merge_label);
 	EmitLabel(state, then_label);
+	const auto* exec_inst = run.exec.TryInstruction();
+	const auto  exec_def  = exec_inst != nullptr ? exec_inst->Definition(0) : 0u;
+	if (exec_inst != nullptr && run.memory) {
+		exec_inst->SetDefinition(0, ConstantBool(state, true));
+	}
 	std::vector<std::pair<const IR::Inst*, uint32_t>> saved;
 	std::unordered_set<const IR::Inst*>                in_branch(run.branch.begin(), run.branch.end());
 	for (const auto* inst: run.branch) {
@@ -619,6 +650,9 @@ void EmitExecRun(ValueEmitContext& ctx, StructuredFunctionState& structured, con
 		} else {
 			EmitStructuredInstruction(ctx, structured, *inst);
 		}
+	}
+	if (exec_inst != nullptr && run.memory) {
+		exec_inst->SetDefinition(0, exec_def);
 	}
 	const auto then_exit = state.current_label;
 	builder.AddFunction(spv::OpBranch, merge_label);

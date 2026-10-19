@@ -234,6 +234,14 @@ bool IsLaneWiseOpcode(ValueOpcode op) {
 	return IsLaneWise(op);
 }
 
+bool IsExecPredicatedMemoryOp(const Inst& inst) {
+	return IsExecPredicatedMemory(inst);
+}
+
+bool ReadsNeighborLanesOpcode(ValueOpcode op) {
+	return ReadsNeighborLanes(op);
+}
+
 uint32_t EliminateExecSelects(const BlockList& blocks) {
 	std::vector<Inst*>                       insts;
 	std::unordered_map<const Inst*, uint32_t> index;

@@ -118,6 +118,11 @@ inline std::atomic<bool> g_shader_native_pkrtz {false};
 [[nodiscard]] inline bool ShaderExecBranches() {
 	return Common::Experiments::Enabled(Common::Experiments::ExecBranches);
 }
+// Codegen option: experiment ExecBranchMemory (key bit 4096): ExecBranches runs also take the
+// memory operations predicated by their EXEC (in order; inside the branch they need no exec check).
+[[nodiscard]] inline bool ShaderExecBranchMemory() {
+	return ShaderExecBranches() && Common::Experiments::Enabled(Common::Experiments::ExecBranchMemory);
+}
 [[nodiscard]] inline uint32_t ShaderFloatCodegenKey() {
 	return static_cast<uint32_t>(ShaderNativeFp16()) | (ShaderNativeMinMax() ? 2u : 0u) |
 	       (ShaderFusedMad() ? 4u : 0u) |
@@ -125,7 +130,7 @@ inline std::atomic<bool> g_shader_native_pkrtz {false};
 	       (ShaderRobustConstReads() ? 32u : 0u) | (ShaderRobustStores() ? 64u : 0u) |
 	       (ShaderNativePkrtz() ? 128u : 0u) | (ShaderNativeF16Sdwa() ? 256u : 0u) |
 	       (ShaderRobustSpillLoads() ? 512u : 0u) | (ShaderBranchlessFormattedLoads() ? 1024u : 0u) |
-	       (ShaderExecBranches() ? 2048u : 0u);
+	       (ShaderExecBranches() ? 2048u : 0u) | (ShaderExecBranchMemory() ? 4096u : 0u);
 }
 [[nodiscard]] inline uint32_t ShaderNativeFp16Modes() {
 	return g_shader_native_fp16_modes.load(std::memory_order_relaxed);
