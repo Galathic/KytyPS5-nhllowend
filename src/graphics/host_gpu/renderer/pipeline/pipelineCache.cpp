@@ -397,7 +397,6 @@ bool GuestReadLog::StillValid(bool without_faults) const {
 	}
 	uint64_t   seq_page       = ~uint64_t {0};
 	bool       seq_later      = false;
-	const auto legacy_lookups = Common::Experiments::Enabled(Common::Experiments::AbPending) ? 1 : 0;
 	const auto check_entry = [&](const Entry& entry) {
 		const auto* recorded = m_bytes.data() + entry.offset;
 		if (entry.strict) {
@@ -414,7 +413,7 @@ bool GuestReadLog::StillValid(bool without_faults) const {
 			// Consecutive reads mostly lie on one page: its last write is looked up once.
 			bool later;
 			const auto page = entry.address >> 12u;
-			if (page == ((entry.address + entry.size - 1) >> 12u) && legacy_lookups == 0) {
+			if (page == ((entry.address + entry.size - 1) >> 12u)) {
 				if (page != seq_page) {
 					seq_page  = page;
 					seq_later = PageWriteSeq::Last(entry.address, entry.size) > m_base;
@@ -474,12 +473,6 @@ bool GuestReadLog::StillValid(bool without_faults) const {
 		}
 		return true;
 	};
-	if (legacy_lookups != 0) {
-		for (const auto& entry: m_entries) {
-			if (!check_entry(entry)) return false;
-		}
-		return true;
-	}
 	// A run of reads on one page that no later operation writes, none strict or possibly
 	// GPU-owned, needs no check at all: one lookup instead of a pass over its reads.
 	for (size_t i = 0; i < m_entries.size();) {
@@ -896,7 +889,6 @@ struct PipelineCache::ProgramCache {
 		// Consecutive draws of a program mostly take the same permutation: try it first.
 		auto permutation = source.permutations.end();
 		if (source.ahead_permutation < source.permutations.size() &&
-		    !Common::Experiments::Enabled(Common::Experiments::AbPending) &&
 		    matches(source.permutations[source.ahead_permutation])) {
 			permutation = source.permutations.begin() + static_cast<ptrdiff_t>(source.ahead_permutation);
 		} else {
@@ -2333,7 +2325,10 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	const auto ps_id = ps_active ? pixel_program.id : 0;
 
 	FrameBreakdown::Timer key_timer(FrameBreakdown::g_pl.key_ns, FrameBreakdown::Verbose());
-	GraphicsPipelineKey key {};
+	// Copied from a default key: initializing its members one by one (the vertex input arrays alone
+	// are 64 entries) was 1.9% of the execution thread.
+	static const GraphicsPipelineKey default_key {};
+	GraphicsPipelineKey              key = default_key;
 	for (uint32_t i = 0; i < programs.vertex.size(); i++) {
 		key.vertex_shader_ids[i] = programs.vertex[i].id;
 	}

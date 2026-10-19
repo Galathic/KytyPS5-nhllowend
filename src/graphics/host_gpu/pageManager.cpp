@@ -1,7 +1,6 @@
 #include "graphics/host_gpu/pageManager.h"
 
 #include "common/alignment.h"
-#include "common/experiments.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -409,8 +408,7 @@ bool PageManager::IsReadWatched(uint64_t vaddr) const {
 	const auto page_address = vaddr & ~(PAGE_SIZE - 1);
 	auto&      answer       = answers[(page_address / PAGE_SIZE) & 63u];
 	const auto version      = m_impl->read_watch_version.load(std::memory_order_acquire);
-	const bool cached       = !Common::Experiments::Enabled(Common::Experiments::AbPending);
-	if (cached && answer.page == page_address && answer.version == version) {
+	if (answer.page == page_address && answer.version == version) {
 		return answer.watched;
 	}
 	auto* region = m_impl->FindRegion(vaddr);
@@ -420,9 +418,7 @@ bool PageManager::IsReadWatched(uint64_t vaddr) const {
 	const auto page = static_cast<size_t>((vaddr % REGION_SIZE) / PAGE_SIZE);
 	SpinGuard  lock(region->lock);
 	const bool watched = region->pages[page].access_watchers != 0;
-	if (cached) {
-		answer = {page_address, version, watched};
-	}
+	answer = {page_address, version, watched};
 	return watched;
 }
 

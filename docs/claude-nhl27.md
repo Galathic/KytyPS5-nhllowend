@@ -496,6 +496,29 @@ and dispatch -6% in total, paused fps 55-57 -> 59-62; a clean match 54.8 fps at 
 54-56). A second resolve thread for dispatches (bit 41 `KYTY_DISPATCH_RESOLVER`, own core) took
 20% off the resolve thread but changed no fps while the execution thread was the limit.
 
+A gameplay profile of the execution thread after that (`samples\pr18-execution.txt`): buffer
+binds 17% (the texture cache's "image at this address?" check on every texel bind 3.6% of it),
+re-protecting pages after BDA uploads 5.8%, description lookups of T#s 3% (a stage alternates
+between programs, and the slot memo kept only the stage's last program), building the pipeline
+key 2% (member-by-member initialization of a 720-byte key). Now the read memo keeps the image
+registration version its "no image here" answer was found at, image memos are kept per program,
+and the key is copied from a default one: draw cost -2.6% (paused A/B, 4.29 -> 4.18 us). The
+earlier A/B switches of the binding memo work are gone; `AbPending` selects only new changes.
+
+GPU time per frame without the per-draw timestamps (`KYTY_IDLE_TRACE_NO_CMDS=1` at boot: the
+idle trace then stamps only command buffers, so the traced match keeps 48-58 fps at 60 Hz;
+`KytyPS5-tools\ts-nocmd.sh`): 14.0-15.4 ms per flip in play (GPU 72-82% busy), 24-27 ms in the
+30 Hz scenes (67-81% busy). The per-draw timestamps had inflated both (17-23 and about 50 ms).
+Neither is GPU-bound yet; the idle time is spread over gaps of 20 us to 1 ms between the 120
+command buffers of a frame, waiting for the CPU side. At 60 fps the GPU has 1.5-2.5 ms to spare.
+
+Bit 42 `KYTY_BDA_LOAD_GROUPS` (default off; key bit 8192; `KYTY_DBG_BDA_GROUPS=1` prints
+`NHL27BDAGROUP` per shader): consecutive DWORD loads of one guest load through an address share
+one page lookup and issue together when the group lies in one page. Grouped loads turned up in
+about 60 pixel shaders (2 to 36 groups each), not in the shadow vertex shaders it was written for.
+A paused GPU A/B (A/B/A, per-draw timestamps) had nearly every shader 8-10% slower with it,
+grouped or not, while A and A2 agreed within 1%: inconclusive, left off.
+
 ## Merged defaults (nhl27 + claude/nhl27-perf)
 
 Where both branches implemented the same feature, only one implementation is left and it is a

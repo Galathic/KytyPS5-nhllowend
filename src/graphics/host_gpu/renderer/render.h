@@ -387,6 +387,10 @@ private:
 	bool m_clear_texture_descs = false;
 	// Advances when m_texture_descs is cleared (bindings keep pointers into it).
 	uint64_t m_texture_descs_generation = 1;
+	// Per program (compiled programs live as long as the cache): the T#s its last draw bound
+	// and the description each had, so draws that alternate programs on a stage skip the
+	// description lookups of unchanged T#s (see PrepareBindings()).
+	std::unordered_map<const void*, ProgramImageMemo> m_program_image_memos;
 	// The last TextureDescDerivation::Found::serial given out.
 	uint64_t m_found_serial = 0;
 

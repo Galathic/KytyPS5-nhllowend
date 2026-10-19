@@ -775,8 +775,7 @@ bool RenderExecutor::ReuseTextureLookup(TextureDescDerivation& derived, TextureB
 	binding.image_view = found.view;
 	// The binding of a stage slot usually reuses the same lookup draw after draw: the description
 	// (a few hundred bytes) is copied once per recording.
-	if (binding.desc_serial != found.serial ||
-	    Common::Experiments::Enabled(Common::Experiments::AbPending)) {
+	if (binding.desc_serial != found.serial) {
 		binding.desc        = found.desc;
 		binding.desc_serial = found.serial;
 	}
@@ -1159,44 +1158,55 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.shader_data.clear();
 	const bool same_program = prepared.last_program == &program &&
 	                          prepared.last_descs_generation == m_texture_descs_generation;
-	const bool same_images  = same_program && prepared.last_images == snapshot.images;
+	// The T#s and descriptions of the program's last draw: a stage alternates between programs,
+	// and a memo of only the stage's last program missed (the description lookups were 3% of
+	// the execution thread).
+	auto* memo = prepared.last_program == &program ? prepared.image_memo : nullptr;
+	if (memo == nullptr) {
+		memo = &m_program_image_memos[&program];
+	}
+	prepared.image_memo    = memo;
+	auto&      last_images = memo->images;
+	auto&      image_descs = memo->image_descs;
+	const bool same_descs  = memo->descs_generation == m_texture_descs_generation;
+	const bool same_images = same_descs && last_images == snapshot.images;
 	// Draws of a program change some T#s and keep the others: a slot whose T# is unchanged keeps
 	// its description instead of looking it up again.
-	const bool slot_reuse = same_program && prepared.last_images.size() == snapshot.images.size() &&
-	                        prepared.image_descs.size() == program.info.images.size() &&
-	                        !Common::Experiments::Enabled(Common::Experiments::AbPending);
+	const bool slot_reuse = same_descs && last_images.size() == snapshot.images.size() &&
+	                        image_descs.size() == program.info.images.size();
 	if (!same_images && !slot_reuse) {
-		prepared.image_descs.assign(program.info.images.size(), nullptr);
+		image_descs.assign(program.info.images.size(), nullptr);
 	}
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		// Sampled textures whose last lookup still holds are written in place.
 		const auto& resource = program.info.images[i];
 		if (!resource.written &&
 		    resource.mip_mode != ShaderRecompiler::IR::ImageMipMode::Dynamic) {
-			auto* derived = prepared.image_descs[i];
-			if (!same_images && !(slot_reuse && prepared.last_images[i] == snapshot.images[i])) {
+			auto* derived = image_descs[i];
+			if (!same_images && !(slot_reuse && last_images[i] == snapshot.images[i])) {
 				const auto cached =
 				    m_texture_descs.find(MakeTextureDescKey(resource, snapshot.images[i]));
 				derived = cached != m_texture_descs.end() ? &cached->second : nullptr;
 			}
 			if (derived != nullptr && derived->found.valid &&
 			    ReuseTextureLookup(*derived, prepared.images[i])) {
-				prepared.image_descs[i] = derived;
+				image_descs[i] = derived;
 				BindImage(prepared.images[i].image_id, false);
 				continue;
 			}
 		}
 		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
 		// The description whose lookups later draws reuse (see ResolveTexture()).
-		prepared.image_descs[i] = binding.lookup;
+		image_descs[i] = binding.lookup;
 		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
 		binding.mip_views.swap(prepared.images[i].mip_views);
 		binding.mip_views.clear();
 		prepared.images[i] = std::move(binding);
 	}
 	if (!same_images) {
-		prepared.last_images = snapshot.images;
+		last_images = snapshot.images;
 	}
+	memo->descs_generation = m_texture_descs_generation;
 	prepared.table_images.clear();
 	prepared.table_sources.clear();
 	prepared.table_roots.clear();
@@ -1265,14 +1275,13 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 		// Half the slots bind the range they had the draw before: unchanged V#s keep their source
 		// (the clamp and the buffer lookup) while no buffer was registered or unregistered and no
 		// memory was mapped or unmapped.
-		const bool     reuse      = !Common::Experiments::Enabled(Common::Experiments::AbPending);
 		const uint64_t generation = cache.BufferSetEpoch() * 0x9e3779b97f4a7c15ull ^ m_context.MappingGeneration();
 		for (uint32_t resource = 0; resource < program.info.buffers.size(); ++resource) {
 			const auto& metadata = program.info.buffers[resource];
 			if (metadata.descriptor_index == UINT32_MAX) continue;
 			auto& source = prepared.buffer_sources[metadata.descriptor_index];
 			auto& key    = prepared.buffer_keys[metadata.descriptor_index];
-			if (reuse && key.program == &program && key.generation == generation &&
+			if (key.program == &program && key.generation == generation &&
 			    key.value == snapshot.buffers[resource]) {
 				if (StageStats::Enabled()) {
 					StageStats::g_bind_total.fetch_add(1, std::memory_order_relaxed);

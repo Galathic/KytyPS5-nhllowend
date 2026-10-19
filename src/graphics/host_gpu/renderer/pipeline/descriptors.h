@@ -68,6 +68,14 @@ struct TextureBinding {
 	uint64_t desc_serial = 0;
 };
 
+// The T#s the last draw of a program bound and the description each had (null when its lookups
+// are not reused), valid while the description map keeps `descs_generation`.
+struct ProgramImageMemo {
+	uint64_t                                           descs_generation = 0;
+	std::vector<ShaderRecompiler::IR::DescriptorValue> images;
+	std::vector<TextureDescDerivation*>                image_descs;
+};
+
 struct PreparedBindings {
 	struct BufferSource {
 		uint64_t address = 0;
@@ -105,13 +113,12 @@ struct PreparedBindings {
 	std::array<uint32_t, ShaderRecompiler::IR::PushData::DwordCount> push_dwords {};
 	bool                                                              push_dwords_valid = false;
 	// What the previous draw of this stage bound: a stage that binds the same program with the
-	// same T#s and S#s again (about half of them) skips the description lookups.
+	// same S#s again keeps its samplers.
 	const void*                                        last_program          = nullptr;
 	uint64_t                                           last_descs_generation = 0;
-	std::vector<ShaderRecompiler::IR::DescriptorValue> last_images;
 	std::vector<ShaderRecompiler::IR::DescriptorValue> last_samplers;
-	// The description each T# of `last_images` has (null when its lookups are not reused).
-	std::vector<TextureDescDerivation*>                image_descs;
+	// The image memo of `last_program` (RenderExecutor::m_program_image_memos).
+	ProgramImageMemo* image_memo = nullptr;
 };
 
 [[nodiscard]] vk::DescriptorType

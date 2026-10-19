@@ -289,6 +289,7 @@ void TextureCache::RegisterImage(ImageId id) {
 		m_image_page_table[page].push_back(id);
 	});
 	m_images_by_address[image.info.data.address].push_back(id);
+	m_address_index_version.fetch_add(1, std::memory_order_release);
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
 	image.lru_tick   = m_gc_tick;
@@ -1999,8 +2000,7 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 	std::scoped_lock lock {m_lock};
 	// Only images that start at `address` match. Texel buffer binds ask on every draw and nearly
 	// always find none: one hash lookup instead of walking the pages of the range.
-	if (!m_images_by_address.contains(address) &&
-	    !Common::Experiments::Enabled(Common::Experiments::AbPending)) {
+	if (!m_images_by_address.contains(address)) {
 		return {};
 	}
 	ImageIds         matches;

@@ -305,8 +305,7 @@ public:
 			// whenever the game writes anywhere in its 4 MiB: the read memo missed almost always).
 			const bool whole = vaddr <= index * TRACKER_REGION_SIZE &&
 			                   vaddr + size >= (index + 1) * TRACKER_REGION_SIZE;
-			epoch += whole || Common::Experiments::Enabled(Common::Experiments::AbPending)
-			             ? m_memory_tracker.RegionCpuDirtyEpoch(index)
+			epoch += whole ? m_memory_tracker.RegionCpuDirtyEpoch(index)
 			             : m_memory_tracker.BlockCpuDirtyEpochs(index, vaddr, size);
 		}
 		return epoch;
@@ -457,6 +456,8 @@ private:
 		uint64_t offset       = 0;
 		BufferId id;
 		bool     texel = false; // a formatted read, while no image started at the address
+		// TextureCache::AddressIndexVersion() when no image started at the address (texel).
+		uint64_t image_version = 0;
 	};
 	// The stream copy a range got within the current draw window (see ObtainBuffer()).
 	struct StreamMemo {

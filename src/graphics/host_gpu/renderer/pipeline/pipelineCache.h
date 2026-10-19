@@ -10,6 +10,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -176,7 +177,13 @@ struct PipelineVertexInputState {
 	uint8_t                                               binding_count   = 0;
 	uint8_t                                               attribute_count = 0;
 
-	bool operator==(const PipelineVertexInputState&) const = default;
+	// The entries past the counts are never set (and the key hash leaves them out).
+	bool operator==(const PipelineVertexInputState& other) const {
+		return binding_count == other.binding_count && attribute_count == other.attribute_count &&
+		       std::equal(bindings.begin(), bindings.begin() + binding_count, other.bindings.begin()) &&
+		       std::equal(attributes.begin(), attributes.begin() + attribute_count,
+		                  other.attributes.begin());
+	}
 };
 
 struct ShaderProgram {

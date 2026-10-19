@@ -370,19 +370,9 @@ void BufferCache::DropGpuFills(uint64_t vaddr, uint64_t size) {
 	}
 	std::scoped_lock lock(m_gpu_fills_mutex);
 	const auto end = vaddr + size;
-	if (size != 0 && !Common::Experiments::Enabled(Common::Experiments::AbPending)) {
-		// Written buffers (bound by many draws, often megabytes) test the filter a word at a time.
-		if (!TestGpuFillChunks(m_gpu_fill_filter, vaddr, end)) {
-			return;
-		}
-	} else if (size != 0 && ((end - 1) >> GpuFillChunkShift) - (vaddr >> GpuFillChunkShift) < 8u) {
-		bool hit = false;
-		for (uint64_t chunk = vaddr >> GpuFillChunkShift; chunk <= (end - 1) >> GpuFillChunkShift; chunk++) {
-			hit = hit || (m_gpu_fill_filter[(chunk >> 6u) & 3u] & (uint64_t {1} << (chunk & 63u))) != 0;
-		}
-		if (!hit) {
-			return;
-		}
+	// Written buffers (bound by many draws, often megabytes) test the filter a word at a time.
+	if (size != 0 && !TestGpuFillChunks(m_gpu_fill_filter, vaddr, end)) {
+		return;
 	}
 	const auto before = m_gpu_fills.size();
 	std::erase_if(m_gpu_fills, [&](const GpuFill& fill) { return fill.begin < end && vaddr < fill.end; });
@@ -1737,17 +1727,27 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	const bool  plain_read = !is_written && !is_texel_buffer;
 	// Texel (formatted) reads too, while no image starts at the address: only such an image is
 	// copied into the buffer (SynchronizeBufferFromImage), and they are most of the bindings.
-	const bool texel_read = !is_written && is_texel_buffer &&
-	                        !Common::Experiments::Enabled(Common::Experiments::AbPending) &&
-	                        !m_texture_cache.HasImageAt(vaddr);
-	ObtainMemo* memo       = nullptr;
-	uint64_t    cpu_epoch  = 0;
-	if (plain_read || texel_read) {
+	// The memo keeps the image registration version its answer was found at: asking the texture
+	// cache (a lock and a hash lookup) on every bind was 3.6% of the execution thread.
+	const bool  texel_candidate = !is_written && is_texel_buffer;
+	bool        texel_read      = false;
+	uint64_t    image_version   = 0;
+	ObtainMemo* memo            = nullptr;
+	uint64_t    cpu_epoch       = 0;
+	if (plain_read || texel_candidate) {
 		const auto hash = (vaddr ^ (size << 40u)) * 0x9e3779b97f4a7c15ull;
 		memo            = &(*m_obtain_memo)[(hash >> 32u) % ObtainMemoSlots];
-		cpu_epoch       = CpuDirtyEpoch(vaddr, size);
+		if (texel_candidate) {
+			image_version = m_texture_cache.AddressIndexVersion();
+			texel_read    = (memo->vaddr == vaddr && memo->texel && memo->image_version == image_version) ||
+			             !m_texture_cache.HasImageAt(vaddr);
+		}
+	}
+	if (plain_read || texel_read) {
+		cpu_epoch = CpuDirtyEpoch(vaddr, size);
 		if (memo->vaddr == vaddr && memo->size == size && memo->texel == texel_read &&
 		    memo->buffer_epoch == m_buffer_set_epoch && memo->cpu_epoch == cpu_epoch) {
+			if (texel_read) memo->image_version = image_version;
 			auto& buffer = m_slot_buffers[memo->id];
 			TouchBuffer(buffer);
 			return {&buffer, memo->offset};
@@ -1813,7 +1813,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		         .cpu_epoch    = cpu_epoch,
 		         .offset       = buffer.Offset(vaddr),
 		         .id           = id,
-		         .texel        = texel_read};
+		         .texel        = texel_read,
+		         .image_version = image_version};
 	}
 	if (is_written || is_texel_buffer) {
 		DropGpuFills(vaddr, size);
@@ -2021,8 +2022,7 @@ bool BufferCache::HasGpuDirtyBytesShared(uint64_t vaddr, uint64_t size) const {
 	};
 	static thread_local std::array<PageAnswer, 64> answers {};
 	const bool page_query = (vaddr & 0xfffu) == 0 && size == 0x1000 &&
-	                        !Common::Experiments::Enabled(Common::Experiments::AbLegacy) &&
-	                        !Common::Experiments::Enabled(Common::Experiments::AbPending);
+	                        !Common::Experiments::Enabled(Common::Experiments::AbLegacy);
 	if (page_query) {
 		const auto& answer = answers[(vaddr >> 12u) & 63u];
 		if (answer.page == vaddr && answer.version == m_gpu_ranges_version.load(std::memory_order_acquire)) {

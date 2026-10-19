@@ -85,6 +85,11 @@ public:
 		std::scoped_lock lock {m_lock};
 		return m_images_by_address.contains(address);
 	}
+	// Advances after each image registration (the only change that can make HasImageAt() true
+	// for an address): a false answer holds while it is unchanged.
+	[[nodiscard]] uint64_t AddressIndexVersion() const {
+		return m_address_index_version.load(std::memory_order_acquire);
+	}
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
 	[[nodiscard]] vk::ImageView FindTexture(ImageId id, const ImageDesc& desc);
@@ -239,6 +244,7 @@ private:
 	ImagePageTable                                    m_image_page_table;
 	// Registered images by exact start address (FindImage fast path).
 	std::unordered_map<uint64_t, std::vector<ImageId>> m_images_by_address;
+	std::atomic<uint64_t>                              m_address_index_version {0};
 	MultiLevelPageTable<uint64_t, ImagePageTable::kPageBits, ImagePageTable::kAddressSpaceBits,
 	                    ImagePageTable::kFirstLevelBits>
 	    m_image_page_epochs;
