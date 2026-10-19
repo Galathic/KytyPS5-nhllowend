@@ -454,6 +454,7 @@ private:
 		uint64_t cpu_epoch    = 0;
 		uint64_t offset       = 0;
 		BufferId id;
+		bool     texel = false; // a formatted read, while no image started at the address
 	};
 	// The stream copy a range got within the current draw window (see ObtainBuffer()).
 	struct StreamMemo {

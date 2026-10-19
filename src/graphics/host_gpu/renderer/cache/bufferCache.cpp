@@ -1735,13 +1735,18 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	// it), the lookup finds the same buffer and has nothing to upload. The epoch is read before
 	// the dirty check: a page dirtied after it advances it.
 	const bool  plain_read = !is_written && !is_texel_buffer;
+	// Texel (formatted) reads too, while no image starts at the address: only such an image is
+	// copied into the buffer (SynchronizeBufferFromImage), and they are most of the bindings.
+	const bool texel_read = !is_written && is_texel_buffer &&
+	                        !Common::Experiments::Enabled(Common::Experiments::AbPending) &&
+	                        !m_texture_cache.HasImageAt(vaddr);
 	ObtainMemo* memo       = nullptr;
 	uint64_t    cpu_epoch  = 0;
-	if (plain_read) {
+	if (plain_read || texel_read) {
 		const auto hash = (vaddr ^ (size << 40u)) * 0x9e3779b97f4a7c15ull;
 		memo            = &(*m_obtain_memo)[(hash >> 32u) % ObtainMemoSlots];
 		cpu_epoch       = CpuDirtyEpoch(vaddr, size);
-		if (memo->vaddr == vaddr && memo->size == size &&
+		if (memo->vaddr == vaddr && memo->size == size && memo->texel == texel_read &&
 		    memo->buffer_epoch == m_buffer_set_epoch && memo->cpu_epoch == cpu_epoch) {
 			auto& buffer = m_slot_buffers[memo->id];
 			TouchBuffer(buffer);
@@ -1794,19 +1799,21 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		FrameBreakdown::Timer touch_timer(bs.ob_touch_ns, bon);
 		TouchBuffer(buffer);
 	}
+	bool synced_from_image = false;
 	{
 		FrameBreakdown::Timer sync_timer(bs.ob_sync_ns, bon);
 		if (bon) bs.ob_syncs.fetch_add(1, std::memory_order_relaxed);
-		(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
+		synced_from_image = SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	}
 	FrameBreakdown::Timer book_timer(bs.ob_book_ns, bon);
-	if (plain_read) {
+	if (plain_read || (texel_read && !synced_from_image)) {
 		*memo = {.vaddr        = vaddr,
 		         .size         = size,
 		         .buffer_epoch = m_buffer_set_epoch,
 		         .cpu_epoch    = cpu_epoch,
 		         .offset       = buffer.Offset(vaddr),
-		         .id           = id};
+		         .id           = id,
+		         .texel        = texel_read};
 	}
 	if (is_written || is_texel_buffer) {
 		DropGpuFills(vaddr, size);

@@ -80,6 +80,11 @@ public:
 	// back: those conversions replace the image other passes use, which then convert it again.
 	[[nodiscard]] ImageId FindImageSpeculative(ImageDesc& desc, bool exact_format = false);
 	void                        UpdateImage(ImageId id);
+	// Whether a registered image starts at `address` (the only images FindImageFromRange finds).
+	[[nodiscard]] bool HasImageAt(uint64_t address) {
+		std::scoped_lock lock {m_lock};
+		return m_images_by_address.contains(address);
+	}
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
 	[[nodiscard]] vk::ImageView FindTexture(ImageId id, const ImageDesc& desc);
