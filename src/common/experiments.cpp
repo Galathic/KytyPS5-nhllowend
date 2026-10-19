@@ -68,6 +68,7 @@ uint64_t EnvironmentMask() {
 	set("KYTY_FAULT_PAGE_DIRECT", FaultPageDirect, true);
 	set("KYTY_BACKING_READ_MRU", BackingReadMru, true);
 	set("KYTY_DISPATCH_AHEAD", DispatchAhead, true);
+	set("KYTY_DISPATCH_RESOLVER", DispatchResolver, false);
 	set("KYTY_GPU_CONDITIONS_BOTH_PATHS", GpuConditionsBothPaths, true);
 	set("KYTY_COMPUTE_UNLOCKED", ComputeUnlocked, true);
 	set("KYTY_AHEAD_UNLOCKED", AheadUnlocked, true);

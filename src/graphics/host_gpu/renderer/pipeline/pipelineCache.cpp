@@ -293,19 +293,23 @@ bool GuestReadLog::Read(uint64_t address, void* data, uint64_t size, bool strict
 		    (!strict || last.size + size <= StrictCheckBytes)) {
 			last.size += static_cast<uint32_t>(size);
 			last.unsafe = last.unsafe || unsafe;
-			if (!m_runs.empty() && !RunClean(last)) {
-				m_runs.back().clean = false;
+			if (m_run_head != NoRun && !RunClean(last)) {
+				// The run is checked entry by entry from now on.
+				m_entries[m_run_head].run_count = 0;
+				m_run_head                      = NoRun;
 			}
 			return true;
 		}
 	}
 	m_entries.push_back({address, static_cast<uint32_t>(size), offset, strict, unsafe});
-	const auto& entry = m_entries.back();
-	const auto  index = static_cast<uint32_t>(m_entries.size() - 1);
-	if (!m_runs.empty() && m_runs.back().page == (address >> 12u) && m_runs.back().clean && RunClean(entry)) {
-		m_runs.back().count++;
+	auto& entry = m_entries.back();
+	if (!RunClean(entry)) {
+		m_run_head = NoRun;
+	} else if (m_run_head != NoRun && (m_entries[m_run_head].address >> 12u) == (address >> 12u)) {
+		m_entries[m_run_head].run_count++;
 	} else {
-		m_runs.push_back({address >> 12u, index, 1, RunClean(entry)});
+		m_run_head      = static_cast<uint32_t>(m_entries.size() - 1);
+		entry.run_count = 1;
 	}
 	return true;
 }
@@ -478,16 +482,18 @@ bool GuestReadLog::StillValid(bool without_faults) const {
 	}
 	// A run of reads on one page that no later operation writes, none strict or possibly
 	// GPU-owned, needs no check at all: one lookup instead of a pass over its reads.
-	for (const auto& run: m_runs) {
-		if (run.clean && skips && !verify_skips && PageWriteSeq::Last(run.page << 12u, 1) <= m_base) {
+	for (size_t i = 0; i < m_entries.size();) {
+		const auto& entry = m_entries[i];
+		if (entry.run_count != 0 && skips && !verify_skips &&
+		    PageWriteSeq::Last(entry.address & ~uint64_t {0xfff}, 1) <= m_base) {
 			if (stats) {
-				StageStats::g_check_skipped[without_faults ? 1 : 0].fetch_add(run.count, std::memory_order_relaxed);
+				StageStats::g_check_skipped[without_faults ? 1 : 0].fetch_add(entry.run_count, std::memory_order_relaxed);
 			}
+			i += entry.run_count;
 			continue;
 		}
-		for (uint32_t i = run.first; i < run.first + run.count; i++) {
-			if (!check_entry(m_entries[i])) return false;
-		}
+		if (!check_entry(entry)) return false;
+		i++;
 	}
 	return true;
 }

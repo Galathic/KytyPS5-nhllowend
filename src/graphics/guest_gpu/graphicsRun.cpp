@@ -154,7 +154,7 @@ GuestGpu::GuestGpu(RenderContext& renderer)
     : m_renderer(renderer),
       m_pipelined((Config::GpuPipelineStages() & Config::GPU_PIPELINE_COMMAND_PROCESSOR) != 0),
       m_resolving(m_pipelined && (Config::GpuPipelineStages() & Config::GPU_PIPELINE_RESOLVE) != 0),
-      m_operations(OperationQueueSize), m_resolved(ResolvedQueueSize),
+      m_operations(OperationQueueSize), m_resolved(ResolvedQueueSize), m_dispatch_jobs(DispatchSlotCount),
       m_neutral_state {&m_neutral_context, &m_neutral_user_config, &m_neutral_shaders} {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	GraphicsInitJmpTables();
@@ -165,7 +165,9 @@ GuestGpu::GuestGpu(RenderContext& renderer)
 		m_gfx_cp->AttachPipeline(this);
 		m_executor = std::jthread([this] { ExecutionThread(); });
 		if (m_resolving) {
-			m_resolver = std::jthread([this] { ResolveThread(); });
+			m_dispatch_slots    = std::make_unique<GpuDispatchSlot[]>(DispatchSlotCount);
+			m_dispatch_resolver = std::jthread([this] { DispatchResolveThread(); });
+			m_resolver          = std::jthread([this] { ResolveThread(); });
 		}
 	}
 	m_thread = std::jthread(ThreadRun, this);
@@ -816,6 +818,24 @@ void GuestGpu::ExecutionThread() {
 		const auto op_kind  = static_cast<uint64_t>(operation->kind) | (uint64_t {operation->trace_op} << 8u);
 		const auto op_start = traced ? Common::EventTrace::NowNs() : int64_t {0};
 		g_exec_op           = op_kind;
+		if (auto* slot = operation->dispatch_slot; slot != nullptr) {
+			if (slot->state.load(std::memory_order_acquire) != 2) {
+				const auto start = StageStats::Enabled() ? std::chrono::steady_clock::now()
+				                                         : std::chrono::steady_clock::time_point {};
+				for (Common::SpinWait wait; slot->state.load(std::memory_order_acquire) != 2;) {
+					if (!wait.Spin()) {
+						std::this_thread::yield();
+					}
+				}
+				if (StageStats::Enabled()) {
+					StageStats::Add(StageStats::ExecIdle, start);
+					StageStats::Add(StageStats::ExecIdleResolve, start);
+				}
+			}
+			operation->resolved_dispatch = slot->result;
+			slot->state.store(0, std::memory_order_release);
+			operation->dispatch_slot = nullptr;
+		}
 		PageWriteSeq::SetOperation(operation->sequence);
 		if (StageStats::Enabled()) {
 			const auto kind  = static_cast<size_t>(operation->kind) & 7u;
@@ -886,6 +906,17 @@ void GuestGpu::ResolveThread() {
 			                              *operation->state.shaders);
 		} else if (operation->kind == GpuOperationKind::DispatchDirect &&
 		           (Common::Experiments::Enabled(Common::Experiments::DispatchAhead) ||
+		            Common::RuntimeFlags::Current().compute_resolve_ahead) &&
+		           DispatchResolverActive()) {
+			QueueDispatchResolution(*operation, false);
+		} else if (operation->kind == GpuOperationKind::DispatchIndirect &&
+		           (operation->dispatch.mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) == 0 &&
+		           (Common::Experiments::Enabled(Common::Experiments::DispatchAhead) ||
+		            Common::RuntimeFlags::Current().compute_resolve_ahead) &&
+		           DispatchResolverActive()) {
+			QueueDispatchResolution(*operation, true);
+		} else if (operation->kind == GpuOperationKind::DispatchDirect &&
+		           (Common::Experiments::Enabled(Common::Experiments::DispatchAhead) ||
 		            Common::RuntimeFlags::Current().compute_resolve_ahead)) {
 			const auto& dispatch = operation->dispatch;
 			operation->resolved_dispatch = executor.ResolveDispatchAhead(
@@ -913,11 +944,65 @@ void GuestGpu::ResolveThread() {
 	m_resolved.Stop();
 }
 
+void GuestGpu::QueueDispatchResolution(GpuOperation& operation, bool indirect) {
+	auto& slot = m_dispatch_slots[m_dispatch_slot_next];
+	m_dispatch_slot_next = (m_dispatch_slot_next + 1) % DispatchSlotCount;
+	// The execution thread frees the slots in order.
+	for (Common::SpinWait wait; slot.state.load(std::memory_order_acquire) != 0;) {
+		if (!wait.Spin()) {
+			std::this_thread::yield();
+		}
+	}
+	slot.result = nullptr;
+	slot.state.store(1, std::memory_order_relaxed);
+	const auto& dispatch = operation.dispatch;
+	DispatchJob job {.slot     = &slot,
+	                 .context  = operation.state.context,
+	                 .shaders  = operation.state.shaders,
+	                 .x        = dispatch.thread_group_x,
+	                 .y        = dispatch.thread_group_y,
+	                 .z        = dispatch.thread_group_z,
+	                 .mode     = dispatch.mode,
+	                 .async    = operation.processor->IsAsyncComputeQueue(),
+	                 .indirect = indirect};
+	m_dispatch_jobs.Push(std::move(job));
+	m_dispatch_jobs_queued++;
+	operation.dispatch_slot = &slot;
+}
+
+// Experiment DispatchResolver: resolves the dispatches the resolve thread passes on, in order,
+// while it resolves the draws. Compute programs are never draw stages, so the two threads do not
+// materialize the same resource plans.
+void GuestGpu::DispatchResolveThread() {
+	KYTY_PROFILER_THREAD("Thread_GpuResolveDispatch");
+	Config::ConfigureGpuStageThread(Config::GpuStageThread::DispatchResolve);
+	auto& executor = m_renderer.GetRenderExecutor();
+	for (;;) {
+		auto job = m_dispatch_jobs.Pop();
+		if (!job) {
+			break;
+		}
+		GuestReadLog::SetResolveBase(m_executed.Load());
+		auto* result = job->indirect
+		                   ? executor.ResolveDispatchIndirectAhead(*job->context, *job->shaders, job->async)
+		                   : executor.ResolveDispatchAhead(*job->context, *job->shaders, job->x, job->y, job->z,
+		                                                   job->mode, job->async);
+		job->slot->result = result;
+		job->slot->state.store(2, std::memory_order_release);
+		m_dispatch_jobs_done.fetch_add(1, std::memory_order_release);
+	}
+}
+
 void GuestGpu::StopExecution() {
 	WaitForExecution();
 	m_operations.Stop();
 	if (m_resolver.joinable()) {
 		m_resolver.join();
+	}
+	// After the resolve thread: it queues no more dispatches; the queued ones are still resolved.
+	m_dispatch_jobs.Stop();
+	if (m_dispatch_resolver.joinable()) {
+		m_dispatch_resolver.join();
 	}
 	if (m_executor.joinable()) {
 		m_executor.join();

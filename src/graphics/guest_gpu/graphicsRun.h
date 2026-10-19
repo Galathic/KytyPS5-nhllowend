@@ -143,6 +143,14 @@ private:
 	void              ProcessCommands();
 	void              ExecutionThread();
 	void              ResolveThread();
+	void              DispatchResolveThread();
+	// Experiment DispatchResolver (resolve thread): hands the dispatch to the dispatch resolver.
+	void              QueueDispatchResolution(GpuOperation& operation, bool indirect);
+	// The experiment is on, or the dispatch resolver still has queued dispatches.
+	[[nodiscard]] bool DispatchResolverActive() const {
+		return Common::Experiments::Enabled(Common::Experiments::DispatchResolver) ||
+		       m_dispatch_jobs_done.load(std::memory_order_acquire) != m_dispatch_jobs_queued;
+	}
 	void              StopExecution();
 	// Command processor thread of a pipelined GPU: runs a command on the execution thread and
 	// waits for it.
@@ -225,6 +233,27 @@ private:
 	GpuRegisterState                m_neutral_state;
 	std::jthread                    m_executor;
 	std::jthread                    m_resolver;
+	// Experiment DispatchResolver: dispatches the resolve thread passes on to a second one.
+	struct DispatchJob {
+		GpuDispatchSlot*   slot     = nullptr;
+		const HW::Context* context  = nullptr;
+		const HW::Shader*  shaders  = nullptr;
+		uint32_t           x        = 0;
+		uint32_t           y        = 0;
+		uint32_t           z        = 0;
+		uint32_t           mode     = 0;
+		bool               async    = false;
+		bool               indirect = false;
+	};
+	static constexpr size_t           DispatchSlotCount = 1024;
+	std::unique_ptr<GpuDispatchSlot[]> m_dispatch_slots;
+	size_t                            m_dispatch_slot_next = 0;
+	Common::SpscQueue<DispatchJob>    m_dispatch_jobs;
+	// Queued (resolve thread) and resolved (dispatch resolver) jobs: the resolve thread resolves
+	// dispatches itself again only once the dispatch resolver is idle (they share a ring).
+	uint64_t                          m_dispatch_jobs_queued = 0;
+	std::atomic<uint64_t>             m_dispatch_jobs_done {0};
+	std::jthread                      m_dispatch_resolver;
 
 	std::jthread m_thread;
 

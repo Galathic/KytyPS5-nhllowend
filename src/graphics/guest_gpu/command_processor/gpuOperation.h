@@ -4,6 +4,7 @@
 #include "common/inlineFunction.h"
 #include "graphics/host_gpu/renderer/render.h"
 
+#include <atomic>
 #include <cstdint>
 
 namespace Libs::Graphics {
@@ -98,6 +99,13 @@ enum class GpuCallbackTag : uint8_t {
 	Count
 };
 
+// Experiment DispatchResolver: where the second resolve thread leaves a dispatch's resolution
+// (state 0 free, 1 queued, 2 resolved); the execution thread waits for it and frees it.
+struct GpuDispatchSlot {
+	std::atomic<uint32_t>             state {0};
+	RenderExecutor::ResolvedDispatch* result = nullptr;
+};
+
 // One unit of emulated GPU work produced by a command processor. Operations execute in the
 // order the command processors produce them; every guest-visible effect of a command buffer
 // (draws, dispatches, labels, interrupts, flips, DMA) is an operation.
@@ -113,6 +121,8 @@ struct GpuOperation {
 	RenderExecutor::ResolvedDraw* resolved = nullptr;
 	// Direct dispatches: the compute program the resolve thread resolved ahead, if any.
 	RenderExecutor::ResolvedDispatch* resolved_dispatch = nullptr;
+	// Experiment DispatchResolver: the resolution of resolved_dispatch is still being made.
+	GpuDispatchSlot* dispatch_slot = nullptr;
 	// The command processor processed a WAIT_REG_MEM since the previous operation: the guest may
 	// have written memory the operations before it read.
 	bool after_wait = false;

@@ -31,7 +31,7 @@ class GuestReadLog {
 public:
 	void Clear() {
 		m_entries.clear();
-		m_runs.clear();
+		m_run_head = NoRun;
 		m_bytes.clear();
 		m_failed     = false;
 		m_base       = t_resolve_base;
@@ -64,18 +64,14 @@ private:
 		// The bytes may have been GPU-dirty when read (read-protected page, pending download):
 		// always checked.
 		bool unsafe = false;
+		// The first entry of a clean run (consecutive single-page entries on one page, neither
+		// strict nor possibly GPU-owned): the run's length; 0 for the other entries.
+		uint32_t run_count = 0;
 	};
 	std::vector<Entry>   m_entries;
-	// Consecutive entries on one page (StillValid checks a clean run with one lookup). A run is
-	// clean while its entries are single-page, not strict and not possibly GPU-owned; an unclean
-	// run is checked entry by entry.
-	struct Run {
-		uint64_t page  = 0;
-		uint32_t first = 0;
-		uint32_t count = 0;
-		bool     clean = false;
-	};
-	std::vector<Run> m_runs;
+	// The clean run the last entry extends (StillValid checks a clean run with one lookup).
+	static constexpr uint32_t NoRun = UINT32_MAX;
+	uint32_t                  m_run_head = NoRun;
 	[[nodiscard]] static bool RunClean(const Entry& entry) {
 		return !entry.strict && !entry.unsafe && (entry.address >> 12u) == ((entry.address + entry.size - 1) >> 12u);
 	}

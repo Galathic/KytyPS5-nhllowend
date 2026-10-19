@@ -61,6 +61,7 @@ enum Bit : uint64_t {
 	CpSkipIdleSpin       = uint64_t {1} << 36u, // KYTY_CP_SKIP_IDLE_SPIN (default off; work queued while the command processor waited for the execution thread starts at once, not after a 2 ms spin)
 	ExecBranches         = uint64_t {1} << 39u, // KYTY_EXEC_BRANCHES (default on; runs of lane-wise instructions under one partial EXEC run in a divergent branch instead of selecting each written VGPR per lane; part of shader keys)
 	ExecBranchMemory     = uint64_t {1} << 40u, // KYTY_EXEC_BRANCH_MEMORY (default on; ExecBranches runs also take memory operations under their EXEC; part of shader keys)
+	DispatchResolver     = uint64_t {1} << 41u, // KYTY_DISPATCH_RESOLVER (default off; a second resolve thread resolves dispatches ahead while the first resolves draws)
 	SpeculateDirtyReads  = uint64_t {1} << 37u, // KYTY_SPECULATE_DIRTY_READS (default off; shader-table reads of GPU-written bytes the GPU keeps rewriting unchanged use the backing, checked later)
 	// A/B only (no environment variable): selects the code a pending change replaces.
 	AbLegacy = 1u << 31u,
