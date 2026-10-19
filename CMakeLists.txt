@@ -385,9 +385,11 @@ if(KYTY_ENABLE_FSR3)
 endif()
 install(FILES "${KYTY_THIRD_PARTY_DIR}/fsr1/LICENSE.txt" DESTINATION licenses/FSR1)
 
-# Linux system libraries.
-if(LINUX)
+# Linux system libraries. Threads is also needed on macOS by experiments_tests.
+if(LINUX OR APPLE)
 	find_package(Threads REQUIRED)
+endif()
+if(LINUX)
 	list(APPEND kyty_emulator_link_libraries m ${CMAKE_DL_LIBS} Threads::Threads)
 endif()
 
