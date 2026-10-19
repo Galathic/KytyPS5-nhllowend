@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
+#include "kernel/memory.h"
 
 #include <array>
 #include <atomic>
@@ -77,11 +78,12 @@ struct Nhl27Fsr3::Impl {
 	unsigned stage = 0;
 	std::atomic<bool> last_recorded {false}, failed {false};
 	Nhl27Fsr3Constants captured;
+	std::optional<Nhl27Fsr3Constants> end;
 	std::array<Role, 8> prepare {}, reactive {};
 	Role luma;
 	Nhl27HistoryState last_state {};
 	bool have_last = false, missed = true;
-	uint64_t resets = 0, present_skips = 0;
+	uint64_t resets = 0, present_skips = 0, dirty_reads = 0, clean_mismatches = 0, replaced = 0;
 	std::atomic<uint64_t> presented {0};
 	explicit Impl(GraphicContext& gfx) : graphics(gfx) {
 		if (!gfx.physical_device.getFeatures().shaderInt16) {
@@ -137,6 +139,12 @@ struct Nhl27Fsr3::Impl {
 		if (bindings.buffer_sources.empty() || bindings.buffers.empty() ||
 			bindings.buffer_sources[0].size != 208 || bindings.buffers[0].range < 208 ||
 			!bindings.buffers[0].buffer) return std::nullopt;
+		// The game writes the block from the CPU into a ring, so its backing is normally clean
+		// and equals what the dispatch uploaded. Verify mode also reads the GPU bytes and compares.
+		std::array<uint32_t, 52> clean;
+		const bool have_clean = LibKernel::Memory::TryReadCleanBufferBacking(
+			bindings.buffer_sources[0].address, clean.data(), 208);
+		if (have_clean && !VerifyEnabled()) return Nhl27Fsr3Constants::Decode(clean);
 		if (!constants && !AllocateBuffer(208, true, constants, constants_alloc, &mapped))
 			return std::nullopt;
 		auto recorder = command.Handle();
@@ -149,14 +157,20 @@ struct Nhl27Fsr3::Impl {
 		vk::DependencyInfo dependency {};
 		dependency.memoryBarrierCount = 1; dependency.pMemoryBarriers = &host;
 		recorder.pipelineBarrier2(dependency);
-		// Intentionally synchronous diagnostic: decode the actual shader-visible GPU bytes,
-		// never CPU/dirty guest backing. The wrapper stays stable across the new submission.
+		// Synchronous: decode the actual shader-visible GPU bytes when the backing is dirty or
+		// in verify mode. The wrapper stays stable across the new submission.
 		context.GetCommandScheduler().Wait(context.GetCommandScheduler().CurrentTick());
 		InvalidateRedundantBinds();
 		if (vmaInvalidateAllocation(graphics.allocator, constants_alloc, 0, 208) != VK_SUCCESS)
 			return std::nullopt;
 		std::array<uint32_t, 52> words;
 		std::memcpy(words.data(), mapped, 208);
+		if (!have_clean) ++dirty_reads;
+		if (have_clean && clean != words && ++clean_mismatches <= 8) {
+			std::printf("NHL27FSR3GAME status=verify-mismatch source=constants count=%llu\n",
+						static_cast<unsigned long long>(clean_mismatches));
+			std::fflush(stdout);
+		}
 		return Nhl27Fsr3Constants::Decode(words);
 	}
 	void CheckOutput(RenderContext& context, CommandBuffer& command, uint32_t guest_frame, bool history) {
@@ -201,11 +215,27 @@ struct Nhl27Fsr3::Impl {
 		std::fflush(stdout);
 		if (!finite) { failed.store(true, std::memory_order_release); Reject("nonfinite-shadow-output"); }
 	}
-	bool EnsureImages(const Nhl27Fsr3Constants& c) {
+	bool AccumulationEdges(const std::vector<TextureBinding>& b) const {
+		return stage == 3 && b.size() == 8 && reactive[6].Matches(b[0]) && prepare[4].Matches(b[1]) &&
+			prepare[3].Matches(b[4]) && reactive[7].Matches(b[5]) &&
+			b[7].desc.info.pixel_format == vk::Format::eR16G16B16A16Sfloat &&
+			b[7].desc.info.extent == vk::Extent3D {captured.OutputWidth(), captured.OutputHeight(), 1};
+	}
+	bool PresentTarget(RenderContext& context, const TextureBinding& target) const {
+		const auto& guest = context.GetTextureCache().GetImage(target.image_id);
+		return target.image_id && target.desc.view_info.base_level == 0 &&
+			target.desc.view_info.base_layer == 0 && guest.backing.image &&
+			guest.backing.samples == 1 && guest.backing.format == vk::Format::eR16G16B16A16Sfloat &&
+			guest.backing.extent == vk::Extent3D {captured.OutputWidth(), captured.OutputHeight(), 1} &&
+			(guest.backing.usage & vk::ImageUsageFlagBits::eTransferDst) &&
+			target.layout != vk::ImageLayout::eUndefined;
+	}
+	bool EnsureImages(RenderContext& context, const Nhl27Fsr3Constants& c) {
 		const vk::Extent2D input {c.Width(), c.Height()}, output {c.OutputWidth(), c.OutputHeight()};
 		if (images[0].resource.image && images[0].resource.extent == input &&
 			images[3].resource.extent == output) return true;
-		// ReadConstants just waited for all prior GPU work, including SDK callbacks.
+		// Previous FSR work and its SDK callbacks must finish before the images go.
+		if (images[0].resource.image) context.GetCommandScheduler().Wait(context.GetCommandScheduler().CurrentTick());
 		ReleaseImages();
 		constexpr std::array<vk::Format, 7> formats {
 			vk::Format::eB10G11R11UfloatPack32, vk::Format::eR32Sfloat,
@@ -301,6 +331,34 @@ bool Nhl27Fsr3::PresentEnabled() {
 	}();
 	return enabled;
 }
+bool Nhl27Fsr3::VerifyEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_FSR3_NHL27_VERIFY");
+		return value && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+bool Nhl27Fsr3::SkipGuestEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_FSR3_NHL27_SKIP_GUEST");
+		return PresentEnabled() && (!value || std::strcmp(value, "0") != 0);
+	}();
+	return enabled;
+}
+bool Nhl27Fsr3::ReplacesDispatch(RenderContext& context, CommandBuffer& command, uint64_t hash,
+								 const PreparedBindings& bindings) {
+	// Only the accumulation output reaches later passes, and the present copy overwrites it, so
+	// the guest dispatch is skipped once FSR has recorded a frame. Its own history goes stale,
+	// which only matters if FSR stops; the copy then stops too and the guest restarts cold.
+	if (hash != kPass[3] || !Enabled() || !SkipGuestEnabled() ||
+		m->failed.load(std::memory_order_acquire) || !m->last_recorded.load(std::memory_order_acquire) ||
+		!m->AccumulationEdges(bindings.images) || !m->PresentTarget(context, bindings.images[7])) return false;
+	// OnDispatch must not reject after this, so its constant check runs now.
+	m->end = m->ReadConstants(context, command, bindings);
+	if (!m->end || !m->captured.SameFrame(*m->end)) return false;
+	++m->replaced;
+	return true;
+}
 bool Nhl27Fsr3::Enabled() {
 #if KYTY_ENABLE_FSR3
 	static const bool enabled = [] {
@@ -319,7 +377,9 @@ void Nhl27Fsr3::OnDispatch(RenderContext& context, CommandBuffer& command, uint6
 	const auto count = b.size();
 	if (hash == kPass[0]) {
 		m->stage = 0;
-		if (m->last_tick) context.GetCommandScheduler().Wait(m->last_tick);
+		// One queue keeps the previous FSR work ahead of these snapshots; verify mode also waits
+		// so a failed Record() is seen before the next frame.
+		if (VerifyEnabled() && m->last_tick) context.GetCommandScheduler().Wait(m->last_tick);
 		if (m->failed.load(std::memory_order_acquire)) return;
 		const auto constants = m->ReadConstants(context, command, bindings);
 		if (!constants || count != 8) { m->Reject("prepare-constants-or-slots"); return; }
@@ -329,7 +389,7 @@ void Nhl27Fsr3::OnDispatch(RenderContext& context, CommandBuffer& command, uint6
 			b[1].desc.info.pixel_format != vk::Format::eR16G16Sfloat ||
 			b[3].desc.info.pixel_format != vk::Format::eB10G11R11UfloatPack32 ||
 			b[0].desc.info.extent != extent || b[1].desc.info.extent != extent ||
-			b[3].desc.info.extent != extent || !m->EnsureImages(c)) {
+			b[3].desc.info.extent != extent || !m->EnsureImages(context, c)) {
 			m->Reject("prepare-layout-or-allocation"); return;
 		}
 		if (!m->Snapshot(context, command, b[3], m->images[0]) ||
@@ -354,16 +414,11 @@ void Nhl27Fsr3::OnDispatch(RenderContext& context, CommandBuffer& command, uint6
 		for (size_t i = 0; i < 8; ++i) m->reactive[i] = Impl::Role::Of(b[i]);
 		m->stage = 3;
 	} else if (hash == kPass[3]) {
-		if (m->stage != 3 || count != 8 || !m->reactive[6].Matches(b[0]) ||
-			!m->prepare[4].Matches(b[1]) || !m->prepare[3].Matches(b[4]) ||
-			!m->reactive[7].Matches(b[5]) ||
-			b[7].desc.info.pixel_format != vk::Format::eR16G16B16A16Sfloat ||
-			b[7].desc.info.extent != vk::Extent3D {m->captured.OutputWidth(),
-				m->captured.OutputHeight(), 1}) {
-			m->Reject("accumulation-edges"); return;
-		}
+		if (!m->AccumulationEdges(b)) { m->Reject("accumulation-edges"); return; }
 		m->stage = 0;
-		const auto end = m->ReadConstants(context, command, bindings);
+		// ReplacesDispatch already read them when it skipped the guest dispatch.
+		const auto end = m->end ? m->end : m->ReadConstants(context, command, bindings);
+		m->end.reset();
 		if (!end || !m->captured.SameFrame(*end)) { m->Reject("constant-frame-mismatch"); return; }
 		const auto& c = m->captured;
 		Fsr3Frame frame {};
@@ -427,16 +482,12 @@ void Nhl27Fsr3::OnDispatch(RenderContext& context, CommandBuffer& command, uint6
 			}
 		});
 		if (PresentEnabled()) {
-			// The guest accumulation dispatch is already recorded; the next guest draw reads this
+			// The guest accumulation dispatch (unless skipped) is already recorded; the next guest draw reads this
 			// image and the one after reuses its memory as depth, so the copy must land here.
 			const auto& target = b[7];
 			const auto& guest = context.GetTextureCache().GetImage(target.image_id);
 			const vk::Extent3D extent {frame.output_size.width, frame.output_size.height, 1};
-			if (target.image_id && target.desc.view_info.base_level == 0 &&
-				target.desc.view_info.base_layer == 0 && guest.backing.image &&
-				guest.backing.samples == 1 && guest.backing.format == vk::Format::eR16G16B16A16Sfloat &&
-				guest.backing.extent == extent && (guest.backing.usage & vk::ImageUsageFlagBits::eTransferDst) &&
-				target.layout != vk::ImageLayout::eUndefined) {
+			if (m->PresentTarget(context, target)) {
 				const vk::Image source = m->images[3].resource.image, destination = guest.backing.image;
 				const vk::ImageLayout layout = target.layout;
 				recorder.RecordExternal([state, source, destination, layout, extent](vk::CommandBuffer native) {
@@ -482,8 +533,16 @@ void Nhl27Fsr3::OnDispatch(RenderContext& context, CommandBuffer& command, uint6
 		g_compute_pipeline_epoch.fetch_add(1, std::memory_order_relaxed);
 		NoteShaderWork();
 		m->last_tick = context.GetCommandScheduler().CurrentTick();
-		if (m->serial <= 3 || m->serial % 600 == 0)
+		if (VerifyEnabled() && (m->serial <= 3 || m->serial % 600 == 0))
 			m->CheckOutput(context, command, guest_frame, history);
+		if (m->serial % 600 == 0) {
+			std::printf("NHL27FSR3GAME status=stats frames=%llu dirty_reads=%llu mismatches=%llu "
+						"replaced=%llu\n", static_cast<unsigned long long>(m->serial),
+						static_cast<unsigned long long>(m->dirty_reads),
+						static_cast<unsigned long long>(m->clean_mismatches),
+						static_cast<unsigned long long>(m->replaced));
+			std::fflush(stdout);
+		}
 	}
 }
 } // namespace Libs::Graphics

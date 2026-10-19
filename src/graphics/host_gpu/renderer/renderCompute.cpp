@@ -872,7 +872,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	                                       thread_group_z);
 	FrameBreakdown::Add(FrameBreakdown::g_counters.dispatches);
 	FrameBreakdown::Add(FrameBreakdown::g_counters.dc_handled);
-	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	// The NHL27 FSR3 present path overwrites the game's accumulation output, so it can drop it.
+	if (!Nhl27Fsr3::Enabled() || !m_nhl27_fsr3 ||
+	    !m_nhl27_fsr3->ReplacesDispatch(m_context, buffer, program.shader_hash, bindings)) {
+		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	}
 	BreadcrumbEnd(m_context.GetGraphics(), vk_buffer, crumb);
 	m_context.GetTextureCache().FlushStorageShadows();
 	record_timer.Stop();

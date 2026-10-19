@@ -21,6 +21,14 @@ public:
 	// KYTY_FSR3_NHL27_PRESENT=1 copies the FSR output over the guest's accumulation output, so the
 	// game's later LUT/UI/composite passes run on it; frames FSR rejects keep the guest image.
 	static bool PresentEnabled();
+	// KYTY_FSR3_NHL27_VERIFY=1 brings back the synchronous GPU readbacks (constants compared
+	// with the clean CPU copy, output pixel checks) and the wait for the previous FSR frame.
+	static bool VerifyEnabled();
+	// When presenting, the guest accumulation dispatch is skipped; KYTY_FSR3_NHL27_SKIP_GUEST=0 keeps it.
+	static bool SkipGuestEnabled();
+	// Called before a guest dispatch is recorded: true means leave it out.
+	bool ReplacesDispatch(RenderContext& context, CommandBuffer& command, uint64_t hash,
+						  const PreparedBindings& bindings);
 	void OnDispatch(RenderContext& context, CommandBuffer& command, uint64_t hash,
 					const PreparedBindings& bindings);
 private:
