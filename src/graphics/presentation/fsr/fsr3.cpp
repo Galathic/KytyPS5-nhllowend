@@ -34,6 +34,33 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL FsrDeviceProcAddr(VkDevice device, cons
 		return reinterpret_cast<PFN_vkVoidFunction>(CreateFsrShaderModule);
 	return VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr(device, name);
 }
+// KYTY_FSR3_TUNE="vf=0,rs=1,sc=1,ap=0.333,md=-0.333" overrides the FSR 3.1.4 tuning constants
+// (velocity factor, reactiveness scale, shading change scale, accumulation added per frame,
+// min disocclusion accumulation). Unlisted keys keep the SDK defaults.
+void ApplyTuning(FfxFsr3UpscalerContext& context) {
+	const char* env = std::getenv("KYTY_FSR3_TUNE");
+	if (env == nullptr) return;
+	constexpr std::array<std::pair<const char*, FfxFsr3UpscalerConfigureKey>, 5> keys {{
+		{"vf", FFX_FSR3UPSCALER_CONFIGURE_UPSCALE_KEY_FVELOCITYFACTOR},
+		{"rs", FFX_FSR3UPSCALER_CONFIGURE_UPSCALE_KEY_FREACTIVENESSSCALE},
+		{"sc", FFX_FSR3UPSCALER_CONFIGURE_UPSCALE_KEY_FSHADINGCHANGESCALE},
+		{"ap", FFX_FSR3UPSCALER_CONFIGURE_UPSCALE_KEY_FACCUMULATIONADDEDPERFRAME},
+		{"md", FFX_FSR3UPSCALER_CONFIGURE_UPSCALE_KEY_FMINDISOCCLUSIONACCUMULATION}}};
+	for (const char* p = env; *p;) {
+		const char* eq = std::strchr(p, '=');
+		if (!eq) break;
+		char* end = nullptr;
+		float value = std::strtof(eq + 1, &end);
+		for (const auto& [name, key] : keys)
+			if (size_t(eq - p) == std::strlen(name) && std::strncmp(p, name, eq - p) == 0) {
+				const auto result = ffxFsr3UpscalerSetConstant(&context, key, &value);
+				std::printf("NHL27FSR3 tune %s=%g result=%d\n", name, value, int(result));
+			}
+		p = (end && *end == ',') ? end + 1 : (end ? end : eq + 1);
+		if (end && *end != ',' ) break;
+	}
+	std::fflush(stdout);
+}
 } // namespace
 #endif
 struct Fsr3::Impl {
@@ -170,6 +197,7 @@ bool Fsr3::Record(vk::CommandBuffer command, const Fsr3Frame& frame) {
 		if (!m->Check(ffxFsr3UpscalerContextCreate(&m->context, &description), "create"))
 			return false;
 		m->created = true;
+		ApplyTuning(m->context);
 		m->input = input;
 		m->output = output;
 		m->flags = flags;
