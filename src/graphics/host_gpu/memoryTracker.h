@@ -176,6 +176,26 @@ public:
 		const auto* manager = m_regions[index].load(std::memory_order_acquire);
 		return manager != nullptr ? manager->RegionCpuDirtyEpoch() : 0;
 	}
+	// The sum of the CPU-dirty epochs of the 64 KiB blocks of [vaddr, vaddr + size) in the tracking
+	// region `index` (0 while it is untracked); see RegionManager::BlockCpuDirtyEpoch.
+	[[nodiscard]] uint64_t BlockCpuDirtyEpochs(uint64_t index, uint64_t vaddr, uint64_t size) const {
+		if (index >= REGION_COUNT) {
+			EXIT("invalid memory tracker region\n");
+		}
+		const auto* manager = m_regions[index].load(std::memory_order_acquire);
+		if (manager == nullptr) {
+			return 0;
+		}
+		const uint64_t region_begin = index * TRACKER_REGION_SIZE;
+		const uint64_t begin        = std::max(vaddr, region_begin) - region_begin;
+		const uint64_t end          = std::min(vaddr + size, region_begin + TRACKER_REGION_SIZE) - region_begin;
+		constexpr uint64_t BlockBytes = RegionManager::DirtyBlockPages * TRACKER_PAGE_SIZE;
+		uint64_t           epoch      = 0;
+		for (uint64_t block = begin / BlockBytes; block * BlockBytes < end; block++) {
+			epoch += manager->BlockCpuDirtyEpoch(static_cast<size_t>(block));
+		}
+		return epoch;
+	}
 
 	// Calls func(address, size) for maximal runs of pages that may hold CPU writes not yet
 	// uploaded, after releasing the region locks. Untracked regions count as dirty, as a new

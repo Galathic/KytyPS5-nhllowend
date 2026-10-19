@@ -41,6 +41,8 @@ inline std::atomic<uint64_t> g_check_calls[2] {}, g_check_entries[2] {}, g_check
 inline std::atomic<uint64_t> g_check_skipped[2] {}; // reads skipped (see GuestReadLog::StillValid)
 // Reads checked because their bytes may have been GPU-owned when read, or a later operation writes their page.
 inline std::atomic<uint64_t> g_check_unsafe[2] {}, g_check_later[2] {};
+// Buffer bindings the execution thread looks up, those its stage slot had the draw before, written.
+inline std::atomic<uint64_t> g_bind_total {0}, g_bind_same {0}, g_bind_written {0};
 inline std::atomic<uint64_t> g_bda_syncs {0}; // BDA synchronizations that scanned for CPU-dirty pages
 inline std::atomic<uint64_t> g_ops {0}; // operations the execution thread ran (written by it only)
 // Execution-thread time and count by operation kind (GpuOperationKind; execution thread only).

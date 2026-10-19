@@ -688,6 +688,13 @@ static void PrintStageStats() {
 		            kind == 0 ? "draws" : "dispatches", static_cast<double>(calls) / seconds, per(entries), per(bytes),
 		            per(pages), per(skipped), per(unsafe), per(later));
 	}
+	{
+		const auto total = StageStats::g_bind_total.exchange(0, std::memory_order_relaxed);
+		const auto same  = StageStats::g_bind_same.exchange(0, std::memory_order_relaxed);
+		const auto wr    = StageStats::g_bind_written.exchange(0, std::memory_order_relaxed);
+		std::printf("NHL27BINDS: buffer bindings/s=%.0f same-as-last=%.0f written=%.0f\n", static_cast<double>(total) / seconds,
+		            static_cast<double>(same) / seconds, static_cast<double>(wr) / seconds);
+	}
 	// By operation kind: ms/s and us per operation.
 	static uint64_t last_kind_ns[8] {}, last_kind_count[8] {};
 	static const char* const kinds[] = {"draw", "draw-auto", "draw-indirect", "dispatch", "dispatch-indirect", "callback", "?", "?"};

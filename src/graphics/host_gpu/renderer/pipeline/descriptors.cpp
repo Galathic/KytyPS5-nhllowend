@@ -15,6 +15,7 @@
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/guest_gpu/stageStats.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/hostMemory.h"
@@ -1307,6 +1308,16 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 			if (size == 0) {
 				source = {};
 				continue;
+			}
+			// KYTY_DBG_STAGE_STATS: bindings, those the slot had the draw before, written ones (NHL27BINDS).
+			if (StageStats::Enabled()) {
+				StageStats::g_bind_total.fetch_add(1, std::memory_order_relaxed);
+				if (source.address == address && source.size == size) {
+					StageStats::g_bind_same.fetch_add(1, std::memory_order_relaxed);
+				}
+				if (metadata.written) {
+					StageStats::g_bind_written.fetch_add(1, std::memory_order_relaxed);
+				}
 			}
 			source = {address, size, cache.FindBuffer(address, size)};
 		}

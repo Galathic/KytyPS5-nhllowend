@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/regionDefinitions.h"
 
 #include <array>
+#include <bit>
 #include <atomic>
 #include <mutex>
 #include <utility>
@@ -89,6 +90,9 @@ public:
 		}
 		m_cpu_dirty.Fill();
 		m_cpu_written.Fill();
+		for (auto& epoch: m_block_dirty_epoch) {
+			epoch.store(1, std::memory_order_relaxed);
+		}
 		m_writable.Fill();
 		m_readable.Fill();
 		s_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel);
@@ -117,6 +121,14 @@ public:
 	[[nodiscard]] uint64_t RegionCpuDirtyEpoch() const {
 		return m_cpu_dirty_epoch.load(std::memory_order_acquire);
 	}
+	// As RegionCpuDirtyEpoch for the 64 KiB block `block` of the region, advancing only when one of
+	// its pages becomes CPU dirty (a page dirty already does not advance it).
+	static constexpr size_t DirtyBlockPages = 16;
+	static constexpr size_t DirtyBlocks     = TRACKER_REGION_PAGES / DirtyBlockPages;
+	static_assert(DirtyBlocks <= 64);
+	[[nodiscard]] uint64_t BlockCpuDirtyEpoch(size_t block) const {
+		return m_block_dirty_epoch[block].load(std::memory_order_acquire);
+	}
 
 	KYTY_CLASS_NO_COPY(RegionManager);
 
@@ -131,6 +143,7 @@ public:
 	template <DirtySource source, bool enable>
 	void ChangeState(uint64_t vaddr, uint64_t size) {
 		const auto [start, end] = GetPageRange(vaddr, size);
+		uint64_t   newly_dirty_blocks = 0;
 		if constexpr (source == DirtySource::Cpu && enable) {
 			if (m_gpu_dirty.AnyInRange(start, end)) {
 				EXIT("CPU dirty state conflicts with GPU dirty state\n");
@@ -146,7 +159,10 @@ public:
 			// Pages already dirty keep their (earlier) epoch.
 			const auto epoch = t_gpu_ordered ? 0u : s_write_epoch.load(std::memory_order_acquire);
 			for (size_t page = start; page < end; page++) {
-				if (!bits.Get(page)) m_page_epoch[page] = epoch;
+				if (!bits.Get(page)) {
+					m_page_epoch[page] = epoch;
+					newly_dirty_blocks |= uint64_t {1} << (page / DirtyBlockPages);
+				}
 			}
 		}
 		if constexpr (enable) {
@@ -159,6 +175,10 @@ public:
 				m_cpu_written.SetRange(start, end);
 				m_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel);
 				s_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel);
+				for (auto blocks = newly_dirty_blocks; blocks != 0; blocks &= blocks - 1) {
+					m_block_dirty_epoch[static_cast<size_t>(std::countr_zero(blocks))].fetch_add(
+					    1, std::memory_order_acq_rel);
+				}
 			}
 			m_has_cpu_dirty.store(m_cpu_dirty.Any(), std::memory_order_release);
 			UpdateProtection<!enable, false>();
@@ -321,6 +341,7 @@ private:
 	std::atomic_bool      m_has_cpu_dirty {true};
 	std::atomic_bool      m_has_gpu_dirty {false};
 	std::atomic<uint64_t> m_cpu_dirty_epoch {1};
+	std::array<std::atomic<uint32_t>, DirtyBlocks> m_block_dirty_epoch {};
 
 	inline static std::atomic<uint64_t> s_cpu_dirty_epoch {0};
 	// Write epoch of each CPU-dirty page (0 for the pages a new region starts dirty with).

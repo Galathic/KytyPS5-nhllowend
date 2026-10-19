@@ -3,6 +3,7 @@
 
 #include "common/abi.h"
 #include "common/common.h"
+#include "common/experiments.h"
 #include "common/lruCache.h"
 #include "common/slotVector.h"
 #include "graphics/host_gpu/memoryTracker.h"
@@ -298,7 +299,13 @@ public:
 		uint64_t epoch = 0;
 		for (auto index = vaddr / TRACKER_REGION_SIZE; index * TRACKER_REGION_SIZE < vaddr + size;
 		     index++) {
-			epoch += m_memory_tracker.RegionCpuDirtyEpoch(index);
+			// Per 64 KiB block where the range covers part of a region (the region's epoch moves
+			// whenever the game writes anywhere in its 4 MiB: the read memo missed almost always).
+			const bool whole = vaddr <= index * TRACKER_REGION_SIZE &&
+			                   vaddr + size >= (index + 1) * TRACKER_REGION_SIZE;
+			epoch += whole || Common::Experiments::Enabled(Common::Experiments::AbPending)
+			             ? m_memory_tracker.RegionCpuDirtyEpoch(index)
+			             : m_memory_tracker.BlockCpuDirtyEpochs(index, vaddr, size);
 		}
 		return epoch;
 	}
