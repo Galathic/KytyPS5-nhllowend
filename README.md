@@ -75,8 +75,17 @@ greater single thread performance.
 Build `kyty_emulator` (see the upstream build instructions below), then run:
 
 ```powershell
-kyty_emulator.exe --game "<path>\eboot.bin" --screen-width 1920 --screen-height 1080 --redzone
+kyty_emulator.exe --game "<path>\eboot.bin" --screen-width 1920 --screen-height 1080 --redzone --readback-linear-images true
 ```
+
+Enable `--readback-linear-images true` for NHL 27, including ONES mode. The option defaults to
+`false` in `src/common/emulatorConfig.h`. With readback disabled, ONES outdoor gameplay was severely
+overexposed (almost entirely white), while regular arena gameplay appeared normal. Enabling it
+restored normal ONES lighting in a 1080p A/B test with the other settings unchanged.
+
+This option copies GPU-written linear images back to guest memory. The affected ONES capture
+included a one-pixel luminance result with no download transfer, consistent with missing exposure
+feedback. No shader brightness adjustment was needed.
 
 Recommended environment variables (all are needed for current performance and stability):
 

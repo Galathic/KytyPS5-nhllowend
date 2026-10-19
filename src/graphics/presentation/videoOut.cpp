@@ -1880,15 +1880,24 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 	static std::atomic<int> status_calls {0};
 	const bool fake_4k = status_calls.fetch_add(1, std::memory_order_relaxed) < fake_4k_calls;
 	ctx->mutex.Lock();
-	// Primary output reports 4K unless param.json Video-out Info enables resolution detection.
-	// KYTY_OUTPUT_1080P=1 reports a 1080p output to the game whatever it declares (NHL 27 then
-	// picks its own display buffers and render resolution).
+	// NHL 27 probes and closes the primary port before reopening it for output.
+	// Its packaged render profiles contain PS5_4K but not PS5_BASE. Keep that
+	// initial hardware probe native; the reopened output port can use 1080p.
+	static const bool nhl27 = [] {
+		std::string title_id;
+		return Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id) && title_id == "PPSA34063";
+	}();
+	// The newer override also applies with a 4K host window.
 	static const bool output_1080p = [] {
 		const char* value = std::getenv("KYTY_OUTPUT_1080P");
 		return value != nullptr && value[0] == '1';
 	}();
+	const bool preserve_profile_probe = (force_1080p || output_1080p) && nhl27 && (attribute3 & 4) == 0 &&
+	                                    ctx->bus == VIDEO_OUT_BUS_TYPE_MAIN && ctx->generation == 1;
 	status->resolution =
-	    (!fake_4k && (output_1080p || ((force_1080p || (attribute3 & 4) != 0) && ctx->width < 3840 && ctx->height < 2160)) ? 1u : 2u);
+	    (!fake_4k && !preserve_profile_probe &&
+	             (output_1080p || ((force_1080p || (attribute3 & 4) != 0) &&
+	                              ctx->width < 3840 && ctx->height < 2160)) ? 1u : 2u);
 	static std::atomic<int> reported {0};
 	if (reported.fetch_add(1, std::memory_order_relaxed) < 4) {
 		std::printf("NHL27VIDEO: output status resolution=%u attribute3=0x%x force_1080p=%d window=%ux%u\n",
