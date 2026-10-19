@@ -2311,8 +2311,40 @@ bool BufferCache::IsStrictRefused(uint64_t vaddr, uint64_t size) {
 	return it != g_spec_reads.end() && (it->second.changed >= 2 || it->second.mispredicts > 0);
 }
 
+// KYTY_SPECULATE_NO_GUESS: keep the dirty-read bookkeeping (changes, strict refusals, which
+// KYTY_SRT_UNION_DIRTY relies on) but return no guess, so those reads download. "1" = for every
+// shader; otherwise a comma-separated list of shader hashes (hex), e.g. 45066550b711ac4b, whose
+// lighting tables are the suspected cause of dark/brown players. Other shaders keep guessing.
+static bool SpeculateNoGuess(uint64_t shader) {
+	struct Config {
+		bool                  all = false;
+		std::vector<uint64_t> shaders;
+	};
+	static const Config config = [] {
+		Config      c;
+		const char* value = std::getenv("KYTY_SPECULATE_NO_GUESS");
+		if (value == nullptr || value[0] == '\0' || value[0] == '0') return c;
+		if (value[0] == '1' && value[1] == '\0') {
+			c.all = true;
+			return c;
+		}
+		for (const char* p = value; *p != '\0';) {
+			char*      end  = nullptr;
+			const auto hash = std::strtoull(p, &end, 16);
+			if (end == p) break;
+			c.shaders.push_back(hash);
+			p = (*end == ',') ? end + 1 : end;
+		}
+		return c;
+	}();
+	if (config.all) return true;
+	return !config.shaders.empty() &&
+	       std::find(config.shaders.begin(), config.shaders.end(), shader) != config.shaders.end();
+}
+
 bool BufferCache::TrySpeculativeRead(uint64_t vaddr, void* data, uint64_t size) {
-	if (size == 0 || size > SpecMaxBytes || data == nullptr || !GuestGpu::IsGpuThread()) {
+	if (size == 0 || size > SpecMaxBytes || data == nullptr || !GuestGpu::IsGpuThread() ||
+	    SpeculateNoGuess(Libs::LibKernel::Memory::ReadContext())) {
 		return false;
 	}
 	const auto key = SpecKey(vaddr, size);
