@@ -80,6 +80,14 @@ struct PreparedBindings {
 	// Keep the resolved guest range through cache preparation; only the host buffer ID may
 	// become stale and need resolving again when bindings are rebound.
 	std::vector<BufferSource>             buffer_sources;
+	// FindBuffers: the V# each buffer slot was found for, with its program and the buffer-set and
+	// mapping generations then: a slot whose V# is unchanged keeps its source.
+	struct BufferSlotKey {
+		ShaderRecompiler::IR::DescriptorValue value;
+		const void*                           program    = nullptr;
+		uint64_t                              generation = 0;
+	};
+	std::vector<BufferSlotKey> buffer_keys;
 	std::vector<vk::DescriptorBufferInfo> buffers;
 	std::vector<TextureBinding>           images;
 	// Bindless table descriptors in binding and table-range order, with the T# and the root

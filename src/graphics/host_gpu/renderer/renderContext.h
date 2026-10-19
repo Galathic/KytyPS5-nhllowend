@@ -115,6 +115,12 @@ private:
 	bool                      m_fault_process_pending = false;
 	bool                      m_bda_logged = false;
 	uint64_t                  m_mapping_generation = 1;
+
+public:
+	// Advances whenever guest memory is mapped or unmapped (execution thread).
+	[[nodiscard]] uint64_t MappingGeneration() const { return m_mapping_generation; }
+
+private:
 	uint64_t                  m_bda_cpu_generation = 0;
 	uint64_t                  m_bda_registration_generation = 0;
 	uint64_t                  m_bda_mapping_generation = 0;

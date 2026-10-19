@@ -1258,13 +1258,29 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 		const auto& snapshot = *prepared.runtime->resources;
 		const auto& layout = program.bindings;
 		prepared.buffer_sources.resize(layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)]);
+		prepared.buffer_keys.resize(prepared.buffer_sources.size());
 		if (layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)] == 0) {
 			continue;
 		}
+		// Half the slots bind the range they had the draw before: unchanged V#s keep their source
+		// (the clamp and the buffer lookup) while no buffer was registered or unregistered and no
+		// memory was mapped or unmapped.
+		const bool     reuse      = !Common::Experiments::Enabled(Common::Experiments::AbPending);
+		const uint64_t generation = cache.BufferSetEpoch() * 0x9e3779b97f4a7c15ull ^ m_context.MappingGeneration();
 		for (uint32_t resource = 0; resource < program.info.buffers.size(); ++resource) {
 			const auto& metadata = program.info.buffers[resource];
 			if (metadata.descriptor_index == UINT32_MAX) continue;
 			auto& source = prepared.buffer_sources[metadata.descriptor_index];
+			auto& key    = prepared.buffer_keys[metadata.descriptor_index];
+			if (reuse && key.program == &program && key.generation == generation &&
+			    key.value == snapshot.buffers[resource]) {
+				if (StageStats::Enabled()) {
+					StageStats::g_bind_total.fetch_add(1, std::memory_order_relaxed);
+					StageStats::g_bind_same.fetch_add(1, std::memory_order_relaxed);
+				}
+				continue;
+			}
+			key = {snapshot.buffers[resource], &program, generation};
 			const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[resource]);
 			const auto address = descriptor.Base48();
 			auto size = descriptor.GetSize();
@@ -1274,6 +1290,7 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 			}
 			if (descriptor.NumRecords() == UINT32_MAX) {
 				if (program.info.buffers[resource].written) {
+					key.program = nullptr;
 					// Sentinel write ranges end before tables captured by any bound stage.
 					for (const auto* reader: stages) {
 						for (const auto [read_address, read_size]: reader->runtime->resources->specialization_reads) {

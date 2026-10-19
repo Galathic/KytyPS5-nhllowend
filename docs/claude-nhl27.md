@@ -483,6 +483,19 @@ the last resolution of a program took is tried first, and read-watch answers are
 thread while no page gains or loses its read watcher: resolve time per operation -7% (paused
 A/B, with the GPU-dirty page cache).
 
+Buffer bindings (`NHL27BINDS`, stage stats): about 1.45 million per second (29,000 per frame, 7.5
+per draw or dispatch), 53% of them the range the slot had the draw before, 4.6% written. Nearly
+all ran a full synchronization (`NHL27BUFFERS2` with `KYTY_PERF_STATS_VERBOSE=1`: 21,500 of
+23,000 per frame) that found nothing to upload (under 5 uploads per frame): the memo of read
+bindings compared the CPU-dirty epoch of the whole 4 MiB tracking region, which moves whenever the
+game writes anywhere in it. Regions now keep an epoch per 64 KiB block as well, advanced only when
+one of its pages becomes CPU dirty, and ranges covering a region partly sum their blocks'
+epochs: draw cost -7.6%, paused fps 50 -> 53. The memo also takes formatted (texel) reads while
+no image starts at the address (only such an image is copied into the buffer): draw cost -10.5%
+and dispatch -6% in total, paused fps 55-57 -> 59-62; a clean match 54.8 fps at 60 Hz (steady
+54-56). A second resolve thread for dispatches (bit 41 `KYTY_DISPATCH_RESOLVER`, own core) took
+20% off the resolve thread but changed no fps while the execution thread was the limit.
+
 ## Merged defaults (nhl27 + claude/nhl27-perf)
 
 Where both branches implemented the same feature, only one implementation is left and it is a

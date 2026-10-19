@@ -290,6 +290,8 @@ public:
 	// Advances whenever a buffer is registered: a new buffer may cover CPU-dirty pages that no
 	// earlier synchronization uploaded.
 	[[nodiscard]] uint64_t RegisterEpoch() const { return m_registration_generation; }
+	// Advances whenever a buffer is registered or unregistered.
+	[[nodiscard]] uint64_t BufferSetEpoch() const { return m_buffer_set_epoch; }
 	// Advances whenever recorded work may write cached buffers (written bindings, fills, copies,
 	// device-address stores).
 	[[nodiscard]] uint64_t GpuWriteGeneration() const noexcept { return m_gpu_write_generation; }
