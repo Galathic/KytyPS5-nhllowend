@@ -123,6 +123,11 @@ inline std::atomic<bool> g_shader_native_pkrtz {false};
 [[nodiscard]] inline bool ShaderExecBranchMemory() {
 	return ShaderExecBranches() && Common::Experiments::Enabled(Common::Experiments::ExecBranchMemory);
 }
+// Codegen option: experiment BdaLoadGroups (key bit 8192): consecutive DWORD loads of one guest
+// load through an address share one page lookup when they are in one page.
+[[nodiscard]] inline bool ShaderBdaLoadGroups() {
+	return Common::Experiments::Enabled(Common::Experiments::BdaLoadGroups);
+}
 [[nodiscard]] inline uint32_t ShaderFloatCodegenKey() {
 	return static_cast<uint32_t>(ShaderNativeFp16()) | (ShaderNativeMinMax() ? 2u : 0u) |
 	       (ShaderFusedMad() ? 4u : 0u) |
@@ -130,7 +135,8 @@ inline std::atomic<bool> g_shader_native_pkrtz {false};
 	       (ShaderRobustConstReads() ? 32u : 0u) | (ShaderRobustStores() ? 64u : 0u) |
 	       (ShaderNativePkrtz() ? 128u : 0u) | (ShaderNativeF16Sdwa() ? 256u : 0u) |
 	       (ShaderRobustSpillLoads() ? 512u : 0u) | (ShaderBranchlessFormattedLoads() ? 1024u : 0u) |
-	       (ShaderExecBranches() ? 2048u : 0u) | (ShaderExecBranchMemory() ? 4096u : 0u);
+	       (ShaderExecBranches() ? 2048u : 0u) | (ShaderExecBranchMemory() ? 4096u : 0u) |
+	       (ShaderBdaLoadGroups() ? 8192u : 0u);
 }
 [[nodiscard]] inline uint32_t ShaderNativeFp16Modes() {
 	return g_shader_native_fp16_modes.load(std::memory_order_relaxed);

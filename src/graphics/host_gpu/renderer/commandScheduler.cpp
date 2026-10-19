@@ -924,7 +924,10 @@ void GpuTracePoll() {
 
 uint32_t GpuTraceCmdBegin(GraphicContext& graphics, const CommandRecorder& cmd, const char* kind,
                           uint64_t hash_a, uint64_t hash_b, uint64_t info, uint64_t aux) {
-	if (!Common::EventTrace::g_capturing.load(std::memory_order_relaxed)) {
+	// KYTY_IDLE_TRACE_NO_CMDS=1: command buffer timestamps only, so the GPU busy time per flip is
+	// measured without the cost of a timestamp pair around every draw and dispatch.
+	static const bool no_cmds = std::getenv("KYTY_IDLE_TRACE_NO_CMDS") != nullptr;
+	if (no_cmds || !Common::EventTrace::g_capturing.load(std::memory_order_relaxed)) {
 		return 0;
 	}
 	std::lock_guard lock(g_gtrace.mutex);

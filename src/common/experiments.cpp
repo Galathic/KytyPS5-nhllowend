@@ -56,6 +56,7 @@ uint64_t EnvironmentMask() {
 	set("KYTY_EXEC_SELECTS", ExecSelects, false);
 	set("KYTY_EXEC_BRANCHES", ExecBranches, true);
 	set("KYTY_EXEC_BRANCH_MEMORY", ExecBranchMemory, true);
+	set("KYTY_BDA_LOAD_GROUPS", BdaLoadGroups, false);
 	set("KYTY_GPU_COLOR_CLEAR", GpuColorClear, false);
 	set("KYTY_POOLED_BDA_BUFFERS", PooledBdaBuffers, false);
 	set("KYTY_ASYNC_GUEST_READS", AsyncGuestReads, false);
