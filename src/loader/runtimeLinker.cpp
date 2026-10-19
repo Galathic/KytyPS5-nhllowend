@@ -1729,6 +1729,7 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 		}
 	}
 	StartNhlResolutionScale(m_programs.empty() ? 0 : m_programs.front()->base_vaddr);
+	Libs::Graphics::Fsr2Capture::SetEbootBase(m_programs.empty() ? 0 : m_programs.front()->base_vaddr);
 	if (libc != nullptr && libc->dynamic_info->init_vaddr != 0) {
 		StartModule(libc, 0, nullptr, nullptr);
 	}

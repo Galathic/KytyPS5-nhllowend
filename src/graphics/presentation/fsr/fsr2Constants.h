@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -36,5 +37,19 @@ struct Fsr2ConstantsCandidate {
 	}
 };
 static_assert(sizeof(Fsr2ConstantsCandidate) == 128);
+
+// KYTY_FSR2_CAPTURE=1 (NHL 27 PPSA34063 v01.003.001): the guest's AMD FSR2 library keeps the
+// constants it uploads for every pass in globalFsr2ConstantBuffers (eboot+0xF01AA80, IDA
+// analysis of fsr2Dispatch); its first entry is { uint32Size = 31, Fsr2Constants data }. The
+// "cbFSR2" reflection string at eboot+0xDC16F76 identifies the build before anything is read.
+namespace Fsr2Capture {
+inline std::atomic<uint64_t> g_eboot_base {0};
+inline void                  SetEbootBase(uint64_t base) { g_eboot_base.store(base, std::memory_order_release); }
+constexpr uint64_t           GlobalConstantsOffset = 0xF01AA80;
+constexpr uint64_t           CbNameOffset          = 0xDC16F76;
+// The FSR2 shader blobs embedded in the eboot (fsr2_*_blob / blobRelOffsets targets).
+constexpr uint64_t           BlobRangeBegin        = 0xE184530;
+constexpr uint64_t           BlobRangeEnd          = 0xE1B0000;
+} // namespace Fsr2Capture
 
 } // namespace Libs::Graphics
