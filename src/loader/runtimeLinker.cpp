@@ -16,6 +16,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/pageManager.h"
+#include "graphics/presentation/fsr/fsr2Constants.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
@@ -70,6 +71,23 @@ namespace {
 // renders below its 4K-display preset. The NHL preset applier rewrites both whenever a preset is
 // (re)selected, so the values are re-applied periodically. Offsets come from static analysis of
 // this eboot: the settings pointer slot is at eboot+0xf1ef808, the floats at +0x170 and +0xc0.
+// The eboot image (and some guest heap) is mapped at its guest address without a guest-memory
+// backing, so TryReadBacking/TryWriteBacking refuse it; fall back to the mapping itself once
+// VirtualQuery shows the range is readable (writable for writes).
+bool NhlReadGuest(uint64_t address, void* out, uint64_t size) {
+	if (Libs::LibKernel::Memory::TryReadBacking(address, out, size)) return true;
+	if (!Common::VirtualMemory::IsReadable(address, size)) return false;
+	std::memcpy(out, reinterpret_cast<const void*>(address), size);
+	return true;
+}
+
+bool NhlWriteGuest(uint64_t address, const void* data, uint64_t size) {
+	if (Libs::LibKernel::Memory::TryWriteBacking(address, data, size)) return true;
+	if (!Common::VirtualMemory::IsWritable(address, size)) return false;
+	std::memcpy(reinterpret_cast<void*>(address), data, size);
+	return true;
+}
+
 void StartNhlResolutionScale(uint64_t eboot_base) {
 	const char* env = std::getenv("KYTY_NHL_RES_SCALE");
 	if (env == nullptr || eboot_base == 0) {
@@ -89,16 +107,16 @@ void StartNhlResolutionScale(uint64_t eboot_base) {
 		for (;;) {
 			std::this_thread::sleep_for(std::chrono::milliseconds(50));
 			uint64_t settings = 0;
-			if (!Libs::LibKernel::Memory::TryReadBacking(eboot_base + SlotOffset, &settings,
+			if (!NhlReadGuest(eboot_base + SlotOffset, &settings,
 			                                            sizeof(settings)) ||
 			    settings == 0 || (settings & 0xfu) != 0) {
 				continue;
 			}
 			float current = 0.0f;
 			float current_min = 0.0f;
-			if (!Libs::LibKernel::Memory::TryReadBacking(settings + ScaleOffset, &current,
+			if (!NhlReadGuest(settings + ScaleOffset, &current,
 			                                            sizeof(current)) ||
-			    !Libs::LibKernel::Memory::TryReadBacking(settings + ScaleMinOffset, &current_min,
+			    !NhlReadGuest(settings + ScaleMinOffset, &current_min,
 			                                            sizeof(current_min))) {
 				continue;
 			}
@@ -117,19 +135,17 @@ void StartNhlResolutionScale(uint64_t eboot_base) {
 			if (announced != settings) {
 				announced = settings;
 				uint8_t drs = 0;
-				(void)Libs::LibKernel::Memory::TryReadBacking(settings + 0x211, &drs, 1);
+				(void)NhlReadGuest(settings + 0x211, &drs, 1);
 				::printf("NHL27RES: settings at 0x%016llx scale=%g min=%g drs=%u -> %g\n",
 				         static_cast<unsigned long long>(settings), current, current_min,
 				         static_cast<unsigned>(drs), scale);
 			}
 			if (current != scale || current_min != scale) {
-				(void)Libs::LibKernel::Memory::TryWriteBacking(settings + ScaleOffset, &scale,
-				                                              sizeof(scale));
-				(void)Libs::LibKernel::Memory::TryWriteBacking(settings + ScaleMinOffset, &scale,
-				                                              sizeof(scale));
+				const bool wrote = NhlWriteGuest(settings + ScaleOffset, &scale, sizeof(scale)) &&
+				                   NhlWriteGuest(settings + ScaleMinOffset, &scale, sizeof(scale));
 				if (++writes <= 8) {
-					::printf("NHL27RES: applied scale %g (was %g, min %g)\n", scale, current,
-					         current_min);
+					::printf("NHL27RES: %s scale %g (was %g, min %g)\n", wrote ? "applied" : "FAILED to write",
+					         scale, current, current_min);
 				}
 			}
 		}
@@ -1713,6 +1729,7 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 		}
 	}
 	StartNhlResolutionScale(m_programs.empty() ? 0 : m_programs.front()->base_vaddr);
+	Libs::Graphics::Fsr2Capture::SetEbootBase(m_programs.empty() ? 0 : m_programs.front()->base_vaddr);
 	if (libc != nullptr && libc->dynamic_info->init_vaddr != 0) {
 		StartModule(libc, 0, nullptr, nullptr);
 	}

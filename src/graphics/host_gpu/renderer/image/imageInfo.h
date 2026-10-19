@@ -120,6 +120,12 @@ struct ImageInfo {
 	[[nodiscard]] constexpr uint32_t TransferLayers() const noexcept {
 		return IsVolume() ? extent.depth : resources.layers;
 	}
+	// Guest descriptors may declare levels past 1x1; Vulkan stops the chain there. Guest
+	// addressing keeps resources.levels, host images and commands use this count.
+	[[nodiscard]] constexpr uint32_t HostLevels() const noexcept {
+		const auto largest = std::max({extent.width, extent.height, IsVolume() ? extent.depth : 1u});
+		return std::min(resources.levels, static_cast<uint32_t>(std::bit_width(largest)));
+	}
 	[[nodiscard]] vk::Extent2D BlockExtent() const noexcept {
 		const auto shift = Prospero::BlockCompressedBytesPerBlock(guest_format) != 0 ? 2u : 0u;
 		return {pitch >> shift, extent.height >> shift};

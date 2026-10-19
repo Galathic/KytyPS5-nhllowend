@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/presenter.h"
+#include "graphics/presentation/fsr/nhl27Fsr3.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
@@ -704,6 +705,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.vertexPipelineStoresAndAtomics != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.dualSrcBlend != VK_TRUE);
 	vk::PhysicalDeviceFeatures device_features {};
+	if (Nhl27Fsr3::Enabled()) {
+		device_features.shaderInt16 = supported_features2.features.shaderInt16;
+		std::printf("NHL27FSR3GAME feature=shaderInt16 enabled=%u\n",
+			unsigned(device_features.shaderInt16));
+		std::fflush(stdout);
+	}
 	device_features.fragmentStoresAndAtomics = VK_TRUE;
 	device_features.samplerAnisotropy        = VK_TRUE;
 	device_features.multiDrawIndirect = supported_features2.features.multiDrawIndirect;
@@ -1216,6 +1223,11 @@ void WindowContext::CreateVulkan() {
 	    VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
 	    VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
 	    "VK_KHR_maintenance1"};
+#if KYTY_ENABLE_FSR3
+	// SDK 1.1.4 resolves these KHR aliases even on Vulkan 1.3 devices.
+	device_extensions.push_back(VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME);
+	device_extensions.push_back(VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME);
+#endif
 
 #if defined(__APPLE__)
 	// MoltenVK lacks VK_EXT_depth_clip_enable and VK_EXT_color_write_enable; the renderer

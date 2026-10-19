@@ -4,6 +4,7 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/runtimeFlags.h"
 #include "common/threads.h"
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_overlay_spv.h"
@@ -12,6 +13,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/presenter.h"
+#include "graphics/presentation/fsr/fsr1.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/windowInternal.h"
@@ -19,6 +21,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <vector>
@@ -309,6 +314,8 @@ private:
 	vk::PipelineLayout             m_overlay_layout      = nullptr;
 	vk::Pipeline                   m_overlay_pipeline    = nullptr;
 	vk::Sampler                    m_overlay_sampler     = nullptr;
+	std::vector<std::unique_ptr<Fsr1>> m_fsr1;
+	std::string m_fsr1_status;
 	uint32_t                       m_image_index         = static_cast<uint32_t>(-1);
 	uint32_t                       m_frame_index         = 0;
 };
@@ -532,6 +539,8 @@ void Swapchain::Destroy() {
 		Common::LockGuard queue_lock(graphics.queue_mutex);
 		RequireVulkanSuccess(graphics.queue.waitIdle(), "wait for swapchain queue");
 	}
+	m_fsr1.clear();
+	m_fsr1_status.clear();
 	if (m_system_overlay != nullptr) {
 		m_system_overlay->ReleaseVulkan();
 	}
@@ -771,6 +780,56 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	auto       vk_command      = command.Handle();
 	const bool draw_overlay    = overlay.frame != nullptr;
 	const bool draw_attachment = draw_overlay || draw_system_overlay;
+	vk::Image blit_source = source ? source->image.image : vk::Image {};
+	vk::Extent2D blit_extent = source ? vk::Extent2D {source->image.extent.width, source->image.extent.height} : vk::Extent2D {};
+	const bool fsr1_enabled = Common::RuntimeFlags::Current().fsr1;
+	if (!fsr1_enabled && !m_fsr1_status.empty()) {
+		std::printf("NHL27FSR version=1 status=disabled\n");
+		std::fflush(stdout);
+		m_fsr1_status.clear();
+	}
+	if (source && fsr1_enabled) {
+		const bool sdr_format = source->image.format == vk::Format::eR8G8B8A8Unorm ||
+		                        source->image.format == vk::Format::eB8G8R8A8Unorm ||
+		                        source->image.format == vk::Format::eA2B10G10R10UnormPack32 ||
+		                        source->image.format == vk::Format::eA2R10G10B10UnormPack32;
+		std::string status = "fallback (HDR, format or downscaling)";
+		if (!source->hdr && !m_hdr_active && !source->blank && sdr_format &&
+		    blit_extent.width <= m_extent.width && blit_extent.height <= m_extent.height) {
+			if (m_fsr1.empty()) m_fsr1.resize(m_images.size());
+			auto& fsr = m_fsr1[m_image_index];
+			if (!fsr) fsr = std::make_unique<Fsr1>(m_window.graphic_ctx.physical_device, m_window.graphic_ctx.device);
+			if (!source->view) {
+				vk::ImageViewCreateInfo view {};
+				view.image = source->image.image;
+				view.viewType = vk::ImageViewType::e2D;
+				view.format = source->image.format;
+				view.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+				RequireVulkanSuccess(m_window.graphic_ctx.device.createImageView(&view, nullptr, &source->view), "create FSR source view");
+			}
+			source->Transit(vk_command, vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead);
+			static const float sharpness = [] {
+				const char* value = std::getenv("KYTY_FSR_SHARPNESS");
+				char* end = nullptr;
+				const float parsed = value ? std::strtof(value, &end) : 0.2f;
+				return value && (end == value || *end || !std::isfinite(parsed)) ? 0.2f : std::clamp(parsed, 0.0f, 1.0f);
+			}();
+			const auto output = fsr->Record(vk_command.Direct(), source->view, blit_extent, m_extent, sharpness);
+			if (output) {
+				status = fmt::format("{} {}x{} -> {}x{} sharpness={:.2f}", blit_extent == m_extent ? "RCAS" : "EASU+RCAS",
+				                     blit_extent.width, blit_extent.height, m_extent.width, m_extent.height, sharpness);
+				blit_source = output;
+				blit_extent = m_extent;
+			} else {
+				status = "fallback (FSR allocation or pipeline unavailable)";
+			}
+		}
+		if (status != m_fsr1_status) {
+			std::printf("NHL27FSR version=1 status=%s\n", status.c_str());
+			std::fflush(stdout);
+			m_fsr1_status = std::move(status);
+		}
+	}
 	if (source != nullptr) {
 		source->Transit(vk_command, vk::ImageLayout::eTransferSrcOptimal,
 		                vk::AccessFlagBits2::eTransferRead);
@@ -804,8 +863,8 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 		region.srcSubresource.mipLevel       = 0;
 		region.srcSubresource.baseArrayLayer = 0;
 		region.srcSubresource.layerCount     = 1;
-		region.srcOffsets[1].x               = static_cast<int>(source->image.extent.width);
-		region.srcOffsets[1].y               = static_cast<int>(source->image.extent.height);
+		region.srcOffsets[1].x               = static_cast<int>(blit_extent.width);
+		region.srcOffsets[1].y               = static_cast<int>(blit_extent.height);
 		region.srcOffsets[1].z               = 1;
 		region.dstSubresource.aspectMask     = vk::ImageAspectFlagBits::eColor;
 		region.dstSubresource.mipLevel       = 0;
@@ -814,7 +873,7 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 		region.dstOffsets[1].x               = static_cast<int>(m_extent.width);
 		region.dstOffsets[1].y               = static_cast<int>(m_extent.height);
 		region.dstOffsets[1].z               = 1;
-		vk_command.blitImage(source->image.image, vk::ImageLayout::eTransferSrcOptimal,
+		vk_command.blitImage(blit_source, vk::ImageLayout::eTransferSrcOptimal,
 		                     m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal, 1,
 		                     &region, vk::Filter::eLinear);
 	} else {
