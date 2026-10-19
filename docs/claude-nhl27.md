@@ -592,6 +592,12 @@ The profile matches clang 22.1.8; other versions ignore it with a warning. `-DKY
 builds the instrumented emulator that records a new profile, and `-DKYTY_THIN_LTO=ON` adds
 ThinLTO; `tools/pgo/README.md` has the steps.
 
+Refresh the profile after larger changes: functions whose code changed get no profile data and
+are optimized as cold. Profile v5 (2026-10-19, recorded on 0cc673db; v4 predated the resolve and
+execution-thread rewrites): gameplay 45.6 -> 49.8 fps at 60 Hz in a fixed-profile match. A new
+profile file takes effect only after a reconfigure (its hash is a configure-time define):
+otherwise ninja rebuilds nothing.
+
 Comparing builds needs separate boots, and scenes differ between boots, so compare the
 window-title fps over a few minutes of gameplay in several boots of each. `KYTY_PERF_STATS=1`
 must be off for such comparisons: its timers take tens of millions of timestamps per second.

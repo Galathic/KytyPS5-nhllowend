@@ -28,6 +28,8 @@ of each build, same switches).
 3. Play for a few minutes and close the emulator.
 4. `llvm-profdata merge -o tools/pgo/nhl27.profdata nhl27.profraw` (same LLVM version as the
    compiler), then rebuild with `-DKYTY_PGO=use`.
+   Reconfigure (`cmake -S . -B <build dir> -DKYTY_PGO=use`) before building: the profile's hash
+   is a configure-time define, and without it nothing is rebuilt with the new profile.
 
 Do not enable `KYTY_PERF_STATS` while recording: its timers run millions of times per second
 and would make their own code look hot.
