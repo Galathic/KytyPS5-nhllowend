@@ -1145,6 +1145,10 @@ bool Enabled() noexcept {
 	return enabled;
 }
 
+bool WriteRgbPng(const std::string& path, uint32_t w, uint32_t h, const std::vector<uint8_t>& rgb) {
+	return WritePng(path, w, h, rgb);
+}
+
 void Request() {
 	if (!Enabled()) return;
 	g_request.store(true);
