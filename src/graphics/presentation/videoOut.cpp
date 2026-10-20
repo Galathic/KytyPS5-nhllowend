@@ -846,12 +846,14 @@ static std::atomic<int> g_requested_flip_rate {0};
 // KYTY_MENU_VBLANK_HZ=<hz>: while the game asks for 30 or 20 Hz (menus, the pause menu,
 // presentation scenes) the emulated display runs at this rate, so those screens are not held to
 // 60 fps (flips go out at every vblank, see VideoOutSetFlipRate). KYTY_PLAY_VBLANK_HZ=<hz>: the
-// same while it asks for 60 Hz (play). Off (0) by default: the configured vblank frequency. The
-// game is not told of a faster display (its 120 Hz output mode follows the configured one).
+// same while it asks for 60 Hz (play). Both 240 by default, so neither is held to 60 fps (NHL 27
+// times its game by the clock: nothing runs faster at more frames); 0 = the configured vblank
+// frequency. The game is not told of a faster display (its 120 Hz output mode follows the
+// configured one).
 static uint32_t VblankHzFromEnv(const char* name) {
 	const char* value = std::getenv(name);
 	return value != nullptr ? static_cast<uint32_t>(std::clamp<unsigned long>(std::strtoul(value, nullptr, 10), 0ul, 1000ul))
-	                        : 0u;
+	                        : 240u;
 }
 static uint32_t MenuVblankHz() {
 	static const uint32_t hz = VblankHzFromEnv("KYTY_MENU_VBLANK_HZ");
