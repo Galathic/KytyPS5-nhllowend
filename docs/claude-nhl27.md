@@ -581,6 +581,25 @@ A dispatch has none: its submission waits for the copies before it, and only wit
 `CpuCopyForward` (default off) does a dispatch write guest memory. In-boot gameplay A/B: 48.0 ->
 49.0 fps at 60 Hz (paired rounds 48/50, 48/49, 45/52, 45/45, 48/51).
 
+Measured and dropped: guest threads kept off the cores of the GPU stage threads (host affinity
+of all 41 guest threads switched in boot; Petr's PC has a Ryzen 7 5800X3D, 8 cores, so the five
+stage threads on logical CPUs 2-10 leave three cores and the SMT siblings to the game). Off the
+stage cores and their siblings (mask 0xf22b): draw 4.13 -> 3.91 us, dispatch 3.23 -> 2.79 us,
+but 51.3 -> 47.9 fps; only off the siblings of the execution and resolve threads (0xf77f): draw
+4.01 -> 3.73 us, dispatch 3.27 -> 2.68 us, 52.4 -> 50.2 fps, the execution thread waiting for
+the game's next submission 34 -> 104 ms/s. The game's job threads are each ~28% busy (5% of it
+in the emulator: process time counter, exceptions) and want many cores at once; the SMT
+siblings cost the stage threads 7-18% per operation.
+Measured and dropped: the command processor on the execution thread's SMT sibling and the
+host copy thread on the resolve thread's (re-pinned in boot, `KytyPS5-tools\pin.py`, `PIN_A` /
+`PIN_B` in `abwin.sh`), freeing two cores for the game: draw 4.00 -> 4.55 us, 50.7 -> 46.8 fps.
+The second draw resolver on the resolve thread's SMT sibling (`KYTY_GPU_THREAD_CPUS=4,6,8,10,2,12,11`,
+10 rounds): waits for the resolve thread 72 -> 59 ms/s in heavy play, but the game's submissions
+later (34 -> 64 ms/s), 49.3 -> 48.4 fps: the CPU it takes is the game's. The command processor
+sleeping on a full register snapshot ring (61% of its time is spent waiting for a free slot,
+spinning) until an eighth of the ring is free: the execution thread then waited longer for work
+(no-submission 56 -> 93 ms/s), 51.2 -> 50.8 fps.
+
 Measured and dropped: a resource memo for resolutions ahead (the execution thread's
 `ResourceMemo` per program, 4 states, the recorded reads re-read through the resolution's log).
 Only 10% of resolutions repeat a program's register inputs (per-object pointers in user data),
