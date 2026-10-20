@@ -559,6 +559,14 @@ not new with these changes. The draw resolver's other crash (pc 0x909568416, job
 loading) is the only one of its kind so far. Four more boots with the draw resolver on: no crash,
 but 60 Hz fps 46.6 / 50.8 / 45.7 / 51.4 against 52.2 / 50.7 for two boots of the same build
 without it (fixed save, 240 s each): no gain in whole matches despite the in-boot A/Bs; still off.
+A later in-boot A/B (20 s phases) had it behind (paired rounds 42/47, 42/48, 44/40): in much of
+play the execution thread waits 70-220 ms/s for the game's next submission (`no-submission`),
+and the extra resolver costs the execution thread +4% per draw.
+
+Measured and dropped (in-boot gameplay A/Bs, 60 Hz windows): pipeline threads sleeping after
+200 us instead of 2 ms (54.1 / 54.0 fps); presenting a flip that missed its vblank as soon as it
+is ready (50.9 / 50.6 fps: flip waits are small, frames are not quantized by vsync); the host
+copy thread on the command processor's SMT sibling (two matches 52.5 / 55.6, within noise).
 
 GPU time per frame without the per-draw timestamps (`KYTY_IDLE_TRACE_NO_CMDS=1` at boot: the
 idle trace then stamps only command buffers, so the traced match keeps 48-58 fps at 60 Hz;
