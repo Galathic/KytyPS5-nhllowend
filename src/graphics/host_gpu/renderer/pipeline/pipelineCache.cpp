@@ -831,6 +831,21 @@ struct PipelineCache::ProgramCache {
 				QueueCompile(stage, params, input_info, push_data_cursor, nullptr);
 			}
 		}
+		// Experiment DrawResolver: the other draw resolver materializes this program; wait for it
+		// without the lock (a busy entry would leave the draw to the execution thread).
+		if constexpr (!compute) {
+			if (program_lock != nullptr && entry != programs.end() &&
+			    entry->second.busy.load(std::memory_order_acquire) &&
+			    Common::Experiments::Enabled(Common::Experiments::DrawResolver)) {
+				const auto& waited = entry->second;
+				UnlockPrograms();
+				while (waited.busy.load(std::memory_order_acquire)) {
+					Common::SpinPause();
+				}
+				LockPrograms();
+				return GetAhead(params, input_info, push_data_cursor, ahead);
+			}
+		}
 		// SWAPPC programs link the functions they call from guest memory: the execution thread
 		// resolves them.
 		if (entry == programs.end() || ahead.stages == ProgramResolution::MaxStages ||

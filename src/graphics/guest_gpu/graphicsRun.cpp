@@ -155,6 +155,7 @@ GuestGpu::GuestGpu(RenderContext& renderer)
       m_pipelined((Config::GpuPipelineStages() & Config::GPU_PIPELINE_COMMAND_PROCESSOR) != 0),
       m_resolving(m_pipelined && (Config::GpuPipelineStages() & Config::GPU_PIPELINE_RESOLVE) != 0),
       m_operations(OperationQueueSize), m_resolved(ResolvedQueueSize), m_dispatch_jobs(DispatchSlotCount),
+      m_draw_jobs(DrawSlotCount),
       m_neutral_state {&m_neutral_context, &m_neutral_user_config, &m_neutral_shaders} {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	GraphicsInitJmpTables();
@@ -167,6 +168,8 @@ GuestGpu::GuestGpu(RenderContext& renderer)
 		if (m_resolving) {
 			m_dispatch_slots    = std::make_unique<GpuDispatchSlot[]>(DispatchSlotCount);
 			m_dispatch_resolver = std::jthread([this] { DispatchResolveThread(); });
+			m_draw_slots        = std::make_unique<GpuDrawSlot[]>(DrawSlotCount);
+			m_draw_resolver     = std::jthread([this] { DrawResolveThread(); });
 			m_resolver          = std::jthread([this] { ResolveThread(); });
 		}
 	}
@@ -843,6 +846,24 @@ void GuestGpu::ExecutionThread() {
 			slot->state.store(0, std::memory_order_release);
 			operation->dispatch_slot = nullptr;
 		}
+		if (auto* slot = operation->draw_slot; slot != nullptr) {
+			if (slot->state.load(std::memory_order_acquire) != 2) {
+				const auto start = StageStats::Enabled() ? std::chrono::steady_clock::now()
+				                                         : std::chrono::steady_clock::time_point {};
+				for (Common::SpinWait wait; slot->state.load(std::memory_order_acquire) != 2;) {
+					if (!wait.Spin()) {
+						std::this_thread::yield();
+					}
+				}
+				if (StageStats::Enabled()) {
+					StageStats::Add(StageStats::ExecIdle, start);
+					StageStats::Add(StageStats::ExecIdleResolve, start);
+				}
+			}
+			operation->resolved = slot->result;
+			slot->state.store(0, std::memory_order_release);
+			operation->draw_slot = nullptr;
+		}
 		PageWriteSeq::SetOperation(operation->sequence);
 		if (StageStats::Enabled()) {
 			const auto kind  = static_cast<size_t>(operation->kind) & 7u;
@@ -905,7 +926,24 @@ void GuestGpu::ResolveThread() {
 		}
 		if (StageStats::Enabled()) StageStats::g_resolve_working.store(true, std::memory_order_relaxed);
 		GuestReadLog::SetResolveBase(m_executed.Load());
-		if (operation->kind == GpuOperationKind::DrawIndex ||
+		if ((operation->kind == GpuOperationKind::DrawIndex ||
+		     operation->kind == GpuOperationKind::DrawAuto) &&
+		    Common::Experiments::Enabled(Common::Experiments::DrawResolver)) {
+			// Experiment DrawResolver: by the vertex and pixel shader addresses, about half of the
+			// draws go to the second draw resolver; the draws of a program pair stay on one thread,
+			// so the two rarely materialize the same program at once (the second one then leaves
+			// the draw to the execution thread).
+			const auto& shaders = *operation->state.shaders;
+			const auto  key     = shaders.GetPs().ps_regs.data_addr ^ shaders.GetVs().gs_regs.data_addr ^
+			                 shaders.GetVs().es_regs.data_addr;
+			if (((key >> 8u) * 0x9e3779b97f4a7c15ull) >> 63u) {
+				QueueDrawResolution(*operation);
+			} else {
+				operation->resolved =
+				    executor.ResolveDrawAhead(*operation->state.context, *operation->state.user_config,
+				                              *operation->state.shaders);
+			}
+		} else if (operation->kind == GpuOperationKind::DrawIndex ||
 		    operation->kind == GpuOperationKind::DrawAuto) {
 			// The register snapshots stay valid until the operation executed.
 			operation->resolved =
@@ -977,6 +1015,41 @@ void GuestGpu::QueueDispatchResolution(GpuOperation& operation, bool indirect) {
 	operation.dispatch_slot = &slot;
 }
 
+void GuestGpu::QueueDrawResolution(GpuOperation& operation) {
+	auto& slot       = m_draw_slots[m_draw_slot_next];
+	m_draw_slot_next = (m_draw_slot_next + 1) % DrawSlotCount;
+	// The execution thread frees the slots in order.
+	for (Common::SpinWait wait; slot.state.load(std::memory_order_acquire) != 0;) {
+		if (!wait.Spin()) {
+			std::this_thread::yield();
+		}
+	}
+	slot.result = nullptr;
+	slot.state.store(1, std::memory_order_relaxed);
+	m_draw_jobs.Push(DrawJob {.slot        = &slot,
+	                          .context     = operation.state.context,
+	                          .user_config = operation.state.user_config,
+	                          .shaders     = operation.state.shaders});
+	operation.draw_slot = &slot;
+}
+
+// Experiment DrawResolver: resolves the draws the resolve thread passes on, in order, into a
+// resolution ring of its own.
+void GuestGpu::DrawResolveThread() {
+	KYTY_PROFILER_THREAD("Thread_GpuResolveDraw");
+	Config::ConfigureGpuStageThread(Config::GpuStageThread::DrawResolve);
+	auto& executor = m_renderer.GetRenderExecutor();
+	for (;;) {
+		auto job = m_draw_jobs.Pop();
+		if (!job) {
+			break;
+		}
+		GuestReadLog::SetResolveBase(m_executed.Load());
+		job->slot->result = executor.ResolveDrawAhead(*job->context, *job->user_config, *job->shaders, 1);
+		job->slot->state.store(2, std::memory_order_release);
+	}
+}
+
 // Experiment DispatchResolver: resolves the dispatches the resolve thread passes on, in order,
 // while it resolves the draws. Compute programs are never draw stages, so the two threads do not
 // materialize the same resource plans.
@@ -1010,6 +1083,10 @@ void GuestGpu::StopExecution() {
 	m_dispatch_jobs.Stop();
 	if (m_dispatch_resolver.joinable()) {
 		m_dispatch_resolver.join();
+	}
+	m_draw_jobs.Stop();
+	if (m_draw_resolver.joinable()) {
+		m_draw_resolver.join();
 	}
 	if (m_executor.joinable()) {
 		m_executor.join();

@@ -288,10 +288,11 @@ public:
 	// Resolve thread: resolves the shader programs of a draw with the given registers ahead of
 	// its execution; null when the draw resolves them itself (tessellation, programs that are not
 	// compiled yet, guest memory that cannot be read ahead). Waits while every resolution is in
-	// use: the execution thread releases them in order.
+	// use: the execution thread releases them in order. Each resolving thread has its own ring
+	// (ring 1: experiment DrawResolver).
 	[[nodiscard]] ResolvedDraw* ResolveDrawAhead(const HW::Context&    context,
 	                                             const HW::UserConfig& user_config,
-	                                             const HW::Shader&     shaders);
+	                                             const HW::Shader& shaders, uint32_t ring_index = 0);
 	// Execution thread: the next draw uses `resolved` when the guest memory it read still holds
 	// the same bytes.
 	void UseResolvedDraw(ResolvedDraw* resolved) noexcept { m_resolved_draw = resolved; }
@@ -544,6 +545,8 @@ private:
 	// Resolutions ahead of execution; see ResolveDrawAhead().
 	std::unique_ptr<ResolvedDrawRing, void (*)(ResolvedDrawRing*)> m_resolved_ring {nullptr,
 	                                                                                nullptr};
+	std::unique_ptr<ResolvedDrawRing, void (*)(ResolvedDrawRing*)> m_resolved_ring_second {nullptr,
+	                                                                                       nullptr};
 	ResolvedDraw*                                                  m_resolved_draw = nullptr;
 	std::unique_ptr<ResolvedDispatchRing, void (*)(ResolvedDispatchRing*)> m_resolved_dispatch_ring {nullptr,
 	                                                                                                nullptr};

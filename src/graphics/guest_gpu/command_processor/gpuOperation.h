@@ -106,6 +106,12 @@ struct GpuDispatchSlot {
 	RenderExecutor::ResolvedDispatch* result = nullptr;
 };
 
+// Experiment DrawResolver: the same for a draw the second draw resolver resolves.
+struct GpuDrawSlot {
+	std::atomic<uint32_t>         state {0};
+	RenderExecutor::ResolvedDraw* result = nullptr;
+};
+
 // One unit of emulated GPU work produced by a command processor. Operations execute in the
 // order the command processors produce them; every guest-visible effect of a command buffer
 // (draws, dispatches, labels, interrupts, flips, DMA) is an operation.
@@ -123,6 +129,8 @@ struct GpuOperation {
 	RenderExecutor::ResolvedDispatch* resolved_dispatch = nullptr;
 	// Experiment DispatchResolver: the resolution of resolved_dispatch is still being made.
 	GpuDispatchSlot* dispatch_slot = nullptr;
+	// Experiment DrawResolver: the resolution of `resolved` is still being made.
+	GpuDrawSlot* draw_slot = nullptr;
 	// The command processor processed a WAIT_REG_MEM since the previous operation: the guest may
 	// have written memory the operations before it read.
 	bool after_wait = false;

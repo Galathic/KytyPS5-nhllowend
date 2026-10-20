@@ -517,7 +517,25 @@ some 10,000 waits per second of a few microseconds each (it caught up with the r
 in a light stretch (58 fps) a third of the frames also wait 2-10 ms after their flip for the game's
 next frame (vsync pacing, not a bottleneck). A second resolve thread for dispatches (bit 41)
 took the resolve thread from 834 to 679 ms/s busy but left the execution thread's waits for it
-nearly unchanged (94 -> 84 ms/s, paused A/B) and the throughput the same: still off.
+nearly unchanged (94 -> 84 ms/s, paused A/B) and the throughput the same: still off. Deeper
+queues again (resolved queue 256 -> 768, resolution rings 320 -> 800, register snapshots 512 ->
+1280; cross-build A/B, two paused boots each): draw cost unchanged (4.08 / 4.06 us), dispatch
+cost +8%, resolve thread +12% busy for the same work (its rings no longer stay in cache): dropped.
+
+Bit 43 `KYTY_DRAW_RESOLVER` (second draw resolver on CPU 14, its own resolution ring): the
+resolve thread hands about half of the draws to it, chosen by the vertex and pixel shader
+addresses so the draws of a program pair stay on one thread; a program the other resolver is
+materializing is waited for instead of leaving the draw to the execution thread. The execution
+thread waits for slots in order, as for the dispatch resolver. Paused A/B (a 60 fps scene): the
+execution thread's waits for the resolve thread 84 -> 15 ms/s (the scene reached the 60 Hz cap
+and waited for flips instead). In play (unpaused in-boot A/B, 60 Hz windows): waits 89 -> 30 ms/s,
+fps 48.8 -> 49.6, but per-draw execution cost +5% (4.58 -> 4.82 us). Two changes since: each
+of the two resolution rings holds half as many resolutions while the second resolver is on (as
+many in total as one ring before), and a draw state's vertex input info (9.6 KB, almost all of it
+arrays filled from the front and read up to their counts) is reset only up to the entries its
+last use filled instead of value-initialized whole (1.5 GB/s of writes; resolve thread -9% busy
+in play). Now default on: in-boot gameplay A/B, 15 s phases, the window-title fps of paired
+phases 55/52, 54/52, 55/52 (+4 to +6%), waits for the resolve thread 110 -> 38 ms/s.
 
 GPU time per frame without the per-draw timestamps (`KYTY_IDLE_TRACE_NO_CMDS=1` at boot: the
 idle trace then stamps only command buffers, so the traced match keeps 48-58 fps at 60 Hz;

@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
+#include "common/experiments.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -45,6 +46,7 @@
 #include <atomic>
 #include <bit>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -736,6 +738,25 @@ void RenderExecutor::StoreRenderTargetMemo(const RenderColorInfo* colors, uint32
 	memo.valid                = true;
 }
 
+// A vertex input info is 9.6 KB, nearly all of it three arrays of RES_MAX entries that its
+// writers fill from the front and its readers read only up to resources_num and buffers_num:
+// restore the entries its last use filled and the members after the arrays (value-initializing
+// all of it for every draw resolution wrote 1.5 GB/s; resolve thread -9% busy in play).
+static void ResetVertexInputInfo(ShaderVertexInputInfo& info) {
+	static_assert(std::is_trivially_copyable_v<ShaderVertexInputInfo>);
+	static const ShaderVertexInputInfo defaults {};
+	const auto resources = static_cast<size_t>(std::clamp(info.resources_num, 0, ShaderVertexInputInfo::RES_MAX));
+	const auto buffers   = static_cast<size_t>(std::clamp(info.buffers_num, 0, ShaderVertexInputInfo::RES_MAX));
+	std::copy_n(defaults.resources, resources, info.resources);
+	std::copy_n(defaults.resources_dst, resources, info.resources_dst);
+	std::copy_n(defaults.buffers, buffers, info.buffers);
+	info.native_draw = defaults.native_draw;
+	constexpr auto tail = offsetof(ShaderVertexInputInfo, stage);
+	static_assert(tail >= offsetof(ShaderVertexInputInfo, buffers) + sizeof(ShaderVertexInputInfo::buffers));
+	std::memcpy(reinterpret_cast<uint8_t*>(&info) + tail, reinterpret_cast<const uint8_t*>(&defaults) + tail,
+	            sizeof(ShaderVertexInputInfo) - tail);
+}
+
 static void ResetDrawRenderState(DrawRenderState& state, bool tessellation_stages) {
 	ValueInitialize(state.depth_info);
 	// Only the first color_count targets are read, and resolving a target resets it first; the
@@ -743,10 +764,10 @@ static void ResetDrawRenderState(DrawRenderState& state, bool tessellation_stage
 	ValueInitialize(state.color_info[0]);
 	state.color_count = 0;
 	state.ps_active   = true;
-	ValueInitialize(state.vertex_info[0]);
+	ResetVertexInputInfo(state.vertex_info[0]);
 	if (tessellation_stages) {
-		ValueInitialize(state.vertex_info[1]);
-		ValueInitialize(state.vertex_info[2]);
+		ResetVertexInputInfo(state.vertex_info[1]);
+		ResetVertexInputInfo(state.vertex_info[2]);
 	}
 	ValueInitialize(state.ps_input_info);
 	ValueInitialize(state.programs);
@@ -1469,14 +1490,16 @@ static bool PixelShaderActive(const HW::Context& ctx, const HW::Shader& shaders,
 
 RenderExecutor::ResolvedDraw* RenderExecutor::ResolveDrawAhead(const HW::Context&    context,
                                                                const HW::UserConfig& user_config,
-                                                               const HW::Shader&     shaders) {
+                                                               const HW::Shader&     shaders,
+                                                               uint32_t              ring_index) {
 	if (user_config.GetPrimType() == Prospero::PrimitiveType::kPatch) {
 		return nullptr;
 	}
-	if (m_resolved_ring == nullptr) {
-		m_resolved_ring = {new ResolvedDrawRing {}, [](ResolvedDrawRing* ring) { delete ring; }};
+	auto& ring_storage = ring_index == 0 ? m_resolved_ring : m_resolved_ring_second;
+	if (ring_storage == nullptr) {
+		ring_storage = {new ResolvedDrawRing {}, [](ResolvedDrawRing* ring) { delete ring; }};
 	}
-	auto& ring = *m_resolved_ring;
+	auto& ring = *ring_storage;
 	auto& draw = ring.draws[ring.next];
 	// The execution thread releases resolutions in order.
 	for (Common::SpinWait wait; draw.busy.load(std::memory_order_acquire);) {
@@ -1484,7 +1507,14 @@ RenderExecutor::ResolvedDraw* RenderExecutor::ResolveDrawAhead(const HW::Context
 			std::this_thread::yield();
 		}
 	}
-	ring.next   = (ring.next + 1) % ResolvedDrawRing::Size;
+	// Experiment DrawResolver: each of the two rings holds half as many resolutions, as many in
+	// total as one ring without it (the resolutions are large, and more of them did not stay in
+	// cache). AbPending: full rings.
+	const size_t size = Common::Experiments::Enabled(Common::Experiments::DrawResolver) &&
+	                            !Common::Experiments::Enabled(Common::Experiments::AbPending)
+	                        ? ResolvedDrawRing::Size / 2
+	                        : ResolvedDrawRing::Size;
+	ring.next = (ring.next + 1) % size;
 	auto& state = draw.storage.state;
 	ResetDrawRenderState(state, false);
 	draw.programs.Reset();
