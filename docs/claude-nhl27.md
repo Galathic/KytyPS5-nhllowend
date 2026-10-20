@@ -606,6 +606,18 @@ never reach their 64-item batch. Measured and dropped: interrupt and compute-sub
 batched like labels (flushes -10%; 47.4 -> 49.3 fps in one A/B, inside the noise), and with it
 no host-copy drain before flush, barrier and BDA callbacks (51.1 -> 45.7 fps).
 
+BDA boundaries (`CommandProcessor::BdaBoundary`, after waits, events, acquires, DMA, indirect
+buffers and each submission slice) only make the next draw or dispatch synchronize again; a
+boundary with no draw or dispatch emitted since the previous one is no longer an operation
+(statistics builds still emit them all). In play: 599k -> 531k operations a second, the
+execution thread's waits for the resolve thread 63 -> 49 ms/s, 60.6 -> 61.3 fps (in-boot A/B,
+240 Hz display, 60 Hz windows; paired rounds even).
+
+Display: flips go out at every vblank (`KYTY_FORCE_FLIP_RATE` defaults to 0) and the emulated
+display runs at 240 Hz (`KYTY_PLAY_VBLANK_HZ` / `KYTY_MENU_VBLANK_HZ`, 0 = the configured
+frequency): menus and loading screens reach 75-86 fps, light play 61-69; the game is timed by
+the clock (Petr saw nothing run fast). Measurements since then are uncapped.
+
 Measured and dropped: a resource memo for resolutions ahead (the execution thread's
 `ResourceMemo` per program, 4 states, the recorded reads re-read through the resolution's log).
 Only 10% of resolutions repeat a program's register inputs (per-object pointers in user data),

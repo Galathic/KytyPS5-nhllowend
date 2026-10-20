@@ -1207,11 +1207,17 @@ GpuRegisterState CommandProcessor::SnapshotState(uint64_t sequence) {
 	return state;
 }
 
+// Draws and dispatches emitted by every command processor (pipelined), and their count at the
+// last BDA boundary emitted: one command processor thread emits them all.
+static uint64_t g_work_emitted     = 0;
+static uint64_t g_bda_work_emitted = ~uint64_t {0};
+
 uint64_t CommandProcessor::Emit(GpuOperation&& operation) {
 	if (m_pipeline != nullptr) {
 		EXIT_IF(operation.kind != GpuOperationKind::Callback &&
 		        m_pipeline->NextSequence() !=
 		            m_ctx_snapshots.last_use[m_ctx_snapshots.current]);
+		g_work_emitted += operation.kind != GpuOperationKind::Callback ? 1u : 0u;
 		return m_pipeline->EmitOperation(std::move(operation));
 	}
 	Execute(operation);
@@ -1248,6 +1254,13 @@ void CommandProcessor::BdaBoundary(RenderContext::BdaBoundary kind) {
 		m_renderer.BdaBatchBoundary(kind);
 		return;
 	}
+	// The boundary only makes the next draw or dispatch synchronize again: with none since the
+	// last boundary, that one already does (80,000 boundaries a second were mostly such repeats,
+	// each an operation through the pipeline). Statistics (KYTY_PERF_STATS) count them all.
+	if (g_bda_work_emitted == g_work_emitted && !FrameBreakdown::Enabled()) {
+		return;
+	}
+	g_bda_work_emitted = g_work_emitted;
 	// KYTY_BDA_BATCH orders boundaries with the draws and dispatches that execute around them.
 	const auto saved_trace_op = g_trace_op;
 	g_trace_op                = static_cast<uint16_t>(g_trace_op | 0x4000u);
