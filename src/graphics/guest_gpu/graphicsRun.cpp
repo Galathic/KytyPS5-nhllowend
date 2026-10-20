@@ -1271,8 +1271,13 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 	    operation.kind != GpuOperationKind::DrawIndirect) {
 		executor.InvalidateRenderTargetMemo();
 		// Guest-visible effects (labels, interrupts, flips, host commands) let the guest overwrite
-		// what earlier draws read: their copies complete first.
-		if (auto* copies = GetScheduler().HostCopies(); copies != nullptr) {
+		// what earlier draws read: their copies complete first. A dispatch has none (a submission
+		// waits for the copies before it; with CpuCopyForward a dispatch also writes guest memory),
+		// and waiting before each of them was 7.6% of this thread.
+		const bool dispatch = operation.kind == GpuOperationKind::DispatchDirect ||
+		                      operation.kind == GpuOperationKind::DispatchIndirect;
+		if (auto* copies = GetScheduler().HostCopies();
+		    copies != nullptr && (!dispatch || Common::Experiments::Enabled(Common::Experiments::CpuCopyForward))) {
 			copies->Drain();
 		}
 	}

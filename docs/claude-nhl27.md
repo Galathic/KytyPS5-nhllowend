@@ -574,6 +574,13 @@ hash of the registered images' start addresses (counts kept under the cache lock
 without the lock and the map lookup. In-boot gameplay A/B (with deferred protection): 48.7 ->
 51.2 fps at 60 Hz, draw 4.34 -> 3.93 us.
 
+No host-copy drain before dispatches: the execution thread waited for the host copy thread
+before every operation that is not a draw (7.6% of the thread), for guest-visible effects
+(labels, interrupts, flips, host commands) that let the guest overwrite what earlier draws read.
+A dispatch has none: its submission waits for the copies before it, and only with
+`CpuCopyForward` (default off) does a dispatch write guest memory. In-boot gameplay A/B: 48.0 ->
+49.0 fps at 60 Hz (paired rounds 48/50, 48/49, 45/52, 45/45, 48/51).
+
 Measured and dropped: a resource memo for resolutions ahead (the execution thread's
 `ResourceMemo` per program, 4 states, the recorded reads re-read through the resolution's log).
 Only 10% of resolutions repeat a program's register inputs (per-object pointers in user data),
