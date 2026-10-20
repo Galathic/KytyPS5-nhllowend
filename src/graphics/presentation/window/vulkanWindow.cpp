@@ -1311,6 +1311,14 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
 			graphic_ctx.conditional_rendering_enabled = true;
 		}
+#if defined(_WIN32)
+		// FSR 4 bridge (KYTY_FSR4=1): D3D12 images and fence shared with Vulkan.
+		for (const auto* extension: {"VK_KHR_external_memory_win32", "VK_KHR_external_semaphore_win32"}) {
+			if (HasExtension(available_extensions, extension)) {
+				device_extensions.push_back(extension);
+			}
+		}
+#endif
 		// KYTY_DBG_PIPELINE_STATS=<hex hash>[,...]: driver statistics and ISA of those shaders' pipelines.
 		if (std::getenv("KYTY_DBG_PIPELINE_STATS") != nullptr &&
 		    HasExtension(available_extensions, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME)) {

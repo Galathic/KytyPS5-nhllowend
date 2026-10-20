@@ -1,5 +1,6 @@
 #include "graphics/presentation/window.h"
 
+#include <cstdio>
 #include <SDL3/SDL.h>
 
 #include "common/assert.h"
@@ -990,6 +991,10 @@ void WindowContext::UpdateTitle(uint64_t frame_num, double current_fps) {
 	    device_name, processor_name, frame_num, current_fps);
 
 	SDL_SetWindowTitle(window, text.c_str());
+	// Same number as the title, once a second, so test runs can be compared from the log.
+	std::printf("NHL27FPS t=%llu frame=%llu fps=%.1f\n", static_cast<unsigned long long>(SDL_GetTicks() / 1000),
+	            static_cast<unsigned long long>(frame_num), current_fps);
+	std::fflush(stdout);
 }
 
 } // namespace Libs::Graphics
