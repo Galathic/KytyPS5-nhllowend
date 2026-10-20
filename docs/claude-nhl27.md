@@ -535,7 +535,11 @@ many in total as one ring before), and a draw state's vertex input info (9.6 KB,
 arrays filled from the front and read up to their counts) is reset only up to the entries its
 last use filled instead of value-initialized whole (1.5 GB/s of writes; resolve thread -9% busy
 in play). Now default on: in-boot gameplay A/B, 15 s phases, the window-title fps of paired
-phases 55/52, 54/52, 55/52 (+4 to +6%), waits for the resolve thread 110 -> 38 ms/s.
+phases 55/52, 54/52, 55/52 (+4 to +6%), waits for the resolve thread 110 -> 38 ms/s. Back to
+default off: with it on, 2 of 8 boots crashed in guest job threads (a UI table holding -1 right
+after the match start; a pointer read from memory the emulator had written 1 ms before, during
+loading), and none of the boots without it today. Fixed-save matches, 60 Hz / 30 Hz fps: off
+54.2/25.2 and 49.6/25.3, on 59.3/28.0 (the second boot with it on crashed while loading).
 
 GPU time per frame without the per-draw timestamps (`KYTY_IDLE_TRACE_NO_CMDS=1` at boot: the
 idle trace then stamps only command buffers, so the traced match keeps 48-58 fps at 60 Hz;
