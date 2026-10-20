@@ -1509,9 +1509,8 @@ RenderExecutor::ResolvedDraw* RenderExecutor::ResolveDrawAhead(const HW::Context
 	}
 	// Experiment DrawResolver: each of the two rings holds half as many resolutions, as many in
 	// total as one ring without it (the resolutions are large, and more of them did not stay in
-	// cache). AbPending: full rings.
-	const size_t size = Common::Experiments::Enabled(Common::Experiments::DrawResolver) &&
-	                            !Common::Experiments::Enabled(Common::Experiments::AbPending)
+	// cache).
+	const size_t size = Common::Experiments::Enabled(Common::Experiments::DrawResolver)
 	                        ? ResolvedDrawRing::Size / 2
 	                        : ResolvedDrawRing::Size;
 	ring.next = (ring.next + 1) % size;

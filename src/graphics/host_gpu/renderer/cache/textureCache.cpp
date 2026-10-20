@@ -289,6 +289,9 @@ void TextureCache::RegisterImage(ImageId id) {
 		m_image_page_table[page].push_back(id);
 	});
 	m_images_by_address[image.info.data.address].push_back(id);
+	if (const auto index = AddressFilterIndex(image.info.data.address); m_address_filter_counts[index]++ == 0) {
+		m_address_filter[index / 64].fetch_or(uint64_t {1} << (index % 64), std::memory_order_release);
+	}
 	m_address_index_version.fetch_add(1, std::memory_order_release);
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
@@ -332,6 +335,9 @@ void TextureCache::UnregisterImage(ImageId id) {
 		}
 		ids.erase(found);
 		if (ids.empty()) m_images_by_address.erase(by_address);
+		if (const auto index = AddressFilterIndex(image.info.data.address); --m_address_filter_counts[index] == 0) {
+			m_address_filter[index / 64].fetch_and(~(uint64_t {1} << (index % 64)), std::memory_order_release);
+		}
 	}
 	m_lru_cache.Free(image.lru_id);
 	const auto accounted = image.AccountedSize();
@@ -1995,6 +2001,9 @@ void TextureCache::UpdateImage(ImageId id) {
 
 ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool ensure_valid) {
 	if (!GuestRange {address, size}.Valid()) {
+		return {};
+	}
+	if (!AddressFilterHit(address)) {
 		return {};
 	}
 	std::scoped_lock lock {m_lock};

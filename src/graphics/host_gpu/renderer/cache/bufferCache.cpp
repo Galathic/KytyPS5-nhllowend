@@ -2371,11 +2371,9 @@ uint64_t BufferCache::SynchronizeBuffersInRanges(const RangeSet& ranges, bool fu
 bool BufferCache::SynchronizeBuffersInRangesBefore(const RangeSet& ranges, bool full, uint32_t limit,
                                                    uint32_t& first_left) {
 	// Pages uploaded here are protected again by the host copy thread, before the uploads' copies
-	// (which it makes as well: the staging memory is coherent). AbPending: here, as before.
+	// (which it makes as well: the staging memory is coherent).
 	auto* const host_copies = m_scheduler.HostCopies();
-	const bool  defer       = host_copies != nullptr && m_staging_buffer.IsCoherent() &&
-	                   GuestGpu::IsGpuThread() &&
-	                   !Common::Experiments::Enabled(Common::Experiments::AbPending);
+	const bool  defer       = host_copies != nullptr && m_staging_buffer.IsCoherent() && GuestGpu::IsGpuThread();
 	const PageManager::DeferredProtectionScope deferred(defer ? host_copies : nullptr);
 	bool       left = false;
 	const auto sync = [&](uint64_t vaddr, uint64_t size) {
