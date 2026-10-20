@@ -556,7 +556,9 @@ boots fine; the third hit the guest crash at pc 0x9093c3f41 (job thread, a UI ta
 -1 when the game switches to a 30 Hz screen after play), which also crashed boots on 2026-10-14
 (74b7740) and 2026-10-15 (6138c3b) and the first draw-resolver boot today: a rare existing crash,
 not new with these changes. The draw resolver's other crash (pc 0x909568416, job thread, during
-loading) is the only one of its kind so far.
+loading) is the only one of its kind so far. Four more boots with the draw resolver on: no crash,
+but 60 Hz fps 46.6 / 50.8 / 45.7 / 51.4 against 52.2 / 50.7 for two boots of the same build
+without it (fixed save, 240 s each): no gain in whole matches despite the in-boot A/Bs; still off.
 
 GPU time per frame without the per-draw timestamps (`KYTY_IDLE_TRACE_NO_CMDS=1` at boot: the
 idle trace then stamps only command buffers, so the traced match keeps 48-58 fps at 60 Hz;
