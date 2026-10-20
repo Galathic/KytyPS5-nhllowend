@@ -54,6 +54,13 @@ public:
 			(void)Flush();
 		}
 	}
+	// Producer: queues a call of function(argument) on the copy thread, in order with the copies.
+	void Call(void (*function)(void*), void* argument) {
+		m_pending.jobs[m_pending.count++] = {argument, nullptr, 0, function};
+		if (m_pending.count == BatchSize) {
+			(void)Flush();
+		}
+	}
 	// Producer: hands the gathered copies to the copy thread; returns the number of copies
 	// queued so far.
 	uint64_t Flush() {
@@ -79,6 +86,8 @@ private:
 		void*       destination = nullptr;
 		const void* source      = nullptr;
 		size_t      size        = 0;
+		// A call instead of a copy (destination is its argument).
+		void (*function)(void*) = nullptr;
 	};
 	struct Batch {
 		std::array<Job, BatchSize> jobs {};
@@ -99,7 +108,11 @@ private:
 			}
 			for (size_t i = 0; i < batch->count; i++) {
 				const auto& job = batch->jobs[i];
-				std::memcpy(job.destination, job.source, job.size);
+				if (job.function != nullptr) {
+					job.function(job.destination);
+				} else {
+					std::memcpy(job.destination, job.source, job.size);
+				}
 			}
 			done += batch->count;
 			m_completed.Publish(done);

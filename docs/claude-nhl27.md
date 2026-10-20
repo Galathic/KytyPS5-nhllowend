@@ -540,6 +540,23 @@ default off: with it on, 2 of 8 boots crashed in guest job threads (a UI table h
 after the match start; a pointer read from memory the emulator had written 1 ms before, during
 loading), and none of the boots without it today. Fixed-save matches, 60 Hz / 30 Hz fps: off
 54.2/25.2 and 49.6/25.3, on 59.3/28.0 (the second boot with it on crashed while loading).
+Three more boots with it on and `KYTY_DBG_VERIFY_SKIPS=1` (skipped read checks compared anyway,
+`NHL27SKIPBAD`): no crash, no mismatch. Both crashes read guest memory the emulator had written
+back from the GPU just before (`--- Host writes near guest pointers ---`), so the suspicion is a
+download / CPU-write race that the faster pipeline exposes more often, not the resolutions.
+
+Deferred protection (`PageManager::DeferredProtectionScope`): while the execution thread
+synchronizes CPU-dirty buffers for BDA, pages that gain write watchers are marked stale in their
+region and protected by the host copy thread (an apply call queued before the uploads' copies,
+which go through that thread too while it is on); losing watchers (fault handling) stays
+immediate, and the apply protects each stale page as its watchers want at that time. In-boot
+gameplay A/B (`AbPending` = immediate): execution-thread protect calls 18,330 -> 4,770 per 2 s
+(all calls about the same, write faults unchanged), per-draw cost 4.55 -> 4.35 us. Soak: 2 of 3
+boots fine; the third hit the guest crash at pc 0x9093c3f41 (job thread, a UI table slot holding
+-1 when the game switches to a 30 Hz screen after play), which also crashed boots on 2026-10-14
+(74b7740) and 2026-10-15 (6138c3b) and the first draw-resolver boot today: a rare existing crash,
+not new with these changes. The draw resolver's other crash (pc 0x909568416, job thread, during
+loading) is the only one of its kind so far.
 
 GPU time per frame without the per-draw timestamps (`KYTY_IDLE_TRACE_NO_CMDS=1` at boot: the
 idle trace then stamps only command buffers, so the traced match keeps 48-58 fps at 60 Hz;

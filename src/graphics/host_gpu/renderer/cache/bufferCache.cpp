@@ -1677,6 +1677,10 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 
 	auto temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Upload, 0,
 	                                         vk::BufferUsageFlagBits::eTransferSrc, total_size);
+	// Copies made here must come after the protections the host copy thread still applies.
+	if (PageManager::DeferringProtection()) {
+		m_scheduler.HostCopies()->Drain();
+	}
 	for (const auto& copy: copies) {
 		const auto address = buffer.CpuAddress() + copy.dstOffset;
 		std::memcpy(temporary->Mapped().data() + copy.srcOffset,
@@ -1695,11 +1699,17 @@ void BufferCache::StreamGuestData(uint8_t* destination, uint64_t vaddr, uint64_t
 	constexpr uint64_t MinHostCopy = 256;
 	auto*              copies      = m_scheduler.HostCopies();
 	// Callers write coherent memory (the stream buffer, coherent staging).
-	if (copies != nullptr && size >= MinHostCopy && GuestGpu::IsGpuThread()) {
+	// While protection is deferred, every copy goes there too (after the protections queued
+	// before it), or waits for them.
+	const bool deferring = PageManager::DeferringProtection();
+	if (copies != nullptr && (size >= MinHostCopy || deferring) && GuestGpu::IsGpuThread()) {
 		if (const void* source = Libs::LibKernel::Memory::FindBackingPointer(vaddr, size)) {
 			copies->Copy(destination, source, size);
 			return;
 		}
+	}
+	if (deferring && copies != nullptr) {
+		copies->Drain();
 	}
 	std::memcpy(destination, reinterpret_cast<const void*>(vaddr), size);
 }
@@ -2360,6 +2370,13 @@ uint64_t BufferCache::SynchronizeBuffersInRanges(const RangeSet& ranges, bool fu
 
 bool BufferCache::SynchronizeBuffersInRangesBefore(const RangeSet& ranges, bool full, uint32_t limit,
                                                    uint32_t& first_left) {
+	// Pages uploaded here are protected again by the host copy thread, before the uploads' copies
+	// (which it makes as well: the staging memory is coherent). AbPending: here, as before.
+	auto* const host_copies = m_scheduler.HostCopies();
+	const bool  defer       = host_copies != nullptr && m_staging_buffer.IsCoherent() &&
+	                   GuestGpu::IsGpuThread() &&
+	                   !Common::Experiments::Enabled(Common::Experiments::AbPending);
+	const PageManager::DeferredProtectionScope deferred(defer ? host_copies : nullptr);
 	bool       left = false;
 	const auto sync = [&](uint64_t vaddr, uint64_t size) {
 		left |= m_memory_tracker.ForEachCpuDirtySpanBefore(
