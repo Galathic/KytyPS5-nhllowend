@@ -195,6 +195,8 @@ struct VideoOutConfig {
 	VideoOutConfig*                     master      = nullptr;
 	uint32_t                            slave_count = 0;
 	int                                 flip_rate   = 0;
+	// The rate the game asked for (flip_rate is the one flips use, see VideoOutSetFlipRate).
+	int                                 requested_flip_rate = 0;
 	uint64_t                            output_mode = VIDEO_OUT_OUTPUT_MODE_DEFAULT;
 	float                               gamma       = 1.0f;
 	VideoOutFlipStatus                  flip_status;
@@ -835,6 +837,31 @@ void VideoOutDriver::Impl::VblankBegin() {
 	}
 }
 
+// The next NHL27FPS report of each handle (process time, microseconds).
+static std::array<uint64_t, VideoOutDriver::Impl::VIDEO_OUT_NUM_MAX> ctx_report_us {};
+
+// The game's requested flip rate on the first handle, for the vblank period (see MenuVblankHz).
+static std::atomic<int> g_requested_flip_rate {0};
+
+// KYTY_MENU_VBLANK_HZ=<hz>: while the game asks for 30 or 20 Hz (menus, the pause menu,
+// presentation scenes) the emulated display runs at this rate, so those screens are not held to
+// 60 fps (flips go out at every vblank, see VideoOutSetFlipRate). KYTY_PLAY_VBLANK_HZ=<hz>: the
+// same while it asks for 60 Hz (play). Off (0) by default: the configured vblank frequency. The
+// game is not told of a faster display (its 120 Hz output mode follows the configured one).
+static uint32_t VblankHzFromEnv(const char* name) {
+	const char* value = std::getenv(name);
+	return value != nullptr ? static_cast<uint32_t>(std::clamp<unsigned long>(std::strtoul(value, nullptr, 10), 0ul, 1000ul))
+	                        : 0u;
+}
+static uint32_t MenuVblankHz() {
+	static const uint32_t hz = VblankHzFromEnv("KYTY_MENU_VBLANK_HZ");
+	return hz;
+}
+static uint32_t PlayVblankHz() {
+	static const uint32_t hz = VblankHzFromEnv("KYTY_PLAY_VBLANK_HZ");
+	return hz;
+}
+
 void VideoOutDriver::Impl::VblankEnd() {
 	Common::LockGuard lock(m_mutex);
 
@@ -851,9 +878,11 @@ void VideoOutDriver::Impl::VblankEnd() {
 			                      reinterpret_cast<void*>(ctx.vblank_status.count));
 			ctx.vblank_cond.SignalAll();
 			// Every 5 s: flips so far and the rate the game asks for (fps-by-rate.py).
-			const bool report = ctx.vblank_status.count % 300 == 0;
+			const auto now_us = ctx.vblank_status.processTime;
+			const bool report = now_us >= ctx_report_us[i];
+			if (report) ctx_report_us[i] = now_us + 5000000u;
 			const auto flips  = static_cast<uint64_t>(ctx.flip_status.count);
-			const int  rate   = ctx.flip_rate;
+			const int  rate   = ctx.requested_flip_rate;
 			ctx.mutex.Unlock();
 			if (report) {
 				std::printf("NHL27FPS: handle=%d t=%.1f s flips=%" PRIu64 " rate=%d\n", i,
@@ -883,8 +912,12 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 		const auto frame_begin = Common::Timer::QueryPerformanceCounter();
 		total_wait -= static_cast<int64_t>(frame_begin - sleep_begin);
 
-		const auto refresh = std::max(Config::GetVblankFrequency(), 1u);
-		const auto period  = std::max(frequency / refresh, uint64_t {1});
+		auto refresh = std::max(Config::GetVblankFrequency(), 1u);
+		if (const auto hz = g_requested_flip_rate.load(std::memory_order_relaxed) != 0 ? MenuVblankHz() : PlayVblankHz();
+		    hz > refresh) {
+			refresh = hz;
+		}
+		const auto period = std::max(frequency / refresh, uint64_t {1});
 
 		if (m_presenter.IsGuestPaused()) {
 			(void)m_presenter.PresentLastFrame();
@@ -1420,28 +1453,33 @@ KYTY_SYSV_ABI int VideoOutSetFlipRate(int handle, int rate) {
 	if (rate < 0 || rate > 2) {
 		return VIDEO_OUT_ERROR_INVALID_VALUE;
 	}
-	// Benchmarking: KYTY_FORCE_FLIP_RATE=0 keeps 60 Hz flips in menus and the pause menu (where
-	// NHL 27 asks for 30 Hz), so a paused match is an uncapped, steady A/B scene.
+	// Flips go out at every vblank: NHL 27 asks for 30 Hz in menus, the pause menu and
+	// presentation scenes, which then run at up to 60 fps (Petr prefers it). KYTY_FORCE_FLIP_RATE
+	// =<0-2> forces that rate instead, =off keeps the game's.
 	static const int forced_rate = [] {
 		const char* value = std::getenv("KYTY_FORCE_FLIP_RATE");
-		return value != nullptr && value[0] >= '0' && value[0] <= '2' ? value[0] - '0' : -1;
+		if (value == nullptr) return 0;
+		return value[0] >= '0' && value[0] <= '2' ? value[0] - '0' : -1;
 	}();
+	const int requested = rate;
 	if (forced_rate >= 0) {
 		rate = forced_rate;
 	}
 
 	Common::LockGuard lock(ctx->mutex);
-	if (ctx->flip_rate != rate) {
-		Common::Timeline::Mark("flip-rate", static_cast<uint64_t>(rate));
+	if (ctx->requested_flip_rate != requested) {
+		Common::Timeline::Mark("flip-rate", static_cast<uint64_t>(requested));
 		// The game picks its frame rate (0 = 60, 1 = 30, 2 = 20 Hz): 60 Hz in play, 30 Hz in menus
-		// and many presentation scenes. With the flip count, a run's fps splits by rate
-		// (KytyPS5-tools fps-by-rate.py); a few changes per minute.
-		std::printf("NHL27FLIPRATE: handle=%d rate=%d -> %d at %.1f s flips=%" PRIu64 "\n", handle,
-		            ctx->flip_rate, rate, static_cast<double>(LibKernel::KernelGetProcessTime()) / 1e6,
-		            static_cast<uint64_t>(ctx->flip_status.count));
+		// and many presentation scenes. With the flip count, a run's fps splits by the rate it
+		// asked for (KytyPS5-tools fps-by-rate.py); a few changes per minute.
+		std::printf("NHL27FLIPRATE: handle=%d rate=%d -> %d at %.1f s flips=%" PRIu64 " (flips at rate %d)\n", handle,
+		            ctx->requested_flip_rate, requested, static_cast<double>(LibKernel::KernelGetProcessTime()) / 1e6,
+		            static_cast<uint64_t>(ctx->flip_status.count), rate);
 		std::fflush(stdout);
 	}
-	ctx->flip_rate = rate;
+	ctx->requested_flip_rate = requested;
+	ctx->flip_rate           = rate;
+	if (handle == 1) g_requested_flip_rate.store(requested, std::memory_order_relaxed);
 
 	return OK;
 }
