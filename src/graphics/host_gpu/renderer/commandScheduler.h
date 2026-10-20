@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <memory>
@@ -18,6 +19,11 @@
 #include <vector>
 
 namespace Libs::Graphics {
+
+// KYTY_DBG_STAGE_STATS: command buffers submitted by Flush() (NHL27EXECIDLE flushes/s).
+inline std::atomic<uint64_t> g_scheduler_flushes {0};
+// The flushes of: 0 flush callbacks, 1 batch-ready callbacks, 2 asynchronous guest reads, 3 flips.
+inline std::array<std::atomic<uint64_t>, 4> g_scheduler_flush_sites {};
 
 struct GraphicContext;
 

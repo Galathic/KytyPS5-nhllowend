@@ -672,10 +672,15 @@ static void PrintStageStats() {
 	            ms[StageStats::ResolveProgramLock], ms[StageStats::ResolveQueueFull], ms[StageStats::ResolveIdle],
 	            1000.0 - ms[StageStats::ResolveQueueFull] - ms[StageStats::ResolveIdle]);
 	std::printf("NHL27EXECIDLE ms/s: resolve=%.1f cp-busy=%.1f no-submission=%.1f blocked=%.1f "
-	            "cp-decision-wait=%.1f cp-other-wait=%.1f | bda syncs/s=%.0f\n",
+	            "cp-decision-wait=%.1f cp-other-wait=%.1f | bda syncs/s=%.0f flushes/s=%.0f (callbacks %.0f batch %.0f guest-reads %.0f flips %.0f)\n",
 	            ms[StageStats::ExecIdleResolve], ms[StageStats::ExecIdleCp], ms[StageStats::ExecIdleNoWork],
 	            ms[StageStats::ExecIdleBlocked], ms[StageStats::ExecIdleDecision], ms[StageStats::ExecIdleOther],
-	            static_cast<double>(StageStats::g_bda_syncs.exchange(0, std::memory_order_relaxed)) / seconds);
+	            static_cast<double>(StageStats::g_bda_syncs.exchange(0, std::memory_order_relaxed)) / seconds,
+	            static_cast<double>(g_scheduler_flushes.exchange(0, std::memory_order_relaxed)) / seconds,
+	            static_cast<double>(g_scheduler_flush_sites[0].exchange(0, std::memory_order_relaxed)) / seconds,
+	            static_cast<double>(g_scheduler_flush_sites[1].exchange(0, std::memory_order_relaxed)) / seconds,
+	            static_cast<double>(g_scheduler_flush_sites[2].exchange(0, std::memory_order_relaxed)) / seconds,
+	            static_cast<double>(g_scheduler_flush_sites[3].exchange(0, std::memory_order_relaxed)) / seconds);
 	for (int kind = 0; kind < 2; kind++) {
 		const auto calls = StageStats::g_check_calls[kind].exchange(0, std::memory_order_relaxed);
 		const auto entries = StageStats::g_check_entries[kind].exchange(0, std::memory_order_relaxed);
@@ -1337,7 +1342,10 @@ void CommandProcessor::BufferInit() {
 }
 
 void CommandProcessor::BufferFlush() {
-	EmitCallback([this] { GetScheduler().Flush(); }, GpuCallbackTag::Flush);
+	EmitCallback([this] {
+		g_scheduler_flush_sites[0].fetch_add(1, std::memory_order_relaxed);
+		GetScheduler().Flush();
+	}, GpuCallbackTag::Flush);
 }
 
 void CommandProcessor::NoteRecordedWork() {
@@ -1356,6 +1364,7 @@ void CommandProcessor::BufferFlushIfBatchReady() {
 	EmitCallback([this] {
 		constexpr uint32_t MinBatchWork = 64;
 		if (GetScheduler().CurrentTick() == m_batch_tick && m_batch_work >= MinBatchWork) {
+			g_scheduler_flush_sites[1].fetch_add(1, std::memory_order_relaxed);
 			GetScheduler().Flush();
 		}
 	}, GpuCallbackTag::Flush);
@@ -3778,6 +3787,7 @@ void CommandProcessor::Flip() {
 		GetScheduler().DeferHostOperation(
 		    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); },
 		    true);
+		g_scheduler_flush_sites[3].fetch_add(1, std::memory_order_relaxed);
 		GetScheduler().Flush();
 	}, GpuCallbackTag::Flip);
 }
@@ -3799,6 +3809,7 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 		GetScheduler().DeferHostOperation(
 		    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); },
 		    true);
+		g_scheduler_flush_sites[3].fetch_add(1, std::memory_order_relaxed);
 		GetScheduler().Flush();
 	}, GpuCallbackTag::Flip);
 	NoteGuestWrite(sequence, reinterpret_cast<uint64_t>(dst_gpu_addr), sizeof(value), &value);
@@ -3833,6 +3844,7 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 			    renderer.TriggerInterrupt(event_id, 0);
 		    },
 		    true);
+		g_scheduler_flush_sites[3].fetch_add(1, std::memory_order_relaxed);
 		GetScheduler().Flush();
 	}, GpuCallbackTag::Flip);
 	NoteGuestWrite(sequence, reinterpret_cast<uint64_t>(dst_gpu_addr), sizeof(value), &value);
@@ -3854,6 +3866,7 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 		m_renderer.GetVideoOut().PrepareFlip(request_id, CurrentBuffer());
 		GetScheduler().DeferHostOperation(
 		    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); }, true);
+		g_scheduler_flush_sites[3].fetch_add(1, std::memory_order_relaxed);
 		GetScheduler().Flush();
 	}, GpuCallbackTag::Flip);
 }

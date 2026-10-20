@@ -1306,6 +1306,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadC
 			if (DownloadBufferMemory<true>(buffer, vaddr, size)) {
 				async_tick       = m_scheduler.CurrentTick();
 				m_pending_guest_reads.push_back({first, last - first, async_tick, std::move(bytes)});
+				g_scheduler_flush_sites[2].fetch_add(1, std::memory_order_relaxed);
 				m_scheduler.Flush();
 				Common::Timeline::Mark("async-guest-read", vaddr);
 			} else {

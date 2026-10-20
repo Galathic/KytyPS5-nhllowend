@@ -599,6 +599,12 @@ later (34 -> 64 ms/s), 49.3 -> 48.4 fps: the CPU it takes is the game's. The com
 sleeping on a full register snapshot ring (61% of its time is spent waiting for a free slot,
 spinning) until an eighth of the ring is free: the execution thread then waited longer for work
 (no-submission 56 -> 93 ms/s), 51.2 -> 50.8 fps.
+Command buffer flushes (`NHL27EXECIDLE ... flushes/s`, by origin): ~5,300 a second in play,
+nearly all flush callbacks (the submission split every 48 draws with `AsyncSubmit`, the end of
+each graphics submission, end-of-pipe interrupts and compute submissions); label-only releases
+never reach their 64-item batch. Measured and dropped: interrupt and compute-submission flushes
+batched like labels (flushes -10%; 47.4 -> 49.3 fps in one A/B, inside the noise), and with it
+no host-copy drain before flush, barrier and BDA callbacks (51.1 -> 45.7 fps).
 
 Measured and dropped: a resource memo for resolutions ahead (the execution thread's
 `ResourceMemo` per program, 4 states, the recorded reads re-read through the resolution's log).

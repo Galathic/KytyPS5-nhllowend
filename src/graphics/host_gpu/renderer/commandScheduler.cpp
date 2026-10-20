@@ -1163,6 +1163,7 @@ void CommandScheduler::Flush() {
 }
 
 void CommandScheduler::Flush(SubmitInfo& submit) {
+	g_scheduler_flushes.fetch_add(1, std::memory_order_relaxed);
 	Submit(submit);
 	BeginNext();
 }
