@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <span>
@@ -266,6 +267,55 @@ class ResourceMemoEntry {
                SameReadCoverage(left.specialization_reads, right.specialization_reads) &&
                left.uniform_fill == right.uniform_fill;
     }
+    // KYTY_DBG_MEMO_CHECK=1: every hit is materialized again with the live readers and compared
+    // (NHL27MEMOCHECK; a mismatch is a hit that reused resources the inputs no longer give).
+    static bool CheckHitsEnabled() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("KYTY_DBG_MEMO_CHECK");
+            return value != nullptr && value[0] == '1';
+        }();
+        return enabled;
+    }
+    void CheckHit(const ShaderRecompiler::IR::ResourcePlan& plan, const Runtime& runtime,
+                  const ShaderRecompiler::IR::ResourceSnapshot& cached_snapshot,
+                  const ShaderRecompiler::IR::ResourceSpecialization& cached_specialization) {
+        static std::atomic<uint64_t> hits {0}, mismatches {0}, failed {0};
+        auto check = runtime;
+        check.observe_user_data = nullptr;
+        check.user_data_observer_userdata = nullptr;
+        check.specialization_cache = nullptr;
+        check.delta = nullptr;
+        const auto active_sources = plan.active_sources;
+        ShaderRecompiler::IR::ResourceSnapshot fresh_snapshot;
+        ShaderRecompiler::IR::ResourceSpecialization fresh_specialization;
+        const bool ok = ShaderRecompiler::IR::MaterializeResources(plan, check, fresh_snapshot, fresh_specialization);
+        plan.active_sources = active_sources;
+        auto expected = cached_snapshot;
+        expected.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
+        const auto count = hits.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (!ok) {
+            failed.fetch_add(1, std::memory_order_relaxed);
+        } else if (!SameSnapshot(expected, fresh_snapshot) || cached_specialization != fresh_specialization) {
+            const auto bad = mismatches.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (bad <= 16) {
+                std::printf("NHL27MEMOCHECK: mismatch plan=%p buffers %zu/%zu images %zu/%zu same buffers=%d images=%d "
+                            "flat=%d spec=%d\n",
+                            static_cast<const void*>(&plan), expected.buffers.size(), fresh_snapshot.buffers.size(),
+                            expected.images.size(), fresh_snapshot.images.size(),
+                            expected.buffers == fresh_snapshot.buffers ? 1 : 0,
+                            expected.images == fresh_snapshot.images ? 1 : 0,
+                            expected.flattened_srt == fresh_snapshot.flattened_srt ? 1 : 0,
+                            cached_specialization == fresh_specialization ? 1 : 0);
+                std::fflush(stdout);
+            }
+        }
+        if ((count & 4095u) == 0) {
+            std::printf("NHL27MEMOCHECK: hits=%llu mismatches=%llu failed=%llu\n", static_cast<unsigned long long>(count),
+                        static_cast<unsigned long long>(mismatches.load(std::memory_order_relaxed)),
+                        static_cast<unsigned long long>(failed.load(std::memory_order_relaxed)));
+            std::fflush(stdout);
+        }
+    }
     bool VerifyCachedHit(const ShaderRecompiler::IR::ResourcePlan& plan, const Runtime& runtime,
                          const ShaderRecompiler::IR::ResourceSnapshot& cached_snapshot,
                          const ShaderRecompiler::IR::ResourceSpecialization& cached_specialization,
@@ -434,6 +484,7 @@ public:
                     }
                 }
             }
+            if (equal && inputs_equal && CheckHitsEnabled()) CheckHit(plan, runtime, snapshot, specialization);
             if (equal && inputs_equal) {
                 // Non-resource SGPRs can vary per draw. They still feed push data,
                 // but do not require walking the descriptor graph again.

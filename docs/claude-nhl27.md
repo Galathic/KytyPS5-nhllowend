@@ -568,6 +568,26 @@ Measured and dropped (in-boot gameplay A/Bs, 60 Hz windows): pipeline threads sl
 is ready (50.9 / 50.6 fps: flip waits are small, frames are not quantized by vsync); the host
 copy thread on the command processor's SMT sibling (two matches 52.5 / 55.6, within noise).
 
+Image filter (`TextureCache::HasImageAt`, `FindImageFromRange`): texel buffer binds ask whether
+an image starts at the bound address on nearly every draw and almost never find one; a bit per
+hash of the registered images' start addresses (counts kept under the cache lock) answers no
+without the lock and the map lookup. In-boot gameplay A/B (with deferred protection): 48.7 ->
+51.2 fps at 60 Hz, draw 4.34 -> 3.93 us.
+
+Measured and dropped: a resource memo for resolutions ahead (the execution thread's
+`ResourceMemo` per program, 4 states, the recorded reads re-read through the resolution's log).
+Only 10% of resolutions repeat a program's register inputs (per-object pointers in user data),
+so capturing the reads and copying snapshots cost more than the hits saved: resolve thread
+828 -> 936 ms/s, 51.2 -> 43.1 fps. Its first version crashed the GPU within seconds: with
+`KYTY_RESOURCE_DYNAMIC_DEPS` (default on) a memo depends on the user-data registers the walk
+reports, and the direct table reader (`SrtWalker::DirectReadRun`, `DirectSrtReads` default on)
+read its pointer registers without reporting them, so a draw whose tables moved reused the
+resources read through the old pointer while the old bytes were unchanged. The direct reader and
+the cached branch conditions now report their registers. The execution thread's memo
+(`KYTY_PROGRAM_RESOURCE_CACHE=1`) had the same exposure, but it rarely hits: `KYTY_DBG_MEMO_CHECK=1`
+(every hit materialized again with the live readers and compared, `NHL27MEMOCHECK`) saw fewer than
+4,096 hits and no mismatch in a match, with and without the fix.
+
 GPU time per frame without the per-draw timestamps (`KYTY_IDLE_TRACE_NO_CMDS=1` at boot: the
 idle trace then stamps only command buffers, so the traced match keeps 48-58 fps at 60 Hz;
 `KytyPS5-tools\ts-nocmd.sh`): 14.0-15.4 ms per flip in play (GPU 72-82% busy), 24-27 ms in the
