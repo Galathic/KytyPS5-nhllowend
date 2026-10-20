@@ -504,6 +504,20 @@ key 2% (member-by-member initialization of a 720-byte key). Now the read memo ke
 registration version its "no image here" answer was found at, image memos are kept per program,
 and the key is copied from a default one: draw cost -2.6% (paused A/B, 4.29 -> 4.18 us). The
 earlier A/B switches of the binding memo work are gone; `AbPending` selects only new changes.
+Measured and dropped (paused A/B, -0.5% together): push-descriptor words compared with the last
+push in place (instead of building a key vector), and texture bindings kept per program across
+stage switches (fewer description copies).
+
+With PGO v6 (`samples\pr19-execution.txt`): re-protecting pages after BDA uploads is 8.4% of
+the execution thread (NtProtectVirtualMemory about 7.5 us per call, about 190 calls per frame, 10
+BDA syncs per frame), and the execution thread idles 80 ms/s waiting for the resolve thread in
+a paused scene: the two threads are now about balanced. In the play captures of the low-overhead
+trace, the execution thread waits about 6% of the time in heavy frames (48-50 fps), all of it in
+some 10,000 waits per second of a few microseconds each (it caught up with the resolve thread);
+in a light stretch (58 fps) a third of the frames also wait 2-10 ms after their flip for the game's
+next frame (vsync pacing, not a bottleneck). A second resolve thread for dispatches (bit 41)
+took the resolve thread from 834 to 679 ms/s busy but left the execution thread's waits for it
+nearly unchanged (94 -> 84 ms/s, paused A/B) and the throughput the same: still off.
 
 GPU time per frame without the per-draw timestamps (`KYTY_IDLE_TRACE_NO_CMDS=1` at boot: the
 idle trace then stamps only command buffers, so the traced match keeps 48-58 fps at 60 Hz;
