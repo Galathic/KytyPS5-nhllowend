@@ -695,8 +695,10 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		copy.dstOffset += offset;
 	}
 	// Experiment LazySharedWrites: the guest bytes as they are before the faulting CPU write runs.
+	// Asynchronous guest reads publish the same way: bytes the CPU stored while the download was
+	// pending (through a mapping or a path that did not fault) are newer than the GPU's.
 	std::vector<uint8_t> snapshot;
-	if constexpr (merge) {
+	if constexpr (async) {
 		snapshot.resize(m_last_download_bytes);
 		uint64_t at = 0;
 		for (const auto& copy: copies) {
@@ -714,6 +716,29 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		uint64_t at = 0;
 		for (const auto& copy: copies) {
 			const auto* gpu = mapped + (copy.dstOffset - offset);
+			if constexpr (!merge) {
+				// Diagnostics: a pending guest read whose bytes changed before their publish (the old
+				// publish wrote the GPU's bytes over them).
+				if (!snapshot.empty()) {
+					std::vector<uint8_t> now(copy.size);
+					if (Libs::LibKernel::Memory::TryReadBacking(buffer_address + copy.srcOffset, now.data(), copy.size) &&
+					    std::memcmp(now.data(), snapshot.data() + at, copy.size) != 0) {
+						uint64_t changed = 0;
+						for (uint64_t i = 0; i < copy.size; i++) {
+							changed += now[i] != snapshot[at + i] ? 1u : 0u;
+						}
+						static std::atomic<uint32_t> reported {0};
+						if (reported.fetch_add(1, std::memory_order_relaxed) < 64) {
+							std::printf("NHL27ASYNCKEEP: guest read download 0x%016llx+0x%llx: %llu bytes changed while "
+							            "pending, kept\n",
+							            static_cast<unsigned long long>(buffer_address + copy.srcOffset),
+							            static_cast<unsigned long long>(copy.size),
+							            static_cast<unsigned long long>(changed));
+							std::fflush(stdout);
+						}
+					}
+				}
+			}
 			if (!snapshot.empty()) {
 				// Bytes the CPU stored since the download was queued are newer than the GPU's.
 				if (!Libs::LibKernel::Memory::TryMergeBacking(buffer_address + copy.srcOffset, gpu,

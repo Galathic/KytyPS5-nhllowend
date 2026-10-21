@@ -690,6 +690,14 @@ memo is versioned by the registrations hashing to its address's filter bit
 (`TextureCache::AddressBucketVersion`) instead of every registration. Rounds 2-7 in sum: 295 fps,
 290 with the old memo, 281 with the old scan; draw cost 4.17 / 4.30 / 4.21 us.
 
+Asynchronous guest reads (`KYTY_ASYNC_GUEST_READS`, on in the recommended set) published their
+download with a plain write of the GPU's bytes. Three of today's guest crashes read objects in pages
+that such a publish (the priority thread) had written 1-10 ms before, and the match-start hangs
+waited on counters one short in the pages NHL 27 builds command buffers in (0x1131xxxxxx). The
+publish now merges like the lazy shared writes: a byte that changed while the download was pending
+keeps its new value. `NHL27ASYNCKEEP` reports such cases; in four boots one came up, 8 bytes in
+0x1131274000 (the page of an earlier hang's counter) that the old publish would have overwritten.
+
 Display: flips go out at every vblank (`KYTY_FORCE_FLIP_RATE` defaults to 0) and the emulated
 display runs at 240 Hz (`KYTY_PLAY_VBLANK_HZ` / `KYTY_MENU_VBLANK_HZ`, 0 = the configured
 frequency): menus and loading screens reach 75-86 fps, light play 61-69; the game is timed by
