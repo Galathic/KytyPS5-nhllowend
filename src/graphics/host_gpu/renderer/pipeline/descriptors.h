@@ -101,6 +101,17 @@ struct PreparedBindings {
 	};
 	std::vector<BufferSlotKey> buffer_keys;
 	std::vector<vk::DescriptorBufferInfo> buffers;
+	// RebindBuffers: what each plain-read slot bound last (see BufferCache::PlainReadHolds()).
+	struct BufferSlotMemo {
+		Buffer*                  buffer         = nullptr;
+		uint64_t                 address        = 0;
+		uint64_t                 size           = 0;
+		uint64_t                 cpu_generation = 0;
+		uint64_t                 registration   = 0;
+		vk::DescriptorBufferInfo info;
+		uint32_t                 buffer_offset = 0;
+	};
+	std::vector<BufferSlotMemo> buffer_memos;
 	std::vector<TextureBinding>           images;
 	// Bindless table descriptors in binding and table-range order, with the T# and the root
 	// image each element was resolved for.

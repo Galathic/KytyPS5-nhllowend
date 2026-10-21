@@ -181,7 +181,8 @@ static bool IsMultisampledTexture(Prospero::ImageType type) {
 
 static vk::DescriptorBufferInfo
 NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource& source,
-                    const ShaderRecompiler::IR::BufferResource& resource, uint32_t& buffer_offset) {
+                    const ShaderRecompiler::IR::BufferResource& resource, uint32_t& buffer_offset,
+                    Buffer** obtained = nullptr) {
 	buffer_offset = 0;
 
 	const auto& [address, size, id] = source;
@@ -196,6 +197,9 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	auto [buffer, offset] = context.GetBufferCache().ObtainBufferCached(
 	    address, size, resource.written,
 	    resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled()), id);
+	if (obtained != nullptr) {
+		*obtained = buffer;
+	}
 	const auto aligned_offset = Common::AlignDown(offset, alignment);
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
@@ -1384,13 +1388,44 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	};
 	FrameBreakdown::Timer lookup_timer(FrameBreakdown::g_counters.dp_rebind_lookup_ns);
 	FrameBreakdown::BufScope buf_scope(1);
+	auto& cache = m_context.GetBufferCache();
+	prepared.buffer_memos.resize(prepared.buffers.size());
+	// Plain reads (most slots) whose range found the same buffer the draw before skip the lookup
+	// while no buffer was registered and the range stayed CPU-clean.
+	const bool slot_memo = Common::RuntimeFlags::Current().buffer_fast;
 	for (const auto& resource: program.info.buffers) {
 		const auto index = resource.descriptor_index;
 		if (index == UINT32_MAX) continue;
-		uint32_t buffer_offset = 0;
-		prepared.buffers[index] = NativeStorageBuffer(m_context, prepared.buffer_sources[index],
-		                                              resource, buffer_offset);
+		uint32_t    buffer_offset = 0;
+		const auto& source        = prepared.buffer_sources[index];
+		auto&       memo          = prepared.buffer_memos[index];
+		const bool  plain = slot_memo && !resource.written && !resource.formatted &&
+		                   !(resource.read && Config::SyncRawImageBuffersEnabled()) && source.address != 0 &&
+		                   source.size != 0;
+		if (plain && memo.buffer != nullptr && memo.address == source.address && memo.size == source.size &&
+		    cache.PlainReadHolds(*memo.buffer, source.address, source.size, memo.cpu_generation,
+		                         memo.registration)) {
+			prepared.buffers[index] = memo.info;
+			pack_memory_offset(index, memo.buffer_offset);
+			continue;
+		}
+		const auto cpu          = cache.CpuModificationGeneration();
+		const auto registration = cache.RegistrationGeneration();
+		Buffer*    obtained     = nullptr;
+		prepared.buffers[index] = NativeStorageBuffer(m_context, source, resource, buffer_offset, &obtained);
 		pack_memory_offset(index, buffer_offset);
+		if (plain && obtained != nullptr && !cache.IsStreamBuffer(obtained) &&
+		    registration == cache.RegistrationGeneration()) {
+			memo = {.buffer         = obtained,
+			        .address        = source.address,
+			        .size           = source.size,
+			        .cpu_generation = cpu,
+			        .registration   = registration,
+			        .info           = prepared.buffers[index],
+			        .buffer_offset  = buffer_offset};
+		} else {
+			memo.buffer = nullptr;
+		}
 	}
 	lookup_timer.Stop();
 	FrameBreakdown::Timer upload_timer(FrameBreakdown::g_counters.dp_rebind_upload_ns);

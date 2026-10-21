@@ -1935,6 +1935,21 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferCached(uint64_t vaddr, uin
 	return result;
 }
 
+bool BufferCache::PlainReadHolds(Buffer& buffer, uint64_t vaddr, uint64_t size, uint64_t& cpu_generation,
+                                 uint64_t registration) {
+	if (&buffer == &m_stream_buffer || registration != m_registration_generation) {
+		return false;
+	}
+	const auto cpu = m_memory_tracker.CpuModificationGeneration();
+	if (cpu != cpu_generation && m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
+		return false;
+	}
+	cpu_generation = cpu;
+	FrameBreakdown::BdaBatchNoteUsed(vaddr, size);
+	TouchBuffer(buffer);
+	return true;
+}
+
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid image source\n");

@@ -213,6 +213,13 @@ public:
 	                                                              bool is_written, bool is_texel_buffer,
 	                                                              BufferId id = {});
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
+	// A plain read ObtainBufferCached served from `buffer` when the registration generation was
+	// `registration` and the CPU modification generation `cpu_generation`: whether the same buffer
+	// and offset still hold (registration unchanged, range not CPU-modified since); touches it and
+	// advances `cpu_generation`. The stream buffer never holds.
+	[[nodiscard]] bool PlainReadHolds(Buffer& buffer, uint64_t vaddr, uint64_t size, uint64_t& cpu_generation,
+	                                  uint64_t registration);
+	[[nodiscard]] bool IsStreamBuffer(const Buffer* buffer) const noexcept { return buffer == &m_stream_buffer; }
 	// Copies guest memory into coherent mapped memory (the stream buffer, staging), possibly on the
 	// host copy thread (see CommandScheduler::HostCopies()).
 	void StreamGuestData(uint8_t* destination, uint64_t vaddr, uint64_t size);

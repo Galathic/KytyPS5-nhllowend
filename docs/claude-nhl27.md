@@ -708,6 +708,12 @@ boots: no hang. Also measured: no host-copy drain before flush callbacks (the re
 waits for the copies before it submits): 359 / 377 fps in paired rounds, dropped. The second draw
 resolver once more in one boot: 345 / 360 (with it, the execution thread is 97% busy): it stays off.
 
+Plain-read buffer slots keep what they bound (`PreparedBindings::buffer_memos`): a slot whose range
+is the one it bound the draw before reuses the descriptor while no buffer was registered and the
+range stayed CPU-clean (`BufferCache::PlainReadHolds`, the obtain cache's own test, without its
+hash lookup); stream-buffer copies are never kept. One boot, 8 paired rounds: 374 / 365 fps in sum
+(7 of 8 rounds ahead), draw cost 4.64 -> 4.40 us.
+
 Display: flips go out at every vblank (`KYTY_FORCE_FLIP_RATE` defaults to 0) and the emulated
 display runs at 240 Hz (`KYTY_PLAY_VBLANK_HZ` / `KYTY_MENU_VBLANK_HZ`, 0 = the configured
 frequency): menus and loading screens reach 75-86 fps, light play 61-69; the game is timed by
