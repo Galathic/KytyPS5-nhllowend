@@ -1154,7 +1154,6 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.shader_data_buffer = {};
 	prepared.shared_memory = {};
 	prepared.push_dwords_valid = false;
-	prepared.images.resize(program.info.images.size());
 	prepared.shader_data.clear();
 	const bool same_program = prepared.last_program == &program &&
 	                          prepared.last_descs_generation == m_texture_descs_generation;
@@ -1165,7 +1164,19 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	if (memo == nullptr) {
 		memo = &m_program_image_memos[&program];
 	}
+	// The program's own image bindings come back with it: a slot reusing the lookup its last draw
+	// made already holds the description (ReuseTextureLookup copied one for most slots of
+	// alternating programs, 1.2% of the execution thread).
+	if (prepared.image_memo != memo && (memo->holder == nullptr || memo->holder == &prepared)) {
+		if (prepared.image_memo != nullptr && prepared.image_memo->holder == &prepared) {
+			prepared.images.swap(prepared.image_memo->bindings);
+			prepared.image_memo->holder = nullptr;
+		}
+		prepared.images.swap(memo->bindings);
+		memo->holder = &prepared;
+	}
 	prepared.image_memo    = memo;
+	prepared.images.resize(program.info.images.size());
 	auto&      last_images = memo->images;
 	auto&      image_descs = memo->image_descs;
 	const bool same_descs  = memo->descs_generation == m_texture_descs_generation;

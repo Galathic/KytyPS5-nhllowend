@@ -74,6 +74,10 @@ struct ProgramImageMemo {
 	uint64_t                                           descs_generation = 0;
 	std::vector<ShaderRecompiler::IR::DescriptorValue> images;
 	std::vector<TextureDescDerivation*>                image_descs;
+	// The program's image bindings while another program uses its stage (swapped with
+	// PreparedBindings::images; `holder` has them meanwhile).
+	std::vector<TextureBinding> bindings;
+	const void*                 holder = nullptr;
 };
 
 struct PreparedBindings {

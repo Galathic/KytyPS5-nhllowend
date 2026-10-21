@@ -659,6 +659,17 @@ play) no longer drain; the occlusion counter dump, the only event that writes gu
 tagged `Other` and still does. In-boot A/B: draw cost 4.80 -> 4.62 us, 50.2 -> 51.8 fps at
 60 Hz.
 
+The second draw resolver (bit 43) again, on this build: the execution thread's waits for the
+resolve thread 79 -> 25 ms/s, its waits for the game's next submission 16 -> 82 ms/s, draw cost
++2%; paired 20 s rounds 476 / 452 fps in sum (+5%), but whole-phase 60 Hz fps 50.7 / 52.0. The CPU
+it takes is the game's (8 cores here, fewer on lower-end PCs): still off.
+
+Image bindings per program: a stage's draws alternate between programs, and its one set of
+`TextureBinding`s took the description of whichever program drew last, so `ReuseTextureLookup`
+copied a description (a few hundred bytes) for most slots. Each program's image memo now keeps
+its own bindings, swapped in with the program (`ProgramImageMemo::bindings`): in-boot A/B, draw
+cost 4.73 -> 4.35 us (-8%), execution thread 891 -> 876 ms/s busy.
+
 Display: flips go out at every vblank (`KYTY_FORCE_FLIP_RATE` defaults to 0) and the emulated
 display runs at 240 Hz (`KYTY_PLAY_VBLANK_HZ` / `KYTY_MENU_VBLANK_HZ`, 0 = the configured
 frequency): menus and loading screens reach 75-86 fps, light play 61-69; the game is timed by
