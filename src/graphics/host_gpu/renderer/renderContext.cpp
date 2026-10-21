@@ -219,6 +219,23 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 	return m_mapped_ranges.Contains(vaddr, size);
 }
 
+uint64_t RenderContext::UnmapSequence() const noexcept {
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	return m_unmap_sequence;
+}
+
+bool RenderContext::UnmappedSince(uint64_t sequence, uint64_t vaddr, uint64_t size) const noexcept {
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	const auto       first = m_unmap_sequence > m_unmap_log.size() ? m_unmap_sequence - m_unmap_log.size() : 0;
+	for (auto s = std::max(sequence, first); s < m_unmap_sequence; s++) {
+		const auto& record = m_unmap_log[s % m_unmap_log.size()];
+		if (record.begin < vaddr + size && vaddr < record.end) {
+			return true;
+		}
+	}
+	return false;
+}
+
 bool RenderContext::IsReadProtected(uint64_t vaddr, uint64_t size) const noexcept {
 	if (size == 0 || !GuestRange {vaddr, size}.Valid()) {
 		return false;
@@ -267,10 +284,17 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		const bool active  = m_command_scheduler.Active();
 		const bool gpu     = active && m_buffer_cache.IsRegionGpuModified(vaddr, size);
 		const bool images  = active && !gpu && m_texture_cache.HasImagesInRegion(vaddr, size);
-		const bool pending = active && !gpu && !images && m_command_scheduler.HasPendingGuestOperations(vaddr, size);
-		const bool drain   = gpu || images || pending;
+		// Only completions writing the range: the GPU up to the command buffer of the last of them
+		// (a whole drain took 4-6 ms).
+		const uint64_t pending_tick =
+		    active && !gpu && !images ? m_command_scheduler.PendingGuestWriteTick(vaddr, size) : 0;
+		const bool pending = pending_tick != 0;
+		const bool drain   = gpu || images;
 		const auto start   = CpReadDebugEnabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
-		if (drain) {
+		if (pending) {
+			m_command_scheduler.WaitGuestWrites(pending_tick);
+		}
+		if (drain || (pending && m_command_scheduler.HasPendingGuestOperations(vaddr, size))) {
 			const auto tick = m_command_scheduler.CurrentTick();
 			m_command_scheduler.Finish();
 			m_command_scheduler.WaitPriorityOperations(tick);
@@ -303,6 +327,8 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
 		m_bda_new_ranges.Subtract(vaddr, size);
+		m_unmap_log[m_unmap_sequence % m_unmap_log.size()] = {m_unmap_sequence, vaddr, vaddr + size};
+		m_unmap_sequence++;
 		++m_mapping_generation;
 		m_mapped_ranges_version++;
 		PageWriteSeq::ForceChecks();
@@ -590,8 +616,8 @@ void RenderContext::RunGarbageCollector() {
 		m_buffer_cache.ProcessFaultBuffer();
 	}
 	if (m_indirect_write_tables.TakePendingWrites()) {
-		m_buffer_cache.ProcessWriteBuffer([this](std::span<const uint64_t> pages) {
-			m_indirect_write_tables.NoteWrites(pages);
+		m_buffer_cache.ProcessWriteBuffer([this, sequence = UnmapSequence()](std::span<const uint64_t> pages) {
+			m_indirect_write_tables.NoteWrites(pages, sequence);
 		});
 	}
 	m_texture_cache.ProcessDownloadImages();

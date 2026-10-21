@@ -639,6 +639,18 @@ earlier draw-resolver boot (0x909568416, a null pointer read from a page the emu
 written back from the GPU 10 ms before): the rare existing crash, not the memo (whose hits are
 exactly the ranges where `SynchronizeBuffer` uploads nothing).
 
+Unmaps (about 190 a second in play) drained the whole GPU whenever a deferred completion that
+may write guest memory was pending, 3-6 times a second for 4-6 ms each (`NHL27UNMAP` with
+`KYTY_DBG_CP_READS=1`; `KytyPS5-tools\unmap-by-mask.py` splits it by A/B phase): 20-36 ms a
+second of the execution thread. Most of them waited for the write scan of the indirect write
+tables, which was tracked as writing anywhere so that a remap would not inherit its GPU-written
+marks. Unmaps are now numbered and the scan skips pages unmapped since it was queued
+(`RenderContext::UnmappedSince`), so it no longer counts as a write; the other completions are
+waited for only up to the command buffer of the last one writing the range
+(`CommandScheduler::WaitGuestWrites`). In-boot A/B: unmap waits 35.7 -> 13.7 ms/s (3.6 ms each),
+draw cost 4.60 -> 4.42 us, execution thread 904 -> 874 ms/s busy. The waits left are downloads
+into the unmapped range.
+
 Display: flips go out at every vblank (`KYTY_FORCE_FLIP_RATE` defaults to 0) and the emulated
 display runs at 240 Hz (`KYTY_PLAY_VBLANK_HZ` / `KYTY_MENU_VBLANK_HZ`, 0 = the configured
 frequency): menus and loading screens reach 75-86 fps, light play 61-69; the game is timed by

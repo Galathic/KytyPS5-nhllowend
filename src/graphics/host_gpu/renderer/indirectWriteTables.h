@@ -35,8 +35,9 @@ public:
 		m_pending_writes   = false;
 		return pending;
 	}
-	// Records the caching pages that V#-table stores wrote.
-	void NoteWrites(std::span<const uint64_t> pages);
+	// Records the caching pages that V#-table stores wrote, except those unmapped after
+	// RenderContext::UnmapSequence() returned `unmap_sequence`.
+	void NoteWrites(std::span<const uint64_t> pages, uint64_t unmap_sequence);
 
 	// The guest range a store through `target` can write, or an empty range when the shader drops
 	// every store through it: a T#, S# or stale table entry, or a buffer without a data format.

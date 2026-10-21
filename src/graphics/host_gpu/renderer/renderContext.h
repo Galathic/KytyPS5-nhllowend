@@ -57,6 +57,10 @@ public:
 	void PrepareGpuWrite(const void* destination, uint64_t size) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
+	// Unmaps are numbered: whether [vaddr, vaddr + size) was unmapped after UnmapSequence()
+	// returned `sequence` (false once the log of the last unmaps no longer reaches back that far).
+	[[nodiscard]] uint64_t UnmapSequence() const noexcept;
+	[[nodiscard]] bool     UnmappedSince(uint64_t sequence, uint64_t vaddr, uint64_t size) const noexcept;
 	// Whether a read of the range would fault on a page holding GPU-written bytes. Any thread.
 	[[nodiscard]] bool IsReadProtected(uint64_t vaddr, uint64_t size) const noexcept;
 	// Advances whenever a range is mapped or unmapped.
@@ -109,6 +113,13 @@ private:
 	// The parts of m_mapped_ranges mapped since the last BDA synchronization (it clears them under
 	// the shared lock: it is their only reader, and mapping changes take the lock exclusively).
 	RangeSet                  m_bda_new_ranges;
+	struct UnmapRecord {
+		uint64_t sequence = 0;
+		uint64_t begin    = 0;
+		uint64_t end      = 0;
+	};
+	std::array<UnmapRecord, 1024> m_unmap_log {};
+	uint64_t                      m_unmap_sequence = 0;
 	uint64_t                  m_mapped_ranges_version = 0;
 	// Epochs (CPU dirty, buffer registrations, mapped ranges) read before the last full BDA
 	// synchronization.

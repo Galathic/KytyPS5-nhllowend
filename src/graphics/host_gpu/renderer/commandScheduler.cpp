@@ -1287,7 +1287,7 @@ CommandScheduler::TrackGuestOperation(Common::UniqueFunction<void>&& operation, 
 		std::lock_guard lock(m_guest_writes_mutex);
 		id = ++m_next_guest_write;
 		m_guest_writes.push_back(
-		    {id, address, size > UINT64_MAX - address ? UINT64_MAX : address + size});
+		    {id, address, size > UINT64_MAX - address ? UINT64_MAX : address + size, CurrentTick()});
 	}
 	return [this, id, operation = std::move(operation)]() mutable {
 		operation();
@@ -1306,6 +1306,35 @@ bool CommandScheduler::HasPendingGuestOperations(uint64_t address, uint64_t size
 	return std::any_of(m_guest_writes.begin(), m_guest_writes.end(), [&](const GuestWrite& write) {
 		return write.begin < end && address < write.end;
 	});
+}
+
+uint64_t CommandScheduler::PendingGuestWriteTick(uint64_t address, uint64_t size) {
+	const auto      end  = size > UINT64_MAX - address ? UINT64_MAX : address + size;
+	uint64_t        tick = 0;
+	std::lock_guard lock(m_guest_writes_mutex);
+	for (const auto& write: m_guest_writes) {
+		if (write.begin < end && address < write.end) {
+			tick = std::max(tick, write.tick);
+		}
+	}
+	return tick;
+}
+
+void CommandScheduler::WaitGuestWrites(uint64_t tick) {
+	CheckActive();
+	if (tick < CurrentTick()) {
+		m_master.Wait(tick);
+	} else if (!m_command.IsInvalid()) {
+		// The current command buffer: submitted first (as Finish() would).
+		Wait(Submit());
+		BeginNext();
+	} else {
+		m_master.Wait(CurrentTick() - 1);
+	}
+	// Pending operations are popped in order once their command buffer is known to be done.
+	m_master.Refresh();
+	PopPendingOperations();
+	WaitPriorityOperations(tick);
 }
 
 void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation) {
