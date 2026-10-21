@@ -284,17 +284,10 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		const bool active  = m_command_scheduler.Active();
 		const bool gpu     = active && m_buffer_cache.IsRegionGpuModified(vaddr, size);
 		const bool images  = active && !gpu && m_texture_cache.HasImagesInRegion(vaddr, size);
-		// Only completions writing the range: the GPU up to the command buffer of the last of them
-		// (a whole drain took 4-6 ms).
-		const uint64_t pending_tick =
-		    active && !gpu && !images ? m_command_scheduler.PendingGuestWriteTick(vaddr, size) : 0;
-		const bool pending = pending_tick != 0;
-		const bool drain   = gpu || images;
+		const bool pending = active && !gpu && !images && m_command_scheduler.HasPendingGuestOperations(vaddr, size);
+		const bool drain   = gpu || images || pending;
 		const auto start   = CpReadDebugEnabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
-		if (pending) {
-			m_command_scheduler.WaitGuestWrites(pending_tick);
-		}
-		if (drain || (pending && m_command_scheduler.HasPendingGuestOperations(vaddr, size))) {
+		if (drain) {
 			const auto tick = m_command_scheduler.CurrentTick();
 			m_command_scheduler.Finish();
 			m_command_scheduler.WaitPriorityOperations(tick);

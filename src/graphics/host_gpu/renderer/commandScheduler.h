@@ -75,11 +75,6 @@ public:
 	// Whether a deferred or priority operation that may write guest memory in
 	// [address, address + size) is queued or running.
 	[[nodiscard]] bool HasPendingGuestOperations(uint64_t address, uint64_t size);
-	// The latest command-buffer tick of those operations (0: none).
-	[[nodiscard]] uint64_t PendingGuestWriteTick(uint64_t address, uint64_t size);
-	// Waits for the GPU up to `tick` and completes the deferred and priority operations queued up
-	// to it.
-	void               WaitGuestWrites(uint64_t tick);
 	void               WaitPriorityOperations(uint64_t tick);
 	// Completions that may act on guest memory: an unmap of memory one may write drains the GPU
 	// while it is pending. They write at most [address, address + size), by default anywhere.
@@ -201,7 +196,6 @@ private:
 		uint64_t id    = 0;
 		uint64_t begin = 0;
 		uint64_t end   = 0;
-		uint64_t tick  = 0; // the command buffer it completes after
 	};
 	std::mutex                   m_guest_writes_mutex;
 	std::vector<GuestWrite>      m_guest_writes;

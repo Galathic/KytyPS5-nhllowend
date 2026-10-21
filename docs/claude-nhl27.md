@@ -645,11 +645,12 @@ may write guest memory was pending, 3-6 times a second for 4-6 ms each (`NHL27UN
 second of the execution thread. Most of them waited for the write scan of the indirect write
 tables, which was tracked as writing anywhere so that a remap would not inherit its GPU-written
 marks. Unmaps are now numbered and the scan skips pages unmapped since it was queued
-(`RenderContext::UnmappedSince`), so it no longer counts as a write; the other completions are
-waited for only up to the command buffer of the last one writing the range
-(`CommandScheduler::WaitGuestWrites`). In-boot A/B: unmap waits 35.7 -> 13.7 ms/s (3.6 ms each),
-draw cost 4.60 -> 4.42 us, execution thread 904 -> 874 ms/s busy. The waits left are downloads
-into the unmapped range.
+(`RenderContext::UnmappedSince`), so it no longer counts as a write. In-boot A/B (together with
+a wait only up to the command buffer of the last completion writing the range, since reverted):
+unmap waits 35.7 -> 13.7 ms/s, draw cost 4.60 -> 4.42 us, execution thread 904 -> 874 ms/s busy.
+The waits left are downloads into the unmapped range. The partial wait went back to the whole
+drain after a boot ended with a download published into memory unmapped before it
+(`Memory: required direct-backing write failed`, the first such exit; second draw resolver on).
 
 Host-copy drains before callbacks: every callback waited for the host copy thread (4.5% of the
 execution thread, spinning), although only guest-visible effects need the copies done first. BDA
