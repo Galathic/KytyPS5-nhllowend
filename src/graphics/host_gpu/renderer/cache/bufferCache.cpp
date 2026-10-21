@@ -457,6 +457,11 @@ void BufferCache::ForgetGpuWrite(uint64_t vaddr, uint64_t size) {
 void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source,
                                   uint64_t size) {
 	auto* bytes = static_cast<const uint8_t*>(source);
+	// A readback on the second queue waits for the buffer's last writer only: without this, one
+	// that followed a label write (TryWriteLabel) copied the buffer before the label's copy ran
+	// and published the old value over the label in guest memory (match-start hangs on a
+	// counter one short).
+	buffer.last_write_tick = m_scheduler.CurrentTick();
 	while (size != 0) {
 		const auto chunk  = std::min(size, m_staging_buffer.Size());
 		// Copy waits for ring reuse and flushes the fresh host data before submission.

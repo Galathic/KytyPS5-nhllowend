@@ -698,6 +698,16 @@ publish now merges like the lazy shared writes: a byte that changed while the do
 keeps its new value. `NHL27ASYNCKEEP` reports such cases; in four boots one came up, 8 bytes in
 0x1131274000 (the page of an earlier hang's counter) that the old publish would have overwritten.
 
+A later boot still hung in the menus, on two counters one short in a page where two such merges
+had just kept changed bytes. The cause: label writes (`TryWriteLabel`, EOP and WRITE_DATA labels)
+update guest memory and record a copy into the label's buffer, but did not count as a write of the
+buffer, so a synchronous readback on the second queue (`KYTY_READBACK_QUEUE`), which waits only
+for the buffer's last writer, copied the buffer before the label's copy ran and published the old
+value over the label. `WriteDataBuffer` now sets the buffer's `last_write_tick`. The following
+boots: no hang. Also measured: no host-copy drain before flush callbacks (the recording thread
+waits for the copies before it submits): 359 / 377 fps in paired rounds, dropped. The second draw
+resolver once more in one boot: 345 / 360 (with it, the execution thread is 97% busy): it stays off.
+
 Display: flips go out at every vblank (`KYTY_FORCE_FLIP_RATE` defaults to 0) and the emulated
 display runs at 240 Hz (`KYTY_PLAY_VBLANK_HZ` / `KYTY_MENU_VBLANK_HZ`, 0 = the configured
 frequency): menus and loading screens reach 75-86 fps, light play 61-69; the game is timed by
