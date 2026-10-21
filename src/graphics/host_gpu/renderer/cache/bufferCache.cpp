@@ -2369,8 +2369,8 @@ uint64_t BufferCache::SynchronizeBuffersInRanges(const RangeSet& ranges, bool fu
 	return visited;
 }
 
-bool BufferCache::SynchronizeBuffersInRangesBefore(const RangeSet& ranges, bool full, uint32_t limit,
-                                                   uint32_t& first_left) {
+bool BufferCache::SynchronizeBuffersInRangesBefore(const RangeSet& ranges, const RangeSet* full_ranges,
+                                                   uint32_t limit, uint32_t& first_left) {
 	// Pages uploaded here are protected again by the host copy thread, before the uploads' copies
 	// (which it makes as well: the staging memory is coherent).
 	auto* const host_copies = m_scheduler.HostCopies();
@@ -2396,13 +2396,14 @@ bool BufferCache::SynchronizeBuffersInRangesBefore(const RangeSet& ranges, bool 
 		    });
 	};
 	// Drain before a full scan so a CPU write during that scan remains queued.
+	const bool all = full_ranges == &ranges;
 	m_memory_tracker.DrainCpuDirtyRegions([&](uint64_t address, uint64_t size) {
-		if (!full) {
+		if (!all) {
 			ranges.ForEachInRange(address, size, [&](uint64_t begin, uint64_t end) { sync(begin, end - begin); });
 		}
 	});
-	if (full) {
-		ranges.ForEach([&](uint64_t begin, uint64_t end) { sync(begin, end - begin); });
+	if (full_ranges != nullptr) {
+		full_ranges->ForEach([&](uint64_t begin, uint64_t end) { sync(begin, end - begin); });
 	}
 	return left;
 }

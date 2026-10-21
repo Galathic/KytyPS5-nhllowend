@@ -242,6 +242,7 @@ void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	PageWriteSeq::ForceChecks();
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
+	m_bda_new_ranges.Add(vaddr, size);
 	++m_mapping_generation;
 	m_mapped_ranges_version++;
 }
@@ -301,6 +302,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		m_texture_cache.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
+		m_bda_new_ranges.Subtract(vaddr, size);
 		++m_mapping_generation;
 		m_mapped_ranges_version++;
 		PageWriteSeq::ForceChecks();
@@ -402,7 +404,14 @@ void RenderContext::PrepareBda() {
 			batch.scan_ranges.clear();
 		}
 		if (cache_enabled && dirty_regions) {
-			const bool full = m_mapping_generation != m_bda_mapping_generation;
+			// Drained regions outside the mapped ranges are dropped, so only memory mapped since the
+			// last synchronization can hold CPU-dirty pages no drain will bring back (pages left for
+			// later epochs are queued again); unmaps leave nothing to upload. The full scan covers
+			// just that memory (AbPending: all mapped ranges after any mapping change).
+			const bool mapping_changed = m_mapping_generation != m_bda_mapping_generation;
+			const bool new_only        = m_operation_epoch_valid &&
+			                      !Common::Experiments::Enabled(Common::Experiments::AbPending);
+			const bool full = new_only ? !m_bda_new_ranges.Empty() : mapping_changed;
 			m_bda_stats.full_scans += full;
 			if (full) {
 				FrameBreakdown::Add(FrameBreakdown::g_counters.bda_scans);
@@ -420,8 +429,9 @@ void RenderContext::PrepareBda() {
 				}
 				if (m_operation_epoch_valid) {
 					uint32_t first_left = 0;
-					m_bda_pages_left = m_buffer_cache.SynchronizeBuffersInRangesBefore(
-					    m_mapped_ranges, full, m_operation_write_epoch, first_left);
+					const RangeSet* full_ranges = !full ? nullptr : new_only ? &m_bda_new_ranges : &m_mapped_ranges;
+					m_bda_pages_left            = m_buffer_cache.SynchronizeBuffersInRangesBefore(
+					    m_mapped_ranges, full_ranges, m_operation_write_epoch, first_left);
 					m_bda_first_left = first_left;
 				} else {
 					drained          = m_buffer_cache.SynchronizeBuffersInRanges(m_mapped_ranges, full);
@@ -452,6 +462,10 @@ void RenderContext::PrepareBda() {
 		// another scan, even if it targets a range we already visited.
 		m_bda_cpu_generation = cpu;
 		m_bda_registration_generation = registrations;
+		if (m_bda_mapping_generation != m_mapping_generation) {
+			// Every path above synchronized the newly mapped memory.
+			m_bda_new_ranges.Clear();
+		}
 		m_bda_mapping_generation = m_mapping_generation;
 		if (stats_enabled) {
 			batch.collecting = false;

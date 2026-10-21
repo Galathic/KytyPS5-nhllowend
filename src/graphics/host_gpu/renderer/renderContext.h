@@ -106,6 +106,9 @@ private:
 	IndirectWriteTables       m_indirect_write_tables {*this};
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
+	// The parts of m_mapped_ranges mapped since the last BDA synchronization (it clears them under
+	// the shared lock: it is their only reader, and mapping changes take the lock exclusively).
+	RangeSet                  m_bda_new_ranges;
 	uint64_t                  m_mapped_ranges_version = 0;
 	// Epochs (CPU dirty, buffer registrations, mapped ranges) read before the last full BDA
 	// synchronization.
