@@ -1749,7 +1749,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		const auto hash = (vaddr ^ (size << 40u)) * 0x9e3779b97f4a7c15ull;
 		memo            = &(*m_obtain_memo)[(hash >> 32u) % ObtainMemoSlots];
 		if (texel_candidate) {
-			image_version = m_texture_cache.AddressIndexVersion();
+			// Only registrations of images at addresses sharing the filter bit change the answer (the
+			// version of every registration made the memo miss most texel binds).
+			image_version = m_texture_cache.AddressBucketVersion(vaddr);
 			texel_read    = (memo->vaddr == vaddr && memo->texel && memo->image_version == image_version) ||
 			             !m_texture_cache.HasImageAt(vaddr);
 		}

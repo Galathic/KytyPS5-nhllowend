@@ -289,9 +289,11 @@ void TextureCache::RegisterImage(ImageId id) {
 		m_image_page_table[page].push_back(id);
 	});
 	m_images_by_address[image.info.data.address].push_back(id);
-	if (const auto index = AddressFilterIndex(image.info.data.address); m_address_filter_counts[index]++ == 0) {
-		m_address_filter[index / 64].fetch_or(uint64_t {1} << (index % 64), std::memory_order_release);
+	const auto filter_index = AddressFilterIndex(image.info.data.address);
+	if (m_address_filter_counts[filter_index]++ == 0) {
+		m_address_filter[filter_index / 64].fetch_or(uint64_t {1} << (filter_index % 64), std::memory_order_release);
 	}
+	m_address_filter_versions[filter_index].fetch_add(1, std::memory_order_release);
 	m_address_index_version.fetch_add(1, std::memory_order_release);
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
@@ -389,7 +391,9 @@ void TextureCache::DeleteImage(ImageId id) {
 	if (image == nullptr || !image->registered) {
 		return;
 	}
-	if (!image->depth_id) {
+	// Only depth images ever get stencil planes: the scan of every image for them was 1% of the
+	// execution thread in play (images are replaced all the time).
+	if (!image->depth_id && image->stencil_associated) {
 		std::vector<ImageId> associations;
 		m_slot_images.ForEach([&](ImageId candidate, const Image& associated) {
 			if (associated.depth_id == id) {
@@ -1726,6 +1730,7 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 		record.depth_id             = depth_id;
 		record.stencil_subresources = depth.stencil_subresources;
 	}
+	depth.stencil_associated = true;
 
 	return association;
 }

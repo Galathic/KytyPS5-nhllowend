@@ -683,6 +683,13 @@ stays on despite its documented gaps. New default mask 1651247152614; A/B-only b
 Test boots reach the match about 75 s sooner: `play-nhl.ps1` polls the boot every 2 s, waits
 half as long on the menus and detects the match start in the console instead of sleeping.
 
+Two smaller cuts, compared in one boot (base, and each one's old code, 7 rounds of 15 s): deleting
+an image no longer scans every image for stencil planes associated with it unless it is a depth
+image that has one (1% of the execution thread: images are replaced all the time); the texel read
+memo is versioned by the registrations hashing to its address's filter bit
+(`TextureCache::AddressBucketVersion`) instead of every registration. Rounds 2-7 in sum: 295 fps,
+290 with the old memo, 281 with the old scan; draw cost 4.17 / 4.30 / 4.21 us.
+
 Display: flips go out at every vblank (`KYTY_FORCE_FLIP_RATE` defaults to 0) and the emulated
 display runs at 240 Hz (`KYTY_PLAY_VBLANK_HZ` / `KYTY_MENU_VBLANK_HZ`, 0 = the configured
 frequency): menus and loading screens reach 75-86 fps, light play 61-69; the game is timed by
