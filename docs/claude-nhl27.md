@@ -651,6 +651,13 @@ waited for only up to the command buffer of the last one writing the range
 draw cost 4.60 -> 4.42 us, execution thread 904 -> 874 ms/s busy. The waits left are downloads
 into the unmapped range.
 
+Host-copy drains before callbacks: every callback waited for the host copy thread (4.5% of the
+execution thread, spinning), although only guest-visible effects need the copies done first. BDA
+boundaries, global barriers and cache events (two thirds of the 155,000 callbacks a second in
+play) no longer drain; the occlusion counter dump, the only event that writes guest memory, is
+tagged `Other` and still does. In-boot A/B: draw cost 4.80 -> 4.62 us, 50.2 -> 51.8 fps at
+60 Hz.
+
 Display: flips go out at every vblank (`KYTY_FORCE_FLIP_RATE` defaults to 0) and the emulated
 display runs at 240 Hz (`KYTY_PLAY_VBLANK_HZ` / `KYTY_MENU_VBLANK_HZ`, 0 = the configured
 frequency): menus and loading screens reach 75-86 fps, light play 61-69; the game is timed by

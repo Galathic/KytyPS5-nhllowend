@@ -1294,8 +1294,16 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 		// and waiting before each of them was 7.6% of this thread.
 		const bool dispatch = operation.kind == GpuOperationKind::DispatchDirect ||
 		                      operation.kind == GpuOperationKind::DispatchIndirect;
+		// Neither have BDA boundaries, barriers and cache events (the occlusion dump is tagged
+		// Other): two thirds of the callbacks in play, and the waits before them were 4.5% of this
+		// thread.
+		const bool invisible =
+		    operation.kind == GpuOperationKind::Callback &&
+		    (operation.callback_tag == GpuCallbackTag::Bda || operation.callback_tag == GpuCallbackTag::Barrier ||
+		     operation.callback_tag == GpuCallbackTag::Event);
 		if (auto* copies = GetScheduler().HostCopies();
-		    copies != nullptr && (!dispatch || Common::Experiments::Enabled(Common::Experiments::CpuCopyForward))) {
+		    copies != nullptr && !invisible &&
+		    (!dispatch || Common::Experiments::Enabled(Common::Experiments::CpuCopyForward))) {
 			copies->Drain();
 		}
 	}
@@ -3695,9 +3703,10 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 		     event_type, event_index, event_address);
 	}
 
+	// The occlusion counter dump writes guest memory (see CommandProcessor::Execute()).
 	const auto sequence = EmitCallback([this, event_type, event_index, event_address] {
 		ExecuteTriggerEvent(event_type, event_index, event_address);
-	}, GpuCallbackTag::Event);
+	}, event_type == 0x00000039 ? GpuCallbackTag::Other : GpuCallbackTag::Event);
 	if (event_type == 0x00000039) {
 		// Occlusion counter pairs of 16 DBs.
 		NoteGuestWrite(sequence, event_address, 16u * 2u * sizeof(uint64_t), nullptr, "wait-occlusion");
