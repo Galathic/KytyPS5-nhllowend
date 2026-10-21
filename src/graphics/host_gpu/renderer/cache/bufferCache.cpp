@@ -1990,6 +1990,20 @@ bool BufferCache::WrittenBindHolds(Buffer& buffer, uint64_t vaddr, uint64_t size
 	return true;
 }
 
+bool BufferCache::TexelReadHolds(Buffer& buffer, uint64_t vaddr, uint64_t size, uint64_t& cpu_generation,
+                                 uint64_t registration, uint64_t image_version) {
+	return image_version == m_texture_cache.AddressBucketVersion(vaddr) &&
+	       PlainReadHolds(buffer, vaddr, size, cpu_generation, registration);
+}
+
+bool BufferCache::TexelReadKeepable(uint64_t vaddr) {
+	return !m_texture_cache.HasImageAt(vaddr);
+}
+
+uint64_t BufferCache::TexelImageVersion(uint64_t vaddr) const {
+	return m_texture_cache.AddressBucketVersion(vaddr);
+}
+
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid image source\n");

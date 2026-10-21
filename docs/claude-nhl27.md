@@ -728,6 +728,11 @@ holds while its own range is still wholly in the GPU-written ranges and not pend
 (its pages are then GPU-owned with nothing to upload). One boot: 417 / 371 fps in paired rounds
 (6 of 8 ahead), draw cost 4.72 -> 4.54 us. `MaterializeColorClear` asks whether its metadata
 slices hold GPU-written bytes once instead of up to three times.
+With the small version table, the texel slot memo pays off after all (texel reads whose address
+has no image keep their binding while the image versions of that address group, the buffer set and
+the range's CPU state are unchanged): one boot with three variants, draw cost 4.76 -> 4.46 us,
+paired rounds 378 / 370. Reusing identical flattened-SRT and shader-data uploads within a lap of
+the stream buffer: draw cost -2% but 378 / 407 fps in the same boot, dropped.
 
 Display: flips go out at every vblank (`KYTY_FORCE_FLIP_RATE` defaults to 0) and the emulated
 display runs at 240 Hz (`KYTY_PLAY_VBLANK_HZ` / `KYTY_MENU_VBLANK_HZ`, 0 = the configured

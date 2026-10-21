@@ -1404,8 +1404,12 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		                   source.size != 0;
 		// Written slots too, while the GPU ranges and the buffer set are unchanged.
 		const bool  written = slot_memo && resource.written && source.address != 0 && source.size != 0;
-		if (plain && memo.buffer != nullptr && !memo.written && memo.address == source.address &&
-		    memo.size == source.size &&
+		// And texel reads while no image starts at the address.
+		const bool  texel = slot_memo && !resource.written && resource.formatted &&
+		                   !(resource.read && Config::SyncRawImageBuffersEnabled()) && source.address != 0 &&
+		                   source.size != 0;
+		if (plain && memo.buffer != nullptr && !memo.written && memo.image_version == 0 &&
+		    memo.address == source.address && memo.size == source.size &&
 		    cache.PlainReadHolds(*memo.buffer, source.address, source.size, memo.cpu_generation,
 		                         memo.registration)) {
 			prepared.buffers[index] = memo.info;
@@ -1421,13 +1425,24 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 			pack_memory_offset(index, memo.buffer_offset);
 			continue;
 		}
-		const auto cpu          = cache.CpuModificationGeneration();
-		const auto registration = cache.RegistrationGeneration();
-		Buffer*    obtained     = nullptr;
-		prepared.buffers[index] = NativeStorageBuffer(m_context, source, resource, buffer_offset, &obtained);
+		if (texel && memo.buffer != nullptr && memo.image_version != 0 && memo.address == source.address &&
+		    memo.size == source.size &&
+		    cache.TexelReadHolds(*memo.buffer, source.address, source.size, memo.cpu_generation,
+		                         memo.registration, memo.image_version)) {
+			prepared.buffers[index] = memo.info;
+			pack_memory_offset(index, memo.buffer_offset);
+			continue;
+		}
+		const auto cpu           = cache.CpuModificationGeneration();
+		const auto registration  = cache.RegistrationGeneration();
+		const auto image_version = texel ? cache.TexelImageVersion(source.address) : 0;
+		Buffer*    obtained      = nullptr;
+		prepared.buffers[index]  = NativeStorageBuffer(m_context, source, resource, buffer_offset, &obtained);
 		pack_memory_offset(index, buffer_offset);
-		if ((plain || written) && obtained != nullptr && !cache.IsStreamBuffer(obtained) &&
-		    registration == cache.RegistrationGeneration()) {
+		if ((plain || written || texel) && obtained != nullptr && !cache.IsStreamBuffer(obtained) &&
+		    registration == cache.RegistrationGeneration() &&
+		    (!texel || (image_version == cache.TexelImageVersion(source.address) &&
+		                cache.TexelReadKeepable(source.address)))) {
 			memo = {.buffer         = obtained,
 			        .address        = source.address,
 			        .size           = source.size,
@@ -1435,6 +1450,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 			        .registration   = registration,
 			        .ranges_version = cache.GpuRangesVersion(),
 			        .written        = written,
+			        .image_version  = image_version,
 			        .info           = prepared.buffers[index],
 			        .buffer_offset  = buffer_offset};
 		} else {

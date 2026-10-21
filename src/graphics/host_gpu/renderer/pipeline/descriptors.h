@@ -111,6 +111,7 @@ struct PreparedBindings {
 		// Written slots (WrittenBindHolds()): the GPU ranges version after the binding.
 		uint64_t                 ranges_version = 0;
 		bool                     written        = false;
+		uint64_t                 image_version  = 0; // texel reads (0: not one)
 		vk::DescriptorBufferInfo info;
 		uint32_t                 buffer_offset = 0;
 	};

@@ -220,6 +220,13 @@ public:
 	[[nodiscard]] bool PlainReadHolds(Buffer& buffer, uint64_t vaddr, uint64_t size, uint64_t& cpu_generation,
 	                                  uint64_t registration);
 	[[nodiscard]] bool IsStreamBuffer(const Buffer* buffer) const noexcept { return buffer == &m_stream_buffer; }
+	// The same for a texel (formatted) read found while no image started at the address, at image
+	// version `image_version` (TextureCache::AddressBucketVersion()).
+	[[nodiscard]] bool TexelReadHolds(Buffer& buffer, uint64_t vaddr, uint64_t size, uint64_t& cpu_generation,
+	                                  uint64_t registration, uint64_t image_version);
+	// Whether a texel read of `vaddr` may be kept as TexelReadHolds() checks it: no image starts there.
+	[[nodiscard]] bool     TexelReadKeepable(uint64_t vaddr);
+	[[nodiscard]] uint64_t TexelImageVersion(uint64_t vaddr) const;
 	// A written binding ObtainBuffer made of [vaddr, vaddr + size) in `buffer`, after which the GPU
 	// ranges had version `ranges_version`: while neither they nor the buffer set changed, the range
 	// is still GPU-owned with nothing to upload, so binding it again only needs the per-operation
