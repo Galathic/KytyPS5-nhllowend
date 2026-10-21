@@ -742,6 +742,13 @@ read on the command processor or a guest thread is emulated from the backing whe
 not GPU-written (exact, unlike the speculative bit 4). One boot with off / bit 4 / bit 34 in
 alternating 20 s phases: readback waits 65 / 12 / 24 ms/s, paired rounds 361 / 390 / 382 fps.
 Bit 4 in two more boots: 374 / 394 and 464 / 446 fps against off. New default mask 1668427021798.
+Two more boots, each with three variants: bit 1 `KYTY_SKIP_REDUNDANT_BINDS` off made draws
+cheaper (4.58 -> 4.36 and 4.37 -> 4.29 us: building its descriptor key cost more than the pushes
+it saved, which the recording thread has room for), and bit 4 on top of bit 34 cut the readback
+waits to 21-22 ms/s (bit 34 alone 54-96 ms/s in these boots). Paired rounds base / bit 1 off /
+bit 1 off and bit 4 on: 370 / 375 / 386 (bit 4 on with bit 1 still on) and 343 / 363 / 381. Bit 1 is
+now off and bit 4 on again by default (the hang it was suspected of was the label readback
+race): default mask 1668427021812.
 
 Display: flips go out at every vblank (`KYTY_FORCE_FLIP_RATE` defaults to 0) and the emulated
 display runs at 240 Hz (`KYTY_PLAY_VBLANK_HZ` / `KYTY_MENU_VBLANK_HZ`, 0 = the configured

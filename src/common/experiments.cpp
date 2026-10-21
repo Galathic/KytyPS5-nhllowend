@@ -38,7 +38,9 @@ uint64_t EnvironmentMask() {
 		if (EnvSwitch(name, on_by_default)) mask |= bit;
 	};
 	// The NHL 27 recommended set is on unless its variable is set to 0.
-	set("KYTY_SKIP_REDUNDANT_BINDS", SkipRedundantBinds, true);
+	// Off now: building its key cost the execution thread more than the pushes it saved (the
+	// recording thread has room for them); two boots, draw cost -2..-5%.
+	set("KYTY_SKIP_REDUNDANT_BINDS", SkipRedundantBinds, false);
 	set("KYTY_SRT_BATCH_READS", SrtBatchReads, true);
 	set("KYTY_DIRECT_SRT_READS", DirectSrtReads, true);
 	set("KYTY_NATIVE_MINMAX", NativeMinMax, true);
@@ -62,9 +64,9 @@ uint64_t EnvironmentMask() {
 	set("KYTY_POOLED_BDA_BUFFERS", PooledBdaBuffers, false);
 	set("KYTY_ASYNC_GUEST_READS", AsyncGuestReads, false);
 	set("KYTY_BDA_DIRTY_REGIONS", BdaDirtyRegions, false);
-	// Off: a read the execution thread's in-order check found GPU-written preceded a match-start
-	// hang (NHL27CPSPEC MISMATCH at the counter the CP then waited on forever); no fps cost in play.
-	set("KYTY_CP_BACKING_READS", CpBackingReads, false);
+	// On again: the match-start hang it was suspected of was the label readback race
+	// (WriteDataBuffer), and it cuts the execution thread's readback waits to ~20 ms/s.
+	set("KYTY_CP_BACKING_READS", CpBackingReads, true);
 	set("KYTY_EARLY_SUBMIT_WRITERS", EarlySubmitWriters, false);
 	set("KYTY_READBACK_COMPUTE", ReadbackCompute, true);
 	set("KYTY_ROBUST_LOADS", RobustLoads, true);
