@@ -1865,7 +1865,12 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferCached(uint64_t vaddr, uin
 	if (is_written || is_texel_buffer || !Common::RuntimeFlags::Current().buffer_fast) {
 		return ObtainBuffer(vaddr, size, is_written, is_texel_buffer, id);
 	}
-	auto&      entry = m_obtain_cache[((vaddr >> 4) * 0x9E3779B97F4A7C15ull ^ size) % kObtainCacheSize];
+	// The slot comes from the high bits of the product: its low bits only depend on the low bits of
+	// the address, and with 256-byte aligned ranges the old index (the low bits, 512 slots) used
+	// one slot in sixteen.
+	const auto slot =
+	    static_cast<size_t>(((vaddr ^ (size << 40u)) * 0x9E3779B97F4A7C15ull) >> 32u) % kObtainCacheSize;
+	auto&      entry = m_obtain_cache[slot];
 	const auto cpu   = m_memory_tracker.CpuModificationGeneration();
 	if (entry.vaddr == vaddr && entry.size == size && entry.registration == m_registration_generation &&
 	    !IsBufferInvalid(entry.id) && m_slot_buffers[entry.id].IsInBounds(vaddr, size) &&

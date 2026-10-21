@@ -613,6 +613,24 @@ boundary with no draw or dispatch emitted since the previous one is no longer an
 execution thread's waits for the resolve thread 63 -> 49 ms/s, 60.6 -> 61.3 fps (in-boot A/B,
 240 Hz display, 60 Hz windows; paired rounds even).
 
+BDA synchronization after a mapping change walked every mapped range (`RangeSet::ForEach`, 3% of
+the execution thread in play: the game maps and unmaps many times a frame). Drained dirty
+regions outside the mapped ranges are dropped, so only memory mapped since the last
+synchronization can hold CPU-dirty pages that no drain brings back; unmaps leave nothing to
+upload. The scan now covers just that memory (`RenderContext::m_bda_new_ranges`; AbPending: the
+old walk). Sampled execution thread: `PrepareBda` 4.3% -> 2.2%, all of it now the queued dirty
+regions; two in-boot A/Bs within their noise (draw cost -3% and +0.4%).
+
+Buffer bindings were 17% of the execution thread in play (`NHL27BUFFERS2`, `NHL27BINDS` with
+`KYTY_PERF_STATS_VERBOSE=1` and `KYTY_DBG_STAGE_STATS=1`): about 9,000 buffer lookups a frame, of
+which 43% of the read-only ones missed the obtain cache and 4,300 reached `SynchronizeBuffer`,
+which found something to upload 4 times a frame. The obtain cache indexed its 512 slots by the low
+bits of a multiplicative hash, which only depend on the low bits of the address: 256-byte aligned
+ranges used one slot in sixteen. It now takes the high bits, over 2,048 slots. Written storage
+buffers also no longer ask the texture cache to invalidate images starting at their address
+when the start-address filter has none. In-boot A/B: draw cost 4.68 -> 4.44 us (-5%), dispatch
+3.54 -> 3.40 us, execution thread 915 -> 874 ms/s busy.
+
 Display: flips go out at every vblank (`KYTY_FORCE_FLIP_RATE` defaults to 0) and the emulated
 display runs at 240 Hz (`KYTY_PLAY_VBLANK_HZ` / `KYTY_MENU_VBLANK_HZ`, 0 = the configured
 frequency): menus and loading screens reach 75-86 fps, light play 61-69; the game is timed by

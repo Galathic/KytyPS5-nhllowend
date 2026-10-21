@@ -2545,7 +2545,9 @@ bool TextureCache::DownloadImageMemory(ImageId id, bool tolerant_write) {
 }
 
 void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
-	if (!GuestRange {address, size}.Valid()) {
+	// Only images starting at the address change, and every written storage-buffer bind asks:
+	// the start-address filter answers most without the lock and the page walk.
+	if (!GuestRange {address, size}.Valid() || !AddressFilterHit(address)) {
 		return;
 	}
 	std::scoped_lock lock {m_lock};

@@ -488,7 +488,7 @@ private:
 		BufferId   id {};
 		uint64_t   offset         = 0;
 	};
-	static constexpr size_t kObtainCacheSize = 512;
+	static constexpr size_t kObtainCacheSize = 2048;
 	std::array<ObtainCacheEntry, kObtainCacheSize> m_obtain_cache {};
 	// CPU-dirty epoch of each tracking region as SynchronizeBuffersInRanges last visited it.
 	std::unordered_map<uint64_t, uint64_t>     m_synced_region_epochs;
