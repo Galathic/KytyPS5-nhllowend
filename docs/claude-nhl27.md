@@ -670,6 +670,19 @@ copied a description (a few hundred bytes) for most slots. Each program's image 
 its own bindings, swapped in with the program (`ProgramImageMemo::bindings`): in-boot A/B, draw
 cost 4.73 -> 4.35 us (-8%), execution thread 891 -> 876 ms/s busy.
 
+Bit 4 `KYTY_CP_BACKING_READS` is now off by default: the command processor read WAIT_REG_MEM
+values and packets on read-protected pages from the backing, checked later in order by the
+execution thread. A boot hung at the match start right after that check reported a mismatch at
+the very counter the CP then waited on forever (`NHL27CPSPEC: MISMATCH`, `NHL27STUCKWAIT` with the
+value one short); the three earlier hangs of that kind left no such line. Its cost, in one boot
+with both variants in alternating 15 s phases (`KytyPS5-toolsbmulti.sh`): none (paired rounds
+287 / 301 fps in sum with it on / off). `KYTY_LAZY_SHARED_WRITES` off in the same boot: 248, so it
+stays on despite its documented gaps. New default mask 1651247152614; A/B-only bits 44 and 45
+(`AbPending2`, `AbPending3`) let one boot compare several pending changes.
+
+Test boots reach the match about 75 s sooner: `play-nhl.ps1` polls the boot every 2 s, waits
+half as long on the menus and detects the match start in the console instead of sleeping.
+
 Display: flips go out at every vblank (`KYTY_FORCE_FLIP_RATE` defaults to 0) and the emulated
 display runs at 240 Hz (`KYTY_PLAY_VBLANK_HZ` / `KYTY_MENU_VBLANK_HZ`, 0 = the configured
 frequency): menus and loading screens reach 75-86 fps, light play 61-69; the game is timed by

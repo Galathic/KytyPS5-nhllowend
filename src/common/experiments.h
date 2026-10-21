@@ -29,7 +29,7 @@ enum Bit : uint64_t {
 	CpuCopyForward     = 1u << 3u, // KYTY_CPU_COPY_FORWARD (default off)
 	RobustLoads        = 1u << 8u, // KYTY_ROBUST_LOADS (default on; storage-buffer loads without per-load exec and bounds branches, relying on robustBufferAccess2; part of shader keys; was ReadbackTransfer)
 	FusedMad           = 1u << 9u, // KYTY_FUSED_MAD (default off; V_MAD/V_MAC_F32 as one fused multiply-add, part of shader keys; was ReadbackSpin)
-	CpBackingReads     = 1u << 4u, // KYTY_CP_BACKING_READS (default on; command-processor reads of read-protected pages go through the execution thread and the backing store instead of faulting; was SrtJit, now env-only KYTY_SRT_JIT)
+	CpBackingReads     = 1u << 4u, // KYTY_CP_BACKING_READS (default off; command-processor reads of read-protected pages go through the execution thread and the backing store instead of faulting; was SrtJit, now env-only KYTY_SRT_JIT)
 	FaultPageDirect    = 1u << 5u, // KYTY_FAULT_PAGE_DIRECT (default on; direct SRT reads and read-ahead checks of pages that faulted before use the backing)
 	WideWriteDownloads = 1u << 6u, // KYTY_WIDE_WRITE_DOWNLOADS (default on; a guest store into a GPU-written page downloads the GPU-written bytes of its 64 KiB window at once; was FalseShareReads, now env-only KYTY_FALSE_SHARE_READS)
 	SrtBatchReads      = 1u << 7u, // KYTY_SRT_BATCH_READS (default on; also read by the program cache)
@@ -70,6 +70,9 @@ enum Bit : uint64_t {
 	// A/B only, like AbLegacy, for the changes made after it was taken (AbLegacy also turns off
 	// the earlier changes it still selects).
 	AbPending = uint64_t {1} << 38u,
+	// More A/B-only bits, so that one boot can compare several pending changes (KytyPS5-toolsbmulti.sh).
+	AbPending2 = uint64_t {1} << 44u,
+	AbPending3 = uint64_t {1} << 45u,
 };
 
 namespace Detail {

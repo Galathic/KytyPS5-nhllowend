@@ -62,7 +62,9 @@ uint64_t EnvironmentMask() {
 	set("KYTY_POOLED_BDA_BUFFERS", PooledBdaBuffers, false);
 	set("KYTY_ASYNC_GUEST_READS", AsyncGuestReads, false);
 	set("KYTY_BDA_DIRTY_REGIONS", BdaDirtyRegions, false);
-	set("KYTY_CP_BACKING_READS", CpBackingReads, true);
+	// Off: a read the execution thread's in-order check found GPU-written preceded a match-start
+	// hang (NHL27CPSPEC MISMATCH at the counter the CP then waited on forever); no fps cost in play.
+	set("KYTY_CP_BACKING_READS", CpBackingReads, false);
 	set("KYTY_EARLY_SUBMIT_WRITERS", EarlySubmitWriters, false);
 	set("KYTY_READBACK_COMPUTE", ReadbackCompute, true);
 	set("KYTY_ROBUST_LOADS", RobustLoads, true);
