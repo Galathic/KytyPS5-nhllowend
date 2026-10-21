@@ -1454,24 +1454,22 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	// the buffer cache recorded, the clear code is known without draining the GPU queue. The
 	// fill is dropped by any later write, download or invalidation of the range.
 	uint32_t shadow_value = 0;
-	const bool shadowed = selected_size != 0 && desc.type != BindingType::VideoOut &&
-	                      BufferCache::PerfNoSyncReadback() &&
-	                      m_buffer_cache.HasGpuDirtyBytes(selected_address, selected_size) &&
+	// Asked once: the three checks below wanted it each (0.8% of the execution thread in play).
+	const bool gpu_dirty = selected_size != 0 && m_buffer_cache.HasGpuDirtyBytes(selected_address, selected_size);
+	const bool shadowed  = gpu_dirty && desc.type != BindingType::VideoOut && BufferCache::PerfNoSyncReadback() &&
 	                      m_buffer_cache.TryGetGpuFill(selected_address, selected_size, shadow_value);
 	if (shadowed) {
 		BufferCache::PerfCount(BufferCache::PerfEvent::ColorClearShadowHit);
 	}
 	// Experiment GpuColorClear: the GPU wrote these metadata bytes. Check them on the GPU and clear
 	// through conditional rendering instead of reading them back, which waits for that GPU work.
-	if (!shadowed && selected_size != 0 && m_graphics.conditional_rendering_enabled &&
+	if (!shadowed && gpu_dirty && m_graphics.conditional_rendering_enabled &&
 	    Common::Experiments::Enabled(Common::Experiments::GpuColorClear) &&
-	    m_buffer_cache.HasGpuDirtyBytes(selected_address, selected_size) &&
 	    MaterializeColorClearOnGpu(id, desc, selected_address, slice_size, count, image_first)) {
 		return;
 	}
 	// This may submit; never hold the texture lock across the readback.
-	if (!shadowed && selected_size != 0 &&
-	    m_buffer_cache.HasGpuDirtyBytes(selected_address, selected_size)) {
+	if (!shadowed && gpu_dirty) {
 		static const bool debug_cpu = std::getenv("KYTY_DBG_GPU_CLEAR") != nullptr;
 		static uint32_t   cpu_logged = 0;
 		if (debug_cpu && cpu_logged++ < 32) {

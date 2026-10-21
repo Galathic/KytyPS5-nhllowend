@@ -1950,10 +1950,19 @@ bool BufferCache::PlainReadHolds(Buffer& buffer, uint64_t vaddr, uint64_t size, 
 	return true;
 }
 
-bool BufferCache::WrittenBindHolds(Buffer& buffer, uint64_t vaddr, uint64_t size, uint64_t ranges_version,
+bool BufferCache::WrittenBindHolds(Buffer& buffer, uint64_t vaddr, uint64_t size, uint64_t& ranges_version,
                                    uint64_t registration) {
-	if (registration != m_registration_generation || ranges_version != GpuRangesVersion()) {
+	if (registration != m_registration_generation) {
 		return false;
+	}
+	if (const auto version = GpuRangesVersion(); version != ranges_version) {
+		// Other ranges change all the time (new written ranges, downloads): the range still holds
+		// while it is wholly GPU-written, as its pages are then GPU-owned with nothing to upload.
+		std::shared_lock ranges_lock(m_gpu_ranges_mutex);
+		if (!m_gpu_modified_ranges.Contains(vaddr, size) || m_pending_read_ranges.Intersects(vaddr, size)) {
+			return false;
+		}
+		ranges_version = version;
 	}
 	FrameBreakdown::BdaBatchNoteUsed(vaddr, size);
 	TouchBuffer(buffer);

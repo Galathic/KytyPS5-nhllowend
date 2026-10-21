@@ -723,6 +723,11 @@ every download, lazy write and new range moves it) and the buffer set are unchan
 then still GPU-owned with nothing to upload, and `BufferCache::WrittenBindHolds` does only the
 per-operation bookkeeping of a GPU write (fills dropped, last write tick, write generations,
 `PageWriteSeq`). One boot: draw cost 4.65 -> 4.51 us, paired rounds 404 / 408 (within noise).
+The version changes too often for that (new written ranges, downloads): a written slot now also
+holds while its own range is still wholly in the GPU-written ranges and not pending a guest read
+(its pages are then GPU-owned with nothing to upload). One boot: 417 / 371 fps in paired rounds
+(6 of 8 ahead), draw cost 4.72 -> 4.54 us. `MaterializeColorClear` asks whether its metadata
+slices hold GPU-written bytes once instead of up to three times.
 
 Display: flips go out at every vblank (`KYTY_FORCE_FLIP_RATE` defaults to 0) and the emulated
 display runs at 240 Hz (`KYTY_PLAY_VBLANK_HZ` / `KYTY_MENU_VBLANK_HZ`, 0 = the configured

@@ -224,7 +224,7 @@ public:
 	// ranges had version `ranges_version`: while neither they nor the buffer set changed, the range
 	// is still GPU-owned with nothing to upload, so binding it again only needs the per-operation
 	// bookkeeping of a GPU write, done here.
-	[[nodiscard]] bool WrittenBindHolds(Buffer& buffer, uint64_t vaddr, uint64_t size, uint64_t ranges_version,
+	[[nodiscard]] bool WrittenBindHolds(Buffer& buffer, uint64_t vaddr, uint64_t size, uint64_t& ranges_version,
 	                                    uint64_t registration);
 	[[nodiscard]] uint64_t GpuRangesVersion() const noexcept {
 		return m_gpu_ranges_version.load(std::memory_order_acquire);
