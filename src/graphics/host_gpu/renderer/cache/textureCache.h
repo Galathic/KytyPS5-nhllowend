@@ -95,11 +95,12 @@ public:
 	[[nodiscard]] uint64_t AddressIndexVersion() const {
 		return m_address_index_version.load(std::memory_order_acquire);
 	}
-	// The same for the addresses sharing the HasImageAt() filter bit of `address` only (bit 63 set:
-	// never equal to an AddressIndexVersion()).
+	// The same for the addresses sharing one of 4,096 groups of HasImageAt() filter bits with
+	// `address` only (bit 63 set: never equal to an AddressIndexVersion()). A small table: a
+	// version per filter bit (256 KiB) missed the cache on most texel binds.
 	[[nodiscard]] uint64_t AddressBucketVersion(uint64_t address) const {
 		return (uint64_t {1} << 63u) |
-		       m_address_filter_versions[AddressFilterIndex(address)].load(std::memory_order_acquire);
+		       m_address_filter_versions[AddressFilterIndex(address) >> 4u].load(std::memory_order_acquire);
 	}
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
@@ -268,7 +269,7 @@ private:
 	}
 	std::array<std::atomic<uint64_t>, AddressFilterBits / 64> m_address_filter {};
 	std::array<uint16_t, AddressFilterBits>                   m_address_filter_counts {};
-	std::array<std::atomic<uint32_t>, AddressFilterBits>      m_address_filter_versions {};
+	std::array<std::atomic<uint32_t>, AddressFilterBits / 16> m_address_filter_versions {};
 	MultiLevelPageTable<uint64_t, ImagePageTable::kPageBits, ImagePageTable::kAddressSpaceBits,
 	                    ImagePageTable::kFirstLevelBits>
 	    m_image_page_epochs;

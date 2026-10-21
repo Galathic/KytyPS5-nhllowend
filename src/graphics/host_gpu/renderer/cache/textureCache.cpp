@@ -293,7 +293,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	if (m_address_filter_counts[filter_index]++ == 0) {
 		m_address_filter[filter_index / 64].fetch_or(uint64_t {1} << (filter_index % 64), std::memory_order_release);
 	}
-	m_address_filter_versions[filter_index].fetch_add(1, std::memory_order_release);
+	m_address_filter_versions[filter_index >> 4u].fetch_add(1, std::memory_order_release);
 	m_address_index_version.fetch_add(1, std::memory_order_release);
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);

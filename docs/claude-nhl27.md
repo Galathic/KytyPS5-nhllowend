@@ -713,6 +713,11 @@ is the one it bound the draw before reuses the descriptor while no buffer was re
 range stayed CPU-clean (`BufferCache::PlainReadHolds`, the obtain cache's own test, without its
 hash lookup); stream-buffer copies are never kept. One boot, 8 paired rounds: 374 / 365 fps in sum
 (7 of 8 rounds ahead), draw cost 4.64 -> 4.40 us.
+The texel memo's image versions now come from a 4,096-entry table (groups of 16 filter bits)
+instead of one version per filter bit (256 KiB, a cache miss on most texel binds: 1.2% of the
+execution thread): one boot, draw cost 4.75 -> 4.37 us, rounds 1-6 ahead by 1-4 fps each. A slot
+memo for texel reads as well (on top of the per-address memo in `ObtainBuffer`) gained nothing:
+388 / 406 fps in sum, dropped.
 
 Display: flips go out at every vblank (`KYTY_FORCE_FLIP_RATE` defaults to 0) and the emulated
 display runs at 240 Hz (`KYTY_PLAY_VBLANK_HZ` / `KYTY_MENU_VBLANK_HZ`, 0 = the configured
