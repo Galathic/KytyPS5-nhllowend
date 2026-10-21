@@ -1756,8 +1756,13 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	}
 	if (plain_read || texel_read) {
 		cpu_epoch = CpuDirtyEpoch(vaddr, size);
+		// The epochs move whenever the game writes other bytes of the 64 KiB blocks: a range with
+		// no CPU-dirty page has nothing to upload either (about 4,000 synchronizations a frame in
+		// play found nothing).
 		if (memo->vaddr == vaddr && memo->size == size && memo->texel == texel_read &&
-		    memo->buffer_epoch == m_buffer_set_epoch && memo->cpu_epoch == cpu_epoch) {
+		    memo->buffer_epoch == m_buffer_set_epoch &&
+		    (memo->cpu_epoch == cpu_epoch || !m_memory_tracker.IsRegionCpuModified(vaddr, size))) {
+			memo->cpu_epoch = cpu_epoch;
 			if (texel_read) memo->image_version = image_version;
 			auto& buffer = m_slot_buffers[memo->id];
 			TouchBuffer(buffer);

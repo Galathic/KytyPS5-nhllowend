@@ -630,6 +630,14 @@ ranges used one slot in sixteen. It now takes the high bits, over 2,048 slots. W
 buffers also no longer ask the texture cache to invalidate images starting at their address
 when the start-address filter has none. In-boot A/B: draw cost 4.68 -> 4.44 us (-5%), dispatch
 3.54 -> 3.40 us, execution thread 915 -> 874 ms/s busy.
+The read memo of `ObtainBuffer` (lookups that miss the obtain cache, and texel reads) also hits
+when its CPU-dirty epoch moved but no page of the range is CPU dirty: the epochs count writes
+anywhere in a 64 KiB block, so the memo missed and `SynchronizeBuffer` found nothing to upload.
+In-boot A/Bs: draw cost 4.71 -> 4.47 us and 5.04 -> 4.96 us, dispatch 3.42 -> 3.34 us. One of
+these boots crashed in a job thread while loading the match, at the same guest pc as one
+earlier draw-resolver boot (0x909568416, a null pointer read from a page the emulator had
+written back from the GPU 10 ms before): the rare existing crash, not the memo (whose hits are
+exactly the ranges where `SynchronizeBuffer` uploads nothing).
 
 Display: flips go out at every vblank (`KYTY_FORCE_FLIP_RATE` defaults to 0) and the emulated
 display runs at 240 Hz (`KYTY_PLAY_VBLANK_HZ` / `KYTY_MENU_VBLANK_HZ`, 0 = the configured
