@@ -1402,9 +1402,21 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		const bool  plain = slot_memo && !resource.written && !resource.formatted &&
 		                   !(resource.read && Config::SyncRawImageBuffersEnabled()) && source.address != 0 &&
 		                   source.size != 0;
-		if (plain && memo.buffer != nullptr && memo.address == source.address && memo.size == source.size &&
+		// Written slots too, while the GPU ranges and the buffer set are unchanged.
+		const bool  written = slot_memo && resource.written && source.address != 0 && source.size != 0;
+		if (plain && memo.buffer != nullptr && !memo.written && memo.address == source.address &&
+		    memo.size == source.size &&
 		    cache.PlainReadHolds(*memo.buffer, source.address, source.size, memo.cpu_generation,
 		                         memo.registration)) {
+			prepared.buffers[index] = memo.info;
+			pack_memory_offset(index, memo.buffer_offset);
+			continue;
+		}
+		if (written && memo.buffer != nullptr && memo.written && memo.address == source.address &&
+		    memo.size == source.size &&
+		    cache.WrittenBindHolds(*memo.buffer, source.address, source.size, memo.ranges_version,
+		                           memo.registration)) {
+			m_context.GetTextureCache().InvalidateMemoryFromGPU(source.address, source.size);
 			prepared.buffers[index] = memo.info;
 			pack_memory_offset(index, memo.buffer_offset);
 			continue;
@@ -1414,13 +1426,15 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		Buffer*    obtained     = nullptr;
 		prepared.buffers[index] = NativeStorageBuffer(m_context, source, resource, buffer_offset, &obtained);
 		pack_memory_offset(index, buffer_offset);
-		if (plain && obtained != nullptr && !cache.IsStreamBuffer(obtained) &&
+		if ((plain || written) && obtained != nullptr && !cache.IsStreamBuffer(obtained) &&
 		    registration == cache.RegistrationGeneration()) {
 			memo = {.buffer         = obtained,
 			        .address        = source.address,
 			        .size           = source.size,
 			        .cpu_generation = cpu,
 			        .registration   = registration,
+			        .ranges_version = cache.GpuRangesVersion(),
+			        .written        = written,
 			        .info           = prepared.buffers[index],
 			        .buffer_offset  = buffer_offset};
 		} else {

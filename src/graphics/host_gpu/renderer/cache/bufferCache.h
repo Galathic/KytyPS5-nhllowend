@@ -220,6 +220,15 @@ public:
 	[[nodiscard]] bool PlainReadHolds(Buffer& buffer, uint64_t vaddr, uint64_t size, uint64_t& cpu_generation,
 	                                  uint64_t registration);
 	[[nodiscard]] bool IsStreamBuffer(const Buffer* buffer) const noexcept { return buffer == &m_stream_buffer; }
+	// A written binding ObtainBuffer made of [vaddr, vaddr + size) in `buffer`, after which the GPU
+	// ranges had version `ranges_version`: while neither they nor the buffer set changed, the range
+	// is still GPU-owned with nothing to upload, so binding it again only needs the per-operation
+	// bookkeeping of a GPU write, done here.
+	[[nodiscard]] bool WrittenBindHolds(Buffer& buffer, uint64_t vaddr, uint64_t size, uint64_t ranges_version,
+	                                    uint64_t registration);
+	[[nodiscard]] uint64_t GpuRangesVersion() const noexcept {
+		return m_gpu_ranges_version.load(std::memory_order_acquire);
+	}
 	// Copies guest memory into coherent mapped memory (the stream buffer, staging), possibly on the
 	// host copy thread (see CommandScheduler::HostCopies()).
 	void StreamGuestData(uint8_t* destination, uint64_t vaddr, uint64_t size);

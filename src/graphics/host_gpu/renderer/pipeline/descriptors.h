@@ -108,6 +108,9 @@ struct PreparedBindings {
 		uint64_t                 size           = 0;
 		uint64_t                 cpu_generation = 0;
 		uint64_t                 registration   = 0;
+		// Written slots (WrittenBindHolds()): the GPU ranges version after the binding.
+		uint64_t                 ranges_version = 0;
+		bool                     written        = false;
 		vk::DescriptorBufferInfo info;
 		uint32_t                 buffer_offset = 0;
 	};

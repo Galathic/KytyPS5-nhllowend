@@ -718,6 +718,11 @@ instead of one version per filter bit (256 KiB, a cache miss on most texel binds
 execution thread): one boot, draw cost 4.75 -> 4.37 us, rounds 1-6 ahead by 1-4 fps each. A slot
 memo for texel reads as well (on top of the per-address memo in `ObtainBuffer`) gained nothing:
 388 / 406 fps in sum, dropped.
+Written slots keep their binding as well while the GPU ranges version (`m_gpu_ranges_version`:
+every download, lazy write and new range moves it) and the buffer set are unchanged: the range is
+then still GPU-owned with nothing to upload, and `BufferCache::WrittenBindHolds` does only the
+per-operation bookkeeping of a GPU write (fills dropped, last write tick, write generations,
+`PageWriteSeq`). One boot: draw cost 4.65 -> 4.51 us, paired rounds 404 / 408 (within noise).
 
 Display: flips go out at every vblank (`KYTY_FORCE_FLIP_RATE` defaults to 0) and the emulated
 display runs at 240 Hz (`KYTY_PLAY_VBLANK_HZ` / `KYTY_MENU_VBLANK_HZ`, 0 = the configured

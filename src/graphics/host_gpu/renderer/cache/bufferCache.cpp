@@ -1950,6 +1950,37 @@ bool BufferCache::PlainReadHolds(Buffer& buffer, uint64_t vaddr, uint64_t size, 
 	return true;
 }
 
+bool BufferCache::WrittenBindHolds(Buffer& buffer, uint64_t vaddr, uint64_t size, uint64_t ranges_version,
+                                   uint64_t registration) {
+	if (registration != m_registration_generation || ranges_version != GpuRangesVersion()) {
+		return false;
+	}
+	FrameBreakdown::BdaBatchNoteUsed(vaddr, size);
+	TouchBuffer(buffer);
+	// As ObtainBuffer for a written binding, after SynchronizeBuffer (which found the pages GPU-owned).
+	DropGpuFills(vaddr, size);
+	buffer.last_write_tick = m_scheduler.CurrentTick();
+	if (PerfStatsEnabled()) {
+		LogGpuWrite(vaddr, size);
+	}
+	if (FrameDump::TraceEnabled()) {
+		FrameDump::TraceWrite("buffer-write", vaddr, vaddr + size, m_writer_kind, m_writer_hash);
+	}
+	m_gpu_write_generation++;
+	PageWriteSeq::RaiseCurrent(vaddr, size);
+	++m_gpu_dirty_generation;
+	if (!m_watched_writes.empty() && !m_submit_requested &&
+	    Common::Experiments::Enabled(Common::Experiments::EarlySubmitWriters)) {
+		for (const auto& [address, bytes]: m_watched_writes) {
+			if (address < vaddr + size && vaddr < address + bytes) {
+				m_submit_requested = true;
+				break;
+			}
+		}
+	}
+	return true;
+}
+
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid image source\n");
