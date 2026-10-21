@@ -56,7 +56,7 @@ enum Bit : uint64_t {
 	LdsLaneSlots         = 1u << 30u, // KYTY_LDS_LANE_SLOTS (default on; per-lane LDS slots of non-compute stages as a small array, part of shader keys)
 	ProtectSharedLock    = uint64_t {1} << 32u, // KYTY_PROTECT_SHARED_LOCK (default off; page-tracking protections of different pages run in parallel)
 	ClockWaitPredict     = uint64_t {1} << 33u, // KYTY_CLOCK_WAIT_PREDICT (default off; WAIT_REG_MEM on a pending clock write need not wait for it)
-	FalseShareAnyThread  = uint64_t {1} << 34u, // KYTY_FALSE_SHARE_ANY_THREAD (default off; CP and guest reads of clean bytes on GPU-dirty pages use the backing)
+	FalseShareAnyThread  = uint64_t {1} << 34u, // KYTY_FALSE_SHARE_ANY_THREAD (default on; CP and guest reads of clean bytes on GPU-dirty pages use the backing)
 	CpCleanRegReads      = uint64_t {1} << 35u, // KYTY_CP_CLEAN_REG_READS (default off; the command processor reads clean indirect register tables from the backing)
 	CpSkipIdleSpin       = uint64_t {1} << 36u, // KYTY_CP_SKIP_IDLE_SPIN (default off; work queued while the command processor waited for the execution thread starts at once, not after a 2 ms spin)
 	ExecBranches         = uint64_t {1} << 39u, // KYTY_EXEC_BRANCHES (default on; runs of lane-wise instructions under one partial EXEC run in a divergent branch instead of selecting each written VGPR per lane; part of shader keys)

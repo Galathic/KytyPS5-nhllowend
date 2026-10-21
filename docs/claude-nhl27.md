@@ -734,6 +734,15 @@ the range's CPU state are unchanged): one boot with three variants, draw cost 4.
 paired rounds 378 / 370. Reusing identical flattened-SRT and shader-data uploads within a lap of
 the stream buffer: draw cost -2% but 378 / 407 fps in the same boot, dropped.
 
+Readback waits of the execution thread (`NHL27RBWAIT`; `KytyPS5-toolsbwait-by-mask.py`) were
+65-92 ms/s in play with bit 4 off, nearly all synchronous downloads for command-processor read
+faults on bytes the GPU never wrote (pages NHL 27 shares between command buffers and the 16
+bytes a compute shader writes). Bit 34 `KYTY_FALSE_SHARE_ANY_THREAD` is now on by default: such a
+read on the command processor or a guest thread is emulated from the backing when its bytes are
+not GPU-written (exact, unlike the speculative bit 4). One boot with off / bit 4 / bit 34 in
+alternating 20 s phases: readback waits 65 / 12 / 24 ms/s, paired rounds 361 / 390 / 382 fps.
+Bit 4 in two more boots: 374 / 394 and 464 / 446 fps against off. New default mask 1668427021798.
+
 Display: flips go out at every vblank (`KYTY_FORCE_FLIP_RATE` defaults to 0) and the emulated
 display runs at 240 Hz (`KYTY_PLAY_VBLANK_HZ` / `KYTY_MENU_VBLANK_HZ`, 0 = the configured
 frequency): menus and loading screens reach 75-86 fps, light play 61-69; the game is timed by

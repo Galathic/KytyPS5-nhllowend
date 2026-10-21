@@ -79,7 +79,10 @@ uint64_t EnvironmentMask() {
 	set("KYTY_BACKING_LOOKUP_CACHE", BackingLookupCache, true);
 	set("KYTY_PROTECT_SHARED_LOCK", ProtectSharedLock, false);
 	set("KYTY_CLOCK_WAIT_PREDICT", ClockWaitPredict, false);
-	set("KYTY_FALSE_SHARE_ANY_THREAD", FalseShareAnyThread, false);
+	// On: the command processor's and guest threads' reads of bytes the GPU never wrote, on pages
+	// protected for other GPU-written bytes, use the backing (exact, no speculation): the execution
+	// thread's readback waits for them 65 -> 24 ms/s in play.
+	set("KYTY_FALSE_SHARE_ANY_THREAD", FalseShareAnyThread, true);
 	set("KYTY_SPECULATE_DIRTY_READS", SpeculateDirtyReads, false);
 	set("KYTY_CP_CLEAN_REG_READS", CpCleanRegReads, false);
 	set("KYTY_CP_SKIP_IDLE_SPIN", CpSkipIdleSpin, false);
