@@ -966,7 +966,9 @@ ms/s. A new profile file takes effect only after a reconfigure (its hash is a co
 define): otherwise ninja rebuilds nothing. Profile v7 (2026-10-20, recorded on 053750b3 after the
 execution thread's loop and the BDA synchronization changed): cross-build A/B against v6, the one
 comparable pair of paused boots: draw 3.69 / 3.71 us, dispatch 3.01 / 2.89 us (the other pair
-landed in 30 fps scenes); kept as it matches the current code.
+landed in 30 fps scenes); kept as it matches the current code. Profile v11 (2026-10-22, recorded on bdc062b3:
+the buffer slot memos, texel version table, unmap log and guest CPU sets had changed
+`RebindBuffers`, `ObtainBuffer` and the execution loop since v10).
 
 Single fixed-save matches of the same build differ by up to 5 fps at 60 Hz (52.2 and 57.1 within
 an hour): compare builds with `exe-ab.sh` (per-draw cost in paused boots), not one match each.
