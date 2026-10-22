@@ -454,6 +454,8 @@ private:
 	                                               uint32_t color_count, RenderDepthInfo& depth,
 	                                               vk::ImageAspectFlags& feedback_aspects,
 	                                               std::span<PreparedBindings* const> stages = {});
+	[[nodiscard]] bool        ConsumeMetadataColorOperation(CommandBuffer& buffer,
+	                                                        uint32_t render_target_slice_offset);
 	[[nodiscard]] bool        ResolveColorTargets(CommandBuffer& buffer,
 	                                              uint32_t render_target_slice_offset);
 	void                      BindImage(ImageId id, bool storage);

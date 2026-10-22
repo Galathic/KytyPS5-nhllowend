@@ -1161,9 +1161,27 @@ enum class CbColorMode : uint8_t {
 	DccDecompress      = 6,
 };
 
-static bool ConsumeMetadataColorOperation(const CommandBuffer& buffer) {
+bool RenderExecutor::ConsumeMetadataColorOperation(CommandBuffer& buffer,
+                                                   uint32_t render_target_slice_offset) {
 	const auto& ctx  = buffer.GetRegisters();
 	const auto  mode = ctx.GetColorControl().mode;
+	// KYTY_FCE_MATERIALIZE=1, off by default: NHL 27 test Oct 22 (together with KYTY_NAN_CLAMP)
+	// gave pitch-black ice.
+	static const bool materialize_fce = [] {
+		const char* value = std::getenv("KYTY_FCE_MATERIALIZE");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (materialize_fce && mode == static_cast<uint8_t>(CbColorMode::EliminateFastClear)) {
+		// FCE can precede sampling the target with no ordinary draw to it in between. Resolve the
+		// target so its pending clear is written into the expanded image first (upstream 31b7be9f).
+		RenderColorInfo target {};
+		ResolveRenderColorTarget(buffer, target, render_target_slice_offset, 0, true);
+		static std::atomic<uint32_t> fce_count {0};
+		if (fce_count.fetch_add(1, std::memory_order_relaxed) == 0) {
+			Log::WriteToConsoleAndLog("NHL27FCE: first eliminate-fast-clear draw materialized\n");
+		}
+		return true;
+	}
 	// These special modes run color-buffer metadata or decompression operations. The shader is a
 	// vehicle for that operation, and its exported color must not be applied as a normal draw.
 	// Kyty stores expanded Vulkan images rather than compressed guest surfaces, so no equivalent
@@ -2252,7 +2270,8 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 
-	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
+	if (ConsumeMetadataColorOperation(buffer, args.render_target_slice_offset) ||
+	    DepthStencilCopy(buffer) ||
 	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
 		InvalidateRenderTargetMemo();
 		ResetBindings();
@@ -2376,7 +2395,8 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		return;
 	}
 
-	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
+	if (ConsumeMetadataColorOperation(buffer, args.render_target_slice_offset) ||
+	    DepthStencilCopy(buffer) ||
 	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
 		InvalidateRenderTargetMemo();
 		ResetBindings();

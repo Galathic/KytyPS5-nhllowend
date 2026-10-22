@@ -114,6 +114,17 @@ inline std::atomic<bool> g_shader_native_pkrtz {false};
 // directly instead of emulating the guest's signed-zero ordering and NaN operand selection.
 // NMin/NMax still return the non-NaN operand; only -0/+0 ordering and NaN payloads may differ.
 // Read once per process; off by default.
+// Codegen fix (KYTY_NAN_CLAMP=1, upstream 4f1f3b1b): the clamp output modifier turns NaN into 0
+// like the hardware's DX10 clamp mode; plain FClamp leaves NaN undefined. Off by default:
+// NHL 27 test Oct 22 (together with KYTY_FCE_MATERIALIZE) gave pitch-black ice.
+[[nodiscard]] inline bool ShaderNanClamp() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_NAN_CLAMP");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
 [[nodiscard]] inline bool ShaderFastMinMax() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_FAST_MINMAX");
