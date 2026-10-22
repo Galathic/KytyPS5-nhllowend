@@ -858,6 +858,12 @@ GPU time by shader in play (`KYTY_PERF_GPU_TIMING=2`, 30 s): compute dispatches 
 (a 4K full-screen pass, 1.4 ms), c556aaf3 (dispatch-indirect, 1.4-1.6 ms each, about one a frame),
 9380d724 (0.7 ms), 62ece4db (30 dispatches of 16 us), 40d1ee8b (0.35 ms).
 
+The host copy thread turned out mostly idle in play (91% waiting, a third of it asleep; its
+work is a few page-protection calls and small copies), so the execution thread's drains before
+guest-visible operations (4% of it) partly wait for it to wake. Pinning it to the resolve thread's
+SMT sibling and polling for 20 ms before sleeping: one boot, 60 Hz fps 59.5 / 59.1, paired rounds
+449 / 456, callback time 143 / 116 ms/s: no gain, dropped.
+
 Bit 42 `KYTY_BDA_LOAD_GROUPS` (default off; key bit 8192; `KYTY_DBG_BDA_GROUPS=1` prints
 `NHL27BDAGROUP` per shader): consecutive DWORD loads of one guest load through an address share
 one page lookup and issue together when the group lies in one page. Grouped loads turned up in
