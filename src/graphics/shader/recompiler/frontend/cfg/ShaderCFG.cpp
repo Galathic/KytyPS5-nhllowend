@@ -478,10 +478,10 @@ bool ResolveSetpcDwordJumpTable(const Decoder::Program& program, uint32_t setpc_
 	    ScalarCodeWrittenInRange(program, load_index + 1u, setpc_index, selector_code)) {
 		return false;
 	}
-	// Some compilers use the scaled selector register as the table-load destination too:
-	// the load replaces the index with the selected relative target offset. That loaded offset
-	// remains live until S_SETPC and is an exact selector for the corresponding target.
-	const bool selector_is_loaded_offset = selector_code == offset_code;
+	// Some compilers use the scaled selector register as the table-load destination too. The
+	// translator drops every resolved table load (code_table_load_pcs), so the register still
+	// holds the scaled index at S_SETPC: compare against i * 4 in both forms (NHL 27 layer blend
+	// shader ad738baf31b6e28b took the last case for every mode while it compared loaded offsets).
 
 	const size_t table_word = table_pc / 4u;
 	if ((table_pc & 3u) != 0 || table_word > program.code.size() ||
@@ -499,7 +499,7 @@ bool ResolveSetpcDwordJumpTable(const Decoder::Program& program, uint32_t setpc_
 		}
 		const auto target_pc = (target_base - offset) & ~3u;
 		AddUnique(targets, target_pc);
-		selector_values.push_back(selector_is_loaded_offset ? offset : i * 4u);
+		selector_values.push_back(i * 4u);
 		selector_target_pcs.push_back(target_pc);
 	}
 	if (targets.empty()) {

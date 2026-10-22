@@ -11531,8 +11531,8 @@ void TestNewShaderRecompilerSetpcDwordJumpTable() {
 }
 
 void TestSetpcDwordJumpTableAliasedLoadSelector() {
-  // The scaled index is also the scalar-load destination. After the load, it contains
-  // the selected relative target delta and remains unchanged through S_SETPC.
+  // The scaled index is also the scalar-load destination. The translator drops the table
+  // load, so the register still holds the scaled index at S_SETPC and the compares use it.
   const uint32_t shader[] = {
       EncodeSop2(0x07, 19, 0, 130),       // s_min_u32 s19, s0, 2
       EncodeSop2(0x1e, 19, 19, 130),      // s_lshl_b32 s19, s19, 2
@@ -11593,9 +11593,9 @@ void TestSetpcDwordJumpTableAliasedLoadSelector() {
           "aliased S_SETPC compare has no resolved target block");
     selected_target_pcs.push_back(target->start_pc);
   }
-  Check(compare_values == std::vector<uint32_t>({0x1cu, 0x14u}) &&
+  Check(compare_values == std::vector<uint32_t>({0x0u, 0x4u}) &&
             selected_target_pcs == std::vector<uint32_t>({0x30u, 0x38u}),
-        "aliased S_SETPC did not dispatch on the loaded deltas with the last entry as default");
+        "aliased S_SETPC did not dispatch on the scaled index with the last entry as default");
 
   auto options = MakeCompileOptions(ShaderType::Compute);
   const auto compiled = RecompileForTest(shader, options);
@@ -11637,7 +11637,7 @@ void TestSetpcDwordJumpTableAliasedLoadSelector() {
                ShaderRecompiler::CFG::BranchCondition::SelectorEq;
       });
   Check(duplicate_compare != duplicate_graph.blocks.end() &&
-            duplicate_compare->terminator.compare_value == 0x14u,
+            duplicate_compare->terminator.compare_value == 0x4u,
         "duplicate S_SETPC delta was not collapsed to its common target");
   const auto target_pc = [&](uint32_t id) {
     const auto target = std::find_if(
