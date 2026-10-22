@@ -890,6 +890,13 @@ waits attributed to VS 126d611593f8bf08 happen in the loading screens, not in pl
 after a device loss now count in the render scheduler's ticks: the presenter's own scheduler,
 made later, had made every recorded command look unfinished.
 
+The heaviest compute shaders spend many instructions on 16-bit lane handling (a36f0b4f: 456
+`v_and_b32 0xffff` of 3,285 instructions). Native scalar f16 ops reading their source lanes
+without the zero-extending extract (the high result half is discarded anyway): paused A/B/A,
+top shaders +2.5% / +2.2% GPU time (drift 0.2%): slower, dropped. Twelve soak matches after the
+`WRITE_DATA` fix (six with `KYTY_DBG_BREADCRUMBS=1`): 57.9-59.5 fps at 60 Hz, no errors, no device
+loss (the losses before were Windows GPU timeouts, LiveKernelEvent 141/117, about one in 40 boots).
+
 Bit 42 `KYTY_BDA_LOAD_GROUPS` (default off; key bit 8192; `KYTY_DBG_BDA_GROUPS=1` prints
 `NHL27BDAGROUP` per shader): consecutive DWORD loads of one guest load through an address share
 one page lookup and issue together when the group lies in one page. Grouped loads turned up in
