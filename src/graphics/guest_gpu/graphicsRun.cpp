@@ -2150,7 +2150,9 @@ static std::atomic<int64_t>  g_split_us {0};
 
 static void SubmitSplitRefresh() {
 	// Measured best on an RX 9070 XT: 768 draws / 12 ms when each split costs this thread a
-	// vkQueueSubmit, 48 draws / 0.75 ms with experiment AsyncSubmit (+4.5% paused match).
+	// vkQueueSubmit, 48 draws / 0.75 ms with experiment AsyncSubmit (+4.5% paused match). With the
+	// recording thread submitting and guest command buffers batched, 192 draws / 3 ms (in-boot A/B
+	// through split.ctl, 48 / 192 / 768 draws: 433 / 455 / 451 fps in paired rounds).
 	const bool            async     = Common::Experiments::Enabled(Common::Experiments::AsyncSubmit);
 	static const uint32_t env_draws = [] {
 		const char* s = std::getenv("KYTY_SUBMIT_SPLIT_DRAWS");
@@ -2168,8 +2170,8 @@ static void SubmitSplitRefresh() {
 		return;
 	}
 	last           = now;
-	uint32_t draws = env_draws != 0 ? env_draws : async ? 48u : 768u;
-	int64_t  us    = env_us != 0 ? env_us : async ? int64_t {750} : int64_t {12000};
+	uint32_t draws = env_draws != 0 ? env_draws : async ? 192u : 768u;
+	int64_t  us    = env_us != 0 ? env_us : async ? int64_t {3000} : int64_t {12000};
 	if (FILE* file = std::fopen("split.ctl", "r"); file != nullptr) {
 		char line[64];
 		while (std::fgets(line, sizeof(line), file) != nullptr) {

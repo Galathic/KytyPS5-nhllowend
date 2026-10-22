@@ -973,7 +973,11 @@ Windows), so without `KYTY_ASYNC_SUBMIT` the default thresholds are now 768 draw
 `KYTY_SUBMIT_SPLIT_US`; `split.ctl` overrides them at runtime): +3.9% paused match against
 48 draws / 0.75 ms. Turning the split off costs 8%. Deferring the submit across queued guest
 submissions (one host command buffer for many of them) lost 16%, because the GPU then idles while
-the GPU thread records.
+the GPU thread records. With the recording thread submitting (the retired `KYTY_ASYNC_SUBMIT` still selects the
+short thresholds, and play-nhl sets it) and guest command buffers batched (above), the async
+defaults are now 192 draws / 3 ms: an in-boot A/B through `split.ctl` (`KytyPS5-toolsbsplit.sh`)
+of 48 / 192 / 768 draws, 433 / 455 / 451 fps in paired rounds, most rounds at 59-61 fps. A
+fixed-save match afterwards: 57.5 fps at 60 Hz over 96 s (49.5-51.4 in the morning's builds).
 
 ## Profile-guided build
 
