@@ -809,6 +809,13 @@ extra operation). One boot: callbacks per draw 0.99 -> 0.85, callback time 91 ->
 buffers through the obtain cache (as plain-read shader buffers) made draws no cheaper (3.83 against
 3.73 us without): dropped.
 
+Shader compiles that reach the execution thread (a compute permutation first seen there) spent
+most of their time finding EXEC runs (`FindExecRuns`, 8.8% of the execution thread in a sample at
+the start of a match): every shrink of a run rebuilt a hash set of its instructions. Membership is
+now by position in the block. A boot comparing the new and the old search on every block compiled
+(`KYTY_DBG_EXEC_RUNS_CHECK`, removed again): 69,632 blocks, 38,019 runs, no difference. The guest
+CPU sets also keep threads off the cores of the extra resolvers (bits 41 and 43) while those run.
+
 Bit 42 `KYTY_BDA_LOAD_GROUPS` (default off; key bit 8192; `KYTY_DBG_BDA_GROUPS=1` prints
 `NHL27BDAGROUP` per shader): consecutive DWORD loads of one guest load through an address share
 one page lookup and issue together when the group lies in one page. Grouped loads turned up in

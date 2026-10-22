@@ -11,6 +11,7 @@
 #include <functional>
 #include <optional>
 #include <type_traits>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -492,6 +493,12 @@ uint32_t ExecRunMinSelects() {
 std::vector<ExecRun> FindExecRuns(const IR::Block& block) {
 	std::vector<const IR::Inst*> insts;
 	for (const auto& inst: block) insts.push_back(&inst);
+	// Runs are index ranges of the block: membership by position, not by hash sets rebuilt for
+	// every shrink of a run (most of the compile time of large shaders).
+	std::unordered_map<const IR::Inst*, size_t> position;
+	position.reserve(insts.size());
+	for (size_t i = 0; i < insts.size(); i++) position.emplace(insts[i], i);
+	std::vector<uint8_t> hoisted_at(insts.size(), 0);
 	const auto* condition_inst = block.condition.IsEmpty() || block.condition.IsImmediate()
 	                                 ? nullptr
 	                                 : block.condition.TryInstruction();
@@ -516,9 +523,22 @@ std::vector<ExecRun> FindExecRuns(const IR::Block& block) {
 		}
 		size_t end = start;
 		while (end < insts.size() && candidate(*insts[end])) end++;
+		const auto index_of = [&](const IR::Inst* inst) {
+			const auto it = position.find(inst);
+			return it != position.end() ? it->second : SIZE_MAX;
+		};
+		struct InRun {
+			const decltype(index_of)& index;
+			const size_t&             first;
+			const size_t&             last;
+			[[nodiscard]] bool        contains(const IR::Inst* inst) const {
+				const auto i = index(inst);
+				return i != SIZE_MAX && i >= first && i < last;
+			}
+		};
 		// The run's EXEC value: the condition of its first select whose condition is an
 		// instruction defined before the run.
-		std::unordered_set<const IR::Inst*> in_run(insts.begin() + start, insts.begin() + end);
+		const InRun in_run {index_of, start, end};
 		IR::Value exec;
 		for (size_t i = start; i < end && exec.IsEmpty(); i++) {
 			const auto& inst = *insts[i];
@@ -535,10 +555,21 @@ std::vector<ExecRun> FindExecRuns(const IR::Block& block) {
 		// Shrink the run until everything it computes is used inside it, is a select under the
 		// EXEC value (a phi after it), or can be computed before the branch.
 		for (;;) {
-			in_run = std::unordered_set<const IR::Inst*>(insts.begin() + start, insts.begin() + end);
 			ExecRun run;
 			run.exec = exec;
-			std::unordered_set<const IR::Inst*> hoisted;
+			std::fill(hoisted_at.begin() + static_cast<ptrdiff_t>(start), hoisted_at.begin() + static_cast<ptrdiff_t>(end),
+			          uint8_t {0});
+			struct Hoisted {
+				const decltype(index_of)& index;
+				std::vector<uint8_t>&     at;
+				[[nodiscard]] bool        contains(const IR::Inst* inst) const {
+					const auto i = index(inst);
+					return i != SIZE_MAX && at[i] != 0;
+				}
+				void insert(const IR::Inst* inst) {
+					if (const auto i = index(inst); i != SIZE_MAX) at[i] = 1;
+				}
+			} hoisted {index_of, hoisted_at};
 			size_t                              violation = end;
 			uint32_t                            selects   = 0;
 			for (size_t i = start; i < end && violation == end; i++) {

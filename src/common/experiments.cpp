@@ -100,29 +100,38 @@ uint64_t EnvironmentMask() {
 // without its own CPU selection follows; the pinned GPU stage threads keep their affinity.
 void ApplyCpuSets(uint64_t mask) {
 #if defined(_WIN32)
-	static int applied = 0;
-	const int  wanted  = (mask & GuestOffStageCores) != 0 ? 2 : (mask & GuestOffStageSiblings) != 0 ? 1 : 0;
-	if (wanted == applied) {
-		return;
-	}
-	applied = wanted;
-	if (wanted == 0) {
-		(void)::SetProcessDefaultCpuSets(::GetCurrentProcess(), nullptr, 0);
-		std::printf("Experiments: default CPU sets cleared\n");
-		std::fflush(stdout);
-		return;
-	}
-	uint64_t excluded = 0;
-	for (const auto stage: {Config::GpuStageThread::Execution, Config::GpuStageThread::Resolve}) {
+	const int wanted = (mask & GuestOffStageCores) != 0 ? 2 : (mask & GuestOffStageSiblings) != 0 ? 1 : 0;
+	uint64_t  excluded = 0;
+	const auto exclude = [&](Config::GpuStageThread stage) {
 		const int cpu = Config::GpuStageCpu(stage);
-		if (cpu < 0 || cpu >= 64) {
-			continue;
+		if (wanted == 0 || cpu < 0 || cpu >= 64) {
+			return;
 		}
 		// SMT siblings are adjacent logical CPUs.
 		excluded |= uint64_t {1} << static_cast<uint32_t>(cpu ^ 1);
 		if (wanted == 2) {
 			excluded |= uint64_t {1} << static_cast<uint32_t>(cpu);
 		}
+	};
+	exclude(Config::GpuStageThread::Execution);
+	exclude(Config::GpuStageThread::Resolve);
+	// The extra resolvers' cores too while they run.
+	if ((mask & DispatchResolver) != 0) {
+		exclude(Config::GpuStageThread::DispatchResolve);
+	}
+	if ((mask & DrawResolver) != 0) {
+		exclude(Config::GpuStageThread::DrawResolve);
+	}
+	static uint64_t applied = 0;
+	if (excluded == applied) {
+		return;
+	}
+	applied = excluded;
+	if (excluded == 0) {
+		(void)::SetProcessDefaultCpuSets(::GetCurrentProcess(), nullptr, 0);
+		std::printf("Experiments: default CPU sets cleared\n");
+		std::fflush(stdout);
+		return;
 	}
 	ULONG length = 0;
 	(void)::GetSystemCpuSetInformation(nullptr, 0, &length, ::GetCurrentProcess(), 0);
