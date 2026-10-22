@@ -118,10 +118,13 @@ public:
 	void DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,
 	                       const volatile uint32_t* count_addr, uint32_t stride_in_bytes,
 	                       IndirectDrawRegisters registers, uint32_t draw_initiator, bool indexed);
+	// flush_if_batch_ready: the write's own operation then does what BufferFlushIfBatchReady()
+	// queues as one more.
 	void WriteAtEndOfPipe32(uint32_t cache_policy, uint32_t event_write_dest,
 	                        uint32_t eop_event_type, uint32_t cache_action, uint32_t event_index,
 	                        uint32_t event_write_source, void* dst_gpu_addr, uint32_t value,
-	                        uint32_t interrupt_selector, uint32_t interrupt_context_id = 0);
+	                        uint32_t interrupt_selector, uint32_t interrupt_context_id = 0,
+	                        bool flush_if_batch_ready = false);
 	void WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_write_dest,
 	                        uint32_t eop_event_type, uint32_t cache_action, uint32_t event_index,
 	                        uint32_t event_write_source, void* dst_gpu_addr, uint64_t value,
@@ -228,7 +231,9 @@ private:
 	void WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_write_dest, uint32_t eop_event_type,
 	                      uint32_t cache_action, uint32_t event_index, uint32_t event_write_source,
 	                      void* dst_gpu_addr, T value, uint32_t interrupt_selector,
-	                      uint32_t interrupt_context_id);
+	                      uint32_t interrupt_context_id, bool flush_if_batch_ready);
+	// Execution thread: submits when the current command buffer holds a batch of work.
+	void FlushIfBatchReady();
 	void ProcessPm4(Pm4Execution& execution);
 	const uint32_t* ShadowPm4Packet(const uint32_t* packet, uint32_t remaining_dw);
 	const uint32_t* ShadowProtectedPm4Packet(const uint32_t* packet, uint32_t remaining_dw);

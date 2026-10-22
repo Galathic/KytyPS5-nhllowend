@@ -1382,13 +1382,15 @@ void CommandProcessor::BufferFlushIfBatchReady() {
 	// Label writes reach guest memory when the packet is executed, and resources are captured
 	// when a draw is recorded, so submitting here only starts the GPU earlier. A submission per
 	// label costs a queue submit and a new command buffer, so wait for a batch of work.
-	EmitCallback([this] {
-		constexpr uint32_t MinBatchWork = 64;
-		if (GetScheduler().CurrentTick() == m_batch_tick && m_batch_work >= MinBatchWork) {
-			g_scheduler_flush_sites[1].fetch_add(1, std::memory_order_relaxed);
-			GetScheduler().Flush();
-		}
-	}, GpuCallbackTag::Flush);
+	EmitCallback([this] { FlushIfBatchReady(); }, GpuCallbackTag::Flush);
+}
+
+void CommandProcessor::FlushIfBatchReady() {
+	constexpr uint32_t MinBatchWork = 64;
+	if (GetScheduler().CurrentTick() == m_batch_tick && m_batch_work >= MinBatchWork) {
+		g_scheduler_flush_sites[1].fetch_add(1, std::memory_order_relaxed);
+		GetScheduler().Flush();
+	}
 }
 
 void CommandProcessor::BufferWait() {
@@ -3353,7 +3355,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
                                         uint32_t eop_event_type, uint32_t cache_action,
                                         uint32_t event_index, uint32_t event_write_source,
                                         void* dst_gpu_addr, T value, uint32_t interrupt_selector,
-                                        uint32_t interrupt_context_id) {
+                                        uint32_t interrupt_context_id, bool flush_if_batch_ready) {
 	static_assert(sizeof(T) == sizeof(uint32_t) || sizeof(T) == sizeof(uint64_t));
 
 	if (GraphicsRunDebugDumpEnabled()) {
@@ -3383,6 +3385,9 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 		ExecuteWriteAtEndOfPipe(submit_id, eop_event_type, cache_action, event_index,
 		                        event_write_source, dst_gpu_addr, value, interrupt_selector,
 		                        interrupt_context_id);
+		if (flush_if_batch_ready) {
+			FlushIfBatchReady();
+		}
 	}, GpuCallbackTag::Eop);
 	// What ExecuteWriteAtEndOfPipe() writes: nothing for a graphics end-of-pipe interrupt, GDS
 	// dwords or the clock (values known only then), the low dword of a 64-bit value from source
@@ -3601,10 +3606,10 @@ void CommandProcessor::WriteAtEndOfPipe32(uint32_t cache_policy, uint32_t event_
                                           uint32_t event_index, uint32_t event_write_source,
                                           void* dst_gpu_addr, uint32_t value,
                                           uint32_t interrupt_selector,
-                                          uint32_t interrupt_context_id) {
+                                          uint32_t interrupt_context_id, bool flush_if_batch_ready) {
 	WriteAtEndOfPipe(cache_policy, event_write_dest, eop_event_type, cache_action, event_index,
 	                 event_write_source, dst_gpu_addr, value, interrupt_selector,
-	                 interrupt_context_id);
+	                 interrupt_context_id, flush_if_batch_ready);
 }
 
 void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_write_dest,
@@ -3615,7 +3620,7 @@ void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_
                                           uint32_t interrupt_context_id) {
 	WriteAtEndOfPipe(cache_policy, event_write_dest, eop_event_type, cache_action, event_index,
 	                 event_write_source, dst_gpu_addr, value, interrupt_selector,
-	                 interrupt_context_id);
+	                 interrupt_context_id, false);
 }
 
 void CommandProcessor::EmitGlobalBarrier() {

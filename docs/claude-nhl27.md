@@ -801,6 +801,14 @@ per dispatch 3.18 / 2.57 / 2.47 and 3.29 / 2.71 / 2.95 us, resolve busy 880 / 80
 830 / 788 / 818 ms/s; paired rounds 304 / 304 / 283 and 323 / 389 / 363 fps in sum. Default mask
 now 72037171199476.
 
+In play the execution thread runs about 350,000 operations a second, half of them callbacks.
+A label-only `RELEASE_MEM` (about 37,000 a second) queued its label write and then one more
+operation that submits when the command buffer holds a batch of work; the label write's own
+operation now checks the batch (`CommandProcessor::FlushIfBatchReady`; `AbPending2` restores the
+extra operation). One boot: callbacks per draw 0.99 -> 0.85, callback time 91 -> 83 ms/s. Index
+buffers through the obtain cache (as plain-read shader buffers) made draws no cheaper (3.83 against
+3.73 us without): dropped.
+
 Bit 42 `KYTY_BDA_LOAD_GROUPS` (default off; key bit 8192; `KYTY_DBG_BDA_GROUPS=1` prints
 `NHL27BDAGROUP` per shader): consecutive DWORD loads of one guest load through an address share
 one page lookup and issue together when the group lies in one page. Grouped loads turned up in
