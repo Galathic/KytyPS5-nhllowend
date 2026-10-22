@@ -92,15 +92,16 @@ uint64_t EnvironmentMask() {
 	set("KYTY_CP_SKIP_IDLE_SPIN", CpSkipIdleSpin, false);
 	// Two boots: execution-thread cost per draw -4..-7%, per dispatch -18..-20%.
 	set("KYTY_GUEST_OFF_STAGE_CORES", GuestOffStageCores, true);
-	set("KYTY_GUEST_OFF_STAGE_SIBLINGS", GuestOffStageSiblings, false);
+	set("KYTY_GUEST_OFF_COPY_CORE", GuestOffCopyCore, false);
+	set("KYTY_GUEST_OFF_CP_CORES", GuestOffCpCores, false);
 	return mask;
 }
 
-// Bits GuestOffStageCores / GuestOffStageSiblings: the process default CPU sets, which every thread
+// Bits GuestOffStageCores / GuestOffCopyCore / GuestOffCpCores: the process default CPU sets, which every thread
 // without its own CPU selection follows; the pinned GPU stage threads keep their affinity.
 void ApplyCpuSets(uint64_t mask) {
 #if defined(_WIN32)
-	const int wanted = (mask & GuestOffStageCores) != 0 ? 2 : (mask & GuestOffStageSiblings) != 0 ? 1 : 0;
+	const int wanted = (mask & GuestOffStageCores) != 0 ? 2 : 0;
 	uint64_t  excluded = 0;
 	const auto exclude = [&](Config::GpuStageThread stage) {
 		const int cpu = Config::GpuStageCpu(stage);
@@ -115,6 +116,13 @@ void ApplyCpuSets(uint64_t mask) {
 	};
 	exclude(Config::GpuStageThread::Execution);
 	exclude(Config::GpuStageThread::Resolve);
+	if ((mask & GuestOffCopyCore) != 0) {
+		exclude(Config::GpuStageThread::HostCopy);
+	}
+	if ((mask & GuestOffCpCores) != 0) {
+		exclude(Config::GpuStageThread::CommandProcessor);
+		exclude(Config::GpuStageThread::Recording);
+	}
 	// The extra resolvers' cores too while they run.
 	if ((mask & DispatchResolver) != 0) {
 		exclude(Config::GpuStageThread::DispatchResolve);

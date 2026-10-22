@@ -794,8 +794,8 @@ Bit 46 `KYTY_GUEST_OFF_STAGE_CORES` (default on) sets the process default CPU se
 (`SetProcessDefaultCpuSets`) to every logical CPU except both of those two cores' CPUs, so guest,
 driver and helper threads keep off them while the pinned stage threads keep their affinity
 (`Experiments: threads without a CPU of their own avoid CPUs 0xcc0` at boot on the 8-core
-5800X3D; the mask is reapplied when the experiments mask changes). Bit 47
-`KYTY_GUEST_OFF_STAGE_SIBLINGS` (default off) excludes only the two siblings. Two boots with
+5800X3D; the mask is reapplied when the experiments mask changes). Bit 47 (then
+`KYTY_GUEST_OFF_STAGE_SIBLINGS`, excluding only the two siblings) measured no better. Two boots with
 base / bit 46 / bit 47: execution-thread cost per draw 4.15 / 3.97 / 3.90 and 4.34 / 4.03 / 4.33 us,
 per dispatch 3.18 / 2.57 / 2.47 and 3.29 / 2.71 / 2.95 us, resolve busy 880 / 803 / 828 and
 830 / 788 / 818 ms/s; paired rounds 304 / 304 / 283 and 323 / 389 / 363 fps in sum. Default mask
@@ -815,6 +815,21 @@ the start of a match): every shrink of a run rebuilt a hash set of its instructi
 now by position in the block. A boot comparing the new and the old search on every block compiled
 (`KYTY_DBG_EXEC_RUNS_CHECK`, removed again): 69,632 blocks, 38,019 runs, no difference. The guest
 CPU sets also keep threads off the cores of the extra resolvers (bits 41 and 43) while those run.
+
+Bit 47 is now `KYTY_GUEST_OFF_COPY_CORE` (the host copy thread's core too) and bit 48
+`KYTY_GUEST_OFF_CP_CORES` (also the command processor's and the recording thread's cores), both
+off: one boot with base / bit 47 / bits 47 and 48, paired rounds 418 / 419 / 326 fps in sum,
+draw cost 3.95 / 3.96 / 5.68 us (with four cores left the game's own threads fall behind).
+
+Readback waits of the execution thread in play were mostly downloads for guest threads' write
+faults (stores into pages a shader wrote, `NHL27RBWAIT ... from=guest`) whose writer the GPU had
+not finished: 4,445 such waits of 7.4 ms each in one boot, 4% of the execution thread (the 36,000
+with a finished writer took 0.12 ms each). Such a download now comes back with the writer's tick
+(after submitting the open command buffer when the writer is in it); the guest thread waits for
+the tick itself while the execution thread goes on, then asks again (up to four times;
+`AbPending3`: the execution thread waits). One boot: readback waits 58.2 -> 16.1 ms/s, execution
+thread 869 -> 834 ms/s busy, draw cost 3.82 -> 3.75 us; fps unchanged (53.1 / 53.2 at 60 Hz):
+the execution thread waits for the resolve thread a little more (110 -> 118 ms/s) instead.
 
 Bit 42 `KYTY_BDA_LOAD_GROUPS` (default off; key bit 8192; `KYTY_DBG_BDA_GROUPS=1` prints
 `NHL27BDAGROUP` per shader): consecutive DWORD loads of one guest load through an address share

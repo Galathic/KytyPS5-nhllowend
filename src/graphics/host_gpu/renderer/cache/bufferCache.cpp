@@ -1315,196 +1315,219 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadC
 	uint64_t       async_tick = 0;
 	const uint64_t fault_rip = on_gpu ? static_cast<uint64_t>(g_write_tag)
 	                                : g_fault_rip != 0 ? g_fault_rip : static_cast<uint64_t>(WriteTag::Count);
-	m_scheduler.Context().GetGpu().SendUrgentCommandSync([this, vaddr, size, is_write, caller, on_gpu, tid,
-	                                                      fault_rip, origin, &async_tick] {
-		if (!m_pending_guest_reads.empty()) {
-			FinishPendingGuestReads(vaddr, size);
-		}
-		if (is_write && !IsRegionRegistered(vaddr, size)) {
-			return;
-		}
-		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
-		if (!is_write && !on_gpu && Common::Experiments::Enabled(Common::Experiments::AsyncGuestReads)) {
-			// The download covers whole tracker pages; so does the pending record. The bytes it
-			// carries are the GPU-written ones of those pages.
-			const auto first = vaddr & ~(TRACKER_PAGE_SIZE - 1);
-			const auto last  = (vaddr + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
-			std::vector<std::pair<uint64_t, uint64_t>> bytes;
-			m_gpu_modified_ranges.ForEachInRange(first, last - first,
-			                                     [&](uint64_t begin, uint64_t end) { bytes.emplace_back(begin, end); });
-			// Shared queries stay conservative while downloads move bytes out of the ordinary
-			// dirty ranges. Publish before DownloadBufferMemory removes those ranges.
-			m_pending_guest_read_count.fetch_add(1, std::memory_order_release);
-			{
-				std::unique_lock ranges_lock(m_gpu_ranges_mutex);
-				m_pending_read_ranges.Add(first, last - first);
-				PublishGpuRangesVersion();
+	// A guest thread's download whose writer the GPU has not finished comes back with the writer's
+	// tick instead: the guest thread waits for it here while the execution thread goes on, then
+	// asks again (AbPending3: the execution thread waits). Waits for unfinished writers were 7 ms
+	// each, 4% of the execution thread in play.
+	for (uint32_t attempt = 0;; ++attempt) {
+		uint64_t retry_tick = 0;
+		m_scheduler.Context().GetGpu().SendUrgentCommandSync([this, vaddr, size, is_write, caller, on_gpu, tid,
+		                                                      fault_rip, origin, &async_tick, attempt, &retry_tick] {
+			if (!m_pending_guest_reads.empty()) {
+				FinishPendingGuestReads(vaddr, size);
 			}
-			if (DownloadBufferMemory<true>(buffer, vaddr, size)) {
-				async_tick       = m_scheduler.CurrentTick();
-				m_pending_guest_reads.push_back({first, last - first, async_tick, std::move(bytes)});
-				g_scheduler_flush_sites[2].fetch_add(1, std::memory_order_relaxed);
-				m_scheduler.Flush();
-				Common::Timeline::Mark("async-guest-read", vaddr);
-			} else {
-				m_pending_guest_read_count.fetch_sub(1, std::memory_order_release);
-				RebuildPendingReadRanges();
+			if (is_write && !IsRegionRegistered(vaddr, size)) {
+				return;
 			}
-			return;
-		}
+			auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+			if (!is_write && !on_gpu && Common::Experiments::Enabled(Common::Experiments::AsyncGuestReads)) {
+				// The download covers whole tracker pages; so does the pending record. The bytes it
+				// carries are the GPU-written ones of those pages.
+				const auto first = vaddr & ~(TRACKER_PAGE_SIZE - 1);
+				const auto last  = (vaddr + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
+				std::vector<std::pair<uint64_t, uint64_t>> bytes;
+				m_gpu_modified_ranges.ForEachInRange(first, last - first,
+				                                     [&](uint64_t begin, uint64_t end) { bytes.emplace_back(begin, end); });
+				// Shared queries stay conservative while downloads move bytes out of the ordinary
+				// dirty ranges. Publish before DownloadBufferMemory removes those ranges.
+				m_pending_guest_read_count.fetch_add(1, std::memory_order_release);
+				{
+					std::unique_lock ranges_lock(m_gpu_ranges_mutex);
+					m_pending_read_ranges.Add(first, last - first);
+					PublishGpuRangesVersion();
+				}
+				if (DownloadBufferMemory<true>(buffer, vaddr, size)) {
+					async_tick       = m_scheduler.CurrentTick();
+					m_pending_guest_reads.push_back({first, last - first, async_tick, std::move(bytes)});
+					g_scheduler_flush_sites[2].fetch_add(1, std::memory_order_relaxed);
+					m_scheduler.Flush();
+					Common::Timeline::Mark("async-guest-read", vaddr);
+				} else {
+					m_pending_guest_read_count.fetch_sub(1, std::memory_order_release);
+					RebuildPendingReadRanges();
+				}
+				return;
+			}
 
-		const bool timed = PerfStatsEnabled();
-		const auto start = timed ? std::chrono::steady_clock::now()
-		                         : std::chrono::steady_clock::time_point {};
-		const bool exact_dirty =
-		    timed && caller == ReadCaller::Fault && !is_write && HasGpuDirtyBytes(vaddr, 1);
-		// Experiment LazySharedWrites: a guest thread's store next to a few GPU-written bytes
-		// (NHL 27 builds command buffers in pages a compute shader wrote 16 bytes of) need not wait
-		// for that shader. The download is queued and merged later, keeping any bytes the CPU
-		// changes meanwhile, which are newer.
-		const bool lazy = is_write && !on_gpu &&
-		                  Common::Experiments::Enabled(Common::Experiments::LazySharedWrites) &&
-		                  LazySharedWriteEligible(vaddr, size);
-		if (CpReadDebugEnabled()) {
-			g_readback_origin = origin;
-			g_readback_exact  = !is_write                          ? (HasGpuDirtyBytes(vaddr, size) ? 1u : 0u)
-			                    : HasGpuDirtyBytes(vaddr, size)    ? 3u
-			                    : !LazySharedWriteEligible(vaddr, size) ? 4u
-			                                                       : 5u;
-			g_readback_caller = static_cast<uint32_t>(caller);
-			// A guest store over GPU-written bytes: the GPU-written ranges of its page (NHL27OWNW,
-			// at most 24 lines per 5 s), to see whether the store would cover them all.
-			if (is_write && !on_gpu && g_readback_exact == 3u) {
-				static auto     window = std::chrono::steady_clock::now();
-				static uint32_t lines  = 0;
-				const auto      now    = std::chrono::steady_clock::now();
-				if (now - window >= std::chrono::seconds(5)) {
-					window = now;
-					lines  = 0;
-				}
-				if (lines++ < 24) {
-					const auto  page = vaddr & ~(TRACKER_PAGE_SIZE - 1);
-					std::string ranges;
-					uint64_t    bytes = 0;
-					m_gpu_modified_ranges.ForEachInRange(page, TRACKER_PAGE_SIZE, [&](uint64_t start, uint64_t end) {
-						bytes += end - start;
-						if (ranges.size() < 160) {
-							char text[48];
-							std::snprintf(text, sizeof(text), " +0x%llx..0x%llx",
-							              static_cast<unsigned long long>(start - page),
-							              static_cast<unsigned long long>(end - page));
-							ranges += text;
-						}
-					});
-					std::printf("NHL27OWNW: vaddr=0x%016" PRIx64 " rip=0x%016" PRIx64 " page_gpu_bytes=%llu last_write=%llu "
-					            "current=%llu ranges:%s\n",
-					            vaddr, fault_rip, static_cast<unsigned long long>(bytes),
-					            static_cast<unsigned long long>(buffer.last_write_tick),
-					            static_cast<unsigned long long>(m_scheduler.CurrentTick()), ranges.c_str());
-				}
-			}
-		}
-		// Experiment WideWriteDownloads: NHL 27 fills whole GPU-written pages with memcpy-style
-		// stores (vmovntdq/vmovdqa), each page one fault and one readback (~90 us). The GPU-written
-		// bytes of the store's 64 KiB window (the window a CPU write fault releases) come down at
-		// once, so the next pages of the fill fault only for CPU-write tracking.
-		uint64_t download_vaddr = vaddr;
-		uint64_t download_size  = size;
-		if (is_write && !on_gpu && !lazy &&
-		    Common::Experiments::Enabled(Common::Experiments::WideWriteDownloads)) {
-			constexpr uint64_t Window = 16 * TRACKER_PAGE_SIZE;
-			const auto begin = std::max(vaddr & ~(Window - 1), buffer.CpuAddress());
-			const auto end   = std::min((vaddr + size + Window - 1) & ~(Window - 1),
-			                            buffer.CpuAddress() + buffer.Size());
-			if (begin <= vaddr && vaddr + size <= end) {
-				download_vaddr = begin;
-				download_size  = end - begin;
-			}
-		}
-		const bool downloaded = lazy ? DownloadBufferMemory<true, true>(buffer, vaddr, size)
-		                             : DownloadBufferMemory<false>(buffer, download_vaddr, download_size);
-		if (lazy) {
-			Common::Timeline::Mark("lazy-shared-write", vaddr);
-		}
-		if (timed) {
-			if (downloaded && !is_write) {
-				const auto page = vaddr & ~(TRACKER_PAGE_SIZE - 1);
-				auto&      stat = g_fault_pages[page];
-				stat.via        = caller == ReadCaller::Fault        ? "fault"
-				                  : caller == ReadCaller::ColorClear ? "clear"
-				                                                     : "other";
-				stat.count++;
-				stat.bytes += m_last_download_bytes;
-				stat.exact += exact_dirty ? 1 : 0;
-				stat.tid        = tid;
-				stat.gpu_thread = on_gpu;
-				stat.pm4_op     = on_gpu ? g_perf.pm4_op.load(std::memory_order_relaxed) : 0;
-				stat.ms += static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-				               std::chrono::steady_clock::now() - start).count()) / 1e6;
-				stat.writer = "unknown";
-				stat.writer_hash = 0;
-				for (size_t n = 0; n < m_writer_log.size(); ++n) {
-					const auto& rec = m_writer_log[(m_writer_head + m_writer_log.size() - 1 - n) %
-					                               m_writer_log.size()];
-					if (rec.begin < page + TRACKER_PAGE_SIZE && page < rec.end) {
-						stat.writer      = rec.kind;
-						stat.writer_hash = rec.hash;
-						break;
+			const bool timed = PerfStatsEnabled();
+			const auto start = timed ? std::chrono::steady_clock::now()
+			                         : std::chrono::steady_clock::time_point {};
+			const bool exact_dirty =
+			    timed && caller == ReadCaller::Fault && !is_write && HasGpuDirtyBytes(vaddr, 1);
+			// Experiment LazySharedWrites: a guest thread's store next to a few GPU-written bytes
+			// (NHL 27 builds command buffers in pages a compute shader wrote 16 bytes of) need not wait
+			// for that shader. The download is queued and merged later, keeping any bytes the CPU
+			// changes meanwhile, which are newer.
+			const bool lazy = is_write && !on_gpu &&
+			                  Common::Experiments::Enabled(Common::Experiments::LazySharedWrites) &&
+			                  LazySharedWriteEligible(vaddr, size);
+			if (CpReadDebugEnabled()) {
+				g_readback_origin = origin;
+				g_readback_exact  = !is_write                          ? (HasGpuDirtyBytes(vaddr, size) ? 1u : 0u)
+				                    : HasGpuDirtyBytes(vaddr, size)    ? 3u
+				                    : !LazySharedWriteEligible(vaddr, size) ? 4u
+				                                                       : 5u;
+				g_readback_caller = static_cast<uint32_t>(caller);
+				// A guest store over GPU-written bytes: the GPU-written ranges of its page (NHL27OWNW,
+				// at most 24 lines per 5 s), to see whether the store would cover them all.
+				if (is_write && !on_gpu && g_readback_exact == 3u) {
+					static auto     window = std::chrono::steady_clock::now();
+					static uint32_t lines  = 0;
+					const auto      now    = std::chrono::steady_clock::now();
+					if (now - window >= std::chrono::seconds(5)) {
+						window = now;
+						lines  = 0;
 					}
+					if (lines++ < 24) {
+						const auto  page = vaddr & ~(TRACKER_PAGE_SIZE - 1);
+						std::string ranges;
+						uint64_t    bytes = 0;
+						m_gpu_modified_ranges.ForEachInRange(page, TRACKER_PAGE_SIZE, [&](uint64_t start, uint64_t end) {
+							bytes += end - start;
+							if (ranges.size() < 160) {
+								char text[48];
+								std::snprintf(text, sizeof(text), " +0x%llx..0x%llx",
+								              static_cast<unsigned long long>(start - page),
+								              static_cast<unsigned long long>(end - page));
+								ranges += text;
+							}
+						});
+						std::printf("NHL27OWNW: vaddr=0x%016" PRIx64 " rip=0x%016" PRIx64 " page_gpu_bytes=%llu last_write=%llu "
+						            "current=%llu ranges:%s\n",
+						            vaddr, fault_rip, static_cast<unsigned long long>(bytes),
+						            static_cast<unsigned long long>(buffer.last_write_tick),
+						            static_cast<unsigned long long>(m_scheduler.CurrentTick()), ranges.c_str());
+					}
+				}
+			}
+			// Experiment WideWriteDownloads: NHL 27 fills whole GPU-written pages with memcpy-style
+			// stores (vmovntdq/vmovdqa), each page one fault and one readback (~90 us). The GPU-written
+			// bytes of the store's 64 KiB window (the window a CPU write fault releases) come down at
+			// once, so the next pages of the fill fault only for CPU-write tracking.
+			uint64_t download_vaddr = vaddr;
+			uint64_t download_size  = size;
+			if (is_write && !on_gpu && !lazy &&
+			    Common::Experiments::Enabled(Common::Experiments::WideWriteDownloads)) {
+				constexpr uint64_t Window = 16 * TRACKER_PAGE_SIZE;
+				const auto begin = std::max(vaddr & ~(Window - 1), buffer.CpuAddress());
+				const auto end   = std::min((vaddr + size + Window - 1) & ~(Window - 1),
+				                            buffer.CpuAddress() + buffer.Size());
+				if (begin <= vaddr && vaddr + size <= end) {
+					download_vaddr = begin;
+					download_size  = end - begin;
+				}
+			}
+			if (!lazy && !on_gpu && attempt < 4 && buffer.last_write_tick != 0 &&
+			    !Common::Experiments::Enabled(Common::Experiments::AbPending3) &&
+			    !m_scheduler.IsFree(buffer.last_write_tick) &&
+			    m_gpu_modified_ranges.Intersects(download_vaddr, download_size)) {
+				if (buffer.last_write_tick >= m_scheduler.CurrentTick()) {
+					// The writer is in the open command buffer.
+					m_scheduler.Flush();
+				}
+				retry_tick = buffer.last_write_tick;
+				return;
+			}
+			const bool downloaded = lazy ? DownloadBufferMemory<true, true>(buffer, vaddr, size)
+			                             : DownloadBufferMemory<false>(buffer, download_vaddr, download_size);
+			if (lazy) {
+				Common::Timeline::Mark("lazy-shared-write", vaddr);
+			}
+			if (timed) {
+				if (downloaded && !is_write) {
+					const auto page = vaddr & ~(TRACKER_PAGE_SIZE - 1);
+					auto&      stat = g_fault_pages[page];
+					stat.via        = caller == ReadCaller::Fault        ? "fault"
+					                  : caller == ReadCaller::ColorClear ? "clear"
+					                                                     : "other";
+					stat.count++;
+					stat.bytes += m_last_download_bytes;
+					stat.exact += exact_dirty ? 1 : 0;
+					stat.tid        = tid;
+					stat.gpu_thread = on_gpu;
+					stat.pm4_op     = on_gpu ? g_perf.pm4_op.load(std::memory_order_relaxed) : 0;
+					stat.ms += static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+					               std::chrono::steady_clock::now() - start).count()) / 1e6;
+					stat.writer = "unknown";
+					stat.writer_hash = 0;
+					for (size_t n = 0; n < m_writer_log.size(); ++n) {
+						const auto& rec = m_writer_log[(m_writer_head + m_writer_log.size() - 1 - n) %
+						                               m_writer_log.size()];
+						if (rec.begin < page + TRACKER_PAGE_SIZE && page < rec.end) {
+							stat.writer      = rec.kind;
+							stat.writer_hash = rec.hash;
+							break;
+						}
+					}
+				}
+				if (downloaded) {
+					const auto bucket = is_write                         ? size_t {2}
+					                    : caller == ReadCaller::ColorClear ? size_t {0}
+					                    : caller == ReadCaller::Fault      ? size_t {1}
+					                                                       : size_t {3};
+					// Buckets: 0 color clear, 1 fault, 2 invalidate (CPU write), 3 other.
+					const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+					                    std::chrono::steady_clock::now() - start)
+					                    .count();
+					FrameBreakdown::AddReadback(static_cast<uint64_t>(ns));
+					if (is_write) {
+											WriteBackRecord(fault_rip, on_gpu, vaddr, size, m_last_download_bytes, static_cast<uint64_t>(ns));
+					}
+					g_perf.waits[bucket].fetch_add(1, std::memory_order_relaxed);
+					g_perf.wait_ns[bucket].fetch_add(static_cast<uint64_t>(ns),
+					                                 std::memory_order_relaxed);
+				}
+				PerfMaybePrint();
+			}
+			if (downloaded && is_write && SharedWritesDebug()) {
+				static uint32_t lines = 0;
+				if (lines++ < 200) {
+					const auto page = vaddr & ~(TRACKER_PAGE_SIZE - 1);
+					const char* kind = "unknown";
+					uint64_t    hash = 0, wbegin = 0, wend = 0;
+					for (size_t n = 0; n < m_writer_log.size(); ++n) {
+						const auto& rec = m_writer_log[(m_writer_head + m_writer_log.size() - 1 - n) %
+						                               m_writer_log.size()];
+						if (rec.begin < page + TRACKER_PAGE_SIZE && page < rec.end) {
+							kind = rec.kind; hash = rec.hash; wbegin = rec.begin; wend = rec.end;
+							break;
+						}
+					}
+					std::printf("NHL27SHD: fault=0x%llx bytes=%llu buffer=0x%llx+0x%llx last_write=%llu "
+					            "current=%llu writer=%s %016llx [0x%llx,0x%llx) tid=%llx\n",
+					            static_cast<unsigned long long>(vaddr),
+					            static_cast<unsigned long long>(m_last_download_bytes),
+					            static_cast<unsigned long long>(buffer.CpuAddress()),
+					            static_cast<unsigned long long>(buffer.Size()),
+					            static_cast<unsigned long long>(buffer.last_write_tick),
+					            static_cast<unsigned long long>(m_scheduler.CurrentTick()), kind,
+					            static_cast<unsigned long long>(hash), static_cast<unsigned long long>(wbegin),
+					            static_cast<unsigned long long>(wend), static_cast<unsigned long long>(tid));
 				}
 			}
 			if (downloaded) {
-				const auto bucket = is_write                         ? size_t {2}
-				                    : caller == ReadCaller::ColorClear ? size_t {0}
-				                    : caller == ReadCaller::Fault      ? size_t {1}
-				                                                       : size_t {3};
-				// Buckets: 0 color clear, 1 fault, 2 invalidate (CPU write), 3 other.
-				const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-				                    std::chrono::steady_clock::now() - start)
-				                    .count();
-				FrameBreakdown::AddReadback(static_cast<uint64_t>(ns));
-				if (is_write) {
-										WriteBackRecord(fault_rip, on_gpu, vaddr, size, m_last_download_bytes, static_cast<uint64_t>(ns));
-				}
-				g_perf.waits[bucket].fetch_add(1, std::memory_order_relaxed);
-				g_perf.wait_ns[bucket].fetch_add(static_cast<uint64_t>(ns),
-				                                 std::memory_order_relaxed);
+				m_memory_tracker.UnmarkRegionAsGpuModified(download_vaddr, download_size);
 			}
-			PerfMaybePrint();
-		}
-		if (downloaded && is_write && SharedWritesDebug()) {
-			static uint32_t lines = 0;
-			if (lines++ < 200) {
-				const auto page = vaddr & ~(TRACKER_PAGE_SIZE - 1);
-				const char* kind = "unknown";
-				uint64_t    hash = 0, wbegin = 0, wend = 0;
-				for (size_t n = 0; n < m_writer_log.size(); ++n) {
-					const auto& rec = m_writer_log[(m_writer_head + m_writer_log.size() - 1 - n) %
-					                               m_writer_log.size()];
-					if (rec.begin < page + TRACKER_PAGE_SIZE && page < rec.end) {
-						kind = rec.kind; hash = rec.hash; wbegin = rec.begin; wend = rec.end;
-						break;
-					}
-				}
-				std::printf("NHL27SHD: fault=0x%llx bytes=%llu buffer=0x%llx+0x%llx last_write=%llu "
-				            "current=%llu writer=%s %016llx [0x%llx,0x%llx) tid=%llx\n",
-				            static_cast<unsigned long long>(vaddr),
-				            static_cast<unsigned long long>(m_last_download_bytes),
-				            static_cast<unsigned long long>(buffer.CpuAddress()),
-				            static_cast<unsigned long long>(buffer.Size()),
-				            static_cast<unsigned long long>(buffer.last_write_tick),
-				            static_cast<unsigned long long>(m_scheduler.CurrentTick()), kind,
-				            static_cast<unsigned long long>(hash), static_cast<unsigned long long>(wbegin),
-				            static_cast<unsigned long long>(wend), static_cast<unsigned long long>(tid));
+			if (is_write) {
+				m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 			}
+		});
+		if (retry_tick == 0) {
+			break;
 		}
-		if (downloaded) {
-			m_memory_tracker.UnmarkRegionAsGpuModified(download_vaddr, download_size);
-		}
-		if (is_write) {
-			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
-		}
-	});
+		m_scheduler.WaitSubmitted(retry_tick);
+		m_scheduler.GetMasterSemaphore().Wait(retry_tick);
+	}
 	if (async_tick != 0) {
 		m_scheduler.WaitPriorityOperations(async_tick);
 		m_scheduler.Context().GetGpu().SendUrgentCommandSync(

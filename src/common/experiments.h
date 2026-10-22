@@ -73,12 +73,16 @@ enum Bit : uint64_t {
 	// More A/B-only bits, so that one boot can compare several pending changes (KytyPS5-toolsbmulti.sh).
 	AbPending2 = uint64_t {1} << 44u,
 	AbPending3 = uint64_t {1} << 45u,
+	AbPending4 = uint64_t {1} << 49u,
 	// KYTY_GUEST_OFF_STAGE_CORES (default on): threads without a CPU of their own (guest, driver
 	// and helper threads) keep off both logical CPUs of the execution and resolve threads' cores.
 	GuestOffStageCores = uint64_t {1} << 46u,
-	// KYTY_GUEST_OFF_STAGE_SIBLINGS (default off): the same for the SMT siblings of those two
-	// threads only (other threads still run on the stages' own CPUs while they wait).
-	GuestOffStageSiblings = uint64_t {1} << 47u,
+	// KYTY_GUEST_OFF_COPY_CORE (default off; with GuestOffStageCores): the host copy thread's
+	// core too. Bit 47 was GuestOffStageSiblings (only the two siblings: no gain).
+	GuestOffCopyCore = uint64_t {1} << 47u,
+	// KYTY_GUEST_OFF_CP_CORES (default off; with GuestOffStageCores): the command processor's and
+	// the recording thread's cores too.
+	GuestOffCpCores = uint64_t {1} << 48u,
 };
 
 namespace Detail {
