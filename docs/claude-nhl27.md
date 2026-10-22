@@ -787,6 +787,20 @@ in the range still drain. Bit 38 (`AbPending`) restores the drain. One boot, 7 p
 unmap waits 39.6 -> 3.7 ms/s, draw cost 4.41 -> 4.20 us. The hang report after a device loss
 now prints the first and the last 32 unfinished commands and their count.
 
+The GPU stage threads are pinned to one logical CPU each (`KYTY_GPU_THREAD_CPUS`, default 4, 6,
+8, 10, 2 for command processor, execution, recording, resolve, host copy), but the game's threads
+were free to run on the SMT siblings of the execution and resolve threads, sharing their cores.
+Bit 46 `KYTY_GUEST_OFF_STAGE_CORES` (default on) sets the process default CPU sets
+(`SetProcessDefaultCpuSets`) to every logical CPU except both of those two cores' CPUs, so guest,
+driver and helper threads keep off them while the pinned stage threads keep their affinity
+(`Experiments: threads without a CPU of their own avoid CPUs 0xcc0` at boot on the 8-core
+5800X3D; the mask is reapplied when the experiments mask changes). Bit 47
+`KYTY_GUEST_OFF_STAGE_SIBLINGS` (default off) excludes only the two siblings. Two boots with
+base / bit 46 / bit 47: execution-thread cost per draw 4.15 / 3.97 / 3.90 and 4.34 / 4.03 / 4.33 us,
+per dispatch 3.18 / 2.57 / 2.47 and 3.29 / 2.71 / 2.95 us, resolve busy 880 / 803 / 828 and
+830 / 788 / 818 ms/s; paired rounds 304 / 304 / 283 and 323 / 389 / 363 fps in sum. Default mask
+now 72037171199476.
+
 Bit 42 `KYTY_BDA_LOAD_GROUPS` (default off; key bit 8192; `KYTY_DBG_BDA_GROUPS=1` prints
 `NHL27BDAGROUP` per shader): consecutive DWORD loads of one guest load through an address share
 one page lookup and issue together when the group lies in one page. Grouped loads turned up in

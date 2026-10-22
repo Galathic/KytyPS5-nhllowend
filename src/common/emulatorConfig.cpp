@@ -204,7 +204,32 @@ uint32_t ParseGpuPipelineStages(const char* value) {
 	return parsed == 1 ? GPU_PIPELINE_ALL : static_cast<uint32_t>(parsed) & GPU_PIPELINE_ALL;
 }
 
+static const std::array<int, 7>& GpuStageCpus();
+
+int GpuStageCpu(GpuStageThread stage) {
+	return GpuStageCpus()[static_cast<uint32_t>(stage)];
+}
+
 void ConfigureGpuStageThread(GpuStageThread stage) {
+	const auto& cpus = GpuStageCpus();
+	static const bool high_priority = [] {
+		const char* value = std::getenv("KYTY_GPU_THREAD_PRIORITY");
+		return value == nullptr || std::string_view(value) != "0";
+	}();
+	if (high_priority) {
+		Common::Thread::RaiseCurrentPriority();
+	}
+	Common::Thread::PinCurrent(cpus[static_cast<uint32_t>(stage)]);
+	// For profilers that sample one thread (KytyPS5-tools/prof-stage.sh): which OS thread runs
+	// which stage.
+	static constexpr const char* Names[] = {"command-processor", "execution", "recording", "resolve",
+	                                        "host-copy", "dispatch-resolve", "draw-resolve"};
+	std::printf("NHL27STAGE: %s tid=%s cpu=%d\n", Names[static_cast<uint32_t>(stage)],
+	            Common::Thread::GetThreadId().c_str(), cpus[static_cast<uint32_t>(stage)]);
+	std::fflush(stdout);
+}
+
+static const std::array<int, 7>& GpuStageCpus() {
 	// Five physical cores of the first CCD of a Ryzen 9 5900X (SMT siblings are adjacent), away
 	// from core 0: the stages share its L3.
 	// The dispatch resolver (experiment DispatchResolver) on a sixth core, the second draw resolver
@@ -232,21 +257,7 @@ void ConfigureGpuStageThread(GpuStageThread stage) {
 		}
 		return result;
 	}();
-	static const bool high_priority = [] {
-		const char* value = std::getenv("KYTY_GPU_THREAD_PRIORITY");
-		return value == nullptr || std::string_view(value) != "0";
-	}();
-	if (high_priority) {
-		Common::Thread::RaiseCurrentPriority();
-	}
-	Common::Thread::PinCurrent(cpus[static_cast<uint32_t>(stage)]);
-	// For profilers that sample one thread (KytyPS5-tools/prof-stage.sh): which OS thread runs
-	// which stage.
-	static constexpr const char* Names[] = {"command-processor", "execution", "recording", "resolve",
-	                                        "host-copy", "dispatch-resolve", "draw-resolve"};
-	std::printf("NHL27STAGE: %s tid=%s cpu=%d\n", Names[static_cast<uint32_t>(stage)],
-	            Common::Thread::GetThreadId().c_str(), cpus[static_cast<uint32_t>(stage)]);
-	std::fflush(stdout);
+	return cpus;
 }
 
 uint32_t GpuPipelineStages() {

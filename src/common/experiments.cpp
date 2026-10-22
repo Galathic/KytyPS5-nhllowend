@@ -1,5 +1,7 @@
 #include "common/experiments.h"
 
+#include "common/emulatorConfig.h"
+
 #if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -88,7 +90,68 @@ uint64_t EnvironmentMask() {
 	set("KYTY_SPECULATE_DIRTY_READS", SpeculateDirtyReads, false);
 	set("KYTY_CP_CLEAN_REG_READS", CpCleanRegReads, false);
 	set("KYTY_CP_SKIP_IDLE_SPIN", CpSkipIdleSpin, false);
+	// Two boots: execution-thread cost per draw -4..-7%, per dispatch -18..-20%.
+	set("KYTY_GUEST_OFF_STAGE_CORES", GuestOffStageCores, true);
+	set("KYTY_GUEST_OFF_STAGE_SIBLINGS", GuestOffStageSiblings, false);
 	return mask;
+}
+
+// Bits GuestOffStageCores / GuestOffStageSiblings: the process default CPU sets, which every thread
+// without its own CPU selection follows; the pinned GPU stage threads keep their affinity.
+void ApplyCpuSets(uint64_t mask) {
+#if defined(_WIN32)
+	static int applied = 0;
+	const int  wanted  = (mask & GuestOffStageCores) != 0 ? 2 : (mask & GuestOffStageSiblings) != 0 ? 1 : 0;
+	if (wanted == applied) {
+		return;
+	}
+	applied = wanted;
+	if (wanted == 0) {
+		(void)::SetProcessDefaultCpuSets(::GetCurrentProcess(), nullptr, 0);
+		std::printf("Experiments: default CPU sets cleared\n");
+		std::fflush(stdout);
+		return;
+	}
+	uint64_t excluded = 0;
+	for (const auto stage: {Config::GpuStageThread::Execution, Config::GpuStageThread::Resolve}) {
+		const int cpu = Config::GpuStageCpu(stage);
+		if (cpu < 0 || cpu >= 64) {
+			continue;
+		}
+		// SMT siblings are adjacent logical CPUs.
+		excluded |= uint64_t {1} << static_cast<uint32_t>(cpu ^ 1);
+		if (wanted == 2) {
+			excluded |= uint64_t {1} << static_cast<uint32_t>(cpu);
+		}
+	}
+	ULONG length = 0;
+	(void)::GetSystemCpuSetInformation(nullptr, 0, &length, ::GetCurrentProcess(), 0);
+	std::vector<uint8_t> buffer(length);
+	if (length == 0 || !::GetSystemCpuSetInformation(reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buffer.data()),
+	                                                 length, &length, ::GetCurrentProcess(), 0)) {
+		return;
+	}
+	std::vector<ULONG> ids;
+	for (ULONG at = 0; at < length;) {
+		const auto* info = reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(buffer.data() + at);
+		if (info->Size == 0) {
+			break;
+		}
+		if (info->Type == CpuSetInformation && info->CpuSet.Group == 0 &&
+		    info->CpuSet.LogicalProcessorIndex < 64 &&
+		    ((excluded >> info->CpuSet.LogicalProcessorIndex) & 1u) == 0) {
+			ids.push_back(info->CpuSet.Id);
+		}
+		at += info->Size;
+	}
+	const bool ok = !ids.empty() &&
+	                ::SetProcessDefaultCpuSets(::GetCurrentProcess(), ids.data(), static_cast<ULONG>(ids.size())) != 0;
+	std::printf("Experiments: threads without a CPU of their own avoid CPUs 0x%llx (%zu CPU sets, %s)\n",
+	            static_cast<unsigned long long>(excluded), ids.size(), ok ? "ok" : "failed");
+	std::fflush(stdout);
+#else
+	(void)mask;
+#endif
 }
 
 struct State {
@@ -97,6 +160,7 @@ struct State {
 	State() {
 		const uint64_t defaults = EnvironmentMask();
 		mask.store(defaults, std::memory_order_relaxed);
+		ApplyCpuSets(defaults);
 		const char* path_env = std::getenv("KYTY_EXPERIMENT_FILE");
 		if (path_env == nullptr || path_env[0] == '\0') {
 			return;
@@ -115,6 +179,7 @@ struct State {
 				}
 				if (value != last) {
 					mask.store(value, std::memory_order_relaxed);
+					ApplyCpuSets(value);
 					std::printf("Experiments: mask %" PRIu64 " -> %" PRIu64 "\n", last, value);
 					std::fflush(stdout);
 					last = value;
