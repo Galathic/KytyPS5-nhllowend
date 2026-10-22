@@ -16,9 +16,11 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "kernel/eventQueue.h"
 
+#include <algorithm>
 #include <array>
 #include <memory>
 #include <shared_mutex>
+#include <utility>
 #include <vector>
 
 namespace Libs::VideoOut {
@@ -61,6 +63,41 @@ public:
 	// returned `sequence` (false once the log of the last unmaps no longer reaches back that far).
 	[[nodiscard]] uint64_t UnmapSequence() const noexcept;
 	[[nodiscard]] bool     UnmappedSince(uint64_t sequence, uint64_t vaddr, uint64_t size) const noexcept;
+	// Calls write(address, bytes) for the parts of [vaddr, vaddr + size) not unmapped since
+	// UnmapSequence() returned `sequence`, holding off unmaps meanwhile: a completion queued before
+	// an unmap (a download) must not write memory the guest gave up, or mapped again since. Writes
+	// nothing once the log no longer reaches back that far.
+	template <typename Write>
+	void WriteUnlessUnmapped(uint64_t sequence, uint64_t vaddr, uint64_t size, Write&& write) const {
+		std::shared_lock lock(m_unmap_log_mutex);
+		if (sequence == m_unmap_sequence) {
+			write(vaddr, size);
+			return;
+		}
+		const auto first = m_unmap_sequence > m_unmap_log.size() ? m_unmap_sequence - m_unmap_log.size() : 0;
+		if (sequence < first) {
+			return;
+		}
+		const auto end = vaddr + size;
+		std::vector<std::pair<uint64_t, uint64_t>> holes;
+		for (auto s = sequence; s < m_unmap_sequence; s++) {
+			const auto& record = m_unmap_log[s % m_unmap_log.size()];
+			if (record.begin < end && vaddr < record.end) {
+				holes.emplace_back(std::max(record.begin, vaddr), std::min(record.end, end));
+			}
+		}
+		std::sort(holes.begin(), holes.end());
+		auto at = vaddr;
+		for (const auto& [begin, hole_end]: holes) {
+			if (begin > at) {
+				write(at, begin - at);
+			}
+			at = std::max(at, hole_end);
+		}
+		if (at < end) {
+			write(at, end - at);
+		}
+	}
 	// Whether a read of the range would fault on a page holding GPU-written bytes. Any thread.
 	[[nodiscard]] bool IsReadProtected(uint64_t vaddr, uint64_t size) const noexcept;
 	// Advances whenever a range is mapped or unmapped.
@@ -118,7 +155,9 @@ private:
 		uint64_t begin    = 0;
 		uint64_t end      = 0;
 	};
-	std::array<UnmapRecord, 1024> m_unmap_log {};
+	// Its own lock: deferred downloads hold it while they write guest memory.
+	mutable std::shared_mutex     m_unmap_log_mutex;
+	std::array<UnmapRecord, 8192> m_unmap_log {};
 	uint64_t                      m_unmap_sequence = 0;
 	uint64_t                  m_mapped_ranges_version = 0;
 	// Epochs (CPU dirty, buffer registrations, mapped ranges) read before the last full BDA

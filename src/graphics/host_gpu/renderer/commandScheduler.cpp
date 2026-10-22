@@ -176,16 +176,27 @@ void DumpCpuCrumbs() {
 	std::printf("NHL27HANG: GPU finished tick %llu, recording tick %llu\n",
 	            static_cast<unsigned long long>(known),
 	            static_cast<unsigned long long>(g_crumb_master->CurrentTick()));
-	uint32_t shown = 0;
-	for (auto n = first; n < next && shown < 48; n++) {
+	// The first unfinished commands and the last ones (the GPU hangs somewhere in between, most
+	// likely early, but the last ones show what was queued behind).
+	uint64_t unfinished = 0;
+	for (auto n = first; n < next; n++) {
+		const auto& c = g_cpu_crumbs[n % g_cpu_crumbs.size()];
+		unfinished += (c.kind != nullptr && c.tick > known) ? 1u : 0u;
+	}
+	std::printf("NHL27HANG: %llu unfinished commands\n", static_cast<unsigned long long>(unfinished));
+	uint64_t index = 0;
+	for (auto n = first; n < next; n++) {
 		const auto& c = g_cpu_crumbs[n % g_cpu_crumbs.size()];
 		if (c.kind == nullptr || c.tick <= known) {
 			continue;
 		}
-		std::printf("NHL27HANG:   tick %llu %s a=0x%016llx b=0x%016llx info=0x%llx\n",
-		            static_cast<unsigned long long>(c.tick), c.kind, static_cast<unsigned long long>(c.hash_a),
-		            static_cast<unsigned long long>(c.hash_b), static_cast<unsigned long long>(c.info));
-		shown++;
+		if (index < 32 || index + 32 >= unfinished) {
+			std::printf("NHL27HANG:   #%llu tick %llu %s a=0x%016llx b=0x%016llx info=0x%llx\n",
+			            static_cast<unsigned long long>(index), static_cast<unsigned long long>(c.tick), c.kind,
+			            static_cast<unsigned long long>(c.hash_a), static_cast<unsigned long long>(c.hash_b),
+			            static_cast<unsigned long long>(c.info));
+		}
+		index++;
 	}
 	std::fflush(stdout);
 }

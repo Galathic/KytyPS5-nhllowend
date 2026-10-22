@@ -662,6 +662,8 @@ template <bool async, bool merge>
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
 	static_assert(async || !merge);
 	DropGpuFills(vaddr, size);
+	// The publish writes only what is still mapped by then (unmaps no longer wait for it).
+	const auto unmap_sequence = m_scheduler.Context().UnmapSequence();
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size     = 0;
 	const auto                  buffer_address = buffer.CpuAddress();
@@ -715,7 +717,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 			at += copy.size;
 		}
 	}
-	auto publish = [this, mapped, offset, total_size, buffer_address, copies = copies,
+	auto publish = [this, mapped, offset, total_size, buffer_address, copies = copies, unmap_sequence,
 	                owner = std::move(temporary), snapshot = std::move(snapshot)]() mutable {
 		(owner ? *owner : m_download_buffer).Invalidate(offset, total_size);
 		uint64_t at = 0;
@@ -744,15 +746,20 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 					}
 				}
 			}
-			if (!snapshot.empty()) {
-				// Bytes the CPU stored since the download was queued are newer than the GPU's.
-				if (!Libs::LibKernel::Memory::TryMergeBacking(buffer_address + copy.srcOffset, gpu,
-				                                              snapshot.data() + at, copy.size)) {
-					EXIT("BufferCache: merge of a shared-page download failed\n");
-				}
-			} else {
-				Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset, gpu, copy.size);
-			}
+			const auto copy_address = buffer_address + copy.srcOffset;
+			const auto* expected     = snapshot.empty() ? nullptr : snapshot.data() + at;
+			m_scheduler.Context().WriteUnlessUnmapped(
+			    unmap_sequence, copy_address, copy.size, [&](uint64_t address, uint64_t bytes) {
+				    const auto skip = address - copy_address;
+				    if (expected != nullptr) {
+					    // Bytes the CPU stored since the download was queued are newer than the GPU's.
+					    if (!Libs::LibKernel::Memory::TryMergeBacking(address, gpu + skip, expected + skip, bytes)) {
+						    EXIT("BufferCache: merge of a shared-page download failed\n");
+					    }
+				    } else {
+					    Libs::LibKernel::Memory::WriteBacking(address, gpu + skip, bytes);
+				    }
+			    });
 			at += copy.size;
 		}
 	};

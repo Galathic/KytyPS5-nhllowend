@@ -776,6 +776,17 @@ idle trace then stamps only command buffers, so the traced match keeps 48-58 fps
 Neither is GPU-bound yet; the idle time is spread over gaps of 20 us to 1 ms between the 120
 command buffers of a frame, waiting for the CPU side. At 60 fps the GPU has 1.5-2.5 ms to spare.
 
+A sampled match (`samples\pr34-execution.txt`, 10 s around a whistle) had the execution thread
+20% in unmaps draining the GPU: at stoppages NHL 27 unmaps memory that a pending download (a
+lazy shared write or a texture download) still had to publish into, 24 times in 2 s at 10-13 ms
+each. Unmaps are now logged in `RenderContext` (8,192 entries, its own lock) and deferred
+downloads publish through `RenderContext::WriteUnlessUnmapped`: under the log's lock they write
+only the parts of their range not unmapped since they were queued (a range unmapped and mapped
+again keeps the new contents), so an unmap no longer waits for them; GPU-written pages and images
+in the range still drain. Bit 38 (`AbPending`) restores the drain. One boot, 7 paired rounds:
+unmap waits 39.6 -> 3.7 ms/s, draw cost 4.41 -> 4.20 us. The hang report after a device loss
+now prints the first and the last 32 unfinished commands and their count.
+
 Bit 42 `KYTY_BDA_LOAD_GROUPS` (default off; key bit 8192; `KYTY_DBG_BDA_GROUPS=1` prints
 `NHL27BDAGROUP` per shader): consecutive DWORD loads of one guest load through an address share
 one page lookup and issue together when the group lies in one page. Grouped loads turned up in

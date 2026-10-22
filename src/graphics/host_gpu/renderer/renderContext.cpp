@@ -220,12 +220,12 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 }
 
 uint64_t RenderContext::UnmapSequence() const noexcept {
-	std::shared_lock lock(m_mapped_ranges_mutex);
+	std::shared_lock lock(m_unmap_log_mutex);
 	return m_unmap_sequence;
 }
 
 bool RenderContext::UnmappedSince(uint64_t sequence, uint64_t vaddr, uint64_t size) const noexcept {
-	std::shared_lock lock(m_mapped_ranges_mutex);
+	std::shared_lock lock(m_unmap_log_mutex);
 	const auto       first = m_unmap_sequence > m_unmap_log.size() ? m_unmap_sequence - m_unmap_log.size() : 0;
 	for (auto s = std::max(sequence, first); s < m_unmap_sequence; s++) {
 		const auto& record = m_unmap_log[s % m_unmap_log.size()];
@@ -273,11 +273,11 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		     vaddr, size);
 	}
 	const auto unmap = [this, vaddr, size] {
-		// Finishing the GPU protects GPU writes to the range and completions that may write guest
-		// memory there (downloads, write scans). Queued GPU work only reads cached copies and
-		// host-only completions (cache bookkeeping, flips, interrupts) never touch the range, so
-		// without GPU-owned pages, images or pending guest completions writing the range the
-		// unmap needs no drain.
+		// Finishing the GPU protects GPU writes to the range. Queued GPU work only reads cached
+		// copies, host-only completions (cache bookkeeping, flips, interrupts) never touch the
+		// range, and completions writing guest memory (downloads) skip what was unmapped since
+		// they were queued (WriteUnlessUnmapped), so without GPU-owned pages or images in the range
+		// the unmap needs no drain (AbPending: it drains for those completions too).
 		if (m_command_scheduler.Active()) {
 			m_command_scheduler.PopPendingOperations();
 		}
@@ -285,7 +285,8 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		const bool gpu     = active && m_buffer_cache.IsRegionGpuModified(vaddr, size);
 		const bool images  = active && !gpu && m_texture_cache.HasImagesInRegion(vaddr, size);
 		const bool pending = active && !gpu && !images && m_command_scheduler.HasPendingGuestOperations(vaddr, size);
-		const bool drain   = gpu || images || pending;
+		const bool drain   = gpu || images ||
+		                   (pending && Common::Experiments::Enabled(Common::Experiments::AbPending));
 		const auto start   = CpReadDebugEnabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 		if (drain) {
 			const auto tick = m_command_scheduler.CurrentTick();
@@ -317,11 +318,14 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		BufferCache::WriteTagScope tag(BufferCache::WriteTag::Unmap);
 		m_buffer_cache.InvalidateMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);
+		{
+			std::lock_guard log_lock(m_unmap_log_mutex);
+			m_unmap_log[m_unmap_sequence % m_unmap_log.size()] = {m_unmap_sequence, vaddr, vaddr + size};
+			m_unmap_sequence++;
+		}
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
 		m_bda_new_ranges.Subtract(vaddr, size);
-		m_unmap_log[m_unmap_sequence % m_unmap_log.size()] = {m_unmap_sequence, vaddr, vaddr + size};
-		m_unmap_sequence++;
 		++m_mapping_generation;
 		m_mapped_ranges_version++;
 		PageWriteSeq::ForceChecks();

@@ -18,6 +18,7 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
@@ -2535,14 +2536,19 @@ bool TextureCache::DownloadImageMemory(ImageId id, bool tolerant_write) {
 	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
 	                                               1, &barrier, 0, nullptr);
-	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset, tolerant_write] {
+	// Only what is still mapped by then (unmaps no longer wait for the publish).
+	const auto unmap_sequence = m_scheduler.Context().UnmapSequence();
+	m_scheduler.DeferPriorityOperation([this, &download, range, mapped, offset, tolerant_write, unmap_sequence] {
 		download.Invalidate(offset, range.size);
-		if (tolerant_write) {
-			// The range may have been unmapped after enqueue; skip rather than exit.
-			(void)LibKernel::Memory::TryWriteBacking(range.address, mapped, range.size);
-		} else {
-			LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
-		}
+		m_scheduler.Context().WriteUnlessUnmapped(
+		    unmap_sequence, range.address, range.size, [&](uint64_t address, uint64_t bytes) {
+			    const auto* data = static_cast<const uint8_t*>(mapped) + (address - range.address);
+			    if (tolerant_write) {
+				    (void)LibKernel::Memory::TryWriteBacking(address, data, bytes);
+			    } else {
+				    LibKernel::Memory::WriteBacking(address, data, bytes);
+			    }
+		    });
 	}, range.address, range.size);
 	return true;
 }
