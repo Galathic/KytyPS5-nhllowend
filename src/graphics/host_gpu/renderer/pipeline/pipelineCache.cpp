@@ -134,8 +134,28 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 		return !values.empty() && Libs::LibKernel::Memory::TryReadCleanBufferBacking(
 		                              address, values.data(), values.size_bytes());
 	}
-	return !values.empty() &&
-	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
+	// KYTY_DBG_STRICT_READS=1: strict reads of GPU-written bytes (each waits for the GPU's writer):
+	// the shader, the address and the words read, at most 400 lines (NHL27STRICT).
+	static const bool strict_debug = std::getenv("KYTY_DBG_STRICT_READS") != nullptr;
+	const bool        dirty        = strict_debug && !values.empty() &&
+	                    Libs::LibKernel::Memory::HasGpuDirtyBytesShared(address, values.size_bytes());
+	const bool read = !values.empty() &&
+	                  Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
+	if (dirty) {
+		static std::atomic<uint32_t> lines {0};
+		if (lines.fetch_add(1, std::memory_order_relaxed) < 400) {
+			char words[96] {};
+			int  at = 0;
+			for (size_t i = 0; i < values.size() && i < 8 && at < 80; i++) {
+				at += std::snprintf(words + at, sizeof(words) - at, " %08x", values[i]);
+			}
+			std::printf("NHL27STRICT: shader=%016llx addr=0x%016llx dwords=%zu ok=%d values:%s\n",
+			            static_cast<unsigned long long>(Libs::LibKernel::Memory::ReadContext()),
+			            static_cast<unsigned long long>(address), values.size(), read ? 1 : 0, words);
+			std::fflush(stdout);
+		}
+	}
+	return read;
 }
 
 bool ReadShaderOrdinaryBacking(void*, uint64_t address, std::span<uint32_t> values) {

@@ -876,6 +876,20 @@ Both CPU placements were measured on 8 cores / 16 logical CPUs: the second draw 
 defaults on only with 16 or more logical CPUs (its default CPU is 14) and the game's threads keep
 off the stage cores only with 12 or more; their variables still force either way.
 
+Frame times in play (`ts-nocmd.sh`, eight 3 s captures): in light stretches every frame within
+16.6-18.4 ms; elsewhere single frames of 29-37 ms. `KYTY_DBG_CP_READS` now also logs the GPU
+thread's own writes into GPU-written pages whose downloads wait (`NHL27GPUWRITEWAIT`) and
+`KYTY_DBG_STRICT_READS=1` the strict resource reads of GPU-written bytes (`NHL27STRICT`). In play
+the stalls were PM4 `WRITE_DATA` packets of the pipelined command processor: its fast label path
+(both copies updated, nothing downloaded) ran only on the GPU thread, so on the execution thread
+they went through `PrepareGpuWrite`, which downloaded the page's GPU-written bytes and waited for
+their writer (the command buffer just submitted): 101 waits of 6-23 ms in two minutes. The
+execution thread's write now takes the label path first (`AbPending4`: the old path). One boot:
+write-data waits 14 (334 ms) -> 0 in the same phases, draw cost 3.86 -> 3.79 us. (The 6 ms strict
+waits attributed to VS 126d611593f8bf08 happen in the loading screens, not in play.) Hang reports
+after a device loss now count in the render scheduler's ticks: the presenter's own scheduler,
+made later, had made every recorded command look unfinished.
+
 Bit 42 `KYTY_BDA_LOAD_GROUPS` (default off; key bit 8192; `KYTY_DBG_BDA_GROUPS=1` prints
 `NHL27BDAGROUP` per shader): consecutive DWORD loads of one guest load through an address share
 one page lookup and issue together when the group lies in one page. Grouped loads turned up in

@@ -1085,7 +1085,11 @@ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graph
       m_command_pool(graphics, m_master), m_deferred(deferred_recording),
       m_stream(&m_chunk_queue), m_command(*this, deferred_recording ? &m_stream : nullptr),
       m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {
-	g_crumb_master = &m_master;
+	// The CPU crumbs count in the render scheduler's ticks; the presenter has a scheduler of its
+	// own, made later, whose ticks made every recorded command look unfinished in hang reports.
+	if (&context.GetCommandScheduler() == this) {
+		g_crumb_master = &m_master;
+	}
 	if (m_deferred) {
 		m_host_copies = std::make_unique<HostCopyQueue>(
 		    [] { Config::ConfigureGpuStageThread(Config::GpuStageThread::HostCopy); });

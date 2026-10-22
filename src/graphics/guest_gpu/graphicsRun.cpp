@@ -1664,6 +1664,40 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	// later label.
 	const auto sequence = EmitCallback([this, dst, src, dw_num, write_one_address] {
 		BufferCache::WriteTagScope tag(BufferCache::WriteTag::WriteData);
+		// The pipelined command processor's writes reach here: they take the label path as well
+		// (both copies updated, nothing downloaded), not PrepareGpuWrite, which downloads the
+		// page's GPU-written bytes and waited for their writer, 6-23 ms about once a second in
+		// play (AbPending4: always PrepareGpuWrite).
+		if (Common::RuntimeFlags::Current().pm4_write_data_fast &&
+		    !Common::Experiments::Enabled(Common::Experiments::AbPending4)) {
+			auto& cache = m_renderer.GetBufferCache();
+			if (write_one_address) {
+				uint32_t written = 0;
+				while (written < dw_num) {
+					const uint32_t value = src[written];
+					if (!cache.TryWriteLabel(reinterpret_cast<uint64_t>(dst), &value, sizeof(value))) {
+						break;
+					}
+					written++;
+				}
+				if (written == dw_num) {
+					return;
+				}
+				m_renderer.PrepareGpuWrite(dst, sizeof(uint32_t));
+				for (uint32_t i = written; i < dw_num; i++) {
+					dst[0] = src[i];
+				}
+				return;
+			}
+			if (dw_num <= 64) {
+				std::array<uint32_t, 64> values {};
+				std::memcpy(values.data(), src, static_cast<size_t>(dw_num) * sizeof(uint32_t));
+				if (cache.TryWriteLabel(reinterpret_cast<uint64_t>(dst), values.data(),
+				                        static_cast<uint64_t>(dw_num) * sizeof(uint32_t))) {
+					return;
+				}
+			}
+		}
 		m_renderer.PrepareGpuWrite(dst, uint64_t {write_one_address ? 1u : dw_num} * sizeof(uint32_t));
 		if (write_one_address) {
 			for (uint32_t i = 0; i < dw_num; i++) {

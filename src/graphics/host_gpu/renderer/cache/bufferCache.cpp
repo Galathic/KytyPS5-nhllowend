@@ -1438,8 +1438,28 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadC
 				retry_tick = buffer.last_write_tick;
 				return;
 			}
+			// KYTY_DBG_CP_READS: the GPU thread's own writes into pages the GPU wrote, whose downloads
+			// wait for the writer (NHL27GPUWRITEWAIT, at most 200 lines): the write's tag, address
+			// and how long it waited.
+			const bool gpu_write_debug = CpReadDebugEnabled() && is_write && on_gpu && !lazy;
+			const auto gpu_write_start = gpu_write_debug ? std::chrono::steady_clock::now()
+			                                             : std::chrono::steady_clock::time_point {};
+			const auto gpu_write_tick  = buffer.last_write_tick;
 			const bool downloaded = lazy ? DownloadBufferMemory<true, true>(buffer, vaddr, size)
 			                             : DownloadBufferMemory<false>(buffer, download_vaddr, download_size);
+			if (gpu_write_debug && downloaded) {
+				const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+				                                                           gpu_write_start).count();
+				static std::atomic<uint32_t> lines {0};
+				if (ms >= 1.0 && lines.fetch_add(1, std::memory_order_relaxed) < 200) {
+					const char* name = WriteTagName(fault_rip);
+					std::printf("NHL27GPUWRITEWAIT: tag=%s vaddr=0x%016" PRIx64 " size=%" PRIu64 " downloaded=%" PRIu64
+					            " writer_tick=%" PRIu64 " current=%" PRIu64 " ms=%.1f\n",
+					            name != nullptr ? name : "?", vaddr, size, m_last_download_bytes, gpu_write_tick,
+					            m_scheduler.CurrentTick(), ms);
+					std::fflush(stdout);
+				}
+			}
 			if (lazy) {
 				Common::Timeline::Mark("lazy-shared-write", vaddr);
 			}
