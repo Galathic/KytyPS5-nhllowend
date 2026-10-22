@@ -63,7 +63,7 @@ enum Bit : uint64_t {
 	ExecBranchMemory     = uint64_t {1} << 40u, // KYTY_EXEC_BRANCH_MEMORY (default on; ExecBranches runs also take memory operations under their EXEC; part of shader keys)
 	DispatchResolver     = uint64_t {1} << 41u, // KYTY_DISPATCH_RESOLVER (default off; a second resolve thread resolves dispatches ahead while the first resolves draws)
 	BdaLoadGroups        = uint64_t {1} << 42u, // KYTY_BDA_LOAD_GROUPS (default off; consecutive DWORD loads through an address share one page lookup; part of shader keys)
-	DrawResolver         = uint64_t {1} << 43u, // KYTY_DRAW_RESOLVER (default off: 2 guest job-thread crashes in 8 boots with it; a second resolve thread resolves about half of the draws ahead, by shader addresses)
+	DrawResolver         = uint64_t {1} << 43u, // KYTY_DRAW_RESOLVER (default on since 2026-10-22; earlier off for 2 guest job-thread crashes in 8 boots, since fixed causes; a second resolve thread resolves about half of the draws ahead, by shader addresses)
 	SpeculateDirtyReads  = uint64_t {1} << 37u, // KYTY_SPECULATE_DIRTY_READS (default off; shader-table reads of GPU-written bytes the GPU keeps rewriting unchanged use the backing, checked later)
 	// A/B only (no environment variable): selects the code a pending change replaces.
 	AbLegacy = 1u << 31u,

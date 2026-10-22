@@ -61,7 +61,10 @@ uint64_t EnvironmentMask() {
 	set("KYTY_EXEC_BRANCHES", ExecBranches, true);
 	set("KYTY_EXEC_BRANCH_MEMORY", ExecBranchMemory, true);
 	set("KYTY_BDA_LOAD_GROUPS", BdaLoadGroups, false);
-	set("KYTY_DRAW_RESOLVER", DrawResolver, false);
+	// On since 2026-10-22: with the stage cores kept for the stages, the resolve thread limited the
+	// heavier scenes; sharing its core with the game, the second resolver took 60 Hz play 57.4 ->
+	// 59.4 fps (paired rounds 413 / 447).
+	set("KYTY_DRAW_RESOLVER", DrawResolver, true);
 	set("KYTY_GPU_COLOR_CLEAR", GpuColorClear, false);
 	set("KYTY_POOLED_BDA_BUFFERS", PooledBdaBuffers, false);
 	set("KYTY_ASYNC_GUEST_READS", AsyncGuestReads, false);
@@ -123,13 +126,8 @@ void ApplyCpuSets(uint64_t mask) {
 		exclude(Config::GpuStageThread::CommandProcessor);
 		exclude(Config::GpuStageThread::Recording);
 	}
-	// The extra resolvers' cores too while they run.
-	if ((mask & DispatchResolver) != 0) {
-		exclude(Config::GpuStageThread::DispatchResolve);
-	}
-	if ((mask & DrawResolver) != 0) {
-		exclude(Config::GpuStageThread::DrawResolve);
-	}
+	// The extra resolvers (bits 41 and 43) share their cores: keeping the game off them as well
+	// (one core fewer for it) or putting them on the stages' siblings measured slower.
 	static uint64_t applied = 0;
 	if (excluded == applied) {
 		return;

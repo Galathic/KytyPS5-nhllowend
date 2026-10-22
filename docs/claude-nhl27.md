@@ -843,6 +843,21 @@ releases do not interrupt.) `NHL27EXECIDLE` now also counts who asked for the su
 splits of long command buffers. A host copy drain does the copies not yet handed to the copy
 thread itself (callbacks -3 ms/s).
 
+With the GPU submissions batched, the heavier play scenes (about 2,850 draws a frame) ran at
+55 fps with the resolve thread 90% busy and the execution thread waiting for it 14% of the time;
+the GPU was then 75-87% busy, 12.3-16.2 ms per flip (`ts-nocmd.sh`, eight 3 s captures). Extra
+resolve threads on the stage threads' SMT siblings (CPU 7 or 11) slowed the thread they shared a
+core with (draw cost +20% on CPU 7, resolve waits up on CPU 11), and with their own core kept from
+the game it lost a core. Bit 43 `KYTY_DRAW_RESOLVER` on CPU 14, sharing that core with the game's
+threads (the CPU sets no longer keep the game off the extra resolvers' cores): one boot, 60 Hz
+play 57.4 -> 59.4 fps, paired rounds 413 / 447 (DR rounds at 58-59), resolve busy 840 -> 550
+ms/s, the execution thread waiting for it 124 -> 50 ms/s. It is on by default now (the crashes it
+was once suspected of had other causes, fixed since); default mask 80833264221684. Two fixed-save
+matches with it: 59.1 fps at 60 Hz over 150 s and 58.8 over 96 s, no errors.
+GPU time by shader in play (`KYTY_PERF_GPU_TIMING=2`, 30 s): compute dispatches lead, a36f0b4f
+(a 4K full-screen pass, 1.4 ms), c556aaf3 (dispatch-indirect, 1.4-1.6 ms each, about one a frame),
+9380d724 (0.7 ms), 62ece4db (30 dispatches of 16 us), 40d1ee8b (0.35 ms).
+
 Bit 42 `KYTY_BDA_LOAD_GROUPS` (default off; key bit 8192; `KYTY_DBG_BDA_GROUPS=1` prints
 `NHL27BDAGROUP` per shader): consecutive DWORD loads of one guest load through an address share
 one page lookup and issue together when the group lies in one page. Grouped loads turned up in
