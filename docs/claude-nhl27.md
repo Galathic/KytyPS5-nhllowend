@@ -897,6 +897,13 @@ top shaders +2.5% / +2.2% GPU time (drift 0.2%): slower, dropped. Twelve soak ma
 `WRITE_DATA` fix (six with `KYTY_DBG_BREADCRUMBS=1`): 57.9-59.5 fps at 60 Hz, no errors, no device
 loss (the losses before were Windows GPU timeouts, LiveKernelEvent 141/117, about one in 40 boots).
 
+Loading screens: a sample of the execution thread there (`KytyPS5-tools\prof-load.sh`) had 23% of
+it in the in-order checks of the command processor's early backing reads (`CheckCpBackingRead`
+downloading GPU-written bytes to compare). Checking them asynchronously (a copy after the
+recorded work, compared when it lands) removed those waits, but the time went to the execution
+thread's own faults on the same GPU-written pages (`StillValid`'s plain loads, 37%), and the boot
+reached the match no sooner (243 s against 244-247): dropped.
+
 Bit 42 `KYTY_BDA_LOAD_GROUPS` (default off; key bit 8192; `KYTY_DBG_BDA_GROUPS=1` prints
 `NHL27BDAGROUP` per shader): consecutive DWORD loads of one guest load through an address share
 one page lookup and issue together when the group lies in one page. Grouped loads turned up in
