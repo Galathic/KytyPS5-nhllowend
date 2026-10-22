@@ -73,8 +73,24 @@ public:
 	}
 	// Any thread: waits until the first `count` copies completed.
 	void WaitFor(uint64_t count) noexcept { m_completed.WaitFor(count); }
-	// Producer: waits until every queued copy completed.
+	// Producer: waits until every queued copy completed. The copies not handed over yet are done
+	// here (the copy thread, mostly idle by then, would have to wake for them), unless they include
+	// a call, which runs in order on the copy thread. They are independent of the earlier copies:
+	// each writes its own destination.
 	void Drain() {
+		if (m_pending.count != 0) {
+			bool calls = false;
+			for (size_t i = 0; i < m_pending.count; i++) {
+				calls = calls || m_pending.jobs[i].function != nullptr;
+			}
+			if (!calls) {
+				for (size_t i = 0; i < m_pending.count; i++) {
+					const auto& job = m_pending.jobs[i];
+					std::memcpy(job.destination, job.source, job.size);
+				}
+				m_pending.count = 0;
+			}
+		}
 		const auto queued = Flush();
 		if (m_completed.Load() != queued) {
 			m_completed.WaitFor(queued);

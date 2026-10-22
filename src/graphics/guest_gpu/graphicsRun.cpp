@@ -642,6 +642,9 @@ bool GuestGpu::TryReadProtectedForCp(uint64_t address, void* value, size_t size)
 	return true;
 }
 
+// CommandProcessor::BufferFlush() requests by site (KYTY_DBG_STAGE_STATS).
+static std::array<std::atomic<uint64_t>, static_cast<size_t>(CommandProcessor::FlushSite::Count)> g_buffer_flush_emits {};
+
 // KYTY_DBG_STAGE_STATS: every 5 s (checked when the execution thread runs out of operations).
 static void PrintStageStats() {
 	static auto     last       = std::chrono::steady_clock::now();
@@ -672,7 +675,8 @@ static void PrintStageStats() {
 	            ms[StageStats::ResolveProgramLock], ms[StageStats::ResolveQueueFull], ms[StageStats::ResolveIdle],
 	            1000.0 - ms[StageStats::ResolveQueueFull] - ms[StageStats::ResolveIdle]);
 	std::printf("NHL27EXECIDLE ms/s: resolve=%.1f cp-busy=%.1f no-submission=%.1f blocked=%.1f "
-	            "cp-decision-wait=%.1f cp-other-wait=%.1f | bda syncs/s=%.0f flushes/s=%.0f (callbacks %.0f batch %.0f guest-reads %.0f flips %.0f)\n",
+	            "cp-decision-wait=%.1f cp-other-wait=%.1f | bda syncs/s=%.0f flushes/s=%.0f (callbacks %.0f batch %.0f guest-reads %.0f flips %.0f)"
+	            " | asked by other %.0f submission %.0f interrupt %.0f suspend %.0f split %.0f\n",
 	            ms[StageStats::ExecIdleResolve], ms[StageStats::ExecIdleCp], ms[StageStats::ExecIdleNoWork],
 	            ms[StageStats::ExecIdleBlocked], ms[StageStats::ExecIdleDecision], ms[StageStats::ExecIdleOther],
 	            static_cast<double>(StageStats::g_bda_syncs.exchange(0, std::memory_order_relaxed)) / seconds,
@@ -680,7 +684,12 @@ static void PrintStageStats() {
 	            static_cast<double>(g_scheduler_flush_sites[0].exchange(0, std::memory_order_relaxed)) / seconds,
 	            static_cast<double>(g_scheduler_flush_sites[1].exchange(0, std::memory_order_relaxed)) / seconds,
 	            static_cast<double>(g_scheduler_flush_sites[2].exchange(0, std::memory_order_relaxed)) / seconds,
-	            static_cast<double>(g_scheduler_flush_sites[3].exchange(0, std::memory_order_relaxed)) / seconds);
+	            static_cast<double>(g_scheduler_flush_sites[3].exchange(0, std::memory_order_relaxed)) / seconds,
+	            static_cast<double>(g_buffer_flush_emits[0].exchange(0, std::memory_order_relaxed)) / seconds,
+	            static_cast<double>(g_buffer_flush_emits[1].exchange(0, std::memory_order_relaxed)) / seconds,
+	            static_cast<double>(g_buffer_flush_emits[2].exchange(0, std::memory_order_relaxed)) / seconds,
+	            static_cast<double>(g_buffer_flush_emits[3].exchange(0, std::memory_order_relaxed)) / seconds,
+	            static_cast<double>(g_buffer_flush_emits[4].exchange(0, std::memory_order_relaxed)) / seconds);
 	for (int kind = 0; kind < 2; kind++) {
 		const auto calls = StageStats::g_check_calls[kind].exchange(0, std::memory_order_relaxed);
 		const auto entries = StageStats::g_check_entries[kind].exchange(0, std::memory_order_relaxed);
@@ -1362,7 +1371,10 @@ void CommandProcessor::BufferInit() {
 	}
 }
 
-void CommandProcessor::BufferFlush() {
+void CommandProcessor::BufferFlush(FlushSite site) {
+	if (StageStats::Enabled()) {
+		g_buffer_flush_emits[static_cast<size_t>(site)].fetch_add(1, std::memory_order_relaxed);
+	}
 	EmitCallback([this] {
 		g_scheduler_flush_sites[0].fetch_add(1, std::memory_order_relaxed);
 		GetScheduler().Flush();
@@ -2333,6 +2345,13 @@ static bool BdaBoundaryKind(uint32_t opcode, uint32_t header, RenderContext::Bda
 	}
 }
 
+// The end of a guest command buffer submits the host one only once it holds a batch of work
+// (about 1,400 guest submissions a second); frame ends, interrupts and command-buffer splits still
+// submit, and a readback of the open command buffer submits it.
+static void FlushGuestSubmission(CommandProcessor& cp) {
+	cp.BufferFlushIfBatchReady();
+}
+
 bool GuestGpu::Process(Submission& submission) {
 	const bool first_slice = !submission.started;
 	auto&      cp          = GetProcessor(submission.queue_id);
@@ -2382,7 +2401,7 @@ bool GuestGpu::Process(Submission& submission) {
 				}
 			}
 			if (progressed) {
-				cp.BufferFlush();
+				FlushGuestSubmission(cp);
 			}
 			break;
 		}
@@ -2403,7 +2422,7 @@ bool GuestGpu::Process(Submission& submission) {
 			complete = cp.Process(submission.command_execution, submission.commands) ==
 			           Pm4ProcessResult::Complete;
 			if (submission.command_execution.MadeProgress()) {
-				cp.BufferFlush();
+				FlushGuestSubmission(cp);
 			}
 			break;
 		}
@@ -2422,7 +2441,7 @@ bool GuestGpu::Process(Submission& submission) {
 					ready->release();
 				}, true);
 			});
-			cp.BufferFlush();
+			cp.BufferFlush(CommandProcessor::FlushSite::Suspend);
 			cp.Reset();
 			break;
 	}
@@ -2706,7 +2725,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			} else if (g_submit_split.work >= SubmitSplitDraws() ||
 			           std::chrono::duration_cast<std::chrono::microseconds>(now - g_submit_split.since)
 			                   .count() >= SubmitSplitUs()) {
-				BufferFlush();
+				BufferFlush(FlushSite::Split);
 				g_submit_split.work = 0;
 				g_submit_split_count.fetch_add(1, std::memory_order_relaxed);
 			}

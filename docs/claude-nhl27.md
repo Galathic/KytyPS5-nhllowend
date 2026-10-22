@@ -831,6 +831,18 @@ the tick itself while the execution thread goes on, then asks again (up to four 
 thread 869 -> 834 ms/s busy, draw cost 3.82 -> 3.75 us; fps unchanged (53.1 / 53.2 at 60 Hz):
 the execution thread waits for the resolve thread a little more (110 -> 118 ms/s) instead.
 
+Each guest command buffer (about 1,400 a second) ended its host command buffer and submitted it.
+The end of a guest submission now submits only once the host command buffer holds a batch of work
+(`BufferFlushIfBatchReady`, 64 draws and dispatches, as label-only releases do); frame ends,
+interrupts and the long-buffer splits still submit, and readbacks of the open command buffer
+submit it. Submissions per draw -40%. Three boots, paired rounds against one submission per guest
+command buffer: 433 / 399, 430 / 414 and 431 / 393 fps in sum, 60 Hz fps 54.5 / 52.1, 55.8 / 53.9
+and 58.2 / 54.8. (Batching the submissions after interrupts as well changed nothing: NHL 27's
+releases do not interrupt.) `NHL27EXECIDLE` now also counts who asked for the submissions
+(`asked by other / submission / interrupt / suspend / split`): in play about 3,000 a second are
+splits of long command buffers. A host copy drain does the copies not yet handed to the copy
+thread itself (callbacks -3 ms/s).
+
 Bit 42 `KYTY_BDA_LOAD_GROUPS` (default off; key bit 8192; `KYTY_DBG_BDA_GROUPS=1` prints
 `NHL27BDAGROUP` per shader): consecutive DWORD loads of one guest load through an address share
 one page lookup and issue together when the group lies in one page. Grouped loads turned up in

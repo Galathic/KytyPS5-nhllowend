@@ -73,7 +73,9 @@ public:
 	void BdaBoundary(RenderContext::BdaBoundary kind);
 
 	void BufferInit();
-	void BufferFlush();
+	// Who asked for a submission (KYTY_DBG_STAGE_STATS counts them by site, NHL27EXECIDLE).
+	enum class FlushSite : uint8_t { Other, GuestSubmission, Interrupt, Suspend, Split, Count };
+	void BufferFlush(FlushSite site = FlushSite::Other);
 	void BufferFlushIfBatchReady();
 	void BufferWait();
 	// Register writes go through these; queued operations keep snapshots of the old values.
