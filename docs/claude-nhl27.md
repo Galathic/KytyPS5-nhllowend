@@ -864,6 +864,14 @@ guest-visible operations (4% of it) partly wait for it to wake. Pinning it to th
 SMT sibling and polling for 20 ms before sleeping: one boot, 60 Hz fps 59.5 / 59.1, paired rounds
 449 / 456, callback time 143 / 116 ms/s: no gain, dropped.
 
+The second draw resolver is idle about half the time in play; letting it spin 20 ms instead of
+2 ms before it sleeps cut the execution thread's waits for it 48 -> 40 ms/s but not the fps (one
+boot, 60 Hz 59.7 / 59.1, paired rounds 460 / 461, most rounds at the 60 fps the game paces to):
+dropped. Three 6-minute soak matches on the defaults: 59.2, 58.8 and 59.5 fps at 60 Hz, no errors.
+One boot later stopped in the menus on a PM4 marker NOP the emulator did not know (id 0x11 behind
+the 0x6875 marker signature); unknown markers are now skipped and reported once
+(`NHL27MARKER`).
+
 Bit 42 `KYTY_BDA_LOAD_GROUPS` (default off; key bit 8192; `KYTY_DBG_BDA_GROUPS=1` prints
 `NHL27BDAGROUP` per shader): consecutive DWORD loads of one guest load through an address share
 one page lookup and issue together when the group lies in one page. Grouped loads turned up in

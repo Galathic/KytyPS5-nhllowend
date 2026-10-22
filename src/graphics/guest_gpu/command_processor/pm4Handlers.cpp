@@ -2264,7 +2264,17 @@ KYTY_CP_OP_PARSER(CpOpMarker) {
 			cp.FlipWithInterrupt(eop_event_type, cache_action, addr, value);
 			break;
 		}
-		default: EXIT("unknown marker at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, id);
+		default: {
+			// Markers carry no GPU work besides the flips above; an unknown one (NHL 27 issued
+			// 0x11 once while booting) is skipped and reported once per id.
+			static std::array<std::atomic<bool>, 0x1000> reported {};
+			if (!reported[id].exchange(true, std::memory_order_relaxed)) {
+				std::printf("NHL27MARKER: unknown marker 0x%" PRIx32 " at %05" PRIx32 " (%" PRIu32 " dwords) skipped\n",
+				            id, num_dw - dw, len_dw);
+				std::fflush(stdout);
+			}
+			break;
+		}
 	}
 
 	return len_dw + 1;
