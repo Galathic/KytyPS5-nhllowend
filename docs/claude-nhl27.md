@@ -872,6 +872,10 @@ One boot later stopped in the menus on a PM4 marker NOP the emulator did not kno
 the 0x6875 marker signature); unknown markers are now skipped and reported once
 (`NHL27MARKER`).
 
+Both CPU placements were measured on 8 cores / 16 logical CPUs: the second draw resolver now
+defaults on only with 16 or more logical CPUs (its default CPU is 14) and the game's threads keep
+off the stage cores only with 12 or more; their variables still force either way.
+
 Bit 42 `KYTY_BDA_LOAD_GROUPS` (default off; key bit 8192; `KYTY_DBG_BDA_GROUPS=1` prints
 `NHL27BDAGROUP` per shader): consecutive DWORD loads of one guest load through an address share
 one page lookup and issue together when the group lies in one page. Grouped loads turned up in

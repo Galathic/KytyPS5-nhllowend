@@ -63,8 +63,10 @@ uint64_t EnvironmentMask() {
 	set("KYTY_BDA_LOAD_GROUPS", BdaLoadGroups, false);
 	// On since 2026-10-22: with the stage cores kept for the stages, the resolve thread limited the
 	// heavier scenes; sharing its core with the game, the second resolver took 60 Hz play 57.4 ->
-	// 59.4 fps (paired rounds 413 / 447).
-	set("KYTY_DRAW_RESOLVER", DrawResolver, true);
+	// 59.4 fps (paired rounds 413 / 447). Measured on 16 logical CPUs (its default CPU is 14): with
+	// fewer it would take time from the game's threads, so it stays off there unless asked for.
+	const unsigned cpus = std::thread::hardware_concurrency();
+	set("KYTY_DRAW_RESOLVER", DrawResolver, cpus >= 16);
 	set("KYTY_GPU_COLOR_CLEAR", GpuColorClear, false);
 	set("KYTY_POOLED_BDA_BUFFERS", PooledBdaBuffers, false);
 	set("KYTY_ASYNC_GUEST_READS", AsyncGuestReads, false);
@@ -93,8 +95,9 @@ uint64_t EnvironmentMask() {
 	set("KYTY_SPECULATE_DIRTY_READS", SpeculateDirtyReads, false);
 	set("KYTY_CP_CLEAN_REG_READS", CpCleanRegReads, false);
 	set("KYTY_CP_SKIP_IDLE_SPIN", CpSkipIdleSpin, false);
-	// Two boots: execution-thread cost per draw -4..-7%, per dispatch -18..-20%.
-	set("KYTY_GUEST_OFF_STAGE_CORES", GuestOffStageCores, true);
+	// Two boots: execution-thread cost per draw -4..-7%, per dispatch -18..-20% (8 cores, 16 logical
+	// CPUs). With fewer than 12 logical CPUs the game would keep too few.
+	set("KYTY_GUEST_OFF_STAGE_CORES", GuestOffStageCores, cpus >= 12);
 	set("KYTY_GUEST_OFF_COPY_CORE", GuestOffCopyCore, false);
 	set("KYTY_GUEST_OFF_CP_CORES", GuestOffCpCores, false);
 	return mask;
