@@ -2196,30 +2196,36 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	TouchImage(image);
-	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
-		EXIT("TextureCache: texture requires rediscovery before final acquisition\n");
+	if (!image.info.data.Empty()) {
+		if (!image.registered || image.depth_id || image.binding.needs_rebind) {
+			EXIT("TextureCache: texture requires rediscovery before final acquisition\n");
+		}
 	}
 	if (desc.type == BindingType::Storage) {
 		image.MarkGpuModified();
 	}
-	RefreshImage(id);
-	if (image.info.HasStencil() &&
-	    desc.info.data.address >= image.info.stencil.address &&
-	    desc.info.data.End() <= image.info.stencil.End()) {
-		for (const auto stencil_id:
-		     FindImagesInRegion(image.info.stencil.address, image.info.stencil.size, false)) {
-			const auto* stencil = m_slot_images.try_get(stencil_id);
-			if (stencil != nullptr && stencil->depth_id == id &&
-			    stencil->info.data == image.info.stencil) {
-				RefreshImage(stencil_id);
-				break;
+	if (!image.info.data.Empty()) {
+		RefreshImage(id);
+		if (image.info.HasStencil() &&
+		    desc.info.data.address >= image.info.stencil.address &&
+		    desc.info.data.End() <= image.info.stencil.End()) {
+			for (const auto stencil_id:
+			     FindImagesInRegion(image.info.stencil.address, image.info.stencil.size, false)) {
+				const auto* stencil = m_slot_images.try_get(stencil_id);
+				if (stencil != nullptr && stencil->depth_id == id &&
+				    stencil->info.data == image.info.stencil) {
+					RefreshImage(stencil_id);
+					break;
+				}
 			}
 		}
 	}
 	switch (desc.type) {
 		case BindingType::Texture: break;
 		case BindingType::Storage:
-			CommitGpuWrite(image);
+			if (!image.info.data.Empty()) {
+				CommitGpuWrite(image);
+			}
 			TrackImageDownload(id, image);
 			break;
 		default: EXIT("TextureCache: invalid texture binding\n");

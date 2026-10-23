@@ -76,6 +76,12 @@ constexpr uint32_t NormalizeRegisterOffset(uint32_t raw_offset) {
 	return raw_offset & ~RegisterSelectorMask;
 }
 
+bool ReleaseMemGcrNeedsBarrier(uint32_t eop_event_type, uint32_t gcr_cntl) {
+	return eop_event_type != 0x28u ||
+	       (gcr_cntl & (GcrGl2MetadataInvalidate | GcrGl0VectorInvalidate | GcrGl1Invalidate |
+	                    GcrGl2Invalidate | GcrGl2Writeback)) != 0;
+}
+
 uint32_t ReleaseMemCacheActionFromGcr(uint32_t gcr_cntl) {
 	return ((gcr_cntl & GcrGl2Writeback) != 0 ? 0x38u : 0x00u);
 }
@@ -1281,13 +1287,12 @@ KYTY_HW_UC_PARSER(HwUcSetGdsOaRegisters) {
 KYTY_CP_OP_PARSER(CpOpAcquireMem) {
 	KYTY_PROFILER_FUNCTION();
 
-	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0055800 && cmd_id != 0xc0065800);
+	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0055800 && cmd_id != 0xc0065800 && cmd_id != 0xc0061050);
 	BufferCache::PerfCount(BufferCache::PerfEvent::AcquireMem);
 	if (BufferCache::GuestSyncOnly()) {
 		// Without the automatic per-dispatch barriers, the guest's cache acquire is the point
-		// where earlier shader writes must become visible. Stage-2 merge: the merged header
-		// keeps only the private execution-side barrier, so order through the public sync.
-		cp.SynchronizeGpu();
+		// where earlier shader writes must become visible.
+		cp.EmitGlobalBarrier();
 	}
 	return KYTY_PM4_LEN(cmd_id) - 1;
 }
@@ -2346,12 +2351,19 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 		}
 	};
 
-	// Cache actions only order GPU work, which the renderer's resource barriers already order.
 	if (data_sel == 0 || interrupt_selector == 4 ||
 	    (release_dst == ReleaseMemDstMemory && dst_gpu_addr == nullptr)) {
+		if (eop_event_type != 0x28 || gcr_cntl != 0) {
+			cp.EmitGlobalBarrier();
+		}
+
 		trigger_interrupt();
 
 		return 7;
+	}
+
+	if (ReleaseMemGcrNeedsBarrier(eop_event_type, gcr_cntl)) {
+		cp.EmitGlobalBarrier();
 	}
 
 	auto cache_action = ReleaseMemCacheActionFromGcr(gcr_cntl);

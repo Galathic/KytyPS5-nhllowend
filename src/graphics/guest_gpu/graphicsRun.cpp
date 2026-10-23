@@ -1668,7 +1668,7 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 		    m_pipeline->PendingClockWrite(reinterpret_cast<uint64_t>(addr), sizeof(T)) &&
 		    TestWaitRegMemValue(Sync::ReadReferenceClock(), ref, mask, func)) {
 			if (BufferCache::GuestSyncOnly()) {
-				ExecuteGlobalBarrier();
+				EmitGlobalBarrier();
 			}
 			return;
 		}
@@ -1701,7 +1701,7 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	// KYTY_GUEST_SYNC: labels are written at CP time, so a guest RELEASE_MEM + WAIT_REG_MEM pair
 	// no longer orders GPU work by itself. Without the automatic dispatch barriers the wait must.
 	if (BufferCache::GuestSyncOnly()) {
-		ExecuteGlobalBarrier();
+		EmitGlobalBarrier();
 	}
 	if (timed) {
 		const auto done = DecisionNowNs();
@@ -2585,9 +2585,7 @@ bool GuestGpu::Process(Submission& submission) {
 		case SubmissionType::SuspendPoint:
 			// Age caches at the frame boundary, not once per command list.
 			cp.RunGarbageCollector();
-			// Stage-2 merge: the merged header keeps only the execution-side
-		// ExecuteGlobalBarrier (private); order the suspend through the public sync.
-		cp.SynchronizeGpu();
+			cp.EmitGlobalBarrier();
 			// Registered at the operation's place in the stream: a pipelined command processor
 			// runs ahead of the recorded commands. Releasing the slot only touches host state.
 			cp.EmitHostCommand([this, ready = m_suspend_point_ready] {
@@ -2597,11 +2595,6 @@ bool GuestGpu::Process(Submission& submission) {
 				}, true);
 			});
 			cp.BufferFlush(CommandProcessor::FlushSite::Suspend);
-			m_renderer.RunGarbageCollector();
-			m_renderer.GetCommandScheduler().DeferPriorityOperation(
-			    [ready = m_suspend_point_ready] { ready->release(); });
-			cp.BufferFlush();
-
 			cp.Reset();
 			break;
 	}
@@ -3823,6 +3816,10 @@ void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_
 	WriteAtEndOfPipe(cache_policy, event_write_dest, eop_event_type, cache_action, event_index,
 	                 event_write_source, dst_gpu_addr, value, interrupt_selector,
 	                 interrupt_context_id, false);
+}
+
+void CommandProcessor::EmitGlobalBarrier() {
+	EmitCallback([this] { ExecuteGlobalBarrier(); }, GpuCallbackTag::Barrier);
 }
 
 void CommandProcessor::ExecuteGlobalBarrier() {
