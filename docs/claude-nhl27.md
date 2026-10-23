@@ -929,6 +929,37 @@ busy at about 400k operations/s (2.2-2.4 us each) and the GPU near its 14.6 ms p
 needs both about halved. The game asks whether 119.88 Hz output is supported (`KYTY_VBLANK_HZ=120`
 answers yes; `NHL27VIDEO` lines) but did not switch to it, and play ran the same.
 
+GPU side at uncapped rates (2026-10-23):
+* The guest's global barriers (about 190 a frame after the dedup, 14k/s) cost 2.1 ms of GPU time
+  per frame: a paused scene took 13.0 ms per flip with them and 10.9 ms with them left out (a
+  measurement only; leaving them out is what broke the ice image on 2026-10-20). Waiting only for
+  the stages recorded since the barrier before (64% compute only, 14% graphics only) changed
+  nothing (13.78 vs 13.80 ms): the cost is the drain and the cache maintenance themselves.
+* Per-dispatch timing in play (`KYTY_PERF_GPU_TIMING=2`): compute `d7cfa519` (a wave32 guest
+  shader with 152 VGPRs; on the host 256 VGPRs and 64 bytes of scratch) takes 2.2-2.8 ms per frame,
+  27% of the GPU time; `a36f0b4f` 1.1 ms. In some stretches (a minute of one match) compute
+  `d46af19f`, a horizon-search ambient occlusion pass at the internal resolution (two nested loops
+  over slices and steps, two depth samples per step, mostly f16), takes 6.4 ms per frame, 40% of
+  the GPU time; `KYTY_DBG_LOOP_CAP=256` left it unchanged, so its loops end normally.
+* The guest barriers now name the device-side accesses (shader, attachment and transfer writes;
+  the reads of every device stage) instead of MEMORY_WRITE/MEMORY_READ, which may also make the
+  driver write back and invalidate for the host: paused GPU A/B/A 13.75 / 13.65 / 13.82 ms per flip.
+* The game renders at 2348x1320 and upscales to 3840x2160.
+* `ExecBranches` off (bits 39/40) made the heaviest compute shaders 19-23% slower again.
+
+Execution thread at uncapped rates: about 400k operations/s, 92-94% busy; draws 3.4-3.7 us,
+dispatches 2.2-2.5 us, callbacks 0.5 us. 4% of it spun on the region tracking spin lock, which the
+guest threads' write faults hold across page-protection calls; CPU-dirty queries
+(`MemoryTracker::IsRegionCpuModified`) now read the region's bit words atomically without it
+(in-boot A/B: draw 3.80 -> 3.74 us). Another 4.7% waits in `HostCopyQueue::Drain` before
+guest-visible callbacks, for the copy thread's copies and the page protections it applies.
+Build variants (paused matches, two boots each; cross-boot scenes vary the draw cost by +-7%):
+ThinLTO (`-DKYTY_THIN_LTO=ON`) draw 3.43 -> 3.34 us, dispatch 2.19 -> 2.09 us; AVX2 on top
+(`-DKYTY_ARCH_AVX2=ON`, new option, off) draw 3.09 -> 3.31 us, fps 62.7 -> 66.1: nothing clear. Three soak
+matches with these changes: 63.5, 65.7 and 59.6 fps at 60 Hz (uncapped), no errors, images normal.
+`KYTY_DBG_STAGE_STATS=1` also prints `NHL27DRAINS`: drains before operations by callback tag, those
+that waited for the copy thread, and the time.
+
 `KYTY_DBG_LONG_OPS=<us>`: execution-thread operations taking that long print where the time went
 (`NHL27LONGOP`: waiting for their resolution, then the parts of executing them; the parts need
 `KYTY_PERF_STATS=1`; `KytyPS5-tools\longops.py` sums them up).

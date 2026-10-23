@@ -51,6 +51,9 @@ inline std::atomic<uint64_t> g_kind_count[8] {};
 // Callbacks by GpuCallbackTag (execution thread only).
 inline std::atomic<uint64_t> g_callback_ns[16] {};
 inline std::atomic<uint64_t> g_callback_count[16] {};
+// HostCopyQueue::Drain before operations, by callback tag (15: draws and other non-callbacks):
+// drains, those that had to wait for the copy thread, and the wait time.
+inline std::atomic<uint64_t> g_drain_count[16] {}, g_drain_waits[16] {}, g_drain_ns[16] {};
 inline thread_local Role     t_role = Role::Other;
 
 [[nodiscard]] inline bool Enabled() {

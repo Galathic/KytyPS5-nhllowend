@@ -733,6 +733,26 @@ static void PrintStageStats() {
 	static const char* const tags[] = {"other",   "bda",        "flush", "finish", "flip",
 	                                   "eop",     "event",      "barrier", "write-data", "dma",
 	                                   "clock",   "host",       "gc",    "flip-wait"};
+	{
+		// Waits for the host copy thread before operations (HostCopyQueue::Drain), by callback tag.
+		static uint64_t last_drains[16] {}, last_waits[16] {}, last_drain_ns[16] {};
+		std::string drains = "NHL27DRAINS:";
+		for (size_t k = 0; k < 16; k++) {
+			const auto count = StageStats::g_drain_count[k].load(std::memory_order_relaxed);
+			const auto waits = StageStats::g_drain_waits[k].load(std::memory_order_relaxed);
+			const auto ns    = StageStats::g_drain_ns[k].load(std::memory_order_relaxed);
+			if (count != last_drains[k]) {
+				drains += fmt::format(" {}={:.0f}/s waits={:.0f}/s {:.1f}ms/s", k < std::size(tags) ? tags[k] : "op",
+				                      static_cast<double>(count - last_drains[k]) / seconds,
+				                      static_cast<double>(waits - last_waits[k]) / seconds,
+				                      static_cast<double>(ns - last_drain_ns[k]) / 1e6 / seconds);
+			}
+			last_drains[k]   = count;
+			last_waits[k]    = waits;
+			last_drain_ns[k] = ns;
+		}
+		std::printf("%s\n", drains.c_str());
+	}
 	line = "NHL27CALLBACKS:";
 	for (size_t k = 0; k < std::size(tags); k++) {
 		const auto total_ns    = StageStats::g_callback_ns[k].load(std::memory_order_relaxed);
@@ -1369,7 +1389,25 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 		if (auto* copies = GetScheduler().HostCopies();
 		    copies != nullptr && !invisible &&
 		    (!dispatch || Common::Experiments::Enabled(Common::Experiments::CpuCopyForward))) {
-			copies->Drain();
+			if (StageStats::Enabled()) {
+				const auto tag   = operation.kind == GpuOperationKind::Callback
+				                       ? static_cast<size_t>(operation.callback_tag) & 15u
+				                       : size_t {15};
+				const auto start = std::chrono::steady_clock::now();
+				const bool waits = copies->Pending();
+				copies->Drain();
+				StageStats::g_drain_count[tag].fetch_add(1, std::memory_order_relaxed);
+				if (waits) {
+					StageStats::g_drain_waits[tag].fetch_add(1, std::memory_order_relaxed);
+					StageStats::g_drain_ns[tag].fetch_add(
+					    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+					                              std::chrono::steady_clock::now() - start)
+					                              .count()),
+					    std::memory_order_relaxed);
+				}
+			} else {
+				copies->Drain();
+			}
 		}
 	}
 	switch (operation.kind) {
@@ -3768,10 +3806,22 @@ void CommandProcessor::ExecuteGlobalBarrier() {
 	}
 
 	vk::MemoryBarrier2 barrier {};
-	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
-	barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
-	barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
-	barrier.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+	// The device-side accesses by name: with MEMORY_READ/WRITE the driver may also write back and
+	// invalidate for the host (paused GPU A/B: 13.75-13.82 -> 13.65 ms per flip).
+	barrier.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.dstStageMask = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.srcAccessMask = vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eColorAttachmentWrite |
+	                        vk::AccessFlagBits2::eDepthStencilAttachmentWrite | vk::AccessFlagBits2::eTransferWrite;
+	barrier.dstAccessMask =
+	    vk::AccessFlagBits2::eIndirectCommandRead | vk::AccessFlagBits2::eIndexRead |
+	    vk::AccessFlagBits2::eVertexAttributeRead | vk::AccessFlagBits2::eUniformRead |
+	    vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite |
+	    vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite |
+	    vk::AccessFlagBits2::eDepthStencilAttachmentRead | vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
+	    vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite;
+	if (m_renderer.GetGraphics().conditional_rendering_enabled) {
+		barrier.dstAccessMask |= vk::AccessFlagBits2::eConditionalRenderingReadEXT;
+	}
 
 	vk::DependencyInfo dependency {};
 	dependency.memoryBarrierCount = 1;

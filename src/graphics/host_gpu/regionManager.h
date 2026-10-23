@@ -139,6 +139,12 @@ public:
 		const auto& bits        = GetBits<source>();
 		return bits.AnyInRange(start, end);
 	}
+	// IsModified without the lock (see BitArray::AnyInRangeUnlocked).
+	template <DirtySource source>
+	[[nodiscard]] bool IsModifiedUnlocked(uint64_t offset, uint64_t size) const {
+		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
+		return GetBits<source>().AnyInRangeUnlocked(start, end);
+	}
 
 	template <DirtySource source, bool enable>
 	void ChangeState(uint64_t vaddr, uint64_t size) {

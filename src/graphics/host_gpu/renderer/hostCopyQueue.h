@@ -71,6 +71,10 @@ public:
 		}
 		return m_queued;
 	}
+	// Producer: whether a Drain() now would wait for the copy thread.
+	[[nodiscard]] bool Pending() const noexcept {
+		return m_completed.Load() != m_queued + m_pending.count;
+	}
 	// Any thread: waits until the first `count` copies completed.
 	void WaitFor(uint64_t count) noexcept { m_completed.WaitFor(count); }
 	// Producer: waits until every queued copy completed. The copies not handed over yet are done
