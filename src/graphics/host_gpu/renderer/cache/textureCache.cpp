@@ -58,7 +58,9 @@ constexpr uint64_t SmallTiledReadbackTexels = 64 * 64;
 		// Register clears belong to the color buffer; the texture pipe cannot decode them.
 		return desc.type == TextureCache::BindingType::RenderTarget &&
 		       metadata.clear_register_valid &&
-		       DecodeRegisterColorClear(format, metadata.clear_word, metadata.clear_word1, clear);
+		       DecodeRegisterColorClear(format, static_cast<uint32_t>(metadata.clear_word),
+		                                static_cast<uint32_t>(metadata.clear_word >> 32u),
+		                                clear);
 	}
 	if (cmask) {
 		return false;
@@ -747,6 +749,27 @@ ImageId TextureCache::GetNullImage(const ImageDesc& desc) {
 }
 
 void TextureCache::ValidateImageViewDesc(const ImageDesc& desc) const {
+	if (desc.view_info.format == vk::Format::eUndefined || desc.view_info.level_count == 0 ||
+	    desc.view_info.layer_count == 0 ||
+	    desc.view_info.base_level >= desc.info.resources.levels ||
+	    desc.view_info.level_count > desc.info.resources.levels - desc.view_info.base_level ||
+	    (!desc.info.IsVolume() &&
+	     (desc.view_info.base_layer >= desc.info.resources.layers ||
+	      desc.view_info.layer_count > desc.info.resources.layers - desc.view_info.base_layer))) {
+		EXIT("TextureCache: invalid image view description\n");
+	}
+	if (desc.type == BindingType::DepthTarget && !IsSupportedDepthTargetFormat(desc.info)) {
+		EXIT("TextureCache: unsupported depth image description\n");
+	}
+	if (desc.type == BindingType::VideoOut && !IsSupportedVideoOutFormat(desc.info)) {
+		EXIT("TextureCache: unsupported video-out image description\n");
+	}
+	if (desc.type == BindingType::VideoOut &&
+	    desc.info.metadata.compression == VideoOutCompression::Unsupported) {
+		EXIT("TextureCache: unsupported compressed video-out description\n");
+	}
+}
+
 void TextureCache::ValidateImageDesc(const ImageDesc& desc) const {
 	ImageOps::Validate(desc.info);
 

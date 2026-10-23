@@ -626,7 +626,6 @@ struct ShaderInfo {
 	bool                            coherent_buffers              = false;
 	bool                            float64                       = false;
 	bool                            native_draw                   = false;
-	bool                            subgroup_arithmetic           = false;
 	bool                            float16                       = false;
 	// KYTY_WORKGROUP_BUFFER_SYNC: barriers also order and publish buffer memory.
 	bool                            workgroup_buffer_sync         = false;

@@ -239,6 +239,8 @@ private:
 	// Validates the view and binding of a description; ImageOps::Validate() checks its image
 	// information.
 	void ValidateImageViewDesc(const ImageDesc& desc) const;
+	void ValidateImageDesc(const ImageDesc& desc) const;
+	[[nodiscard]] ImageId GetNullImage(const ImageDesc& desc);
 
 	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
 	// tolerant_write: the deferred guest write skips (instead of exiting) if the range was unmapped.

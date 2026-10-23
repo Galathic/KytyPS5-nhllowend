@@ -95,6 +95,8 @@ const bool g_perf_no_sync_readback = EnvFlag("KYTY_PERF_NO_SYNC_READBACK");
 
 bool PerfStatsEnabled() {
 	return g_perf_stats_enabled;
+}
+
 std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandScheduler& scheduler,
                                         StreamBuffer& staging, uint64_t size, uint64_t alignment,
                                         vk::BufferUsageFlags usage, const auto& write) {
@@ -3019,6 +3021,8 @@ void BufferCache::NoteGpuWrites(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid GPU write range\n");
 	}
+}
+
 void BufferCache::SynchronizeBda(const RangeSet& mapped) {
 	// Take before walking: writes queued during synchronization remain pending.
 	const auto pending = m_memory_tracker.TakeBdaSync();
@@ -3030,35 +3034,18 @@ void BufferCache::SynchronizeBda(const RangeSet& mapped) {
 }
 
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
-
 	const auto end = vaddr + size;
 	auto       it  = m_buffers.upper_bound(vaddr);
 	if (it != m_buffers.begin()) {
 		--it;
 	}
 	for (; it != m_buffers.end() && it->first < end; ++it) {
-		const auto& buffer = m_slot_buffers[it->second];
-		const auto  start  = std::max(buffer.CpuAddress(), vaddr);
-		const auto  finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
-		if (start >= finish) {
-			continue;
+		auto&      buffer = m_slot_buffers[it->second];
+		const auto start  = std::max(buffer.CpuAddress(), vaddr);
+		const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
+		if (start < finish) {
+			(void)SynchronizeBuffer(buffer, start, finish - start, false, false);
 		}
-		TouchBuffer(buffer);
-		m_memory_tracker.MarkRegionAsGpuModifiedUnlessCpuDirty(
-		    start, finish - start, [&](uint64_t page, uint64_t bytes) {
-			    const auto first = std::max(page, start);
-			    const auto last  = std::min(page + bytes, finish);
-			    RangeTicks::Note(first, last - first, m_scheduler.CurrentTick());
-			    {
-				    std::unique_lock ranges_lock(m_gpu_ranges_mutex);
-				    m_gpu_modified_ranges.Add(first, last - first);
-				    PublishGpuRangesVersion();
-				    PageWriteSeq::RaiseCurrent(first, last - first);
-			    }
-			    if (m_async_count.load(std::memory_order_acquire) != 0) {
-				    NoteAsyncReadbackWrite(first, last - first);
-			    }
-		    });
 	}
 }
 
@@ -3158,26 +3145,6 @@ void BufferCache::SynchronizeDirtyRegionsInRanges(const RangeSet& ranges, bool a
 	for (const auto& [index, epoch]: m_sync_regions) {
 		m_synced_region_epochs[index] = epoch;
 	}
-}
-
-void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
-	}
-	// Only tracking regions with pending CPU writes can have anything to upload.
-	m_memory_tracker.ForEachCpuDirtySpan(vaddr, size, [&](uint64_t span, uint64_t span_size) {
-		const auto end = span + span_size;
-		auto       it  = m_buffers.upper_bound(span);
-		if (it != m_buffers.begin()) {
-			--it;
-		}
-		for (; it != m_buffers.end() && it->first < end; ++it) {
-			auto&      buffer = m_slot_buffers[it->second];
-			const auto start  = std::max(buffer.CpuAddress(), span);
-			const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
-			if (start < finish) {
-				(void)SynchronizeBuffer(buffer, start, finish - start, false, false);
-			}
-		}
-	});
 }
 
 } // namespace Libs::Graphics

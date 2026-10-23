@@ -32,8 +32,10 @@ struct CachedImageView {
 };
 
 struct ImageUsage {
+	bool texture       = false;
 	bool storage       = false;
 	bool render_target = false;
+	bool depth_target  = false;
 	bool video_out     = false;
 };
 
