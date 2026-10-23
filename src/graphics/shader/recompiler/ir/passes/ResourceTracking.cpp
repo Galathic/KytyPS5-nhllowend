@@ -3994,7 +3994,7 @@ private:
 		}
 	}
 
-<	// A DMA address is usually a 64-bit base from a user-data register pair plus a per-lane
+	// A DMA address is usually a 64-bit base from a user-data register pair plus a per-lane
 	// offset: the low dword derives from register N and the high dword from register N + 1 (and,
 	// through the carry, from everything the low dword does). Record N so the host can cache the
 	// memory at the base before the shader runs; an access to memory without a cached buffer only

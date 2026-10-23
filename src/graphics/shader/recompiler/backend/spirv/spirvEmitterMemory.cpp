@@ -1429,7 +1429,8 @@ void StoreBdaDword(ValueEmitContext& ctx, uint32_t address, uint32_t active, uin
 void StoreIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
 	auto& state = ctx.state;
 	EmitIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
-		const auto buffer       = PrepareIndirectBuffer(ctx, inst);
+		const auto buffer       = PrepareIndirectBuffer(state, IndirectBufferArgs(ctx, inst),
+		                                              ctx.Memory(inst).formatted);
 		const auto valid_format = Binary(state, spv::OpINotEqual, TypeBool(state), buffer.format,
 		                                 ConstantU32(state, 0));
 		const auto base = Binary(state, spv::OpBitwiseAnd, TypeU64(state), buffer.address,
