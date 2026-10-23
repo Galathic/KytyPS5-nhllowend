@@ -105,6 +105,13 @@ private:
 	std::vector<std::pair<uint64_t, uint64_t>>& m_ranges;
 };
 
+// Retained reads no longer need the guest instruction PC. A clean read evaluates
+// its address and bounds through the strict reader as well as the final DWORD.
+struct SrtReadFlags {
+	uint32_t index = 0;
+	uint32_t clean = 0;
+};
+
 enum class RuntimeValueType { Any, Integer, ImmutableInteger };
 
 // Direct SRT reads (experiment DirectSrtReads, KYTY_DIRECT_SRT_READS): tests force them on (1),

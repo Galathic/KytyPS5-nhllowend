@@ -1358,6 +1358,7 @@ int KYTY_SYSV_ABI KernelTruncate(const char* path, int64_t length) {
 	}
 	LOGF("\tTruncate (size = %" PRId64 ") file: %s\n", length,
 	     Common::PathToString(real_name).c_str());
+	TraceSaveDataFileOp("truncate", path, length); // NHL debugging
 	return OK;
 }
 
@@ -1398,42 +1399,6 @@ int KYTY_SYSV_ABI KernelFtruncate(int d, int64_t length) {
 
 	LOGF("\tFtruncate (size = %" PRId64 ") file: %s\n", length,
 	     Common::PathToString(file->real_name).c_str());
-
-	return OK;
-}
-
-// sceKernelTruncate (WlyEA-sLDf0) was unresolved.
-int KYTY_SYSV_ABI KernelTruncate(const char* path, int64_t length) {
-	PRINT_NAME();
-
-	if (path == nullptr) {
-		return KERNEL_ERROR_EFAULT;
-	}
-	if (length < 0) {
-		return KERNEL_ERROR_EINVAL;
-	}
-
-	auto real_file_name = g_mount_points->ResolvePath(path);
-	if (real_file_name.empty()) {
-		return KERNEL_ERROR_ENOENT;
-	}
-	if (Common::IsArchivePath(real_file_name)) {
-		return KERNEL_ERROR_EROFS;
-	}
-	if (Common::File::IsDirectoryExisting(real_file_name)) {
-		return KERNEL_ERROR_EISDIR;
-	}
-	if (!Common::File::IsFileExisting(real_file_name)) {
-		return KERNEL_ERROR_ENOENT;
-	}
-
-	Common::File file(real_file_name, Common::File::Mode::ReadWrite);
-	if (file.IsInvalid() || !file.Truncate(static_cast<uint64_t>(length))) {
-		return KERNEL_ERROR_EIO;
-	}
-
-	TraceSaveDataFileOp("truncate", path, length); // NHL debugging
-	LOGF("\tKernelTruncate (size = %" PRId64 ") file: %s\n", length, path);
 
 	return OK;
 }
