@@ -577,9 +577,14 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	vk::PhysicalDeviceVulkan13Features supported_features13 {};
 	supported_features13.pNext = &supported_features12;
 
+	const auto robustness2_ext_enabled =
+	    HasExtension(device_extensions, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
+
 	vk::PhysicalDeviceRobustness2FeaturesEXT supported_robustness2 {};
-	supported_robustness2.pNext = supported_features13.pNext;
-	supported_features13.pNext = &supported_robustness2;
+	if (robustness2_ext_enabled) {
+		supported_robustness2.pNext = supported_features13.pNext;
+		supported_features13.pNext = &supported_robustness2;
+	}
 
 	const bool mesh_extension = HasExtension(device_extensions, VK_EXT_MESH_SHADER_EXTENSION_NAME);
 	vk::PhysicalDeviceMeshShaderFeaturesEXT supported_mesh {};

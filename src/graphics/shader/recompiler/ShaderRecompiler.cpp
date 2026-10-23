@@ -998,8 +998,7 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 			            reduction_stats.rewritten_reads);
 			std::fflush(stdout);
 			IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
-			IR::ResolveControlFlowIdentities(ir);
-			IR::RemoveIdentities(ir.blocks);
+			IR::RemoveIdentities(ir);
 			IR::EliminateDeadCode(ir.blocks);
 		}
 	}
@@ -1105,7 +1104,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 		if (std::getenv("KYTY_DBG_EXECSEL") != nullptr) std::printf("NHL27EXECSEL: hash=0x%016" PRIx64 " stage=%s selects=%u removed=%u\n", ir.shader_hash,
 		            StageName(ir.stage), selects, removed);
 		if (removed != 0) {
-			IR::RemoveIdentities(ir.blocks);
+			IR::RemoveIdentities(ir);
 			IR::EliminateDeadCode(ir.blocks);
 		}
 	}

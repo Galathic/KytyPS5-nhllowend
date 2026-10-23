@@ -6,6 +6,18 @@
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
 
+struct Pair {
+	uint32_t low  = 0;
+	uint32_t high = 0;
+};
+
+Pair ExtractPair(EmitterState& state, uint32_t value) {
+	Pair result {state.builder.AllocateId(), state.builder.AllocateId()};
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), result.low, value, 0);
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), result.high, value, 1);
+	return result;
+}
+
 uint32_t EmitMinMaxF64(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value) {
 	const auto bits_type = TypeU32Vector(state, 2);
 	const auto lhs_bits = Unary(state, spv::OpBitcast, bits_type, lhs);
