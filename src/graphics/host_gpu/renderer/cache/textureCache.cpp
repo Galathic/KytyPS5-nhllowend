@@ -1489,6 +1489,8 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	if (first >= layers || count > layers - first) {
 		EXIT("TextureCache: color view exceeds its native metadata slices\n");
 	}
+	const auto       slice_size = range.size / layers;
+	const GuestRange viewed {range.address + slice_size * first, slice_size * count};
 	// Only the selected slices are inspected below. Synchronize actual dirty bytes in that
 	// interval, rather than other layers or unrelated GPU-owned bytes on tracked pages.
 	const auto selected_address = range.address + slice_size * first;
@@ -1546,8 +1548,6 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		}
 		m_buffer_cache.ReadMemory(selected_address, selected_size, false,
 		                          BufferCache::ReadCaller::ColorClear);
-	const auto       slice_size = range.size / layers;
-	const GuestRange viewed {range.address + slice_size * first, slice_size * count};
 	if (m_buffer_cache.IsRegionGpuModified(viewed.address, viewed.size)) {
 		std::array<vk::ClearAttachment, TileManager::ColorClearSlots> clears {};
 		uint32_t keys = 0;
@@ -1925,7 +1925,6 @@ ImageId TextureCache::FindImageImpl(ImageDesc& desc, bool exact_format, bool spe
 		return result;
 	}
 	ImageOps::Validate(desc.info);
-	}
 	{
 		std::scoped_lock lock {m_lock};
 		bool block_alias = false;
@@ -2483,7 +2482,7 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 vk::Rect2D TextureCache::BeginColorRendering(Image& image, vk::Format format, uint32_t level,
                                              uint32_t layer, uint32_t layers,
                                              const vk::ClearValue* clear,
-                                             vk::CommandBuffer     command) {
+                                             CommandRecorder       command) {
 	ImageViewInfo view {};
 	view.format      = format;
 	view.type        = layers == 1 ? vk::ImageViewType::e2D : vk::ImageViewType::e2DArray;

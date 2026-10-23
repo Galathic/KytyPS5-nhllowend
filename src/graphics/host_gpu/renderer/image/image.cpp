@@ -84,7 +84,7 @@ ImageCreateFlags(const GraphicContext& graphics, const ImageInfo& info, vk::Imag
 					    vk::to_string(info.pixel_format), static_cast<int>(info.type),
 					    info.extent.width, info.extent.height, info.extent.depth,
 					    info.resources.levels, info.resources.layers, info.data.address,
-					    static_cast<uint32_t>(ImageCreateFlags(graphics, info))));
+					    static_cast<uint32_t>(ImageCreateFlags(graphics, info, storage))));
 				}
 			}
 		}

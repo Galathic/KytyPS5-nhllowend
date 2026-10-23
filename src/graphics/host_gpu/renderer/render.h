@@ -339,8 +339,14 @@ public:
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
 	                    const PipelineCache::Pipeline&     pipeline,
 	                    std::span<PreparedBindings* const> bindings);
+	// table_candidate rejects (EXIT) a texture whose guest memory cannot be read, for tables
+	// that keep T#s of freed textures, and declines depth/color conversions. examined receives
+	// the guest range before the lookup depends on the texture cache: a failure without it
+	// depends only on the T# and the guest backing.
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
-	                                            const ShaderRecompiler::IR::DescriptorValue& value);
+	                                            const ShaderRecompiler::IR::DescriptorValue& value,
+	                                            bool        table_candidate = false,
+	                                            GuestRange* examined        = nullptr);
 
 private:
 	// False, with nothing drawn, when the draw's indirect records need CPU counts.
@@ -424,14 +430,6 @@ private:
 	};
 	std::array<SamplerMemoEntry, 256> m_sampler_memo {};
 
-	// table_candidate rejects (EXIT) a texture whose guest memory cannot be read, for tables
-	// that keep T#s of freed textures, and declines depth/color conversions. examined receives
-	// the guest range before the lookup depends on the texture cache: a failure without it
-	// depends only on the T# and the guest backing.
-	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
-	                                            const ShaderRecompiler::IR::DescriptorValue& value,
-	                                            bool        table_candidate = false,
-	                                            GuestRange* examined        = nullptr);
 	[[nodiscard]] TextureBinding
 	ResolveTableTexture(const ShaderRecompiler::IR::ImageResource&   root,
 	                    const ShaderRecompiler::IR::DescriptorValue& value,

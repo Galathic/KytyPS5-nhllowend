@@ -586,15 +586,6 @@ static bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, boo
 static TextureDescDerivation DeriveTextureDesc(const ShaderRecompiler::IR::ImageResource& resource,
                                                const ShaderTextureResource& descriptor) {
 	const bool storage = resource.written;
-	if (storage) {
-		ValidateStorageImageResource(resource);
-	}
-
-	auto& texture_cache = m_context.GetTextureCache();
-	if (descriptor.IsNull()) {
-		return {.layout = vk::ImageLayout::eGeneral};
-	}
-
 
 	const auto address         = descriptor.Base40();
 	const auto width           = static_cast<uint32_t>(descriptor.Width5()) + 1u;
@@ -702,10 +693,6 @@ static TextureDescDerivation DeriveTextureDesc(const ShaderRecompiler::IR::Image
 	const auto alignment = desc.info.DataAlignment();
 	EXIT_NOT_IMPLEMENTED(desc.info.data.size == 0 || alignment == 0 ||
 	                     (address & (static_cast<uint64_t>(alignment) - 1u)) != 0);
-	// Image heaps keep the descriptors of unmapped textures, which PS5 never samples.
-	if (resource.heap && !m_context.IsMapped(address, desc.info.data.size)) {
-		return {.layout = vk::ImageLayout::eGeneral};
-	}
 	if (storage) {
 		ValidateStorageTexture(resource, descriptor, desc.info.data.size);
 	}
@@ -837,6 +824,11 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		cached = m_texture_descs.emplace(key, std::move(derived)).first;
 	}
 	auto& derived = cached->second;
+	// Image heaps keep the descriptors of unmapped textures, which PS5 never samples.
+	if (resource.heap &&
+	    !m_context.IsMapped(derived.desc.info.data.address, derived.desc.info.data.size)) {
+		return {.layout = vk::ImageLayout::eGeneral};
+	}
 	// Sampled textures without metadata or stencil: the image and view the last lookup of this
 	// description found, when nothing they depend on changed (see TextureDescDerivation::Found).
 	// Lookups with metadata materialize fast clears and run every time.
@@ -1209,6 +1201,11 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		// Sampled textures whose last lookup still holds are written in place.
 		const auto& resource = program.info.images[i];
+		// Bindless heap images resolve through the image heap, not the texture cache.
+		if (resource.heap) {
+			prepared.images[i] = {};
+			continue;
+		}
 		if (!resource.written &&
 		    resource.mip_mode != ShaderRecompiler::IR::ImageMipMode::Dynamic) {
 			auto* derived = image_descs[i];
@@ -1223,10 +1220,6 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 				BindImage(prepared.images[i].image_id, false);
 				continue;
 			}
-		if (program.info.images[i].heap) {
-			prepared.images[i] = {};
-			continue;
-
 		}
 		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
 		// The description whose lookups later draws reuse (see ResolveTexture()).
@@ -1602,11 +1595,12 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 			m_context.CacheDmaBases(*stage->runtime);
 			uses_dma = true;
 		}
-		uses_dma |= stage->runtime->program->info.uses_dma;
 		uses_image_heap |= stage->runtime->program->info.uses_image_heap;
-
 	}
 	if (uses_dma) m_context.PrepareBda();
+	if (uses_image_heap) {
+		m_context.GetImageHeap().Rebind(*this);
+	}
 	{
 		FrameBreakdown::Timer textures_timer(FrameBreakdown::g_counters.dp_textures_ns);
 		FrameBreakdown::TexScope tex_scope;
@@ -1614,24 +1608,6 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 			FrameBreakdown::Timer rebind_timer(FrameBreakdown::g_tex.rebind_ns, FrameBreakdown::TexOn());
 			for (auto* stage: stages) {
 				RebindImages(*stage);
-	if (uses_dma) {
-		m_context.PrepareBda();
-	}
-	if (uses_image_heap) {
-		m_context.GetImageHeap().Rebind(*this);
-	}
-	for (auto* stage: stages) {
-		RebindImages(*stage);
-	}
-	auto& cache = m_context.GetTextureCache();
-	for (auto& target: colors) {
-		EXIT_IF(!target.image_id);
-		const auto old_image = cache.m_slot_images.try_get(target.image_id);
-		if (old_image == nullptr || !old_image->registered ||
-		    old_image->binding.needs_rebind) {
-			if (old_image != nullptr) {
-				old_image->binding = {};
-
 			}
 		}
 		auto& cache = m_context.GetTextureCache();
@@ -1643,9 +1619,6 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 			    old_image->binding.needs_rebind) {
 				if (old_image != nullptr) {
 					old_image->binding = {};
-	}
-	}
-	}
 				}
 				InvalidateRenderTargetMemo();
 				target.desc.view_info.base_level = target.guest_mip_level;
@@ -1653,7 +1626,6 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 				target.image_id = cache.FindImage(target.desc);
 				BindRenderTarget(target.image_id);
 			}
-
 		}
 	}
 	// Discovery can read back PS5 metadata and submit the scheduler. Reserve draw buffers only
@@ -1764,15 +1736,6 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				for (const auto& [written_address, written_size]: ranges.get()) {
 					written_lo = std::min(written_lo, written_address);
 					written_hi = std::max(written_hi, written_address + written_size);
-					// ADD_TID and swizzle move fixed-offset writes past write_extent.
-					const bool linear = (resource.packed_stride & ((1u << 14u) | (1u << 20u))) == 0u;
-					const auto written_size =
-					    linear ? std::min<uint64_t>(written.size, resource.write_extent) : written.size;
-					if (written_size != 0 && ImageRangeOverlaps(address, size,
-					                                          written.address, written_size)) {
-						EXIT("scalar resource reads overlap a shader buffer write\n");
-					}
-
 				}
 			}
 		}
@@ -1785,7 +1748,6 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			if (run_end != 0 && address >= run_begin && address <= run_end) {
 				run_end = std::max(run_end, address + size);
 				continue;
-			}
 			}
 			if (run_end != 0) check_read(run_begin, run_end - run_begin);
 			run_begin = address;
@@ -1818,17 +1780,18 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		}
 
 		const auto transit = [&](TextureBinding& binding) {
-		for (uint32_t i = 0; i < program.info.images.size(); i++) {
-			auto& binding = descriptors.images[i];
-			if (!binding.image_id) continue;
-	}
-
 			auto& image = m_context.GetTextureCache().GetImage(binding.image_id);
 			const auto&                 view = binding.desc.view_info;
 			const ImageSubresourceRange range {view.base_level, view.level_count, view.base_layer,
 			                                   view.layer_count};
 			const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
-			if (image.binding.is_target) {
+			if (image.info.data.Empty()) {
+				image.Transit(vk::ImageLayout::eGeneral,
+				              storage ? vk::AccessFlagBits2::eShaderRead |
+				                            vk::AccessFlagBits2::eShaderWrite
+				                      : vk::AccessFlagBits2::eShaderRead,
+				              range, vk_buffer);
+			} else if (image.binding.is_target) {
 				const auto layout = image.binding.attachment_layout;
 				EXIT_IF(layout == vk::ImageLayout::eUndefined);
 				if (image.info.IsDepth()) {
