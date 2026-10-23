@@ -573,6 +573,8 @@ bool RobustLoad(const EmitterState& state, IR::ResourceKind kind) {
 	const bool spills = state.program.info.function_lds || state.program.scratch_dwords != 0;
 	return (kind == IR::ResourceKind::Buffer || kind == IR::ResourceKind::ScalarBuffer) && ShaderRobustLoads() &&
 	       (!spills || (ShaderRobustSpillLoads() && state.program.stage != ShaderType::Pixel));
+}
+
 template <typename Fn>
 auto EmitBufferAccess(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem,
                       uint32_t components, Fn&& emit) {
