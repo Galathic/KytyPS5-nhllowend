@@ -1116,7 +1116,6 @@ int64_t KYTY_SYSV_ABI KernelPwritev(int d, const KernelIovec* iov, int iovcnt, i
 	PRINT_NAME();
 	return Writev(d, iov, iovcnt, offset);
 }
-}
 
 int64_t KYTY_SYSV_ABI KernelLseek(int d, int64_t offset, int whence) {
 	PRINT_NAME();

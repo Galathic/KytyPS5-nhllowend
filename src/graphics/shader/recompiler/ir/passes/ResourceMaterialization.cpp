@@ -306,6 +306,35 @@ const DescriptorSource* Source(const ResourcePlan& program, uint32_t source) {
 	return &program.descriptor_sources[source];
 }
 
+void MarkCleanReads(const std::unordered_set<const Inst*>& planned_reads,
+                    const DescriptorSource* source, Value extra = {}) {
+	if (source == nullptr && extra.IsEmpty()) {
+		return;
+	}
+	std::vector<Value> pending;
+	if (source != nullptr) {
+		pending.assign(source->dwords.begin(), source->dwords.begin() + source->dword_count);
+	}
+	if (!extra.IsEmpty()) pending.push_back(extra);
+	std::vector<const Inst*> visited;
+	while (!pending.empty()) {
+		auto* inst = pending.back().Resolve().TryInstruction();
+		pending.pop_back();
+		if (inst == nullptr || std::ranges::find(visited, inst) != visited.end()) {
+			continue;
+		}
+		visited.push_back(inst);
+		if (planned_reads.contains(inst)) {
+			auto flags = inst->Flags<SrtReadFlags>();
+			flags.clean = 1u;
+			inst->SetFlags(flags);
+		}
+		for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
+			pending.push_back(inst->Arg(arg));
+		}
+	}
+}
+
 void MarkCleanFlatSlots(const ResourcePlan& program, const DescriptorSource* source,
                         std::span<uint8_t> slots, Value extra = {}) {
 	if (source == nullptr && extra.IsEmpty()) {
@@ -2125,7 +2154,7 @@ static bool MaterializeResourcesCore(const ResourcePlan& program, const SrtRunti
 	     runtime.read_specialization_memory == nullptr)) {
 		return false;
 	}
-<	MaterializationTimer timer(runtime.materialization_timings);
+	MaterializationTimer timer(runtime.materialization_timings);
 	const auto uses_workgroup_count = [](const DescriptorSource& source) {
 		return source.indirect_descriptor && source.indirect_descriptor->workgroup_axis != UINT32_MAX;
 	};
