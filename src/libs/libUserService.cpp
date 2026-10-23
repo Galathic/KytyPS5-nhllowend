@@ -3,16 +3,29 @@
 #include "common/emulatorConfig.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
+#include "libs/controller.h"
 #include "loader/symbolDatabase.h"
 
 #include <cstdio>
 #include <cstring>
+#include <string>
 
 namespace Libs {
 
 LIB_VERSION("UserService", 1, "UserService", 1, 1);
 
 namespace UserService {
+
+// The player slot of a logged-in user; -1 for unknown users and secondary players whose
+// controller is disconnected.
+static int PlayerIndex(int user_id) {
+	for (int i = 0; i < Controller::PLAYER_SLOT_COUNT; ++i) {
+		if (Controller::GetPlayerUserId(i) == user_id && Controller::IsPlayerControllerConnected(i)) {
+			return i;
+		}
+	}
+	return -1;
+}
 
 struct UserServiceLoginUserIdList {
 	int user_id[4];
@@ -66,12 +79,21 @@ static KYTY_SYSV_ABI int UserServiceGetEvent(SceUserServiceEvent* event) {
 
 	EXIT_NOT_IMPLEMENTED(event == nullptr);
 
+	// Player one logs in once; secondary players follow in the order their controllers changed.
 	static bool logged_in = false;
 
 	if (!logged_in) {
 		logged_in         = true;
 		event->event_type = UserServiceEventTypeLogin;
 		event->user_id    = Config::GetUserId();
+		return OK;
+	}
+
+	int32_t user_id   = 0;
+	bool    connected = false;
+	if (Controller::PollPlayerConnectionEvent(&user_id, &connected)) {
+		event->event_type = connected ? UserServiceEventTypeLogin : UserServiceEventTypeLogout;
+		event->user_id    = user_id;
 		return OK;
 	}
 
@@ -83,22 +105,29 @@ static KYTY_SYSV_ABI int UserServiceGetLoginUserIdList(UserServiceLoginUserIdLis
 
 	EXIT_NOT_IMPLEMENTED(user_id_list == nullptr);
 
-	user_id_list->user_id[0] = Config::GetUserId();
-	user_id_list->user_id[1] = -1;
-	user_id_list->user_id[2] = -1;
-	user_id_list->user_id[3] = -1;
+	// Connected players in slot order, without gaps.
+	int count = 0;
+	for (int i = 0; i < Controller::PLAYER_SLOT_COUNT; ++i) {
+		if (Controller::IsPlayerControllerConnected(i)) {
+			user_id_list->user_id[count++] = Controller::GetPlayerUserId(i);
+		}
+	}
+	for (; count < 4; ++count) {
+		user_id_list->user_id[count] = -1;
+	}
 
 	return OK;
 }
 
 static KYTY_SYSV_ABI int UserServiceGetUserName(int user_id, char* name, size_t size) {
-	if (user_id != Config::GetUserId()) {
+	const int player = PlayerIndex(user_id);
+	if (player < 0) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
 	EXIT_NOT_IMPLEMENTED(size < 5);
 
-	const auto& user_name = Config::GetUserName();
-	int         s         = snprintf(name, size, "%s", user_name.c_str());
+	const auto user_name = player == 0 ? Config::GetUserName() : "Player" + std::to_string(player + 1);
+	int        s         = snprintf(name, size, "%s", user_name.c_str());
 
 	EXIT_NOT_IMPLEMENTED(static_cast<size_t>(s) >= size);
 
@@ -111,11 +140,12 @@ static KYTY_SYSV_ABI int UserServiceGetUserNumber(int user_id, int32_t* number) 
 	if (number == nullptr) {
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
-	if (user_id != Config::GetUserId()) {
+	const int player = PlayerIndex(user_id);
+	if (player < 0) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
 
-	*number = 1;
+	*number = player + 1; // One-based player slot from the same connection snapshot.
 
 	return OK;
 }
@@ -126,7 +156,7 @@ static KYTY_SYSV_ABI int UserServiceGetGamePresets(int user_id, UserServiceGameP
 	if (presets == nullptr) {
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
-	if (user_id != Config::GetUserId()) {
+	if (PlayerIndex(user_id) < 0) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
 
@@ -147,7 +177,7 @@ static KYTY_SYSV_ABI int UserServiceGetAccessibilityVibration(int user_id, int32
 	if (vibration == nullptr) {
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
-	if (user_id != Config::GetUserId()) {
+	if (PlayerIndex(user_id) < 0) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
 
@@ -163,7 +193,7 @@ static KYTY_SYSV_ABI int UserServiceGetAccessibilityTriggerEffect(int      user_
 	if (trigger_effect == nullptr) {
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
-	if (user_id != Config::GetUserId()) {
+	if (PlayerIndex(user_id) < 0) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
 
@@ -178,7 +208,7 @@ static KYTY_SYSV_ABI int UserServiceGetAgeLevel(int user_id, uint32_t* age_level
 	if (age_level == nullptr) {
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
-	if (user_id != Config::GetUserId()) {
+	if (PlayerIndex(user_id) < 0) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
 
@@ -194,7 +224,7 @@ static KYTY_SYSV_ABI int UserServiceGetAccessibilityChatTranscription(int      u
 	if (chat_transcription == nullptr) {
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
-	if (user_id != Config::GetUserId()) {
+	if (PlayerIndex(user_id) < 0) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
 
@@ -210,7 +240,7 @@ UserServiceGetAccessibilityPressAndHoldDelay(int user_id, int32_t* press_and_hol
 	if (press_and_hold_delay == nullptr) {
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
-	if (user_id != Config::GetUserId()) {
+	if (PlayerIndex(user_id) < 0) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
 
@@ -226,7 +256,7 @@ static KYTY_SYSV_ABI int UserServiceGetAccessibilityZoomEnabled(int      user_id
 	if (zoom_enabled == nullptr) {
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
-	if (user_id != Config::GetUserId()) {
+	if (PlayerIndex(user_id) < 0) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
 
@@ -242,7 +272,7 @@ static KYTY_SYSV_ABI int UserServiceGetAccessibilityZoomFollowFocus(int      use
 	if (zoom_follow_focus == nullptr) {
 		return USER_SERVICE_ERROR_INVALID_ARGUMENT;
 	}
-	if (user_id != Config::GetUserId()) {
+	if (PlayerIndex(user_id) < 0) {
 		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
 	}
 

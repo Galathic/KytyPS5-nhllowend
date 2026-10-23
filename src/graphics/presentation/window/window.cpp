@@ -298,11 +298,9 @@ static void GameEventFinger([[maybe_unused]] const EventFinger& f) {
 
 static void GameEventController([[maybe_unused]] const EventController& f) {
 	// A new mapping changes how SDL translates the device. SDL sends no release or neutral axis
-	// events for the old mapping, so input held on the active controller would stay stuck.
+	// events for the old mapping, so input held on that controller's player would stay stuck.
 	if (f.remapped) {
-		if (Controller::GetActiveControllerId() == f.id) {
-			Controller::ResetInputState();
-		}
+		Controller::ResetControllerInputState(f.id);
 		return;
 	}
 

@@ -17,6 +17,7 @@ struct Lifecycle {
 };
 
 constexpr int HOST_INPUT_CONTROLLER_ID = -1000;
+constexpr int PLAYER_SLOT_COUNT = 4;
 
 constexpr uint32_t PAD_BUTTON_L3        = 0x00000002;
 constexpr uint32_t PAD_BUTTON_R3        = 0x00000004;
@@ -74,7 +75,17 @@ void SetRightStick(int id, int x, int y);
 void SetTouchPad(int id, int finger, bool down, float x, float y);
 void SetSensor(int id, Sensor sensor, const float* data, uint64_t time_us);
 void ResetInputState();
-int  GetActiveControllerId();
+// Resets the held input of the player that owns the host input source (SDL gamepad ID or keyboard).
+void ResetControllerInputState(int id);
+
+// Players are zero-based slots 0 through PLAYER_SLOT_COUNT - 1. Player one is the configured user
+// and is always connected through the keyboard pseudo-device.
+int32_t GetPlayerUserId(int player_index);
+bool    IsPlayerControllerConnected(int player_index);
+// Pops one queued login (connected) or logout transition of a secondary player; false when empty.
+bool PollPlayerConnectionEvent(int32_t* user_id, bool* connected);
+// The SDL instance ID of the gamepad assigned to the user, or -1 when there is none.
+int GetPlayerControllerIdForUser(int32_t user_id);
 
 enum class Setting { SpeakerVolume, VibrationIntensity, TriggerEffectIntensity };
 

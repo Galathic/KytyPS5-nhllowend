@@ -101,7 +101,7 @@ public:
 
 	KYTY_CLASS_NO_COPY(Audio);
 
-	Id       AudioOutOpen(int type, uint32_t samples_num, uint32_t freq, Format format);
+	Id       AudioOutOpen(int user_id, int type, uint32_t samples_num, uint32_t freq, Format format);
 	bool     AudioOutClose(Id handle);
 	bool     AudioOutValid(Id handle);
 	bool     AudioOutHasDevice(Id handle);
@@ -120,6 +120,7 @@ public:
 private:
 	struct PortOut {
 		bool        used        = false;
+		int         user_id     = 0;
 		int         type        = 0;
 		uint32_t    samples_num = 0;
 		uint32_t    freq        = 0;
@@ -176,7 +177,7 @@ int AudioOutOpen(int type, uint32_t samples_num, uint32_t freq, Format format) {
 		return 0;
 	}
 
-	auto id = g_audio->AudioOutOpen(type, samples_num, freq, format);
+	auto id = g_audio->AudioOutOpen(Config::GetUserId(), type, samples_num, freq, format);
 	return id.IsValid() ? id.ToInt() : 0;
 }
 
@@ -426,7 +427,7 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking, float 
 	return true;
 }
 
-Audio::Id Audio::AudioOutOpen(int type, uint32_t samples_num, uint32_t freq, Format format) {
+Audio::Id Audio::AudioOutOpen(int user_id, int type, uint32_t samples_num, uint32_t freq, Format format) {
 	if (freq == 0) {
 		return Id::Invalid();
 	}
@@ -438,6 +439,7 @@ Audio::Id Audio::AudioOutOpen(int type, uint32_t samples_num, uint32_t freq, For
 			auto& port = m_out_ports[id];
 
 			port.used        = true;
+			port.user_id     = user_id;
 			port.type        = type;
 			port.samples_num = samples_num;
 			port.freq        = freq;
@@ -565,8 +567,11 @@ uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking
 		if (port.haptics != nullptr) {
 			// Keep the stream alive against close and volume changes.
 			Common::LockGuard lock(m_mutex);
+			// The stream plays on the controller of the user that opened the port. Without one
+			// (-1) the queue fails and the fallback below applies.
 			controller_queued_us = Controller::DualSenseHaptics::Queue(
-			    port.haptics, Controller::GetActiveControllerId(), params[i].data, port.samples_num,
+			    port.haptics, Controller::GetPlayerControllerIdForUser(port.user_id),
+			    params[i].data, port.samples_num,
 			    static_cast<uint32_t>(port.channels_num), FormatIsFloat(port.format), port.volume,
 			    gain, params[i].gains);
 			controller_uses_bluetooth =
@@ -897,7 +902,7 @@ static int AudioOutOpenImpl(int user_id, int type, int index, uint32_t len, uint
 
 	EXIT_IF(g_audio == nullptr);
 
-	auto id = g_audio->AudioOutOpen(type, len, freq, format);
+	auto id = g_audio->AudioOutOpen(user_id, type, len, freq, format);
 
 	if (!id.IsValid()) {
 		return AUDIO_OUT_ERROR_PORT_FULL;
