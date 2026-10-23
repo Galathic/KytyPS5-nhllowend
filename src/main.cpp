@@ -121,6 +121,22 @@ static bool NextArg(int argc, char* argv[], int& index, std::string& out) {
 	return true;
 }
 
+static bool ParseBool(const std::string& value, bool& out) {
+	if (Common::EqualNoCase(value, "true") || value == "1" || Common::EqualNoCase(value, "yes") ||
+	    Common::EqualNoCase(value, "on")) {
+		out = true;
+		return true;
+	}
+
+	if (Common::EqualNoCase(value, "false") || value == "0" || Common::EqualNoCase(value, "no") ||
+	    Common::EqualNoCase(value, "off")) {
+		out = false;
+		return true;
+	}
+
+	return false;
+}
+
 template <typename E>
 static bool ParseEnum(const std::string& value, E& out) {
 	auto enum_value = magic_enum::enum_cast<E>(value.c_str());
