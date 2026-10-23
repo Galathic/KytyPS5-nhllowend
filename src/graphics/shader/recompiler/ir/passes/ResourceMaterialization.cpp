@@ -2159,8 +2159,18 @@ static bool MaterializeResourcesCore(const ResourcePlan& program, const SrtRunti
 	     std::ranges::any_of(program.descriptor_sources, uses_workgroup_count));
 	auto& reads = snapshot.specialization_reads;
 	reads = program.source_reads;
-	SrtReadCapture capture {runtime, reads};
-	auto observed = capture_reads ? capture.ObservedRuntime() : runtime;
+	ReadCapture capture {runtime, reads, Common::RuntimeFlags::Current().srt_source_reuse};
+	SrtRuntime observed = runtime;
+	if (capture_reads) {
+		observed.userdata = &capture;
+		observed.read_specialization_memory = runtime.read_specialization_memory != nullptr
+		                                         ? CaptureStrictRead : nullptr;
+		observed.read_memory = CaptureOrdinaryRead;
+		observed.try_read_specialization_span = runtime.try_read_specialization_span != nullptr
+		                                           ? CaptureStrictSpan : nullptr;
+		observed.try_read_memory_span = runtime.try_read_memory_span != nullptr
+		                                   ? CaptureOrdinarySpan : nullptr;
+	}
 	SrtWalker clean(program, CleanRuntime(observed));
 	SrtWalker walker(program, observed, program.clean_flat_slots,
 	                 capture_reads || program.requires_specialization_memory ? &clean : nullptr);

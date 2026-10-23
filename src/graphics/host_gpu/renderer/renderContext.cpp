@@ -265,8 +265,6 @@ void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	m_bda_new_ranges.Add(vaddr, size);
 	++m_mapping_generation;
 	m_mapped_ranges_version++;
-	m_buffer_cache.QueueBdaSync(vaddr, size);
-
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -552,9 +550,6 @@ void RenderContext::PrepareBda() {
 	}
 	m_bda_batch_synced = true;
 	total_timer.Stop();
-	// Lazy BDA faults still need processing even when uploads were unchanged.
-	m_buffer_cache.SynchronizeBda(m_mapped_ranges);
-
 	m_fault_process_pending = true;
 	if (stats_enabled && ((m_bda_stats.scans + m_bda_stats.reused) & 4095u) == 0) {
 		static auto last = std::chrono::steady_clock::now();

@@ -397,7 +397,9 @@ bool RenderExecutor::TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 	if (!image_clear) {
 		// CPU fills invalidate overlapping cached images. Preserve the native dispatch for
 		// partial or ambiguous image backings, including pooled metadata aliases.
-		if ((descriptor.Base48() & 3u) != 0 ||
+		// Larger fills stay on the GPU: a CPU fill would also have to be uploaded again.
+		constexpr uint64_t MaxBufferFill = uint64_t {1} << 20u;
+		if ((descriptor.Base48() & 3u) != 0 || size > MaxBufferFill ||
 		    !m_context.IsMapped(descriptor.Base48(), size) ||
 		    cache.IsRegionRegistered(descriptor.Base48(), size)) {
 			return false;

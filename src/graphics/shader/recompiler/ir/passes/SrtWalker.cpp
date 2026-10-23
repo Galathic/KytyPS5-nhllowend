@@ -37,6 +37,9 @@ SrtRuntime SrtReadCapture::ObservedRuntime() {
 	runtime.read_specialization_memory = m_source.read_specialization_memory != nullptr
 	                                         ? ReadStrict : nullptr;
 	runtime.read_memory = ReadOrdinary;
+	// Span readers would bypass the capture (and receive its userdata): reads go word by word.
+	runtime.try_read_memory_span = nullptr;
+	runtime.try_read_specialization_span = nullptr;
 	return runtime;
 }
 

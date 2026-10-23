@@ -352,11 +352,6 @@ public:
 		}
 		return epoch;
 	}
-	void               SynchronizeBda(const RangeSet& mapped);
-	void               QueueBdaSync(uint64_t vaddr, uint64_t size) {
-		m_memory_tracker.QueueBdaSync(vaddr, size);
-
-	}
 	void               RunGarbageCollector();
 
 private:
