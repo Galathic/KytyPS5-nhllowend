@@ -165,10 +165,14 @@ enum class GpuStageThread : uint32_t {
 	Execution        = 1,
 	Recording        = 2,
 	Resolve          = 3,
-	HostCopy         = 4
+	HostCopy         = 4,
+	DispatchResolve  = 5,
+	DrawResolve      = 6
 };
 // Applies the priority and affinity of `stage` to the calling thread.
 void ConfigureGpuStageThread(GpuStageThread stage);
+// The logical CPU `stage` is pinned to (-1: none).
+[[nodiscard]] int GpuStageCpu(GpuStageThread stage);
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled();
 #endif

@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/memoryTracker.h"
+#include "graphics/host_gpu/pageWriteSeq.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -71,12 +72,13 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	return Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-		// A region without CPU-dirty pages answers without its lock (see HasCpuDirty()).
+		// Without the region lock: a CPU write the query does not see yet is one that lands after
+		// it, and the guest threads' write faults hold the lock across page-protection changes
+		// (in-boot A/B: execution time per draw -1.6%).
 		if (!manager->HasCpuDirty()) {
 			return false;
 		}
-		std::scoped_lock lock(manager->lock);
-		return manager->IsModified<DirtySource::Cpu>(offset, bytes);
+		return manager->IsModifiedUnlocked<DirtySource::Cpu>(offset, bytes);
 	});
 }
 
@@ -107,6 +109,7 @@ void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
 
 void MemoryTracker::MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
+	PageWriteSeq::RaiseCurrent(vaddr, size);
 	Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
 		manager->ChangeState<DirtySource::Gpu, true>(manager->GetCpuAddr() + offset, bytes);

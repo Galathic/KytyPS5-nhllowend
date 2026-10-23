@@ -3,6 +3,7 @@
 
 #include "common/abi.h"
 #include "common/common.h"
+#include "common/experiments.h"
 #include "common/lruCache.h"
 #include "common/slotVector.h"
 #include "graphics/host_gpu/memoryTracker.h"
@@ -212,6 +213,29 @@ public:
 	                                                              bool is_written, bool is_texel_buffer,
 	                                                              BufferId id = {});
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
+	// A plain read ObtainBufferCached served from `buffer` when the registration generation was
+	// `registration` and the CPU modification generation `cpu_generation`: whether the same buffer
+	// and offset still hold (registration unchanged, range not CPU-modified since); touches it and
+	// advances `cpu_generation`. The stream buffer never holds.
+	[[nodiscard]] bool PlainReadHolds(Buffer& buffer, uint64_t vaddr, uint64_t size, uint64_t& cpu_generation,
+	                                  uint64_t registration);
+	[[nodiscard]] bool IsStreamBuffer(const Buffer* buffer) const noexcept { return buffer == &m_stream_buffer; }
+	// The same for a texel (formatted) read found while no image started at the address, at image
+	// version `image_version` (TextureCache::AddressBucketVersion()).
+	[[nodiscard]] bool TexelReadHolds(Buffer& buffer, uint64_t vaddr, uint64_t size, uint64_t& cpu_generation,
+	                                  uint64_t registration, uint64_t image_version);
+	// Whether a texel read of `vaddr` may be kept as TexelReadHolds() checks it: no image starts there.
+	[[nodiscard]] bool     TexelReadKeepable(uint64_t vaddr);
+	[[nodiscard]] uint64_t TexelImageVersion(uint64_t vaddr) const;
+	// A written binding ObtainBuffer made of [vaddr, vaddr + size) in `buffer`, after which the GPU
+	// ranges had version `ranges_version`: while neither they nor the buffer set changed, the range
+	// is still GPU-owned with nothing to upload, so binding it again only needs the per-operation
+	// bookkeeping of a GPU write, done here.
+	[[nodiscard]] bool WrittenBindHolds(Buffer& buffer, uint64_t vaddr, uint64_t size, uint64_t& ranges_version,
+	                                    uint64_t registration);
+	[[nodiscard]] uint64_t GpuRangesVersion() const noexcept {
+		return m_gpu_ranges_version.load(std::memory_order_acquire);
+	}
 	// Copies guest memory into coherent mapped memory (the stream buffer, staging), possibly on the
 	// host copy thread (see CommandScheduler::HostCopies()).
 	void StreamGuestData(uint8_t* destination, uint64_t vaddr, uint64_t size);
@@ -274,9 +298,10 @@ public:
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	uint64_t           SynchronizeBuffersInRanges(const RangeSet& ranges, bool full);
 	// Synchronizes only the pages dirtied before write epoch `limit` (see RegionManager); returns
-	// whether later ones were left (first_left: the earliest of their epochs).
-	bool               SynchronizeBuffersInRangesBefore(const RangeSet& ranges, bool full, uint32_t limit,
-	                                                    uint32_t& first_left);
+	// whether later ones were left (first_left: the earliest of their epochs). The queued dirty
+	// regions are synchronized within `ranges`, and all of `full_ranges` (if set) is scanned.
+	bool               SynchronizeBuffersInRangesBefore(const RangeSet& ranges, const RangeSet* full_ranges,
+	                                                    uint32_t limit, uint32_t& first_left);
 	[[nodiscard]] uint64_t CpuModificationGeneration() const noexcept {
 		return m_memory_tracker.CpuModificationGeneration();
 	}
@@ -289,6 +314,8 @@ public:
 	// Advances whenever a buffer is registered: a new buffer may cover CPU-dirty pages that no
 	// earlier synchronization uploaded.
 	[[nodiscard]] uint64_t RegisterEpoch() const { return m_registration_generation; }
+	// Advances whenever a buffer is registered or unregistered.
+	[[nodiscard]] uint64_t BufferSetEpoch() const { return m_buffer_set_epoch; }
 	// Advances whenever recorded work may write cached buffers (written bindings, fills, copies,
 	// device-address stores).
 	[[nodiscard]] uint64_t GpuWriteGeneration() const noexcept { return m_gpu_write_generation; }
@@ -298,7 +325,12 @@ public:
 		uint64_t epoch = 0;
 		for (auto index = vaddr / TRACKER_REGION_SIZE; index * TRACKER_REGION_SIZE < vaddr + size;
 		     index++) {
-			epoch += m_memory_tracker.RegionCpuDirtyEpoch(index);
+			// Per 64 KiB block where the range covers part of a region (the region's epoch moves
+			// whenever the game writes anywhere in its 4 MiB: the read memo missed almost always).
+			const bool whole = vaddr <= index * TRACKER_REGION_SIZE &&
+			                   vaddr + size >= (index + 1) * TRACKER_REGION_SIZE;
+			epoch += whole ? m_memory_tracker.RegionCpuDirtyEpoch(index)
+			             : m_memory_tracker.BlockCpuDirtyEpochs(index, vaddr, size);
 		}
 		return epoch;
 	}
@@ -349,6 +381,8 @@ private:
 	// Experiment AsyncGuestReads (GPU thread): waits for the asynchronous guest reads overlapping
 	// the range and releases their pages that hold no newer GPU-written bytes.
 	void FinishPendingGuestReads(uint64_t vaddr, uint64_t size);
+	// m_pending_read_ranges from m_pending_guest_reads (under m_gpu_ranges_mutex).
+	void RebuildPendingReadRanges();
 	[[nodiscard]] bool OverlapsPendingGuestRead(uint64_t vaddr, uint64_t size) const;
 	[[nodiscard]] bool OverlapsPendingGuestBytes(uint64_t vaddr, uint64_t size) const;
 
@@ -367,8 +401,19 @@ private:
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
-	// Guards m_gpu_modified_ranges against readers on other threads (HasGpuDirtyBytesShared).
+	// Guards m_gpu_modified_ranges and m_pending_read_ranges against readers on other threads
+	// (HasGpuDirtyBytesShared).
 	mutable std::shared_mutex                         m_gpu_ranges_mutex;
+	// The pages of pending guest reads (their bytes reach guest memory when they finish), from
+	// before their bytes leave m_gpu_modified_ranges until they are in guest memory.
+	RangeSet                                          m_pending_read_ranges;
+	// The versions of both sets added (under m_gpu_ranges_mutex, after each change):
+	// HasGpuDirtyBytesShared answers a page again from its thread's cache while it holds.
+	std::atomic<uint64_t> m_gpu_ranges_version {0};
+	void                  PublishGpuRangesVersion() {
+		m_gpu_ranges_version.store(m_gpu_modified_ranges.Version() + m_pending_read_ranges.Version(),
+		                           std::memory_order_release);
+	}
 	uint64_t                                          m_gpu_dirty_generation = 0;
 	RangeSet                                          m_released_ranges;
 	bool                                              m_record_released = false;
@@ -434,6 +479,9 @@ private:
 		uint64_t cpu_epoch    = 0;
 		uint64_t offset       = 0;
 		BufferId id;
+		bool     texel = false; // a formatted read, while no image started at the address
+		// TextureCache::AddressIndexVersion() when no image started at the address (texel).
+		uint64_t image_version = 0;
 	};
 	// The stream copy a range got within the current draw window (see ObtainBuffer()).
 	struct StreamMemo {
@@ -463,7 +511,7 @@ private:
 		BufferId   id {};
 		uint64_t   offset         = 0;
 	};
-	static constexpr size_t kObtainCacheSize = 512;
+	static constexpr size_t kObtainCacheSize = 2048;
 	std::array<ObtainCacheEntry, kObtainCacheSize> m_obtain_cache {};
 	// CPU-dirty epoch of each tracking region as SynchronizeBuffersInRanges last visited it.
 	std::unordered_map<uint64_t, uint64_t>     m_synced_region_epochs;

@@ -10,6 +10,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -31,8 +32,18 @@ class GuestReadLog {
 public:
 	void Clear() {
 		m_entries.clear();
+		m_run_head = NoRun;
 		m_bytes.clear();
-		m_failed = false;
+		m_failed     = false;
+		m_base       = t_resolve_base;
+		m_base_valid = t_resolve_base_valid;
+		m_unsafe_pages.fill(~uint64_t {0});
+	}
+	// Resolve thread, before each resolution: the last operation the execution thread finished.
+	// Reads of pages no operation after it writes (PageWriteSeq) need no check.
+	static void SetResolveBase(uint64_t executed) {
+		t_resolve_base       = executed;
+		t_resolve_base_valid = true;
 	}
 	// Reads the backing store without faulting. Strict reads are checked the way specialization
 	// memory is read (GPU-owned bytes fail), the others as plain loads.
@@ -51,10 +62,31 @@ private:
 		uint32_t size    = 0;
 		uint32_t offset  = 0;
 		bool     strict  = false;
+		// The bytes may have been GPU-dirty when read (read-protected page, pending download):
+		// always checked.
+		bool unsafe = false;
+		// The first entry of a clean run (consecutive single-page entries on one page, neither
+		// strict nor possibly GPU-owned): the run's length; 0 for the other entries.
+		uint32_t run_count = 0;
 	};
 	std::vector<Entry>   m_entries;
+	// The clean run the last entry extends (StillValid checks a clean run with one lookup).
+	static constexpr uint32_t NoRun = UINT32_MAX;
+	uint32_t                  m_run_head = NoRun;
+	[[nodiscard]] static bool RunClean(const Entry& entry) {
+		return !entry.strict && !entry.unsafe && (entry.address >> 12u) == ((entry.address + entry.size - 1) >> 12u);
+	}
 	std::vector<uint8_t> m_bytes;
-	bool                 m_failed = false;
+	bool                 m_failed     = false;
+	uint64_t             m_base       = 0;
+	bool                 m_base_valid = false;
+	// The last pages Read() looked up and whether their bytes may be GPU-owned.
+	std::array<uint64_t, 8> m_unsafe_pages {~uint64_t {0}, ~uint64_t {0}, ~uint64_t {0}, ~uint64_t {0},
+	                                        ~uint64_t {0}, ~uint64_t {0}, ~uint64_t {0}, ~uint64_t {0}};
+	std::array<bool, 8>     m_unsafe_values {};
+	size_t                  m_unsafe_next = 0;
+	inline static thread_local uint64_t t_resolve_base       = 0;
+	inline static thread_local bool     t_resolve_base_valid = false;
 };
 
 // Storage of the shader programs a draw resolved ahead of its execution: the resource snapshots
@@ -145,7 +177,13 @@ struct PipelineVertexInputState {
 	uint8_t                                               binding_count   = 0;
 	uint8_t                                               attribute_count = 0;
 
-	bool operator==(const PipelineVertexInputState&) const = default;
+	// The entries past the counts are never set (and the key hash leaves them out).
+	bool operator==(const PipelineVertexInputState& other) const {
+		return binding_count == other.binding_count && attribute_count == other.attribute_count &&
+		       std::equal(bindings.begin(), bindings.begin() + binding_count, other.bindings.begin()) &&
+		       std::equal(attributes.begin(), attributes.begin() + attribute_count,
+		                  other.attributes.begin());
+	}
 };
 
 struct ShaderProgram {

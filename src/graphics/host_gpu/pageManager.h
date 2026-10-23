@@ -22,8 +22,28 @@ struct ProtectStats {
 	                 uint64_t& write_faults) noexcept;
 };
 
+class HostCopyQueue;
+
 class PageManager final {
 public:
+	// Deferred protection (execution thread, while it synchronizes CPU-dirty buffers for BDA):
+	// pages that gain watchers are protected by the host copy thread, in queue order before the
+	// copies queued after it, instead of by the calling thread (each protection call took about
+	// 7.5 us, 8% of the execution thread). Writes before the protection are in those copies,
+	// writes after it fault as before. Losing watchers (fault handling) stays immediate.
+	class DeferredProtectionScope {
+	public:
+		explicit DeferredProtectionScope(HostCopyQueue* queue) noexcept;
+		~DeferredProtectionScope();
+		KYTY_CLASS_NO_COPY(DeferredProtectionScope);
+
+	private:
+		HostCopyQueue* m_previous;
+	};
+	// Whether the calling thread defers protection (its guest-data copies must then go through
+	// the host copy queue, or wait for it).
+	[[nodiscard]] static bool DeferringProtection() noexcept;
+
 	PageManager();
 	// The owner must stop all PageManager callers before destruction.
 	~PageManager();

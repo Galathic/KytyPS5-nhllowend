@@ -24,7 +24,7 @@ namespace Common::Experiments {
 // KYTY_RESOURCE_MULTI_CACHE (16-state resource memo) is read only by the resource memo itself.
 enum Bit : uint64_t {
 	EarlySubmitWriters = 1u << 0u, // KYTY_EARLY_SUBMIT_WRITERS (default off; a draw/dispatch writing bytes resource reads waited for is submitted at once)
-	SkipRedundantBinds = 1u << 1u, // KYTY_SKIP_REDUNDANT_BINDS (default on)
+	SkipRedundantBinds = 1u << 1u, // KYTY_SKIP_REDUNDANT_BINDS (default off)
 	ReadbackCompute    = 1u << 2u, // KYTY_READBACK_COMPUTE (default on; second-queue readbacks on a compute-only queue family)
 	CpuCopyForward     = 1u << 3u, // KYTY_CPU_COPY_FORWARD (default off)
 	RobustLoads        = 1u << 8u, // KYTY_ROBUST_LOADS (default on; storage-buffer loads without per-load exec and bounds branches, relying on robustBufferAccess2; part of shader keys; was ReadbackTransfer)
@@ -56,12 +56,39 @@ enum Bit : uint64_t {
 	LdsLaneSlots         = 1u << 30u, // KYTY_LDS_LANE_SLOTS (default on; per-lane LDS slots of non-compute stages as a small array, part of shader keys)
 	ProtectSharedLock    = uint64_t {1} << 32u, // KYTY_PROTECT_SHARED_LOCK (default off; page-tracking protections of different pages run in parallel)
 	ClockWaitPredict     = uint64_t {1} << 33u, // KYTY_CLOCK_WAIT_PREDICT (default off; WAIT_REG_MEM on a pending clock write need not wait for it)
-	FalseShareAnyThread  = uint64_t {1} << 34u, // KYTY_FALSE_SHARE_ANY_THREAD (default off; CP and guest reads of clean bytes on GPU-dirty pages use the backing)
+	FalseShareAnyThread  = uint64_t {1} << 34u, // KYTY_FALSE_SHARE_ANY_THREAD (default on; CP and guest reads of clean bytes on GPU-dirty pages use the backing)
 	CpCleanRegReads      = uint64_t {1} << 35u, // KYTY_CP_CLEAN_REG_READS (default off; the command processor reads clean indirect register tables from the backing)
 	CpSkipIdleSpin       = uint64_t {1} << 36u, // KYTY_CP_SKIP_IDLE_SPIN (default off; work queued while the command processor waited for the execution thread starts at once, not after a 2 ms spin)
+	ExecBranches         = uint64_t {1} << 39u, // KYTY_EXEC_BRANCHES (default on; runs of lane-wise instructions under one partial EXEC run in a divergent branch instead of selecting each written VGPR per lane; part of shader keys)
+	ExecBranchMemory     = uint64_t {1} << 40u, // KYTY_EXEC_BRANCH_MEMORY (default on; ExecBranches runs also take memory operations under their EXEC; part of shader keys)
+	DispatchResolver     = uint64_t {1} << 41u, // KYTY_DISPATCH_RESOLVER (default off; a second resolve thread resolves dispatches ahead while the first resolves draws)
+	BdaLoadGroups        = uint64_t {1} << 42u, // KYTY_BDA_LOAD_GROUPS (default off; consecutive DWORD loads through an address share one page lookup; part of shader keys)
+	DrawResolver         = uint64_t {1} << 43u, // KYTY_DRAW_RESOLVER (default on since 2026-10-22; earlier off for 2 guest job-thread crashes in 8 boots, since fixed causes; a second resolve thread resolves about half of the draws ahead, by shader addresses)
 	SpeculateDirtyReads  = uint64_t {1} << 37u, // KYTY_SPECULATE_DIRTY_READS (default off; shader-table reads of GPU-written bytes the GPU keeps rewriting unchanged use the backing, checked later)
 	// A/B only (no environment variable): selects the code a pending change replaces.
 	AbLegacy = 1u << 31u,
+	// A/B only, like AbLegacy, for the changes made after it was taken (AbLegacy also turns off
+	// the earlier changes it still selects).
+	AbPending = uint64_t {1} << 38u,
+	// More A/B-only bits, so that one boot can compare several pending changes (KytyPS5-toolsbmulti.sh).
+	AbPending2 = uint64_t {1} << 44u,
+	AbPending3 = uint64_t {1} << 45u,
+	AbPending4 = uint64_t {1} << 49u,
+	// KYTY_GUEST_OFF_STAGE_CORES (default on): threads without a CPU of their own (guest, driver
+	// and helper threads) keep off both logical CPUs of the execution and resolve threads' cores.
+	GuestOffStageCores = uint64_t {1} << 46u,
+	// KYTY_GUEST_OFF_COPY_CORE (default off; with GuestOffStageCores): the host copy thread's
+	// core too. Bit 47 was GuestOffStageSiblings (only the two siblings: no gain).
+	GuestOffCopyCore = uint64_t {1} << 47u,
+	// KYTY_GUEST_OFF_CP_CORES (default off; with GuestOffStageCores): the command processor's and
+	// the recording thread's cores too.
+	GuestOffCpCores = uint64_t {1} << 48u,
+	// KYTY_EXEC_BRANCH_CONTINUE (default on; with ExecBranches): runs in loop continue targets
+	// (loop bodies that branch back) too; part of shader keys.
+	ExecBranchContinue = uint64_t {1} << 50u,
+	// KYTY_F16_LANE_VIEWS (default on; with NativeFp16): scalar f16 ops read and write their
+	// 16-bit lanes as halves of an f16vec2 instead of masking them out of U32s; part of shader keys.
+	F16LaneViews = uint64_t {1} << 51u,
 };
 
 namespace Detail {

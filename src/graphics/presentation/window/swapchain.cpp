@@ -9,6 +9,7 @@
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_overlay_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/frameDump.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -21,9 +22,13 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <string>
 #include <limits>
 #include <memory>
 #include <vector>
@@ -472,10 +477,29 @@ void Swapchain::Create() {
 		case Config::PresentMode::Fifo:
 		default: create_info.presentMode = vk::PresentModeKHR::eFifo; break;
 	}
-	if (std::find(surface.present_modes.begin(), surface.present_modes.end(),
-	              create_info.presentMode) == surface.present_modes.end()) {
+	const auto available = [&](vk::PresentModeKHR mode) {
+		return std::find(surface.present_modes.begin(), surface.present_modes.end(), mode) !=
+		       surface.present_modes.end();
+	};
+	if (create_info.presentMode == vk::PresentModeKHR::eMailbox && !available(create_info.presentMode) &&
+	    available(vk::PresentModeKHR::eImmediate)) {
+		// No Mailbox on AMD under Windows: there FIFO (and FIFO latest ready) blocked every present
+		// until the monitor's refresh, and the game's flips with it (NHL 27 played at exactly 60 fps
+		// on a 60 Hz monitor; Immediate: 61-78). A window the desktop composes does not tear.
+		create_info.presentMode = vk::PresentModeKHR::eImmediate;
+	}
+	if (!available(create_info.presentMode)) {
 		LOGF("warning: requested present mode is unavailable; falling back to Fifo\n");
 		create_info.presentMode = vk::PresentModeKHR::eFifo;
+	}
+	{
+		std::string modes;
+		for (const auto mode: surface.present_modes) {
+			modes += " " + vk::to_string(mode);
+		}
+		std::printf("NHL27VIDEO: swapchain present mode %s (available:%s) %ux%u\n",
+		            vk::to_string(create_info.presentMode).c_str(), modes.c_str(), m_extent.width, m_extent.height);
+		std::fflush(stdout);
 	}
 	create_info.clipped = VK_TRUE;
 	RequireVulkanSuccess(graphics.device.createSwapchainKHR(&create_info, nullptr, &m_handle),
@@ -1081,8 +1105,122 @@ void Presenter::ClearLayer(int bus) {
 	}
 }
 
+// Tools: a file named present.trigger in the working directory writes the next presented guest
+// frame (its flip image, before scaling to the window) to present_<n>.png there; looked for every
+// 30 presents, and that present waits for the GPU once.
+struct PresentCapture {
+	VkBuffer      buffer = VK_NULL_HANDLE;
+	VmaAllocation alloc  = nullptr;
+	void*         mapped = nullptr;
+	uint32_t      w = 0, h = 0;
+	vk::Format    format = vk::Format::eUndefined;
+};
+
+static bool CapturablePresentFormat(vk::Format format) {
+	switch (format) {
+		case vk::Format::eR8G8B8A8Unorm:
+		case vk::Format::eR8G8B8A8Srgb:
+		case vk::Format::eB8G8R8A8Unorm:
+		case vk::Format::eB8G8R8A8Srgb:
+		case vk::Format::eA2B10G10R10UnormPack32:
+		case vk::Format::eA2R10G10B10UnormPack32: return true;
+		default: return false;
+	}
+}
+
+static void RecordPresentCapture(GraphicContext& graphics, CommandBuffer& command, const VulkanImage& image,
+                                 PresentCapture& capture) {
+	if (!CapturablePresentFormat(image.format) || image.state.layout != vk::ImageLayout::eTransferSrcOptimal) {
+		std::printf("NHL27PRESENTCAPTURE: skipped (format %s, layout %s)\n", vk::to_string(image.format).c_str(),
+		            vk::to_string(image.state.layout).c_str());
+		std::fflush(stdout);
+		return;
+	}
+	capture.w      = image.extent.width;
+	capture.h      = image.extent.height;
+	capture.format = image.format;
+	VkBufferCreateInfo info {};
+	info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+	info.size  = static_cast<VkDeviceSize>(capture.w) * capture.h * 4u;
+	info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+	VmaAllocationCreateInfo alloc_info {};
+	alloc_info.usage = VMA_MEMORY_USAGE_AUTO;
+	alloc_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+	VmaAllocationInfo allocated {};
+	if (vmaCreateBuffer(graphics.allocator, &info, &alloc_info, &capture.buffer, &capture.alloc, &allocated) !=
+	    VK_SUCCESS) {
+		capture.buffer = VK_NULL_HANDLE;
+		return;
+	}
+	capture.mapped = allocated.pMappedData;
+	vk::BufferImageCopy region {};
+	region.imageSubresource = vk::ImageSubresourceLayers {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	region.imageExtent      = vk::Extent3D {capture.w, capture.h, 1};
+	command.Handle().copyImageToBuffer(image.image, vk::ImageLayout::eTransferSrcOptimal, vk::Buffer(capture.buffer),
+	                                   1, &region);
+}
+
+static void WritePresentCapture(GraphicContext& graphics, PresentCapture& capture) {
+	static uint32_t count = 0;
+	vmaInvalidateAllocation(graphics.allocator, capture.alloc, 0, VK_WHOLE_SIZE);
+	const auto*          src = static_cast<const uint8_t*>(capture.mapped);
+	const size_t         n   = static_cast<size_t>(capture.w) * capture.h;
+	std::vector<uint8_t> rgb(n * 3);
+	for (size_t i = 0; i < n; i++) {
+		uint32_t v = 0;
+		std::memcpy(&v, src + i * 4, 4);
+		uint32_t r = 0, g = 0, b = 0;
+		switch (capture.format) {
+			case vk::Format::eB8G8R8A8Unorm:
+			case vk::Format::eB8G8R8A8Srgb:
+				b = v & 0xffu;
+				g = (v >> 8u) & 0xffu;
+				r = (v >> 16u) & 0xffu;
+				break;
+			case vk::Format::eA2B10G10R10UnormPack32:
+				r = (v & 0x3ffu) >> 2u;
+				g = ((v >> 10u) & 0x3ffu) >> 2u;
+				b = ((v >> 20u) & 0x3ffu) >> 2u;
+				break;
+			case vk::Format::eA2R10G10B10UnormPack32:
+				b = (v & 0x3ffu) >> 2u;
+				g = ((v >> 10u) & 0x3ffu) >> 2u;
+				r = ((v >> 20u) & 0x3ffu) >> 2u;
+				break;
+			default:
+				r = v & 0xffu;
+				g = (v >> 8u) & 0xffu;
+				b = (v >> 16u) & 0xffu;
+				break;
+		}
+		rgb[i * 3]     = static_cast<uint8_t>(r);
+		rgb[i * 3 + 1] = static_cast<uint8_t>(g);
+		rgb[i * 3 + 2] = static_cast<uint8_t>(b);
+	}
+	const auto path = "present_" + std::to_string(count++) + ".png";
+	const bool ok   = FrameDump::WriteRgbPng(path, capture.w, capture.h, rgb);
+	std::printf("NHL27PRESENTCAPTURE: %s %ux%u %s%s\n", path.c_str(), capture.w, capture.h,
+	            vk::to_string(capture.format).c_str(), ok ? "" : " (write failed)");
+	std::fflush(stdout);
+	vmaDestroyBuffer(graphics.allocator, capture.buffer, capture.alloc);
+	capture = {};
+}
+
 void Presenter::Impl::Present() {
 	KYTY_PROFILER_FUNCTION();
+
+	{
+		// Every 5 s: the frames the window showed.
+		static auto     next  = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+		static uint64_t shown = 0;
+		if (const auto now = std::chrono::steady_clock::now(); now >= next) {
+			next                 = now + std::chrono::seconds(5);
+			const auto shown_now = window.loop.presented_frames.load(std::memory_order_relaxed);
+			std::printf("NHL27PRESENT: shown=%llu in 5 s\n", static_cast<unsigned long long>(shown_now - shown));
+			std::fflush(stdout);
+			shown = shown_now;
+		}
+	}
 
 	const auto overlay_visual = GetSystemOverlayVisualState();
 	// Keep black/blank flips in the current color space; only real main-bus frames switch it.
@@ -1093,12 +1231,20 @@ void Presenter::Impl::Present() {
 	if (hdr_changed || swapchain.NeedsResize()) {
 		RecoverSwapchain(Swapchain::Status::Recreate);
 	}
+	static uint32_t capture_check  = 0;
+	bool            capture_wanted = false;
+	if (++capture_check % 30 == 0 && main_frame != nullptr && !main_frame->blank) {
+		std::error_code error;
+		capture_wanted = std::filesystem::remove("present.trigger", error);
+	}
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
 		auto status = swapchain.AcquireNextImage(present_scheduler);
 		if (status != Swapchain::Status::Success) {
 			RecoverSwapchain(status);
 			continue;
 		}
+		PresentCapture capture;
+		uint64_t       submitted = 0;
 		{
 			Common::LockGuard render_lock(renderer.GetMutex());
 			auto&             command = present_scheduler.BeginCommand();
@@ -1106,12 +1252,21 @@ void Presenter::Impl::Present() {
 			    overlay_visual.active && swapchain.PrepareSystemOverlay();
 			swapchain.RecordPresentCommands(command, layers[0].frame, layers[1],
 			                                draw_system_overlay);
+			if (capture_wanted && layers[0].frame != nullptr) {
+				RecordPresentCapture(window.graphic_ctx, command, layers[0].frame->image, capture);
+			}
 			const auto tick = swapchain.Submit(present_scheduler);
+			submitted       = tick;
 			for (const auto& layer: layers) {
 				if (layer.frame != nullptr) {
 					layer.frame->present_tick = tick;
 				}
 			}
+		}
+		if (capture.buffer != VK_NULL_HANDLE) {
+			present_scheduler.Wait(submitted);
+			WritePresentCapture(window.graphic_ctx, capture);
+			capture_wanted = false;
 		}
 		status = swapchain.Present();
 		if (status != Swapchain::Status::Success) {

@@ -99,12 +99,55 @@ inline std::atomic<bool> g_shader_native_pkrtz {false};
 [[nodiscard]] inline bool ShaderNativeF16Sdwa() {
 	return ShaderNativeFp16();
 }
+// Codegen option: robust (branchless) storage-buffer loads, stores and constant reads also in
+// non-pixel shaders that spill guest VGPRs to LDS or scratch (key bit 512; d7cfa519 -3%).
+[[nodiscard]] inline bool ShaderRobustSpillLoads() {
+	return ShaderRobustLoads();
+}
+// Codegen option: formatted buffer loads under robust loads read unconditionally and select the
+// out-of-bounds value instead of branching (key bit 1024). The crowd vertex shaders had ~400 such
+// branches around 16-bit vertex loads: their draws -9.6%, GPU time per frame -4% with these two
+// options in a paused crowd scene (A/B/A).
+[[nodiscard]] inline bool ShaderBranchlessFormattedLoads() {
+	return ShaderRobustLoads();
+}
+// Codegen option: experiment ExecBranches (key bit 2048). A guest VGPR write under a partial EXEC
+// selects the new value per lane; runs of lane-wise instructions under one EXEC value run in a
+// divergent branch instead, their selects becoming phis where the run's results are used after it
+// (the host compiler masks the writes, as the guest's hardware does).
+[[nodiscard]] inline bool ShaderExecBranches() {
+	return Common::Experiments::Enabled(Common::Experiments::ExecBranches);
+}
+// Codegen option: experiment ExecBranchMemory (key bit 4096): ExecBranches runs also take the
+// memory operations predicated by their EXEC (in order; inside the branch they need no exec check).
+[[nodiscard]] inline bool ShaderExecBranchMemory() {
+	return ShaderExecBranches() && Common::Experiments::Enabled(Common::Experiments::ExecBranchMemory);
+}
+// Codegen option: experiment ExecBranchContinue (key bit 16384): ExecBranches runs also in loop
+// continue targets (the bodies of NHL 27's sampling loops, which selected every write per lane).
+[[nodiscard]] inline bool ShaderExecBranchContinue() {
+	return ShaderExecBranches() && Common::Experiments::Enabled(Common::Experiments::ExecBranchContinue);
+}
+// Codegen option: experiment F16LaneViews (key bit 32768): scalar f16 ops on SDWA/op_sel lanes as
+// f16vec2 components (F16LaneExtract / FP*16Low / F16LaneInsert) instead of integer masking.
+[[nodiscard]] inline bool ShaderF16LaneViews() {
+	return ShaderNativeFp16() && Common::Experiments::Enabled(Common::Experiments::F16LaneViews);
+}
+// Codegen option: experiment BdaLoadGroups (key bit 8192): consecutive DWORD loads of one guest
+// load through an address share one page lookup when they are in one page.
+[[nodiscard]] inline bool ShaderBdaLoadGroups() {
+	return Common::Experiments::Enabled(Common::Experiments::BdaLoadGroups);
+}
 [[nodiscard]] inline uint32_t ShaderFloatCodegenKey() {
 	return static_cast<uint32_t>(ShaderNativeFp16()) | (ShaderNativeMinMax() ? 2u : 0u) |
 	       (ShaderFusedMad() ? 4u : 0u) |
 	       (ShaderRobustLoads() ? (ShaderRobustLoadsKeepExec() ? 24u : 8u) : 0u) |
 	       (ShaderRobustConstReads() ? 32u : 0u) | (ShaderRobustStores() ? 64u : 0u) |
-	       (ShaderNativePkrtz() ? 128u : 0u) | (ShaderNativeF16Sdwa() ? 256u : 0u);
+	       (ShaderNativePkrtz() ? 128u : 0u) | (ShaderNativeF16Sdwa() ? 256u : 0u) |
+	       (ShaderRobustSpillLoads() ? 512u : 0u) | (ShaderBranchlessFormattedLoads() ? 1024u : 0u) |
+	       (ShaderExecBranches() ? 2048u : 0u) | (ShaderExecBranchMemory() ? 4096u : 0u) |
+	       (ShaderBdaLoadGroups() ? 8192u : 0u) | (ShaderExecBranchContinue() ? 16384u : 0u) |
+	       (ShaderF16LaneViews() ? 32768u : 0u);
 }
 [[nodiscard]] inline uint32_t ShaderNativeFp16Modes() {
 	return g_shader_native_fp16_modes.load(std::memory_order_relaxed);

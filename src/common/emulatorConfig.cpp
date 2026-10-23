@@ -204,17 +204,44 @@ uint32_t ParseGpuPipelineStages(const char* value) {
 	return parsed == 1 ? GPU_PIPELINE_ALL : static_cast<uint32_t>(parsed) & GPU_PIPELINE_ALL;
 }
 
+static const std::array<int, 7>& GpuStageCpus();
+
+int GpuStageCpu(GpuStageThread stage) {
+	return GpuStageCpus()[static_cast<uint32_t>(stage)];
+}
+
 void ConfigureGpuStageThread(GpuStageThread stage) {
+	const auto& cpus = GpuStageCpus();
+	static const bool high_priority = [] {
+		const char* value = std::getenv("KYTY_GPU_THREAD_PRIORITY");
+		return value == nullptr || std::string_view(value) != "0";
+	}();
+	if (high_priority) {
+		Common::Thread::RaiseCurrentPriority();
+	}
+	Common::Thread::PinCurrent(cpus[static_cast<uint32_t>(stage)]);
+	// For profilers that sample one thread (KytyPS5-tools/prof-stage.sh): which OS thread runs
+	// which stage.
+	static constexpr const char* Names[] = {"command-processor", "execution", "recording", "resolve",
+	                                        "host-copy", "dispatch-resolve", "draw-resolve"};
+	std::printf("NHL27STAGE: %s tid=%s cpu=%d\n", Names[static_cast<uint32_t>(stage)],
+	            Common::Thread::GetThreadId().c_str(), cpus[static_cast<uint32_t>(stage)]);
+	std::fflush(stdout);
+}
+
+static const std::array<int, 7>& GpuStageCpus() {
 	// Five physical cores of the first CCD of a Ryzen 9 5900X (SMT siblings are adjacent), away
 	// from core 0: the stages share its L3.
-	static const std::array<int, 5> cpus = [] {
-		std::array<int, 5> result {4, 6, 8, 10, 2};
+	// The dispatch resolver (experiment DispatchResolver) on a sixth core, the second draw resolver
+	// (experiment DrawResolver) on a seventh.
+	static const std::array<int, 7> cpus = [] {
+		std::array<int, 7> result {4, 6, 8, 10, 2, 12, 14};
 		const char*        value = std::getenv("KYTY_GPU_THREAD_CPUS");
 		if (value == nullptr) {
 			return result;
 		}
 		if (std::string_view(value) == "off") {
-			return std::array<int, 5> {-1, -1, -1, -1, -1};
+			return std::array<int, 7> {-1, -1, -1, -1, -1, -1, -1};
 		}
 		// Stages without a listed CPU keep their default.
 		for (auto& cpu: result) {
@@ -230,21 +257,7 @@ void ConfigureGpuStageThread(GpuStageThread stage) {
 		}
 		return result;
 	}();
-	static const bool high_priority = [] {
-		const char* value = std::getenv("KYTY_GPU_THREAD_PRIORITY");
-		return value == nullptr || std::string_view(value) != "0";
-	}();
-	if (high_priority) {
-		Common::Thread::RaiseCurrentPriority();
-	}
-	Common::Thread::PinCurrent(cpus[static_cast<uint32_t>(stage)]);
-	// For profilers that sample one thread (KytyPS5-tools/prof-stage.sh): which OS thread runs
-	// which stage.
-	static constexpr const char* Names[] = {"command-processor", "execution", "recording", "resolve",
-	                                        "host-copy"};
-	std::printf("NHL27STAGE: %s tid=%s cpu=%d\n", Names[static_cast<uint32_t>(stage)],
-	            Common::Thread::GetThreadId().c_str(), cpus[static_cast<uint32_t>(stage)]);
-	std::fflush(stdout);
+	return cpus;
 }
 
 uint32_t GpuPipelineStages() {

@@ -1,5 +1,7 @@
 #include "common/experiments.h"
 
+#include "common/emulatorConfig.h"
+
 #if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -38,7 +40,9 @@ uint64_t EnvironmentMask() {
 		if (EnvSwitch(name, on_by_default)) mask |= bit;
 	};
 	// The NHL 27 recommended set is on unless its variable is set to 0.
-	set("KYTY_SKIP_REDUNDANT_BINDS", SkipRedundantBinds, true);
+	// Off now: building its key cost the execution thread more than the pushes it saved (the
+	// recording thread has room for them); two boots, draw cost -2..-5%.
+	set("KYTY_SKIP_REDUNDANT_BINDS", SkipRedundantBinds, false);
 	set("KYTY_SRT_BATCH_READS", SrtBatchReads, true);
 	set("KYTY_DIRECT_SRT_READS", DirectSrtReads, true);
 	set("KYTY_NATIVE_MINMAX", NativeMinMax, true);
@@ -54,10 +58,23 @@ uint64_t EnvironmentMask() {
 	set("KYTY_NATIVE_FP16", NativeFp16, false);
 	set("KYTY_FAULT_PAGE_READS", FaultPageReads, false);
 	set("KYTY_EXEC_SELECTS", ExecSelects, false);
+	set("KYTY_EXEC_BRANCHES", ExecBranches, true);
+	set("KYTY_EXEC_BRANCH_MEMORY", ExecBranchMemory, true);
+	set("KYTY_EXEC_BRANCH_CONTINUE", ExecBranchContinue, true);
+	set("KYTY_F16_LANE_VIEWS", F16LaneViews, true);
+	set("KYTY_BDA_LOAD_GROUPS", BdaLoadGroups, false);
+	// On since 2026-10-22: with the stage cores kept for the stages, the resolve thread limited the
+	// heavier scenes; sharing its core with the game, the second resolver took 60 Hz play 57.4 ->
+	// 59.4 fps (paired rounds 413 / 447). Measured on 16 logical CPUs (its default CPU is 14): with
+	// fewer it would take time from the game's threads, so it stays off there unless asked for.
+	const unsigned cpus = std::thread::hardware_concurrency();
+	set("KYTY_DRAW_RESOLVER", DrawResolver, cpus >= 16);
 	set("KYTY_GPU_COLOR_CLEAR", GpuColorClear, false);
 	set("KYTY_POOLED_BDA_BUFFERS", PooledBdaBuffers, false);
 	set("KYTY_ASYNC_GUEST_READS", AsyncGuestReads, false);
 	set("KYTY_BDA_DIRTY_REGIONS", BdaDirtyRegions, false);
+	// On again: the match-start hang it was suspected of was the label readback race
+	// (WriteDataBuffer), and it cuts the execution thread's readback waits to ~20 ms/s.
 	set("KYTY_CP_BACKING_READS", CpBackingReads, true);
 	set("KYTY_EARLY_SUBMIT_WRITERS", EarlySubmitWriters, false);
 	set("KYTY_READBACK_COMPUTE", ReadbackCompute, true);
@@ -66,17 +83,95 @@ uint64_t EnvironmentMask() {
 	set("KYTY_FAULT_PAGE_DIRECT", FaultPageDirect, true);
 	set("KYTY_BACKING_READ_MRU", BackingReadMru, true);
 	set("KYTY_DISPATCH_AHEAD", DispatchAhead, true);
+	set("KYTY_DISPATCH_RESOLVER", DispatchResolver, false);
 	set("KYTY_GPU_CONDITIONS_BOTH_PATHS", GpuConditionsBothPaths, true);
 	set("KYTY_COMPUTE_UNLOCKED", ComputeUnlocked, true);
 	set("KYTY_AHEAD_UNLOCKED", AheadUnlocked, true);
 	set("KYTY_BACKING_LOOKUP_CACHE", BackingLookupCache, true);
 	set("KYTY_PROTECT_SHARED_LOCK", ProtectSharedLock, false);
 	set("KYTY_CLOCK_WAIT_PREDICT", ClockWaitPredict, false);
-	set("KYTY_FALSE_SHARE_ANY_THREAD", FalseShareAnyThread, false);
+	// On: the command processor's and guest threads' reads of bytes the GPU never wrote, on pages
+	// protected for other GPU-written bytes, use the backing (exact, no speculation): the execution
+	// thread's readback waits for them 65 -> 24 ms/s in play.
+	set("KYTY_FALSE_SHARE_ANY_THREAD", FalseShareAnyThread, true);
 	set("KYTY_SPECULATE_DIRTY_READS", SpeculateDirtyReads, false);
 	set("KYTY_CP_CLEAN_REG_READS", CpCleanRegReads, false);
 	set("KYTY_CP_SKIP_IDLE_SPIN", CpSkipIdleSpin, false);
+	// Two boots: execution-thread cost per draw -4..-7%, per dispatch -18..-20% (8 cores, 16 logical
+	// CPUs). With fewer than 12 logical CPUs the game would keep too few.
+	set("KYTY_GUEST_OFF_STAGE_CORES", GuestOffStageCores, cpus >= 12);
+	set("KYTY_GUEST_OFF_COPY_CORE", GuestOffCopyCore, false);
+	set("KYTY_GUEST_OFF_CP_CORES", GuestOffCpCores, false);
 	return mask;
+}
+
+// Bits GuestOffStageCores / GuestOffCopyCore / GuestOffCpCores: the process default CPU sets, which every thread
+// without its own CPU selection follows; the pinned GPU stage threads keep their affinity.
+void ApplyCpuSets(uint64_t mask) {
+#if defined(_WIN32)
+	const int wanted = (mask & GuestOffStageCores) != 0 ? 2 : 0;
+	uint64_t  excluded = 0;
+	const auto exclude = [&](Config::GpuStageThread stage) {
+		const int cpu = Config::GpuStageCpu(stage);
+		if (wanted == 0 || cpu < 0 || cpu >= 64) {
+			return;
+		}
+		// SMT siblings are adjacent logical CPUs.
+		excluded |= uint64_t {1} << static_cast<uint32_t>(cpu ^ 1);
+		if (wanted == 2) {
+			excluded |= uint64_t {1} << static_cast<uint32_t>(cpu);
+		}
+	};
+	exclude(Config::GpuStageThread::Execution);
+	exclude(Config::GpuStageThread::Resolve);
+	if ((mask & GuestOffCopyCore) != 0) {
+		exclude(Config::GpuStageThread::HostCopy);
+	}
+	if ((mask & GuestOffCpCores) != 0) {
+		exclude(Config::GpuStageThread::CommandProcessor);
+		exclude(Config::GpuStageThread::Recording);
+	}
+	// The extra resolvers (bits 41 and 43) share their cores: keeping the game off them as well
+	// (one core fewer for it) or putting them on the stages' siblings measured slower.
+	static uint64_t applied = 0;
+	if (excluded == applied) {
+		return;
+	}
+	applied = excluded;
+	if (excluded == 0) {
+		(void)::SetProcessDefaultCpuSets(::GetCurrentProcess(), nullptr, 0);
+		std::printf("Experiments: default CPU sets cleared\n");
+		std::fflush(stdout);
+		return;
+	}
+	ULONG length = 0;
+	(void)::GetSystemCpuSetInformation(nullptr, 0, &length, ::GetCurrentProcess(), 0);
+	std::vector<uint8_t> buffer(length);
+	if (length == 0 || !::GetSystemCpuSetInformation(reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buffer.data()),
+	                                                 length, &length, ::GetCurrentProcess(), 0)) {
+		return;
+	}
+	std::vector<ULONG> ids;
+	for (ULONG at = 0; at < length;) {
+		const auto* info = reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(buffer.data() + at);
+		if (info->Size == 0) {
+			break;
+		}
+		if (info->Type == CpuSetInformation && info->CpuSet.Group == 0 &&
+		    info->CpuSet.LogicalProcessorIndex < 64 &&
+		    ((excluded >> info->CpuSet.LogicalProcessorIndex) & 1u) == 0) {
+			ids.push_back(info->CpuSet.Id);
+		}
+		at += info->Size;
+	}
+	const bool ok = !ids.empty() &&
+	                ::SetProcessDefaultCpuSets(::GetCurrentProcess(), ids.data(), static_cast<ULONG>(ids.size())) != 0;
+	std::printf("Experiments: threads without a CPU of their own avoid CPUs 0x%llx (%zu CPU sets, %s)\n",
+	            static_cast<unsigned long long>(excluded), ids.size(), ok ? "ok" : "failed");
+	std::fflush(stdout);
+#else
+	(void)mask;
+#endif
 }
 
 struct State {
@@ -85,6 +180,7 @@ struct State {
 	State() {
 		const uint64_t defaults = EnvironmentMask();
 		mask.store(defaults, std::memory_order_relaxed);
+		ApplyCpuSets(defaults);
 		const char* path_env = std::getenv("KYTY_EXPERIMENT_FILE");
 		if (path_env == nullptr || path_env[0] == '\0') {
 			return;
@@ -103,6 +199,7 @@ struct State {
 				}
 				if (value != last) {
 					mask.store(value, std::memory_order_relaxed);
+					ApplyCpuSets(value);
 					std::printf("Experiments: mask %" PRIu64 " -> %" PRIu64 "\n", last, value);
 					std::fflush(stdout);
 					last = value;

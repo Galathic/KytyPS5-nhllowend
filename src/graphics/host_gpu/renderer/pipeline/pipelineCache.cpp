@@ -1,5 +1,6 @@
 #include "graphics/guest_gpu/stageStats.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/pageWriteSeq.h"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -133,8 +134,28 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 		return !values.empty() && Libs::LibKernel::Memory::TryReadCleanBufferBacking(
 		                              address, values.data(), values.size_bytes());
 	}
-	return !values.empty() &&
-	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
+	// KYTY_DBG_STRICT_READS=1: strict reads of GPU-written bytes (each waits for the GPU's writer):
+	// the shader, the address and the words read, at most 400 lines (NHL27STRICT).
+	static const bool strict_debug = std::getenv("KYTY_DBG_STRICT_READS") != nullptr;
+	const bool        dirty        = strict_debug && !values.empty() &&
+	                    Libs::LibKernel::Memory::HasGpuDirtyBytesShared(address, values.size_bytes());
+	const bool read = !values.empty() &&
+	                  Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
+	if (dirty) {
+		static std::atomic<uint32_t> lines {0};
+		if (lines.fetch_add(1, std::memory_order_relaxed) < 400) {
+			char words[96] {};
+			int  at = 0;
+			for (size_t i = 0; i < values.size() && i < 8 && at < 80; i++) {
+				at += std::snprintf(words + at, sizeof(words) - at, " %08x", values[i]);
+			}
+			std::printf("NHL27STRICT: shader=%016llx addr=0x%016llx dwords=%zu ok=%d values:%s\n",
+			            static_cast<unsigned long long>(Libs::LibKernel::Memory::ReadContext()),
+			            static_cast<unsigned long long>(address), values.size(), read ? 1 : 0, words);
+			std::fflush(stdout);
+		}
+	}
+	return read;
 }
 
 bool ReadShaderOrdinaryBacking(void*, uint64_t address, std::span<uint32_t> values) {
@@ -258,6 +279,31 @@ bool GuestReadLog::Read(uint64_t address, void* data, uint64_t size, bool strict
 	const auto offset = static_cast<uint32_t>(m_bytes.size());
 	m_bytes.insert(m_bytes.end(), static_cast<const uint8_t*>(data),
 	               static_cast<const uint8_t*>(data) + size);
+	// Bytes the GPU may own (the backing holds older ones) are always checked; see StillValid. Looked
+	// up per page (a page answer covers every read in it), for the last few pages of this log.
+	bool       unsafe     = !m_base_valid;
+	const auto first_page = address & ~uint64_t {0xfff};
+	if (!unsafe && first_page == ((address + size - 1) & ~uint64_t {0xfff})) {
+		size_t found = m_unsafe_pages.size();
+		for (size_t i = 0; i < m_unsafe_pages.size(); i++) {
+			if (m_unsafe_pages[i] == first_page) {
+				found = i;
+				break;
+			}
+		}
+		if (found != m_unsafe_pages.size()) {
+			unsafe = m_unsafe_values[found];
+		} else {
+			unsafe = Libs::LibKernel::Memory::IsGpuReadProtected(first_page, 0x1000) ||
+			         Libs::LibKernel::Memory::HasGpuDirtyBytesShared(first_page, 0x1000);
+			m_unsafe_pages[m_unsafe_next]  = first_page;
+			m_unsafe_values[m_unsafe_next] = unsafe;
+			m_unsafe_next                  = (m_unsafe_next + 1) % m_unsafe_pages.size();
+		}
+	} else if (!unsafe) {
+		unsafe = Libs::LibKernel::Memory::IsGpuReadProtected(address, size) ||
+		         Libs::LibKernel::Memory::HasGpuDirtyBytesShared(address, size);
+	}
 	// Contiguous reads of the same kind are checked as one (strict reads up to the size the
 	// check reads at once).
 	if (!m_entries.empty()) {
@@ -266,10 +312,25 @@ bool GuestReadLog::Read(uint64_t address, void* data, uint64_t size, bool strict
 		    last.offset + last.size == offset &&
 		    (!strict || last.size + size <= StrictCheckBytes)) {
 			last.size += static_cast<uint32_t>(size);
+			last.unsafe = last.unsafe || unsafe;
+			if (m_run_head != NoRun && !RunClean(last)) {
+				// The run is checked entry by entry from now on.
+				m_entries[m_run_head].run_count = 0;
+				m_run_head                      = NoRun;
+			}
 			return true;
 		}
 	}
-	m_entries.push_back({address, static_cast<uint32_t>(size), offset, strict});
+	m_entries.push_back({address, static_cast<uint32_t>(size), offset, strict, unsafe});
+	auto& entry = m_entries.back();
+	if (!RunClean(entry)) {
+		m_run_head = NoRun;
+	} else if (m_run_head != NoRun && (m_entries[m_run_head].address >> 12u) == (address >> 12u)) {
+		m_entries[m_run_head].run_count++;
+	} else {
+		m_run_head      = static_cast<uint32_t>(m_entries.size() - 1);
+		entry.run_count = 1;
+	}
 	return true;
 }
 
@@ -329,7 +390,34 @@ bool GuestReadLog::StillValid(bool without_faults) const {
 		}
 		return page_clean[kind];
 	};
-	for (const auto& entry: m_entries) {
+	// Reads that need no check: the resolve thread read them after the execution thread had
+	// finished operation m_base, no later operation writes their pages from the emulator's side
+	// (PageWriteSeq: noted command-processor writes, GPU-written buffer ranges, GPU data written
+	// back), and their bytes were not GPU-owned then. The game itself does not rewrite memory
+	// that submitted GPU work still reads before that work signals completion. Checking each
+	// read was 12% of the execution thread's time per draw and 26% per dispatch. Specialization
+	// (strict) reads are always checked. AbLegacy: every read is checked.
+	// KYTY_DBG_VERIFY_SKIPS=1 checks the skipped reads too and reports any that changed.
+	static const bool verify_skips = std::getenv("KYTY_DBG_VERIFY_SKIPS") != nullptr;
+	const bool        skips        = m_base_valid && !Common::Experiments::Enabled(Common::Experiments::AbLegacy) &&
+	                    m_base >= PageWriteSeq::g_floor.load(std::memory_order_acquire);
+	// KYTY_DBG_STAGE_STATS: NHL27CHECKS (reads, bytes and page switches per check).
+	const bool stats = StageStats::Enabled();
+	if (stats) {
+		const auto kind = without_faults ? 1 : 0;
+		uint64_t   pages = 0, last = ~uint64_t {0};
+		for (const auto& entry: m_entries) {
+			pages += (entry.address >> 12u) != last ? 1u : 0u;
+			last = (entry.address + entry.size - 1) >> 12u;
+		}
+		StageStats::g_check_calls[kind].fetch_add(1, std::memory_order_relaxed);
+		StageStats::g_check_entries[kind].fetch_add(m_entries.size(), std::memory_order_relaxed);
+		StageStats::g_check_bytes[kind].fetch_add(m_bytes.size(), std::memory_order_relaxed);
+		StageStats::g_check_pages[kind].fetch_add(pages, std::memory_order_relaxed);
+	}
+	uint64_t   seq_page       = ~uint64_t {0};
+	bool       seq_later      = false;
+	const auto check_entry = [&](const Entry& entry) {
 		const auto* recorded = m_bytes.data() + entry.offset;
 		if (entry.strict) {
 			// As specialization memory is read on the execution thread: GPU-owned bytes fail.
@@ -342,6 +430,40 @@ bool GuestReadLog::StillValid(bool without_faults) const {
 				return false;
 			}
 		} else {
+			// Consecutive reads mostly lie on one page: its last write is looked up once.
+			bool later;
+			const auto page = entry.address >> 12u;
+			if (page == ((entry.address + entry.size - 1) >> 12u)) {
+				if (page != seq_page) {
+					seq_page  = page;
+					seq_later = PageWriteSeq::Last(entry.address, entry.size) > m_base;
+				}
+				later = seq_later;
+			} else {
+				later = PageWriteSeq::Last(entry.address, entry.size) > m_base;
+			}
+			const bool skippable = skips && !entry.unsafe && !later;
+			if (stats) {
+				const auto kind = without_faults ? 1 : 0;
+				(skippable      ? StageStats::g_check_skipped[kind]
+				 : entry.unsafe ? StageStats::g_check_unsafe[kind]
+				                : StageStats::g_check_later[kind])
+				    .fetch_add(1, std::memory_order_relaxed);
+			}
+			if (skippable && !verify_skips) {
+				return true;
+			}
+			if (skippable && !SameGuestBytes(reinterpret_cast<const void*>(entry.address), recorded, entry.size)) {
+				static std::atomic<uint32_t> reported {0};
+				if (reported.fetch_add(1, std::memory_order_relaxed) < 32) {
+					std::printf("NHL27SKIPBAD: read 0x%016llx+%u changed after resolve (base %llu, page write %llu, %s)\n",
+					            static_cast<unsigned long long>(entry.address), entry.size,
+					            static_cast<unsigned long long>(m_base),
+					            static_cast<unsigned long long>(PageWriteSeq::Last(entry.address, entry.size)),
+					            without_faults ? "dispatch" : "draw");
+					std::fflush(stdout);
+				}
+			}
 			// Experiment FaultPageDirect: on a page that faulted before (the GPU wrote other
 			// bytes of it), clean bytes are compared in the backing instead of faulting again.
 			// Dispatch read-ahead checks never fault: their pages change every frame (ring
@@ -356,7 +478,7 @@ bool GuestReadLog::StillValid(bool without_faults) const {
 				        ? Libs::LibKernel::Memory::CompareCleanBacking(entry.address, recorded, entry.size)
 				        : Libs::LibKernel::Memory::TryValidateCleanBacking(entry.address, recorded, entry.size);
 				if (compare == Libs::LibKernel::Memory::CleanBackingCompare::Equal) {
-					continue;
+					return true;
 				}
 				if (compare == Libs::LibKernel::Memory::CleanBackingCompare::Different ||
 				    (without_faults && compare == Libs::LibKernel::Memory::CleanBackingCompare::Dirty)) {
@@ -369,6 +491,22 @@ bool GuestReadLog::StillValid(bool without_faults) const {
 				return false;
 			}
 		}
+		return true;
+	};
+	// A run of reads on one page that no later operation writes, none strict or possibly
+	// GPU-owned, needs no check at all: one lookup instead of a pass over its reads.
+	for (size_t i = 0; i < m_entries.size();) {
+		const auto& entry = m_entries[i];
+		if (entry.run_count != 0 && skips && !verify_skips &&
+		    PageWriteSeq::Last(entry.address & ~uint64_t {0xfff}, 1) <= m_base) {
+			if (stats) {
+				StageStats::g_check_skipped[without_faults ? 1 : 0].fetch_add(entry.run_count, std::memory_order_relaxed);
+			}
+			i += entry.run_count;
+			continue;
+		}
+		if (!check_entry(entry)) return false;
+		i++;
 	}
 	return true;
 }
@@ -402,7 +540,10 @@ private:
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
                      const std::vector<uint32_t>& spirv) {
-	if (!Config::GraphicsDebugDumpEnabled() && !ForceDumpShader(shader_hash)) {
+	// KYTY_DBG_DUMP_ALL_SPIRV=1: every shader's SPIR-V, nothing else (to validate code-gen changes
+	// with spirv-val).
+	static const bool all_spirv = std::getenv("KYTY_DBG_DUMP_ALL_SPIRV") != nullptr;
+	if (!all_spirv && !Config::GraphicsDebugDumpEnabled() && !ForceDumpShader(shader_hash)) {
 		return;
 	}
 	static std::atomic_int id = 0;
@@ -536,6 +677,8 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		std::deque<Permutation>                    permutations;
+		// The permutation the last resolution ahead took (resolve thread, under the program lock).
+		size_t                                     ahead_permutation = 0;
 		ResourceMemo                               resource_memo;
 		ShaderRecompiler::IR::ResourceSpecializationCache specialization_cache;
 		ShaderRecompiler::IR::ResourceDelta               delta; // KYTY_SRT_COMPILED: this program's previous outputs
@@ -711,6 +854,21 @@ struct PipelineCache::ProgramCache {
 				QueueCompile(stage, params, input_info, push_data_cursor, nullptr);
 			}
 		}
+		// Experiment DrawResolver: the other draw resolver materializes this program; wait for it
+		// without the lock (a busy entry would leave the draw to the execution thread).
+		if constexpr (!compute) {
+			if (program_lock != nullptr && entry != programs.end() &&
+			    entry->second.busy.load(std::memory_order_acquire) &&
+			    Common::Experiments::Enabled(Common::Experiments::DrawResolver)) {
+				const auto& waited = entry->second;
+				UnlockPrograms();
+				while (waited.busy.load(std::memory_order_acquire)) {
+					Common::SpinPause();
+				}
+				LockPrograms();
+				return GetAhead(params, input_info, push_data_cursor, ahead);
+			}
+		}
 		// SWAPPC programs link the functions they call from guest memory: the execution thread
 		// resolves them.
 		if (entry == programs.end() || ahead.stages == ProgramResolution::MaxStages ||
@@ -760,14 +918,23 @@ struct PipelineCache::ProgramCache {
 			ahead.reads.Fail();
 			return {};
 		}
-		const auto permutation =
-		    std::ranges::find_if(source.permutations, [&](const Permutation& candidate) {
-			    const auto& layout = candidate.program.bindings;
-			    return layout.push_data_start_dword ==
-			               ShaderRecompiler::IR::PushData::StartFor(push_data_cursor,
-			                                                        layout.ShaderDataDwords()) &&
-			           candidate.specialization == specialization;
-		    });
+		const auto matches = [&](const Permutation& candidate) {
+			const auto& layout = candidate.program.bindings;
+			return layout.push_data_start_dword ==
+			           ShaderRecompiler::IR::PushData::StartFor(push_data_cursor, layout.ShaderDataDwords()) &&
+			       candidate.specialization == specialization;
+		};
+		// Consecutive draws of a program mostly take the same permutation: try it first.
+		auto permutation = source.permutations.end();
+		if (source.ahead_permutation < source.permutations.size() &&
+		    matches(source.permutations[source.ahead_permutation])) {
+			permutation = source.permutations.begin() + static_cast<ptrdiff_t>(source.ahead_permutation);
+		} else {
+			permutation = std::ranges::find_if(source.permutations, matches);
+			if (permutation != source.permutations.end()) {
+				source.ahead_permutation = static_cast<size_t>(permutation - source.permutations.begin());
+			}
+		}
 		if (permutation == source.permutations.end()) {
 			if constexpr (!compute) {
 				QueueCompile(stage, params, input_info, push_data_cursor, &specialization);
@@ -1634,9 +1801,15 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 		// One store per build: the records copy the layouts of the stage input structures, and
 		// what a program key means may change between builds. A build with local changes uses the
 		// time pipelineCache.cpp (which includes those structures) was compiled.
-		const std::string_view hash = KYTY_GIT_HASH;
-		auto build = std::string(std::string_view(KYTY_GIT_REVISION).substr(0, 12));
-		if (hash.ends_with("-dirty")) {
+		// Builds whose shader translator and program cache are the same committed sources share a
+		// store (KYTY_GIT_SHADER_TREE): the records are compile inputs, recompiled by the running
+		// build and checked against its keys, and only those sources give them their meaning. A
+		// new build of the rest (most changes) then starts with the programs played before.
+		const std::string_view hash   = KYTY_GIT_HASH;
+		const std::string_view shared = KYTY_GIT_SHADER_TREE;
+		auto build = shared.empty() ? std::string(std::string_view(KYTY_GIT_REVISION).substr(0, 12))
+		                            : "s" + std::string(shared.substr(0, 12));
+		if (shared.empty() && hash.ends_with("-dirty")) {
 			build += fmt::format("-{:08x}", static_cast<uint32_t>(XXH3_64bits(
 			                                    __DATE__ __TIME__, sizeof(__DATE__ __TIME__))));
 		}
@@ -2196,7 +2369,10 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	const auto ps_id = ps_active ? pixel_program.id : 0;
 
 	FrameBreakdown::Timer key_timer(FrameBreakdown::g_pl.key_ns, FrameBreakdown::Verbose());
-	GraphicsPipelineKey key {};
+	// Copied from a default key: initializing its members one by one (the vertex input arrays alone
+	// are 64 entries) was 1.9% of the execution thread.
+	static const GraphicsPipelineKey default_key {};
+	GraphicsPipelineKey              key = default_key;
 	for (uint32_t i = 0; i < programs.vertex.size(); i++) {
 		key.vertex_shader_ids[i] = programs.vertex[i].id;
 	}

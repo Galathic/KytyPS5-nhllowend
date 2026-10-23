@@ -140,6 +140,9 @@ struct EmitterState {
 	uint32_t                   entry_label                           = 0;
 	uint32_t                   current_label                         = 0;
 	const IR::Block*           current_block                         = nullptr;
+	// Experiment BdaLoadGroups: the loads of each group by its first load (built on first use).
+	std::unordered_map<const IR::Inst*, std::vector<const IR::Inst*>> bda_load_groups;
+	bool                                                              bda_load_groups_built = false;
 	uint32_t                   pixel_valid_mask_variable             = 0;
 	// NHL debugging: KYTY_DBG_LOOP_CAP iteration budget (Function u32), 0 when disabled.
 	uint32_t                   loop_budget_variable                  = 0;
@@ -254,6 +257,9 @@ struct ValueEmitContext {
 	EmitterState&                                                      state;
 	const std::unordered_map<const IR::Inst*, uint32_t>*               dispatcher_spills = nullptr;
 	std::unordered_map<const IR::Inst*, std::pair<uint32_t, uint32_t>> dispatcher_block_loads;
+	// Experiment BdaLoadGroups: the values the first load of a group loaded for the others, with
+	// the label they were loaded in (one emitted in another label loads by itself).
+	std::unordered_map<const IR::Inst*, std::pair<uint32_t, uint32_t>> grouped_loads;
 	uint32_t                                                           scratch_u32_variable = 0;
 	ValueEmitContext*                                                  other_half = nullptr;
 	uint32_t                                                           half       = 0;

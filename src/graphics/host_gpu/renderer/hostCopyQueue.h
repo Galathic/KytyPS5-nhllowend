@@ -54,6 +54,13 @@ public:
 			(void)Flush();
 		}
 	}
+	// Producer: queues a call of function(argument) on the copy thread, in order with the copies.
+	void Call(void (*function)(void*), void* argument) {
+		m_pending.jobs[m_pending.count++] = {argument, nullptr, 0, function};
+		if (m_pending.count == BatchSize) {
+			(void)Flush();
+		}
+	}
 	// Producer: hands the gathered copies to the copy thread; returns the number of copies
 	// queued so far.
 	uint64_t Flush() {
@@ -64,10 +71,30 @@ public:
 		}
 		return m_queued;
 	}
+	// Producer: whether a Drain() now would wait for the copy thread.
+	[[nodiscard]] bool Pending() const noexcept {
+		return m_completed.Load() != m_queued + m_pending.count;
+	}
 	// Any thread: waits until the first `count` copies completed.
 	void WaitFor(uint64_t count) noexcept { m_completed.WaitFor(count); }
-	// Producer: waits until every queued copy completed.
+	// Producer: waits until every queued copy completed. The copies not handed over yet are done
+	// here (the copy thread, mostly idle by then, would have to wake for them), unless they include
+	// a call, which runs in order on the copy thread. They are independent of the earlier copies:
+	// each writes its own destination.
 	void Drain() {
+		if (m_pending.count != 0) {
+			bool calls = false;
+			for (size_t i = 0; i < m_pending.count; i++) {
+				calls = calls || m_pending.jobs[i].function != nullptr;
+			}
+			if (!calls) {
+				for (size_t i = 0; i < m_pending.count; i++) {
+					const auto& job = m_pending.jobs[i];
+					std::memcpy(job.destination, job.source, job.size);
+				}
+				m_pending.count = 0;
+			}
+		}
 		const auto queued = Flush();
 		if (m_completed.Load() != queued) {
 			m_completed.WaitFor(queued);
@@ -79,6 +106,8 @@ private:
 		void*       destination = nullptr;
 		const void* source      = nullptr;
 		size_t      size        = 0;
+		// A call instead of a copy (destination is its argument).
+		void (*function)(void*) = nullptr;
 	};
 	struct Batch {
 		std::array<Job, BatchSize> jobs {};
@@ -99,7 +128,11 @@ private:
 			}
 			for (size_t i = 0; i < batch->count; i++) {
 				const auto& job = batch->jobs[i];
-				std::memcpy(job.destination, job.source, job.size);
+				if (job.function != nullptr) {
+					job.function(job.destination);
+				} else {
+					std::memcpy(job.destination, job.source, job.size);
+				}
 			}
 			done += batch->count;
 			m_completed.Publish(done);

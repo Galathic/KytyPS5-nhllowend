@@ -36,10 +36,24 @@ inline std::atomic<CpState> g_cp_state {CpState::Processing};
 inline std::atomic<bool>    g_resolve_working {false};
 
 inline std::atomic<uint64_t> g_ns[CounterCount] {};
+// Resolved-read checks (GuestReadLog::StillValid) by kind (0 draws, 1 dispatches): calls, entries, bytes, pages.
+inline std::atomic<uint64_t> g_check_calls[2] {}, g_check_entries[2] {}, g_check_bytes[2] {}, g_check_pages[2] {};
+inline std::atomic<uint64_t> g_check_skipped[2] {}; // reads skipped (see GuestReadLog::StillValid)
+// Reads checked because their bytes may have been GPU-owned when read, or a later operation writes their page.
+inline std::atomic<uint64_t> g_check_unsafe[2] {}, g_check_later[2] {};
+// Buffer bindings the execution thread looks up, those its stage slot had the draw before, written.
+inline std::atomic<uint64_t> g_bind_total {0}, g_bind_same {0}, g_bind_written {0};
+inline std::atomic<uint64_t> g_bda_syncs {0}; // BDA synchronizations that scanned for CPU-dirty pages
 inline std::atomic<uint64_t> g_ops {0}; // operations the execution thread ran (written by it only)
 // Execution-thread time and count by operation kind (GpuOperationKind; execution thread only).
 inline std::atomic<uint64_t> g_kind_ns[8] {};
 inline std::atomic<uint64_t> g_kind_count[8] {};
+// Callbacks by GpuCallbackTag (execution thread only).
+inline std::atomic<uint64_t> g_callback_ns[16] {};
+inline std::atomic<uint64_t> g_callback_count[16] {};
+// HostCopyQueue::Drain before operations, by callback tag (15: draws and other non-callbacks):
+// drains, those that had to wait for the copy thread, and the wait time.
+inline std::atomic<uint64_t> g_drain_count[16] {}, g_drain_waits[16] {}, g_drain_ns[16] {};
 inline thread_local Role     t_role = Role::Other;
 
 [[nodiscard]] inline bool Enabled() {

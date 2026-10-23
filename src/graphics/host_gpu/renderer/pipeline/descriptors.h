@@ -64,6 +64,20 @@ struct TextureBinding {
 	// its view is acquired; see RenderExecutor::ResolveTexture().
 	TextureDescDerivation* lookup = nullptr;
 	bool                   reused = false;
+	// The Found::serial `desc` was copied from by RenderExecutor::ReuseTextureLookup (0: none).
+	uint64_t desc_serial = 0;
+};
+
+// The T#s the last draw of a program bound and the description each had (null when its lookups
+// are not reused), valid while the description map keeps `descs_generation`.
+struct ProgramImageMemo {
+	uint64_t                                           descs_generation = 0;
+	std::vector<ShaderRecompiler::IR::DescriptorValue> images;
+	std::vector<TextureDescDerivation*>                image_descs;
+	// The program's image bindings while another program uses its stage (swapped with
+	// PreparedBindings::images; `holder` has them meanwhile).
+	std::vector<TextureBinding> bindings;
+	const void*                 holder = nullptr;
 };
 
 struct PreparedBindings {
@@ -78,7 +92,30 @@ struct PreparedBindings {
 	// Keep the resolved guest range through cache preparation; only the host buffer ID may
 	// become stale and need resolving again when bindings are rebound.
 	std::vector<BufferSource>             buffer_sources;
+	// FindBuffers: the V# each buffer slot was found for, with its program and the buffer-set and
+	// mapping generations then: a slot whose V# is unchanged keeps its source.
+	struct BufferSlotKey {
+		ShaderRecompiler::IR::DescriptorValue value;
+		const void*                           program    = nullptr;
+		uint64_t                              generation = 0;
+	};
+	std::vector<BufferSlotKey> buffer_keys;
 	std::vector<vk::DescriptorBufferInfo> buffers;
+	// RebindBuffers: what each plain-read slot bound last (see BufferCache::PlainReadHolds()).
+	struct BufferSlotMemo {
+		Buffer*                  buffer         = nullptr;
+		uint64_t                 address        = 0;
+		uint64_t                 size           = 0;
+		uint64_t                 cpu_generation = 0;
+		uint64_t                 registration   = 0;
+		// Written slots (WrittenBindHolds()): the GPU ranges version after the binding.
+		uint64_t                 ranges_version = 0;
+		bool                     written        = false;
+		uint64_t                 image_version  = 0; // texel reads (0: not one)
+		vk::DescriptorBufferInfo info;
+		uint32_t                 buffer_offset = 0;
+	};
+	std::vector<BufferSlotMemo> buffer_memos;
 	std::vector<TextureBinding>           images;
 	// Bindless table descriptors in binding and table-range order, with the T# and the root
 	// image each element was resolved for.
@@ -95,13 +132,12 @@ struct PreparedBindings {
 	std::array<uint32_t, ShaderRecompiler::IR::PushData::DwordCount> push_dwords {};
 	bool                                                              push_dwords_valid = false;
 	// What the previous draw of this stage bound: a stage that binds the same program with the
-	// same T#s and S#s again (about half of them) skips the description lookups.
+	// same S#s again keeps its samplers.
 	const void*                                        last_program          = nullptr;
 	uint64_t                                           last_descs_generation = 0;
-	std::vector<ShaderRecompiler::IR::DescriptorValue> last_images;
 	std::vector<ShaderRecompiler::IR::DescriptorValue> last_samplers;
-	// The description each T# of `last_images` has (null when its lookups are not reused).
-	std::vector<TextureDescDerivation*>                image_descs;
+	// The image memo of `last_program` (RenderExecutor::m_program_image_memos).
+	ProgramImageMemo* image_memo = nullptr;
 };
 
 [[nodiscard]] vk::DescriptorType

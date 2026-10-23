@@ -7,6 +7,8 @@
 #include "common/logging/log.h"
 #include "common/runtimeFlags.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/guest_gpu/stageStats.h"
+#include "graphics/host_gpu/pageWriteSeq.h"
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -217,6 +219,23 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 	return m_mapped_ranges.Contains(vaddr, size);
 }
 
+uint64_t RenderContext::UnmapSequence() const noexcept {
+	std::shared_lock lock(m_unmap_log_mutex);
+	return m_unmap_sequence;
+}
+
+bool RenderContext::UnmappedSince(uint64_t sequence, uint64_t vaddr, uint64_t size) const noexcept {
+	std::shared_lock lock(m_unmap_log_mutex);
+	const auto       first = m_unmap_sequence > m_unmap_log.size() ? m_unmap_sequence - m_unmap_log.size() : 0;
+	for (auto s = std::max(sequence, first); s < m_unmap_sequence; s++) {
+		const auto& record = m_unmap_log[s % m_unmap_log.size()];
+		if (record.begin < vaddr + size && vaddr < record.end) {
+			return true;
+		}
+	}
+	return false;
+}
+
 bool RenderContext::IsReadProtected(uint64_t vaddr, uint64_t size) const noexcept {
 	if (size == 0 || !GuestRange {vaddr, size}.Valid()) {
 		return false;
@@ -237,25 +256,28 @@ uint64_t RenderContext::MappedRangesVersion() const noexcept {
 
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	Common::Timeline::Mark("map", size);
+	PageWriteSeq::ForceChecks();
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
+	m_bda_new_ranges.Add(vaddr, size);
 	++m_mapping_generation;
 	m_mapped_ranges_version++;
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	Common::Timeline::Mark("unmap", size);
+	PageWriteSeq::ForceChecks();
 	if (CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported memory unmap from an asynchronous GPU completion, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
 	const auto unmap = [this, vaddr, size] {
-		// Finishing the GPU protects GPU writes to the range and completions that may write guest
-		// memory there (downloads, write scans). Queued GPU work only reads cached copies and
-		// host-only completions (cache bookkeeping, flips, interrupts) never touch the range, so
-		// without GPU-owned pages, images or pending guest completions writing the range the
-		// unmap needs no drain.
+		// Finishing the GPU protects GPU writes to the range. Queued GPU work only reads cached
+		// copies, host-only completions (cache bookkeeping, flips, interrupts) never touch the
+		// range, and completions writing guest memory (downloads) skip what was unmapped since
+		// they were queued (WriteUnlessUnmapped), so without GPU-owned pages or images in the range
+		// the unmap needs no drain (AbPending: it drains for those completions too).
 		if (m_command_scheduler.Active()) {
 			m_command_scheduler.PopPendingOperations();
 		}
@@ -263,7 +285,8 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		const bool gpu     = active && m_buffer_cache.IsRegionGpuModified(vaddr, size);
 		const bool images  = active && !gpu && m_texture_cache.HasImagesInRegion(vaddr, size);
 		const bool pending = active && !gpu && !images && m_command_scheduler.HasPendingGuestOperations(vaddr, size);
-		const bool drain   = gpu || images || pending;
+		const bool drain   = gpu || images ||
+		                   (pending && Common::Experiments::Enabled(Common::Experiments::AbPending));
 		const auto start   = CpReadDebugEnabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 		if (drain) {
 			const auto tick = m_command_scheduler.CurrentTick();
@@ -295,10 +318,17 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		BufferCache::WriteTagScope tag(BufferCache::WriteTag::Unmap);
 		m_buffer_cache.InvalidateMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);
+		{
+			std::lock_guard log_lock(m_unmap_log_mutex);
+			m_unmap_log[m_unmap_sequence % m_unmap_log.size()] = {m_unmap_sequence, vaddr, vaddr + size};
+			m_unmap_sequence++;
+		}
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
+		m_bda_new_ranges.Subtract(vaddr, size);
 		++m_mapping_generation;
 		m_mapped_ranges_version++;
+		PageWriteSeq::ForceChecks();
 	};
 	// Shutdown still owns the GPU while queued rendering drains, but its command lane no
 	// longer accepts external work. Use the guest GPU's state for the teardown route.
@@ -397,7 +427,14 @@ void RenderContext::PrepareBda() {
 			batch.scan_ranges.clear();
 		}
 		if (cache_enabled && dirty_regions) {
-			const bool full = m_mapping_generation != m_bda_mapping_generation;
+			// Drained regions outside the mapped ranges are dropped, so only memory mapped since the
+			// last synchronization can hold CPU-dirty pages no drain will bring back (pages left for
+			// later epochs are queued again); unmaps leave nothing to upload. The full scan covers
+			// just that memory (AbPending: all mapped ranges after any mapping change).
+			const bool mapping_changed = m_mapping_generation != m_bda_mapping_generation;
+			const bool new_only        = m_operation_epoch_valid &&
+			                      !Common::Experiments::Enabled(Common::Experiments::AbPending);
+			const bool full = new_only ? !m_bda_new_ranges.Empty() : mapping_changed;
 			m_bda_stats.full_scans += full;
 			if (full) {
 				FrameBreakdown::Add(FrameBreakdown::g_counters.bda_scans);
@@ -410,10 +447,14 @@ void RenderContext::PrepareBda() {
 				// Only the pages written before this operation was emitted: pages the game is still
 				// filling for later submissions are not uploaded and protected again just to fault
 				// once more (in-play A/B: protect calls and write faults -20%).
+				if (StageStats::Enabled()) {
+					StageStats::g_bda_syncs.fetch_add(1, std::memory_order_relaxed);
+				}
 				if (m_operation_epoch_valid) {
 					uint32_t first_left = 0;
-					m_bda_pages_left = m_buffer_cache.SynchronizeBuffersInRangesBefore(
-					    m_mapped_ranges, full, m_operation_write_epoch, first_left);
+					const RangeSet* full_ranges = !full ? nullptr : new_only ? &m_bda_new_ranges : &m_mapped_ranges;
+					m_bda_pages_left            = m_buffer_cache.SynchronizeBuffersInRangesBefore(
+					    m_mapped_ranges, full_ranges, m_operation_write_epoch, first_left);
 					m_bda_first_left = first_left;
 				} else {
 					drained          = m_buffer_cache.SynchronizeBuffersInRanges(m_mapped_ranges, full);
@@ -444,6 +485,10 @@ void RenderContext::PrepareBda() {
 		// another scan, even if it targets a range we already visited.
 		m_bda_cpu_generation = cpu;
 		m_bda_registration_generation = registrations;
+		if (m_bda_mapping_generation != m_mapping_generation) {
+			// Every path above synchronized the newly mapped memory.
+			m_bda_new_ranges.Clear();
+		}
 		m_bda_mapping_generation = m_mapping_generation;
 		if (stats_enabled) {
 			batch.collecting = false;
@@ -568,8 +613,8 @@ void RenderContext::RunGarbageCollector() {
 		m_buffer_cache.ProcessFaultBuffer();
 	}
 	if (m_indirect_write_tables.TakePendingWrites()) {
-		m_buffer_cache.ProcessWriteBuffer([this](std::span<const uint64_t> pages) {
-			m_indirect_write_tables.NoteWrites(pages);
+		m_buffer_cache.ProcessWriteBuffer([this, sequence = UnmapSequence()](std::span<const uint64_t> pages) {
+			m_indirect_write_tables.NoteWrites(pages, sequence);
 		});
 	}
 	m_texture_cache.ProcessDownloadImages();

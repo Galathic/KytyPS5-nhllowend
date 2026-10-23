@@ -162,9 +162,14 @@ bool IndirectWriteTables::Prepare(uint64_t address, uint64_t size) {
 	return true;
 }
 
-void IndirectWriteTables::NoteWrites(std::span<const uint64_t> pages) {
+void IndirectWriteTables::NoteWrites(std::span<const uint64_t> pages, uint64_t unmap_sequence) {
 	RangeSet written;
 	for (const auto page: pages) {
+		// Unmaps do not wait for this scan: a page unmapped since its stores (and maybe mapped
+		// again) does not take their marks.
+		if (m_context.UnmappedSince(unmap_sequence, page, BufferCache::CACHING_PAGESIZE)) {
+			continue;
+		}
 		written.Add(page, BufferCache::CACHING_PAGESIZE);
 	}
 	auto&      buffer_cache  = m_context.GetBufferCache();

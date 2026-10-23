@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
+#include "graphics/host_gpu/renderer/hostCopyQueue.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
@@ -221,7 +222,36 @@ struct PageManager::Impl {
 	struct Region {
 		std::atomic_flag                    lock = ATOMIC_FLAG_INIT;
 		std::array<PageState, REGION_PAGES> pages;
+		// Deferred protection: pages whose protection the host copy thread still has to apply
+		// (from their watchers then), and whether an apply call is queued.
+		std::array<uint64_t, (REGION_PAGES + 63) / 64> stale {};
+		std::atomic<bool>                               apply_queued {false};
+		uint64_t                                        base = 0;
 	};
+	inline static thread_local HostCopyQueue* t_deferred_queue = nullptr;
+
+	// Host copy thread: protects the region's stale pages as their watchers want now.
+	static void ApplyStale(void* argument) noexcept {
+		auto& region = *static_cast<Region*>(argument);
+		region.apply_queued.store(false, std::memory_order_release);
+		SpinGuard lock(region.lock);
+		size_t page = 0;
+		while (page < REGION_PAGES) {
+			if ((region.stale[page / 64] >> (page % 64) & 1u) == 0) {
+				page++;
+				continue;
+			}
+			const auto perms = region.pages[page].Perms();
+			size_t     end   = page;
+			while (end < REGION_PAGES && (region.stale[end / 64] >> (end % 64) & 1u) != 0 &&
+			       region.pages[end].Perms() == perms) {
+				region.stale[end / 64] &= ~(uint64_t {1} << (end % 64));
+				end++;
+			}
+			Protect(region.base + page * PAGE_SIZE, (end - page) * PAGE_SIZE, perms);
+			page = end;
+		}
+	}
 
 	Impl() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -271,13 +301,14 @@ struct PageManager::Impl {
 			return region;
 		}
 		auto  region = std::make_unique<Region>();
+		region->base = index * REGION_SIZE;
 		auto* ptr    = region.get();
 		region_storage.push_back(std::move(region));
 		regions[index].store(ptr, std::memory_order_release);
 		return ptr;
 	}
 
-	void Protect(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode) noexcept {
+	static void Protect(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode) noexcept {
 		ProtectStats::Count(size);
 		FrameBreakdown::Add(FrameBreakdown::g_counters.protect_calls);
 		FrameBreakdown::Timer protect_timer(FrameBreakdown::g_counters.protect_ns);
@@ -294,15 +325,37 @@ struct PageManager::Impl {
 	template <bool track, bool is_read, bool masked>
 	void UpdateRegionWatchers(Region& region, uint64_t base_addr, size_t first, size_t last,
 	                          const RegionBits* mask = nullptr) {
+		// Deferred protection: only pages gaining write watchers (see DeferredProtectionScope).
+		auto* const deferred = track && !is_read ? t_deferred_queue : nullptr;
+		bool        apply    = false;
+		UpdateRegionWatchersLocked<track, is_read, masked>(region, base_addr, first, last, mask,
+		                                                     deferred != nullptr, apply);
+		// Queued after the lock is released: the copy thread takes it to apply.
+		if (apply && !region.apply_queued.exchange(true, std::memory_order_acq_rel)) {
+			deferred->Call(&ApplyStale, &region);
+		}
+	}
+
+	template <bool track, bool is_read, bool masked>
+	void UpdateRegionWatchersLocked(Region& region, uint64_t base_addr, size_t first, size_t last,
+	                                const RegionBits* mask, bool defer, bool& apply) {
 		SpinGuard lock(region.lock);
 		auto      perms                 = region.pages[first].Perms();
 		uint64_t  range_begin           = 0;
 		uint64_t  range_bytes           = 0;
 		uint64_t  potential_range_bytes = 0;
+		bool      read_changed          = false;
 
 		const auto release_pending = [&] {
 			if (range_bytes != 0) {
-				Protect(base_addr + range_begin * PAGE_SIZE, range_bytes, perms);
+				if (defer) {
+					for (auto page = range_begin; page < range_begin + range_bytes / PAGE_SIZE; page++) {
+						region.stale[page / 64] |= uint64_t {1} << (page % 64);
+					}
+					apply = true;
+				} else {
+					Protect(base_addr + range_begin * PAGE_SIZE, range_bytes, perms);
+				}
 				range_bytes           = 0;
 				potential_range_bytes = 0;
 			}
@@ -330,6 +383,9 @@ struct PageManager::Impl {
 			}
 
 			const bool watcher_edge = (track && new_count == 1) || (!track && new_count == 0);
+			if constexpr (is_read) {
+				read_changed = read_changed || watcher_edge;
+			}
 			if (watcher_edge && old_perms != new_perms) {
 				if (range_bytes == 0) {
 					range_begin           = page_index;
@@ -340,6 +396,11 @@ struct PageManager::Impl {
 		}
 
 		release_pending();
+		if constexpr (is_read) {
+			if (read_changed) {
+				read_watch_version.fetch_add(1, std::memory_order_release);
+			}
+		}
 	}
 
 	template <bool track, bool is_read>
@@ -363,12 +424,27 @@ struct PageManager::Impl {
 
 	std::unique_ptr<std::atomic<Region*>[]> regions;
 	std::vector<std::unique_ptr<Region>>    region_storage;
+	// Advances after any page gains or loses its read watcher (IsReadWatched caches per thread).
+	std::atomic<uint64_t> read_watch_version {0};
 	std::mutex                              region_mutex;
 };
 
 static_assert(std::atomic<void*>::is_always_lock_free);
 
 PageManager::PageManager(): m_impl(std::make_unique<Impl>()) {}
+
+PageManager::DeferredProtectionScope::DeferredProtectionScope(HostCopyQueue* queue) noexcept
+    : m_previous(Impl::t_deferred_queue) {
+	Impl::t_deferred_queue = queue;
+}
+
+PageManager::DeferredProtectionScope::~DeferredProtectionScope() {
+	Impl::t_deferred_queue = m_previous;
+}
+
+bool PageManager::DeferringProtection() noexcept {
+	return Impl::t_deferred_queue != nullptr;
+}
 
 PageManager::~PageManager() = default;
 
@@ -387,13 +463,28 @@ bool PageManager::IsWatched(uint64_t vaddr) const {
 }
 
 bool PageManager::IsReadWatched(uint64_t vaddr) const {
+	// Read checks ask about the same pages draw after draw, while read watchers change rarely.
+	struct Answer {
+		uint64_t page    = ~uint64_t {0};
+		uint64_t version = 0;
+		bool     watched = false;
+	};
+	static thread_local std::array<Answer, 64> answers {};
+	const auto page_address = vaddr & ~(PAGE_SIZE - 1);
+	auto&      answer       = answers[(page_address / PAGE_SIZE) & 63u];
+	const auto version      = m_impl->read_watch_version.load(std::memory_order_acquire);
+	if (answer.page == page_address && answer.version == version) {
+		return answer.watched;
+	}
 	auto* region = m_impl->FindRegion(vaddr);
 	if (region == nullptr) {
 		return false;
 	}
 	const auto page = static_cast<size_t>((vaddr % REGION_SIZE) / PAGE_SIZE);
 	SpinGuard  lock(region->lock);
-	return region->pages[page].access_watchers != 0;
+	const bool watched = region->pages[page].access_watchers != 0;
+	answer = {page_address, version, watched};
+	return watched;
 }
 
 template <bool track>

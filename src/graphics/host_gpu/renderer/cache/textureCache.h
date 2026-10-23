@@ -80,6 +80,28 @@ public:
 	// back: those conversions replace the image other passes use, which then convert it again.
 	[[nodiscard]] ImageId FindImageSpeculative(ImageDesc& desc, bool exact_format = false);
 	void                        UpdateImage(ImageId id);
+	// Whether a registered image starts at `address` (the only images FindImageFromRange finds).
+	[[nodiscard]] bool HasImageAt(uint64_t address) {
+		// Nearly every texel bind asks and finds none: a filter bit of the start address is
+		// clear then (the lock and the map lookup were 1.5% of the execution thread).
+		if (!AddressFilterHit(address)) {
+			return false;
+		}
+		std::scoped_lock lock {m_lock};
+		return m_images_by_address.contains(address);
+	}
+	// Advances after each image registration (the only change that can make HasImageAt() true
+	// for an address): a false answer holds while it is unchanged.
+	[[nodiscard]] uint64_t AddressIndexVersion() const {
+		return m_address_index_version.load(std::memory_order_acquire);
+	}
+	// The same for the addresses sharing one of 4,096 groups of HasImageAt() filter bits with
+	// `address` only (bit 63 set: never equal to an AddressIndexVersion()). A small table: a
+	// version per filter bit (256 KiB) missed the cache on most texel binds.
+	[[nodiscard]] uint64_t AddressBucketVersion(uint64_t address) const {
+		return (uint64_t {1} << 63u) |
+		       m_address_filter_versions[AddressFilterIndex(address) >> 4u].load(std::memory_order_acquire);
+	}
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
 	[[nodiscard]] vk::ImageView FindTexture(ImageId id, const ImageDesc& desc);
@@ -234,6 +256,20 @@ private:
 	ImagePageTable                                    m_image_page_table;
 	// Registered images by exact start address (FindImage fast path).
 	std::unordered_map<uint64_t, std::vector<ImageId>> m_images_by_address;
+	std::atomic<uint64_t>                              m_address_index_version {0};
+	// HasImageAt() filter: a bit per hash of the start addresses of registered images, set while
+	// the count of registered images hashing to it is not 0 (counts change under m_lock).
+	static constexpr size_t AddressFilterBits = size_t {1} << 16u;
+	[[nodiscard]] static size_t AddressFilterIndex(uint64_t address) {
+		return static_cast<size_t>(((address >> 8u) * 0x9e3779b97f4a7c15ull) >> 48u);
+	}
+	[[nodiscard]] bool AddressFilterHit(uint64_t address) const {
+		const auto index = AddressFilterIndex(address);
+		return ((m_address_filter[index / 64].load(std::memory_order_acquire) >> (index % 64)) & 1u) != 0;
+	}
+	std::array<std::atomic<uint64_t>, AddressFilterBits / 64> m_address_filter {};
+	std::array<uint16_t, AddressFilterBits>                   m_address_filter_counts {};
+	std::array<std::atomic<uint32_t>, AddressFilterBits / 16> m_address_filter_versions {};
 	MultiLevelPageTable<uint64_t, ImagePageTable::kPageBits, ImagePageTable::kAddressSpaceBits,
 	                    ImagePageTable::kFirstLevelBits>
 	    m_image_page_epochs;

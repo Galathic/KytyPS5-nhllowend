@@ -158,6 +158,9 @@ std::unique_ptr<WindowContext> g_window;
 
 constexpr const char* KYTY_SDL_WINDOW_CAPTION = "Game";
 
+static bool WindowMaximizedEnabled();
+static void RememberWindowDisplay(SDL_Window* window);
+
 static void SetPause(WindowLoopState& game, bool flag) {
 	LOGF("Pause: %s\n", flag ? "true" : "false");
 
@@ -415,6 +418,16 @@ void WindowContext::ProcessWindowEvent(const SDL_WindowEvent& event) {
 		case SDL_EVENT_WINDOW_MOVED:
 			LOGF("Window %" PRIu32 " moved to %" PRId32 ",%" PRId32 "\n", window_event.windowID,
 			     window_event.data1, window_event.data2);
+			break;
+
+		case SDL_EVENT_WINDOW_DISPLAY_CHANGED:
+			// Moved to another display: open there next time, and fill it again.
+			if (auto* moved = SDL_GetWindowFromID(window_event.windowID); moved != nullptr) {
+				RememberWindowDisplay(moved);
+				if (WindowMaximizedEnabled() && (SDL_GetWindowFlags(moved) & SDL_WINDOW_MAXIMIZED) == 0) {
+					SDL_MaximizeWindow(moved);
+				}
+			}
 			break;
 
 		case SDL_EVENT_WINDOW_RESIZED:
@@ -781,6 +794,72 @@ void WindowContext::Run() {
 	}
 }
 
+// The display the window was last moved to, kept next to the emulator's working files.
+constexpr const char* WINDOW_DISPLAY_FILE = "window_display.txt";
+
+// A window opens maximized on its display and maximizes again when moved to another one
+// (KYTY_WINDOW_MAXIMIZED=0: at the configured size).
+static bool WindowMaximizedEnabled() {
+	const char* value = std::getenv("KYTY_WINDOW_MAXIMIZED");
+	return !Config::FullscreenEnabled() && (value == nullptr || value[0] != '0');
+}
+
+// KYTY_WINDOW_DISPLAY=<n> opens the window on the n-th display (0 = the first SDL lists),
+// =other on the first one that is not the primary display. Without it, on the display the
+// window was last moved to (WINDOW_DISPLAY_FILE), else on the primary one.
+static SDL_DisplayID InitialWindowDisplay() {
+	SDL_DisplayID primary = SDL_GetPrimaryDisplay();
+	int           count   = 0;
+	SDL_DisplayID* displays = SDL_GetDisplays(&count);
+	if (displays == nullptr) {
+		return primary;
+	}
+	std::string choice;
+	if (const char* value = std::getenv("KYTY_WINDOW_DISPLAY"); value != nullptr) {
+		choice = value;
+	} else if (std::FILE* file = std::fopen(WINDOW_DISPLAY_FILE, "r"); file != nullptr) {
+		char line[32] = {};
+		if (std::fgets(line, sizeof(line), file) != nullptr) {
+			choice = line;
+		}
+		std::fclose(file);
+	}
+	SDL_DisplayID result = primary;
+	if (choice.rfind("other", 0) == 0) {
+		for (int i = 0; i < count; i++) {
+			if (displays[i] != primary) {
+				result = displays[i];
+				break;
+			}
+		}
+	} else if (!choice.empty()) {
+		const auto index = std::strtol(choice.c_str(), nullptr, 10);
+		if (index >= 0 && index < count) result = displays[index];
+	}
+	SDL_free(displays);
+	return result;
+}
+
+static void RememberWindowDisplay(SDL_Window* window) {
+	const SDL_DisplayID display = SDL_GetDisplayForWindow(window);
+	int                 count   = 0;
+	SDL_DisplayID*      displays = SDL_GetDisplays(&count);
+	if (displays == nullptr || display == 0) {
+		SDL_free(displays);
+		return;
+	}
+	for (int i = 0; i < count; i++) {
+		if (displays[i] == display) {
+			if (std::FILE* file = std::fopen(WINDOW_DISPLAY_FILE, "w"); file != nullptr) {
+				std::fprintf(file, "%d\n", i);
+				std::fclose(file);
+			}
+			break;
+		}
+	}
+	SDL_free(displays);
+}
+
 static void WindowCreate(WindowContext& context) {
 	EXIT_IF(context.window != nullptr);
 	EXIT_IF(context.graphic_ctx.screen_width == 0);
@@ -802,6 +881,10 @@ static void WindowCreate(WindowContext& context) {
 	SDL_SetHint(SDL_HINT_JOYSTICK_GAMEINPUT, "0");
 	SDL_SetHint(SDL_HINT_JOYSTICK_GAMEINPUT_RAW, "0");
 #endif
+	// Gamepads keep playing while the window is not focused (an emulator started from a script
+	// rarely gets the focus; SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=0 in the environment restores
+	// focus-only input).
+	SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
 	if (!SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
 		EXIT("%s\n", SDL_GetError());
 	}
@@ -840,7 +923,12 @@ static void WindowCreate(WindowContext& context) {
 		EXIT("%s\n", SDL_GetError());
 	}
 
-	SDL_SetWindowPosition(context.window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+	const auto display = InitialWindowDisplay();
+	SDL_SetWindowPosition(context.window, static_cast<int>(SDL_WINDOWPOS_CENTERED_DISPLAY(display)),
+	                      static_cast<int>(SDL_WINDOWPOS_CENTERED_DISPLAY(display)));
+	if (WindowMaximizedEnabled()) {
+		SDL_MaximizeWindow(context.window);
+	}
 	HostInputInit(context.window);
 	InitializeSystemOverlayInput(context.window);
 	context.UpdateIcon();

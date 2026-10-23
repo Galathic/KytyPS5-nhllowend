@@ -316,8 +316,9 @@ void FaultManager::Process(Reader& reader, uint64_t bitmap_offset, PagesHandler&
 	command.pipelineBarrier2(dependency);
 
 	const auto area = reader.current;
-	// The write scan marks the pages the GPU wrote as GPU-owned: an unmap waits for it, or a remap
-	// of the range would inherit the marks. The fault scan only caches pages still mapped.
+	// The write scan marks the pages the GPU wrote as GPU-owned, except those unmapped since it was
+	// queued (IndirectWriteTables::NoteWrites): unmaps need not wait for it (they waited for the
+	// GPU 4-6 ms each, a few times a second in play). The fault scan only caches pages still mapped.
 	Common::UniqueFunction<void> scan = [this, bitmap_offset, &reader, mapped, offset, area, area_size,
 	                                     handler = std::move(handler)] {
 		reader.download.Invalidate(offset, area_size);
@@ -346,7 +347,7 @@ void FaultManager::Process(Reader& reader, uint64_t bitmap_offset, PagesHandler&
 		reader.ticks[area] = 0;
 	};
 	if (&reader == &m_writes) {
-		m_scheduler.DeferOperation(std::move(scan));
+		m_scheduler.DeferOperation(std::move(scan), 0, 0);
 	} else {
 		m_scheduler.DeferHostOperation(std::move(scan));
 	}

@@ -7,6 +7,8 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstdio>
+#include <cstdlib>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
@@ -301,6 +303,224 @@ uint32_t LoadBda(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint3
 	});
 }
 
+// Experiment BdaLoadGroups (key bit 8192). A guest load of several DWORDs through an address
+// (FLAT, GLOBAL, S_LOAD) is one LoadAddressU32 per DWORD, and each looks up its page and loads in
+// branches of its own, one memory latency after another: the vertex shaders of the most drawn
+// shadow pipelines had 32 of them in a row. Consecutive loads of consecutive DWORDs with the same
+// address operands form a group, loaded at its first load: when the group (with the DWORD after
+// it, for an unaligned address) is in one page, one lookup serves it and its loads issue
+// together; otherwise each DWORD loads as before. Faults and values are the same either way.
+
+// Loads whose own emission is LoadBdaDword (scalar) or LoadBda (vector), non-coherent.
+bool BdaGroupable(const ValueEmitContext& ctx, const IR::Inst& inst) {
+	if (inst.GetOpcode() != IR::ValueOpcode::LoadAddressU32) return false;
+	const auto& mem = ctx.Memory(inst);
+	return !mem.planning_only && !mem.coherent &&
+	       (mem.kind == IR::ResourceKind::ScalarAddress || mem.kind == IR::ResourceKind::Flat ||
+	        mem.kind == IR::ResourceKind::Global);
+}
+
+// The address offset GuestAddress() adds for the load.
+int64_t BdaImmediate(const IR::MemoryInfo& mem) {
+	auto immediate = mem.offset;
+	if (mem.kind == IR::ResourceKind::ScalarAddress) immediate &= ~3u;
+	return static_cast<int64_t>(static_cast<int32_t>(immediate));
+}
+
+// Whether `next` loads the DWORD after `previous`'s with the same address operands.
+bool BdaGroupContinues(const ValueEmitContext& ctx, const IR::Inst& previous, const IR::Inst& next) {
+	const auto& a = ctx.Memory(previous);
+	const auto& b = ctx.Memory(next);
+	if (a.kind != b.kind || a.address_is_full != b.address_is_full ||
+	    previous.NumArgs() != next.NumArgs() || BdaImmediate(b) != BdaImmediate(a) + 4) {
+		return false;
+	}
+	for (size_t arg = 0; arg < previous.NumArgs(); arg++) {
+		if (!(previous.Arg(arg).Resolve() == next.Arg(arg).Resolve())) return false;
+	}
+	return true;
+}
+
+const std::unordered_map<const IR::Inst*, std::vector<const IR::Inst*>>&
+BdaLoadGroups(ValueEmitContext& ctx) {
+	auto& state = ctx.state;
+	if (state.bda_load_groups_built) return state.bda_load_groups;
+	state.bda_load_groups_built = true;
+	constexpr size_t MaxGroup = 16;
+	static const bool debug = std::getenv("KYTY_DBG_BDA_GROUPS") != nullptr;
+	size_t            loads = 0;
+	for (const auto* block: state.program.blocks) {
+		std::vector<const IR::Inst*> group;
+		const auto close = [&]() {
+			if (group.size() >= 2) {
+				loads += group.size();
+				const auto* first = group.front();
+				state.bda_load_groups.emplace(first, std::move(group));
+			}
+			group.clear();
+		};
+		for (const auto& inst: *block) {
+			if (!BdaGroupable(ctx, inst)) {
+				close();
+				continue;
+			}
+			if (group.empty() || group.size() == MaxGroup || !BdaGroupContinues(ctx, *group.back(), inst)) {
+				close();
+			}
+			group.push_back(&inst);
+		}
+		close();
+	}
+	if (debug && !state.bda_load_groups.empty()) {
+		std::printf("NHL27BDAGROUP: hash=0x%016llx stage=%u groups=%zu loads=%zu\n",
+		            static_cast<unsigned long long>(state.program.shader_hash),
+		            static_cast<unsigned>(state.program.stage), state.bda_load_groups.size(), loads);
+		std::fflush(stdout);
+	}
+	return state.bda_load_groups;
+}
+
+uint32_t LoadPhysicalDword(EmitterState& state, uint32_t address) {
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, address);
+	const auto         value     = state.builder.AllocateId();
+	constexpr uint32_t alignment = sizeof(uint32_t);
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer,
+	                          spv::MemoryAccessAlignedMask, alignment);
+	return value;
+}
+
+// "if (condition) values = then(); else values = otherwise();" with a phi per value; without
+// `otherwise` the values are 0 where the condition is false.
+template <typename Then, typename Otherwise>
+std::vector<uint32_t> EmitValuesIfElse(EmitterState& state, uint32_t condition, size_t count,
+                                       Then&& then_values, Otherwise&& otherwise_values) {
+	const auto then_label  = state.builder.AllocateId();
+	const auto else_label  = state.builder.AllocateId();
+	const auto merge_label = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
+	state.builder.AddFunction(spv::OpBranchConditional, condition, then_label, else_label);
+	EmitLabel(state, then_label);
+	const auto then_result = then_values();
+	const auto then_exit   = state.current_label;
+	state.builder.AddFunction(spv::OpBranch, merge_label);
+	EmitLabel(state, else_label);
+	const auto else_result = otherwise_values();
+	const auto else_exit   = state.current_label;
+	state.builder.AddFunction(spv::OpBranch, merge_label);
+	EmitLabel(state, merge_label);
+	std::vector<uint32_t> result(count);
+	for (size_t index = 0; index < count; index++) {
+		result[index] = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpPhi, TypeU32(state), result[index], then_result[index],
+		                          then_exit, else_result[index], else_exit);
+	}
+	return result;
+}
+
+template <typename Then>
+std::vector<uint32_t> EmitValuesOrZerosIfCondition(EmitterState& state, uint32_t condition,
+                                                   size_t count, Then&& then_values) {
+	return EmitValuesIfElse(state, condition, count, std::forward<Then>(then_values), [&]() {
+		return std::vector<uint32_t>(count, ConstantU32(state, 0));
+	});
+}
+
+std::vector<uint32_t> LoadBdaGroup(ValueEmitContext& ctx, const std::vector<const IR::Inst*>& group) {
+	auto&       state   = ctx.state;
+	const auto& leader  = *group.front();
+	const auto& mem     = ctx.Memory(leader);
+	const bool  scalar  = mem.kind == IR::ResourceKind::ScalarAddress;
+	const auto  count   = static_cast<uint32_t>(group.size());
+	const auto  u64     = TypeU64(state);
+	const auto  address = GuestAddress(ctx, leader, mem);
+	const auto  offset  = [&](uint32_t base, uint32_t bytes) {
+		return bytes == 0 ? base : Binary(state, spv::OpIAdd, u64, base, ConstantU64(state, bytes));
+	};
+	const auto load = [&]() {
+		// Scalar addresses are DWORD aligned already; a vector one may need the DWORD after the group.
+		const auto aligned =
+		    scalar ? address
+		           : Binary(state, spv::OpBitwiseAnd, u64, address, ConstantU64(state, ~uint64_t {3}));
+		const auto last      = offset(aligned, 4u * (scalar ? count - 1u : count));
+		const auto same_page = Binary(state, spv::OpIEqual, TypeBool(state), BdaPageIndex(state, aligned),
+		                              BdaPageIndex(state, last));
+		return EmitValuesIfElse(
+		    state, same_page, count,
+		    [&]() {
+			    const auto bda     = GetBdaPointer(state, aligned);
+			    const auto present = Binary(state, spv::OpINotEqual, TypeBool(state), bda,
+			                                ConstantU64(state, 0));
+			    return EmitValuesOrZerosIfCondition(state, present, count, [&]() {
+				    std::vector<uint32_t> dwords;
+				    for (uint32_t index = 0; index < count + (scalar ? 0u : 1u); index++) {
+					    dwords.push_back(LoadPhysicalDword(state, offset(bda, 4u * index)));
+				    }
+				    if (scalar) return dwords;
+				    // As LoadBda merges the two DWORDs an unaligned address spans.
+				    const auto u32   = TypeU32(state);
+				    const auto byte  = Binary(state, spv::OpBitwiseAnd, u32,
+				                              Unary(state, spv::OpUConvert, u32, address),
+				                              ConstantU32(state, 3));
+				    const auto crosses =
+				        Binary(state, spv::OpINotEqual, TypeBool(state), byte, ConstantU32(state, 0));
+				    const auto shift = Binary(state, spv::OpShiftLeftLogical, u32, byte, ConstantU32(state, 3));
+				    const auto upper_shift = Binary(
+				        state, spv::OpShiftLeftLogical, u32,
+				        Binary(state, spv::OpBitwiseAnd, u32,
+				               Binary(state, spv::OpISub, u32, ConstantU32(state, 4), byte),
+				               ConstantU32(state, 3)),
+				        ConstantU32(state, 3));
+				    std::vector<uint32_t> values;
+				    for (uint32_t index = 0; index < count; index++) {
+					    const auto second = Select(state, u32, crosses, dwords[index + 1], ConstantU32(state, 0));
+					    values.push_back(Binary(
+					        state, spv::OpBitwiseOr, u32,
+					        Binary(state, spv::OpShiftRightLogical, u32, dwords[index], shift),
+					        Binary(state, spv::OpShiftLeftLogical, u32, second, upper_shift)));
+				    }
+				    return values;
+			    });
+		    },
+		    [&]() {
+			    std::vector<uint32_t> values;
+			    for (uint32_t index = 0; index < count; index++) {
+				    const auto component = offset(address, 4u * index);
+				    values.push_back(scalar ? LoadBdaDword(ctx, component)
+				                            : LoadBda(ctx, component, ConstantBool(state, true), 32u));
+			    }
+			    return values;
+		    });
+	};
+	if (scalar) return load();
+	return EmitValuesOrZerosIfCondition(state, ctx.Arg(leader, leader.NumArgs() - 1), count, load);
+}
+
+// The value of a grouped load, or 0 when it loads by itself.
+uint32_t LoadGroupedBda(ValueEmitContext& ctx, const IR::Inst& inst) {
+	if (!ShaderBdaLoadGroups() || ctx.state.lane_count != 1) return 0;
+	if (const auto found = ctx.grouped_loads.find(&inst); found != ctx.grouped_loads.end()) {
+		const auto [label, value] = found->second;
+		ctx.grouped_loads.erase(found);
+		if (label == ctx.state.current_label) return value;
+		static const bool debug = std::getenv("KYTY_DBG_BDA_GROUPS") != nullptr;
+		if (debug) {
+			std::printf("NHL27BDAGROUP: hash=0x%016llx load emitted apart from its group\n",
+			            static_cast<unsigned long long>(ctx.state.program.shader_hash));
+		}
+		return 0;
+	}
+	const auto& groups = BdaLoadGroups(ctx);
+	const auto  group  = groups.find(&inst);
+	if (group == groups.end()) return 0;
+	const auto values = LoadBdaGroup(ctx, group->second);
+	for (size_t index = 1; index < values.size(); index++) {
+		ctx.grouped_loads.insert_or_assign(group->second[index],
+		                                   std::pair {ctx.state.current_label, values[index]});
+	}
+	return values.front();
+}
+
 uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
 	if (mem.kind == IR::ResourceKind::Buffer) {
 		const auto resource = ctx.state.program.info.buffers.at(mem.resource).descriptor_index;
@@ -354,8 +574,9 @@ uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& 
 // Shaders that spill guest VGPRs (to LDS or scratch) keep their branches: unconditional loads made
 // the one such NHL 27 pixel shader 16-27% slower (more live values), the others 8-23% faster.
 bool RobustLoad(const EmitterState& state, IR::ResourceKind kind) {
-	return (kind == IR::ResourceKind::Buffer || kind == IR::ResourceKind::ScalarBuffer) &&
-	       ShaderRobustLoads() && !state.program.info.function_lds && state.program.scratch_dwords == 0;
+	const bool spills = state.program.info.function_lds || state.program.scratch_dwords != 0;
+	return (kind == IR::ResourceKind::Buffer || kind == IR::ResourceKind::ScalarBuffer) && ShaderRobustLoads() &&
+	       (!spills || (ShaderRobustSpillLoads() && state.program.stage != ShaderType::Pixel));
 }
 
 uint32_t LoadWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
@@ -802,7 +1023,46 @@ uint32_t FormattedOutOfBoundsValue(ValueEmitContext& ctx, const IR::MemoryInfo& 
 	return ConstructU32Composite(ctx.state, components, values);
 }
 
+// Robust loads: a formatted load reads its components unconditionally (an out-of-range element
+// reads zeros on the device) and selects the out-of-bounds value instead of branching around the
+// loads (the crowd vertex shaders had ~400 such branches around 16-bit vertex loads). Lanes outside
+// EXEC load too; the register write discards their result.
+bool BranchlessFormattedLoad(const EmitterState& state, const IR::MemoryInfo& mem) {
+	return RobustLoad(state, mem.kind) && !ShaderRobustLoadsKeepExec() && ShaderBranchlessFormattedLoads();
+}
+
+uint32_t FormattedLoadSelect(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const PreparedFormattedMemory& plan,
+                             uint32_t components) {
+	std::array<uint32_t, 4> values {};
+	for (uint32_t component = 0; component < components; component++) {
+		const auto loaded = LoadFormattedInBounds(ctx, mem, plan, component);
+		const auto source = ResolveFormattedSource(ctx, mem, plan.info, component);
+		values[component] = Select(ctx.state, TypeU32(ctx.state), plan.in_bounds, loaded,
+		                           FormattedConstant(ctx, plan.info, source.kind));
+	}
+	return ConstructU32Composite(ctx.state, components, values);
+}
+
 uint32_t FormattedLoad(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
+	if (BranchlessFormattedLoad(ctx.state, mem)) {
+		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
+		const auto info     = Format::GetFormatInfo(BufferFormat(ctx, mem));
+		if (info.type != Format::ComponentType::Unknown) {
+			const auto plan  = PrepareFormattedMemory(ctx, inst, mem, resource, info);
+			const auto value = FormattedLoadSelect(ctx, mem, plan, 1u);
+			if (mem.data_bits != 16u) {
+				return value;
+			}
+			if (info.type == Format::ComponentType::Uint) {
+				return EmitUMin32(ctx.state, value, ConstantU32(ctx.state, 0xffffu));
+			}
+			if (info.type == Format::ComponentType::Sint) {
+				const auto lower = EmitSMax32(ctx.state, value, ConstantU32(ctx.state, 0xffff8000u));
+				return EmitSMin32(ctx.state, lower, ConstantU32(ctx.state, 0x7fffu));
+			}
+			return EmitConvertF16F32(ctx.state, EmitBitCastF32U32(ctx.state, value));
+		}
+	}
 	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
 		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
 		const auto info = Format::GetFormatInfo(BufferFormat(ctx, mem));
@@ -1197,6 +1457,14 @@ uint32_t LoadBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compon
 		}
 		return ConstructU32Composite(state, components, values);
 	}
+	if (const auto mem = ctx.Memory(inst);
+	    mem.formatted && mem.kind != IR::ResourceKind::IndirectBuffer && BranchlessFormattedLoad(state, mem)) {
+		const auto resource = PrepareMemoryResourceAccess(state, mem);
+		const auto info     = Format::GetFormatInfo(BufferFormat(ctx, mem));
+		if (info.type != Format::ComponentType::Unknown) {
+			return FormattedLoadSelect(ctx, mem, PrepareFormattedMemory(ctx, inst, mem, resource, info), components);
+		}
+	}
 	return EmitValueOrDefaultIfCondition(
 	    state, ctx.Arg(inst, inst.NumArgs() - 1), TypeU32Composite(state, components),
 	    ConstantU32CompositeZero(state, components), [&]() {
@@ -1563,6 +1831,9 @@ void EmitLoadMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 		value = LoadBuffer(ctx, inst, buffer_components);
 	else if (shared_components > 1u)
 		value = LoadWideShared(ctx, inst, shared_components);
+	else if (const auto grouped = BdaGroupable(ctx, inst) ? LoadGroupedBda(ctx, inst) : 0u;
+	         grouped != 0u)
+		value = grouped;
 	else if (mem.kind == IR::ResourceKind::ScalarAddress)
 		value = LoadBdaDword(ctx, GuestAddress(ctx, inst, mem));
 	else if (address_info.access == IR::AddressAccess::Read &&

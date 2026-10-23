@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_COMMON_BITARRAY_H_
 
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -174,6 +175,35 @@ public:
 		}
 		for (auto word = first_word + 1; word < last_word; word++) {
 			if (m_data[word] != 0) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	// AnyInRange for a reader that does not hold the writers' lock: each word is loaded atomically,
+	// so the answer is one the range had while it was read.
+	[[nodiscard]] bool AnyInRangeUnlocked(size_t start, size_t end) const {
+		if (start >= end || end > N) {
+			return false;
+		}
+		const auto load       = [&](size_t word) {
+			return std::atomic_ref<uint64_t>(const_cast<uint64_t&>(m_data[word])).load(std::memory_order_acquire);
+		};
+		const auto first_word = start / BITS_PER_WORD;
+		const auto last_word  = (end - 1) / BITS_PER_WORD;
+		const auto start_mask = ~uint64_t {0} << (start % BITS_PER_WORD);
+		const auto end_bit    = (end - 1) % BITS_PER_WORD;
+		const auto end_mask =
+		    end_bit == BITS_PER_WORD - 1 ? ~uint64_t {0} : (uint64_t {1} << (end_bit + 1)) - 1;
+		if (first_word == last_word) {
+			return (load(first_word) & start_mask & end_mask) != 0;
+		}
+		if ((load(first_word) & start_mask) != 0 || (load(last_word) & end_mask) != 0) {
+			return true;
+		}
+		for (auto word = first_word + 1; word < last_word; word++) {
+			if (load(word) != 0) {
 				return true;
 			}
 		}

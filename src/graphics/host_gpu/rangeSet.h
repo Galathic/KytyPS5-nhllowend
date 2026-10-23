@@ -25,6 +25,7 @@ public:
 				if (previous->second >= end) {
 					return;
 				}
+				m_version++;
 				uint64_t last = end;
 				while (it != m_ranges.end() && it->first <= last) {
 					last = std::max(last, it->second);
@@ -40,6 +41,7 @@ public:
 			it   = m_ranges.erase(it);
 		}
 		m_ranges.emplace_hint(it, address, last);
+		m_version++;
 	}
 
 	void Subtract(uint64_t address, uint64_t size) {
@@ -52,6 +54,7 @@ public:
 			const auto begin = it->first;
 			const auto last  = it->second;
 			it               = m_ranges.erase(it);
+			m_version++;
 			if (begin < address) {
 				m_ranges.emplace(begin, address);
 			}
@@ -71,6 +74,7 @@ public:
 	}
 
 	void Clear() {
+		m_version += m_ranges.empty() ? 0u : 1u;
 		m_ranges.clear();
 		m_filter       = {};
 		m_filter_stale = 0;
@@ -126,6 +130,8 @@ public:
 	}
 
 	[[nodiscard]] bool Empty() const { return m_ranges.empty(); }
+	// Changes whenever the set does (not when an Add or Subtract leaves it as it was).
+	[[nodiscard]] uint64_t Version() const { return m_version; }
 
 private:
 	static uint64_t End(uint64_t address, uint64_t size) {
@@ -170,6 +176,7 @@ private:
 	std::map<uint64_t, uint64_t>           m_ranges;
 	std::array<uint64_t, FilterBits / 64> m_filter {};
 	uint32_t                               m_filter_stale = 0;
+	uint64_t                               m_version      = 0;
 };
 
 } // namespace Libs::Graphics

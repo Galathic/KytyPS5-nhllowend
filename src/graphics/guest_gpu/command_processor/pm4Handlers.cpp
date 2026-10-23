@@ -2264,7 +2264,17 @@ KYTY_CP_OP_PARSER(CpOpMarker) {
 			cp.FlipWithInterrupt(eop_event_type, cache_action, addr, value);
 			break;
 		}
-		default: EXIT("unknown marker at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, id);
+		default: {
+			// Markers carry no GPU work besides the flips above; an unknown one (NHL 27 issued
+			// 0x11 once while booting) is skipped and reported once per id.
+			static std::array<std::atomic<bool>, 0x1000> reported {};
+			if (!reported[id].exchange(true, std::memory_order_relaxed)) {
+				std::printf("NHL27MARKER: unknown marker 0x%" PRIx32 " at %05" PRIx32 " (%" PRIu32 " dwords) skipped\n",
+				            id, num_dw - dw, len_dw);
+				std::fflush(stdout);
+			}
+			break;
+		}
 	}
 
 	return len_dw + 1;
@@ -2375,7 +2385,7 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 			case 0x02:
 			case 0x04:
 				cp.TriggerEopEventAtEndOfPipe(interrupt_context_id);
-				cp.BufferFlush();
+				cp.BufferFlush(CommandProcessor::FlushSite::Interrupt);
 				break;
 			default: EXIT("unknown release_mem interrupt selector\n");
 		}
@@ -2413,13 +2423,17 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 		event_index       = 6;
 		auto event_source = 2u;
 
+		// A label-only release keeps batching; long batches still start the GPU early. The label
+		// write's operation checks the batch itself (AbPending2: one more operation does, as
+		// before: 40,000 a second in play).
+		const bool interrupt = interrupt_selector == 0x01 || interrupt_selector == 0x02;
+		const bool fold      = !interrupt && !Common::Experiments::Enabled(Common::Experiments::AbPending2);
 		cp.WriteAtEndOfPipe32(cache_policy, event_write_dest, eop_event_type, cache_action,
 		                      event_index, event_source, dst_gpu_addr, static_cast<uint32_t>(value),
-		                      interrupt_selector, interrupt_context_id);
-		if (interrupt_selector == 0x01 || interrupt_selector == 0x02) {
-			cp.BufferFlush();
-		} else {
-			// A label-only release keeps batching; long batches still start the GPU early.
+		                      interrupt_selector, interrupt_context_id, fold);
+		if (interrupt) {
+			cp.BufferFlush(CommandProcessor::FlushSite::Interrupt);
+		} else if (!fold) {
 			cp.BufferFlushIfBatchReady();
 		}
 
@@ -2439,7 +2453,7 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 		                      event_index, event_source, dst_gpu_addr, static_cast<uint32_t>(value),
 		                      interrupt_selector, interrupt_context_id);
 		if (interrupt_selector == 0x01) {
-			cp.BufferFlush();
+			cp.BufferFlush(CommandProcessor::FlushSite::Interrupt);
 		}
 
 		return 7;

@@ -355,3 +355,16 @@ VALUE_OPCODE(Sendmsg, Void)
 VALUE_OPCODE(TtraceData, Void)
 VALUE_OPCODE(InstPrefetch, Void)
 VALUE_OPCODE(SelectU32, U32, U1, U32, U32)
+// Scalar f16 on 16-bit lanes of U32s (experiment F16LaneViews). F16LaneExtract(bits, lane) is the
+// lane zero-extended, F16LaneInsert(old, value, lane) replaces the lane with value's low half, and
+// FP*16Low compute on their operands' low halves (high half 0). The emitter reads and writes the
+// lanes as halves of an f16vec2, so the host compiler can use register halves instead of masks.
+VALUE_OPCODE(F16LaneExtract, U32, U32, U32)
+VALUE_OPCODE(F16LaneInsert, U32, U32, U32, U32)
+VALUE_OPCODE(FPAdd16Low, U32, U32, U32)
+VALUE_OPCODE(FPSub16Low, U32, U32, U32)
+VALUE_OPCODE(FPMul16Low, U32, U32, U32)
+VALUE_OPCODE(FPFma16Low, U32, U32, U32, U32)
+// F16x2Swizzle(bits, lo, hi): the U32 whose low half is lane `lo` of bits and high half lane `hi`
+// (packed f16 sources with op_sel/op_sel_hi), emitted as an f16vec2 shuffle.
+VALUE_OPCODE(F16x2Swizzle, U32, U32, U32, U32)

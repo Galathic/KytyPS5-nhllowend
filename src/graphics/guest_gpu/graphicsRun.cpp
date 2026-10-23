@@ -1,4 +1,5 @@
 #include "graphics/guest_gpu/stageStats.h"
+#include "graphics/host_gpu/pageWriteSeq.h"
 #include "common/eventTrace.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/bindEpoch.h"
@@ -153,7 +154,8 @@ GuestGpu::GuestGpu(RenderContext& renderer)
     : m_renderer(renderer),
       m_pipelined((Config::GpuPipelineStages() & Config::GPU_PIPELINE_COMMAND_PROCESSOR) != 0),
       m_resolving(m_pipelined && (Config::GpuPipelineStages() & Config::GPU_PIPELINE_RESOLVE) != 0),
-      m_operations(OperationQueueSize), m_resolved(ResolvedQueueSize),
+      m_operations(OperationQueueSize), m_resolved(ResolvedQueueSize), m_dispatch_jobs(DispatchSlotCount),
+      m_draw_jobs(DrawSlotCount),
       m_neutral_state {&m_neutral_context, &m_neutral_user_config, &m_neutral_shaders} {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	GraphicsInitJmpTables();
@@ -164,7 +166,11 @@ GuestGpu::GuestGpu(RenderContext& renderer)
 		m_gfx_cp->AttachPipeline(this);
 		m_executor = std::jthread([this] { ExecutionThread(); });
 		if (m_resolving) {
-			m_resolver = std::jthread([this] { ResolveThread(); });
+			m_dispatch_slots    = std::make_unique<GpuDispatchSlot[]>(DispatchSlotCount);
+			m_dispatch_resolver = std::jthread([this] { DispatchResolveThread(); });
+			m_draw_slots        = std::make_unique<GpuDrawSlot[]>(DrawSlotCount);
+			m_draw_resolver     = std::jthread([this] { DrawResolveThread(); });
+			m_resolver          = std::jthread([this] { ResolveThread(); });
 		}
 	}
 	m_thread = std::jthread(ThreadRun, this);
@@ -393,6 +399,7 @@ void GuestGpu::ForgetExecutedWrites() {
 
 void GuestGpu::NoteGuestWrite(uint64_t sequence, uint64_t address, uint64_t size,
                               const void* value, const char* kind, uint8_t origin) {
+	PageWriteSeq::Raise(address, size, sequence);
 	ForgetExecutedWrites();
 	if (sequence <= m_executed.Load()) {
 		return;
@@ -635,6 +642,9 @@ bool GuestGpu::TryReadProtectedForCp(uint64_t address, void* value, size_t size)
 	return true;
 }
 
+// CommandProcessor::BufferFlush() requests by site (KYTY_DBG_STAGE_STATS).
+static std::array<std::atomic<uint64_t>, static_cast<size_t>(CommandProcessor::FlushSite::Count)> g_buffer_flush_emits {};
+
 // KYTY_DBG_STAGE_STATS: every 5 s (checked when the execution thread runs out of operations).
 static void PrintStageStats() {
 	static auto     last       = std::chrono::steady_clock::now();
@@ -665,9 +675,43 @@ static void PrintStageStats() {
 	            ms[StageStats::ResolveProgramLock], ms[StageStats::ResolveQueueFull], ms[StageStats::ResolveIdle],
 	            1000.0 - ms[StageStats::ResolveQueueFull] - ms[StageStats::ResolveIdle]);
 	std::printf("NHL27EXECIDLE ms/s: resolve=%.1f cp-busy=%.1f no-submission=%.1f blocked=%.1f "
-	            "cp-decision-wait=%.1f cp-other-wait=%.1f\n",
+	            "cp-decision-wait=%.1f cp-other-wait=%.1f | bda syncs/s=%.0f flushes/s=%.0f (callbacks %.0f batch %.0f guest-reads %.0f flips %.0f)"
+	            " | asked by other %.0f submission %.0f interrupt %.0f suspend %.0f split %.0f\n",
 	            ms[StageStats::ExecIdleResolve], ms[StageStats::ExecIdleCp], ms[StageStats::ExecIdleNoWork],
-	            ms[StageStats::ExecIdleBlocked], ms[StageStats::ExecIdleDecision], ms[StageStats::ExecIdleOther]);
+	            ms[StageStats::ExecIdleBlocked], ms[StageStats::ExecIdleDecision], ms[StageStats::ExecIdleOther],
+	            static_cast<double>(StageStats::g_bda_syncs.exchange(0, std::memory_order_relaxed)) / seconds,
+	            static_cast<double>(g_scheduler_flushes.exchange(0, std::memory_order_relaxed)) / seconds,
+	            static_cast<double>(g_scheduler_flush_sites[0].exchange(0, std::memory_order_relaxed)) / seconds,
+	            static_cast<double>(g_scheduler_flush_sites[1].exchange(0, std::memory_order_relaxed)) / seconds,
+	            static_cast<double>(g_scheduler_flush_sites[2].exchange(0, std::memory_order_relaxed)) / seconds,
+	            static_cast<double>(g_scheduler_flush_sites[3].exchange(0, std::memory_order_relaxed)) / seconds,
+	            static_cast<double>(g_buffer_flush_emits[0].exchange(0, std::memory_order_relaxed)) / seconds,
+	            static_cast<double>(g_buffer_flush_emits[1].exchange(0, std::memory_order_relaxed)) / seconds,
+	            static_cast<double>(g_buffer_flush_emits[2].exchange(0, std::memory_order_relaxed)) / seconds,
+	            static_cast<double>(g_buffer_flush_emits[3].exchange(0, std::memory_order_relaxed)) / seconds,
+	            static_cast<double>(g_buffer_flush_emits[4].exchange(0, std::memory_order_relaxed)) / seconds);
+	for (int kind = 0; kind < 2; kind++) {
+		const auto calls = StageStats::g_check_calls[kind].exchange(0, std::memory_order_relaxed);
+		const auto entries = StageStats::g_check_entries[kind].exchange(0, std::memory_order_relaxed);
+		const auto bytes   = StageStats::g_check_bytes[kind].exchange(0, std::memory_order_relaxed);
+		const auto pages   = StageStats::g_check_pages[kind].exchange(0, std::memory_order_relaxed);
+		const auto skipped = StageStats::g_check_skipped[kind].exchange(0, std::memory_order_relaxed);
+		const auto unsafe  = StageStats::g_check_unsafe[kind].exchange(0, std::memory_order_relaxed);
+		const auto later   = StageStats::g_check_later[kind].exchange(0, std::memory_order_relaxed);
+		if (calls == 0) continue;
+		const auto per = [calls](uint64_t value) { return static_cast<double>(value) / static_cast<double>(calls); };
+		std::printf("NHL27CHECKS %s: calls/s=%.0f entries/call=%.1f bytes/call=%.0f pages/call=%.1f skipped/call=%.1f"
+		            " checked: gpu-owned/call=%.1f written-later/call=%.1f\n",
+		            kind == 0 ? "draws" : "dispatches", static_cast<double>(calls) / seconds, per(entries), per(bytes),
+		            per(pages), per(skipped), per(unsafe), per(later));
+	}
+	{
+		const auto total = StageStats::g_bind_total.exchange(0, std::memory_order_relaxed);
+		const auto same  = StageStats::g_bind_same.exchange(0, std::memory_order_relaxed);
+		const auto wr    = StageStats::g_bind_written.exchange(0, std::memory_order_relaxed);
+		std::printf("NHL27BINDS: buffer bindings/s=%.0f same-as-last=%.0f written=%.0f\n", static_cast<double>(total) / seconds,
+		            static_cast<double>(same) / seconds, static_cast<double>(wr) / seconds);
+	}
 	// By operation kind: ms/s and us per operation.
 	static uint64_t last_kind_ns[8] {}, last_kind_count[8] {};
 	static const char* const kinds[] = {"draw", "draw-auto", "draw-indirect", "dispatch", "dispatch-indirect", "callback", "?", "?"};
@@ -681,6 +725,44 @@ static void PrintStageStats() {
 		last_kind_count[k]     = total_count;
 		if (count == 0) continue;
 		line += fmt::format(" {}={:.0f}/s {:.1f}ms/s {:.2f}us", kinds[k], static_cast<double>(count) / seconds,
+		                    static_cast<double>(ns) / 1e6 / seconds, static_cast<double>(ns) / 1e3 / static_cast<double>(count));
+	}
+	std::printf("%s\n", line.c_str());
+	// Callbacks by what they do (GpuCallbackTag).
+	static uint64_t    last_cb_ns[16] {}, last_cb_count[16] {};
+	static const char* const tags[] = {"other",   "bda",        "flush", "finish", "flip",
+	                                   "eop",     "event",      "barrier", "write-data", "dma",
+	                                   "clock",   "host",       "gc",    "flip-wait"};
+	{
+		// Waits for the host copy thread before operations (HostCopyQueue::Drain), by callback tag.
+		static uint64_t last_drains[16] {}, last_waits[16] {}, last_drain_ns[16] {};
+		std::string drains = "NHL27DRAINS:";
+		for (size_t k = 0; k < 16; k++) {
+			const auto count = StageStats::g_drain_count[k].load(std::memory_order_relaxed);
+			const auto waits = StageStats::g_drain_waits[k].load(std::memory_order_relaxed);
+			const auto ns    = StageStats::g_drain_ns[k].load(std::memory_order_relaxed);
+			if (count != last_drains[k]) {
+				drains += fmt::format(" {}={:.0f}/s waits={:.0f}/s {:.1f}ms/s", k < std::size(tags) ? tags[k] : "op",
+				                      static_cast<double>(count - last_drains[k]) / seconds,
+				                      static_cast<double>(waits - last_waits[k]) / seconds,
+				                      static_cast<double>(ns - last_drain_ns[k]) / 1e6 / seconds);
+			}
+			last_drains[k]   = count;
+			last_waits[k]    = waits;
+			last_drain_ns[k] = ns;
+		}
+		std::printf("%s\n", drains.c_str());
+	}
+	line = "NHL27CALLBACKS:";
+	for (size_t k = 0; k < std::size(tags); k++) {
+		const auto total_ns    = StageStats::g_callback_ns[k].load(std::memory_order_relaxed);
+		const auto total_count = StageStats::g_callback_count[k].load(std::memory_order_relaxed);
+		const auto ns          = total_ns - last_cb_ns[k];
+		const auto count       = total_count - last_cb_count[k];
+		last_cb_ns[k]          = total_ns;
+		last_cb_count[k]       = total_count;
+		if (count == 0) continue;
+		line += fmt::format(" {}={:.0f}/s {:.1f}ms/s {:.2f}us", tags[k], static_cast<double>(count) / seconds,
 		                    static_cast<double>(ns) / 1e6 / seconds, static_cast<double>(ns) / 1e3 / static_cast<double>(count));
 	}
 	std::printf("%s\n", line.c_str());
@@ -738,6 +820,52 @@ void GuestGpu::ExecuteSync(Common::UniqueFunction<void>&& command) {
 	WaitForExecution();
 }
 
+// KYTY_DBG_LONG_OPS=<us>: every operation the execution thread spends that long on prints where the
+// time went (NHL27LONGOP: waiting for its resolution, then the parts of executing it; the parts need
+// KYTY_PERF_STATS=1, and readback, fault and protect counts include other threads).
+static const int64_t g_long_op_ns = [] {
+	const char* value = std::getenv("KYTY_DBG_LONG_OPS");
+	return value != nullptr ? std::strtoll(value, nullptr, 10) * 1000 : int64_t {0};
+}();
+
+namespace {
+struct LongOpCounters {
+	static constexpr size_t Count = 17;
+	std::array<uint64_t, Count> values {};
+
+	static LongOpCounters Take() {
+		auto&          c = FrameBreakdown::g_counters;
+		LongOpCounters s;
+		const std::array<const std::atomic<uint64_t>*, Count> sources {
+		    &c.dp_materialize_ns, &c.dp_textures_ns, &c.dp_buffers_ns, &c.dp_bda_ns, &c.dp_rebind_ns,
+		    &c.dp_descriptors_ns, &c.dp_pipeline_ns, &c.dc_total_ns,  &c.dc_bda_ns, &c.readback_ns,
+		    &c.fault_ns,          &c.compile_ns,     &c.sync_uploads, &c.sync_bytes, &c.protect_calls,
+		    &c.protect_ns,        &c.gpu_wait_ns};
+		for (size_t i = 0; i < Count; i++) {
+			s.values[i] = sources[i]->load(std::memory_order_relaxed);
+		}
+		return s;
+	}
+};
+
+void PrintLongOp(uint64_t op_kind, int64_t start, int64_t resolved, int64_t end, const LongOpCounters& before) {
+	const auto after = LongOpCounters::Take();
+	std::array<double, LongOpCounters::Count> d {};
+	for (size_t i = 0; i < d.size(); i++) {
+		d[i] = static_cast<double>(after.values[i] - before.values[i]);
+	}
+	const auto us = [](double ns) { return ns / 1000.0; };
+	std::printf("NHL27LONGOP kind=%u op=0x%x total=%.0fus resolve_wait=%.0fus exec=%.0fus | draw: mat=%.0f tex=%.0f "
+	            "buf=%.0f bda=%.0f rebind=%.0f desc=%.0f pipe=%.0f | dispatch=%.0f bda=%.0f | readback=%.0f "
+	            "fault=%.0f compile=%.0f gpu_wait=%.0f | uploads=%.0f kb=%.0f protects=%.0f (%.0fus)\n",
+	            static_cast<uint32_t>(op_kind & 0xffu), static_cast<uint32_t>(op_kind >> 8u),
+	            us(static_cast<double>(end - start)), us(static_cast<double>(resolved - start)),
+	            us(static_cast<double>(end - resolved)), us(d[0]), us(d[1]), us(d[2]), us(d[3]), us(d[4]), us(d[5]),
+	            us(d[6]), us(d[7]), us(d[8]), us(d[9]), us(d[10]), us(d[11]), us(d[16]), d[12], d[13] / 1024.0, d[14],
+	            us(d[15]));
+}
+} // namespace
+
 void GuestGpu::ExecutionThread() {
 	KYTY_PROFILER_THREAD("Thread_GpuExecute");
 	Config::ConfigureGpuStageThread(Config::GpuStageThread::Execution);
@@ -780,6 +908,47 @@ void GuestGpu::ExecutionThread() {
 		const auto op_kind  = static_cast<uint64_t>(operation->kind) | (uint64_t {operation->trace_op} << 8u);
 		const auto op_start = traced ? Common::EventTrace::NowNs() : int64_t {0};
 		g_exec_op           = op_kind;
+		const bool long_ops   = g_long_op_ns != 0;
+		const auto long_start = long_ops ? Common::EventTrace::NowNs() : int64_t {0};
+		const auto long_before = long_ops ? std::optional(LongOpCounters::Take()) : std::nullopt;
+		if (auto* slot = operation->dispatch_slot; slot != nullptr) {
+			if (slot->state.load(std::memory_order_acquire) != 2) {
+				const auto start = StageStats::Enabled() ? std::chrono::steady_clock::now()
+				                                         : std::chrono::steady_clock::time_point {};
+				for (Common::SpinWait wait; slot->state.load(std::memory_order_acquire) != 2;) {
+					if (!wait.Spin()) {
+						std::this_thread::yield();
+					}
+				}
+				if (StageStats::Enabled()) {
+					StageStats::Add(StageStats::ExecIdle, start);
+					StageStats::Add(StageStats::ExecIdleResolve, start);
+				}
+			}
+			operation->resolved_dispatch = slot->result;
+			slot->state.store(0, std::memory_order_release);
+			operation->dispatch_slot = nullptr;
+		}
+		if (auto* slot = operation->draw_slot; slot != nullptr) {
+			if (slot->state.load(std::memory_order_acquire) != 2) {
+				const auto start = StageStats::Enabled() ? std::chrono::steady_clock::now()
+				                                         : std::chrono::steady_clock::time_point {};
+				for (Common::SpinWait wait; slot->state.load(std::memory_order_acquire) != 2;) {
+					if (!wait.Spin()) {
+						std::this_thread::yield();
+					}
+				}
+				if (StageStats::Enabled()) {
+					StageStats::Add(StageStats::ExecIdle, start);
+					StageStats::Add(StageStats::ExecIdleResolve, start);
+				}
+			}
+			operation->resolved = slot->result;
+			slot->state.store(0, std::memory_order_release);
+			operation->draw_slot = nullptr;
+		}
+		PageWriteSeq::SetOperation(operation->sequence);
+		const auto long_resolved = long_ops ? Common::EventTrace::NowNs() : int64_t {0};
 		if (StageStats::Enabled()) {
 			const auto kind  = static_cast<size_t>(operation->kind) & 7u;
 			const auto start = std::chrono::steady_clock::now();
@@ -788,11 +957,24 @@ void GuestGpu::ExecutionThread() {
 			    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
 			StageStats::g_kind_ns[kind].store(StageStats::g_kind_ns[kind].load(std::memory_order_relaxed) + ns, std::memory_order_relaxed);
 			StageStats::g_kind_count[kind].store(StageStats::g_kind_count[kind].load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+			if (operation->kind == GpuOperationKind::Callback) {
+				const auto tag = static_cast<size_t>(operation->callback_tag) & 15u;
+				StageStats::g_callback_ns[tag].store(StageStats::g_callback_ns[tag].load(std::memory_order_relaxed) + ns,
+				                                     std::memory_order_relaxed);
+				StageStats::g_callback_count[tag].store(
+				    StageStats::g_callback_count[tag].load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+			}
 			StageStats::g_ops.store(StageStats::g_ops.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
 		} else {
 			operation->processor->Execute(*operation);
 		}
 		g_exec_op = 0;
+		if (long_ops) {
+			const auto long_end = Common::EventTrace::NowNs();
+			if (long_end - long_start >= g_long_op_ns) {
+				PrintLongOp(op_kind, long_start, long_resolved, long_end, *long_before);
+			}
+		}
 		if (traced) {
 			const auto op_ns = Common::EventTrace::NowNs() - op_start;
 			if (op_ns >= 20000) {
@@ -803,6 +985,8 @@ void GuestGpu::ExecutionThread() {
 		// Destroy the callback before the command processor may reuse what it references.
 		operation.reset();
 		m_executed.Publish(sequence);
+		// Work between operations (urgent commands) writes after this one.
+		PageWriteSeq::SetOperation(sequence + 1);
 		if (++unnotified >= NotifyInterval) {
 			m_executed.Notify();
 			unnotified = 0;
@@ -831,12 +1015,41 @@ void GuestGpu::ResolveThread() {
 			}
 		}
 		if (StageStats::Enabled()) StageStats::g_resolve_working.store(true, std::memory_order_relaxed);
-		if (operation->kind == GpuOperationKind::DrawIndex ||
+		GuestReadLog::SetResolveBase(m_executed.Load());
+		if ((operation->kind == GpuOperationKind::DrawIndex ||
+		     operation->kind == GpuOperationKind::DrawAuto) &&
+		    Common::Experiments::Enabled(Common::Experiments::DrawResolver)) {
+			// Experiment DrawResolver: by the vertex and pixel shader addresses, about half of the
+			// draws go to the second draw resolver; the draws of a program pair stay on one thread,
+			// so the two rarely materialize the same program at once (the second one then leaves
+			// the draw to the execution thread).
+			const auto& shaders = *operation->state.shaders;
+			const auto  key     = shaders.GetPs().ps_regs.data_addr ^ shaders.GetVs().gs_regs.data_addr ^
+			                 shaders.GetVs().es_regs.data_addr;
+			if (((key >> 8u) * 0x9e3779b97f4a7c15ull) >> 63u) {
+				QueueDrawResolution(*operation);
+			} else {
+				operation->resolved =
+				    executor.ResolveDrawAhead(*operation->state.context, *operation->state.user_config,
+				                              *operation->state.shaders);
+			}
+		} else if (operation->kind == GpuOperationKind::DrawIndex ||
 		    operation->kind == GpuOperationKind::DrawAuto) {
 			// The register snapshots stay valid until the operation executed.
 			operation->resolved =
 			    executor.ResolveDrawAhead(*operation->state.context, *operation->state.user_config,
 			                              *operation->state.shaders);
+		} else if (operation->kind == GpuOperationKind::DispatchDirect &&
+		           (Common::Experiments::Enabled(Common::Experiments::DispatchAhead) ||
+		            Common::RuntimeFlags::Current().compute_resolve_ahead) &&
+		           DispatchResolverActive()) {
+			QueueDispatchResolution(*operation, false);
+		} else if (operation->kind == GpuOperationKind::DispatchIndirect &&
+		           (operation->dispatch.mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) == 0 &&
+		           (Common::Experiments::Enabled(Common::Experiments::DispatchAhead) ||
+		            Common::RuntimeFlags::Current().compute_resolve_ahead) &&
+		           DispatchResolverActive()) {
+			QueueDispatchResolution(*operation, true);
 		} else if (operation->kind == GpuOperationKind::DispatchDirect &&
 		           (Common::Experiments::Enabled(Common::Experiments::DispatchAhead) ||
 		            Common::RuntimeFlags::Current().compute_resolve_ahead)) {
@@ -866,11 +1079,104 @@ void GuestGpu::ResolveThread() {
 	m_resolved.Stop();
 }
 
+void GuestGpu::QueueDispatchResolution(GpuOperation& operation, bool indirect) {
+	auto& slot = m_dispatch_slots[m_dispatch_slot_next];
+	m_dispatch_slot_next = (m_dispatch_slot_next + 1) % DispatchSlotCount;
+	// The execution thread frees the slots in order.
+	for (Common::SpinWait wait; slot.state.load(std::memory_order_acquire) != 0;) {
+		if (!wait.Spin()) {
+			std::this_thread::yield();
+		}
+	}
+	slot.result = nullptr;
+	slot.state.store(1, std::memory_order_relaxed);
+	const auto& dispatch = operation.dispatch;
+	DispatchJob job {.slot     = &slot,
+	                 .context  = operation.state.context,
+	                 .shaders  = operation.state.shaders,
+	                 .x        = dispatch.thread_group_x,
+	                 .y        = dispatch.thread_group_y,
+	                 .z        = dispatch.thread_group_z,
+	                 .mode     = dispatch.mode,
+	                 .async    = operation.processor->IsAsyncComputeQueue(),
+	                 .indirect = indirect};
+	m_dispatch_jobs.Push(std::move(job));
+	m_dispatch_jobs_queued++;
+	operation.dispatch_slot = &slot;
+}
+
+void GuestGpu::QueueDrawResolution(GpuOperation& operation) {
+	auto& slot       = m_draw_slots[m_draw_slot_next];
+	m_draw_slot_next = (m_draw_slot_next + 1) % DrawSlotCount;
+	// The execution thread frees the slots in order.
+	for (Common::SpinWait wait; slot.state.load(std::memory_order_acquire) != 0;) {
+		if (!wait.Spin()) {
+			std::this_thread::yield();
+		}
+	}
+	slot.result = nullptr;
+	slot.state.store(1, std::memory_order_relaxed);
+	m_draw_jobs.Push(DrawJob {.slot        = &slot,
+	                          .context     = operation.state.context,
+	                          .user_config = operation.state.user_config,
+	                          .shaders     = operation.state.shaders});
+	operation.draw_slot = &slot;
+}
+
+// Experiment DrawResolver: resolves the draws the resolve thread passes on, in order, into a
+// resolution ring of its own.
+void GuestGpu::DrawResolveThread() {
+	KYTY_PROFILER_THREAD("Thread_GpuResolveDraw");
+	Config::ConfigureGpuStageThread(Config::GpuStageThread::DrawResolve);
+	auto& executor = m_renderer.GetRenderExecutor();
+	for (;;) {
+		auto job = m_draw_jobs.Pop();
+		if (!job) {
+			break;
+		}
+		GuestReadLog::SetResolveBase(m_executed.Load());
+		job->slot->result = executor.ResolveDrawAhead(*job->context, *job->user_config, *job->shaders, 1);
+		job->slot->state.store(2, std::memory_order_release);
+	}
+}
+
+// Experiment DispatchResolver: resolves the dispatches the resolve thread passes on, in order,
+// while it resolves the draws. Compute programs are never draw stages, so the two threads do not
+// materialize the same resource plans.
+void GuestGpu::DispatchResolveThread() {
+	KYTY_PROFILER_THREAD("Thread_GpuResolveDispatch");
+	Config::ConfigureGpuStageThread(Config::GpuStageThread::DispatchResolve);
+	auto& executor = m_renderer.GetRenderExecutor();
+	for (;;) {
+		auto job = m_dispatch_jobs.Pop();
+		if (!job) {
+			break;
+		}
+		GuestReadLog::SetResolveBase(m_executed.Load());
+		auto* result = job->indirect
+		                   ? executor.ResolveDispatchIndirectAhead(*job->context, *job->shaders, job->async)
+		                   : executor.ResolveDispatchAhead(*job->context, *job->shaders, job->x, job->y, job->z,
+		                                                   job->mode, job->async);
+		job->slot->result = result;
+		job->slot->state.store(2, std::memory_order_release);
+		m_dispatch_jobs_done.fetch_add(1, std::memory_order_release);
+	}
+}
+
 void GuestGpu::StopExecution() {
 	WaitForExecution();
 	m_operations.Stop();
 	if (m_resolver.joinable()) {
 		m_resolver.join();
+	}
+	// After the resolve thread: it queues no more dispatches; the queued ones are still resolved.
+	m_dispatch_jobs.Stop();
+	if (m_dispatch_resolver.joinable()) {
+		m_dispatch_resolver.join();
+	}
+	m_draw_jobs.Stop();
+	if (m_draw_resolver.joinable()) {
+		m_draw_resolver.join();
 	}
 	if (m_executor.joinable()) {
 		m_executor.join();
@@ -986,11 +1292,17 @@ GpuRegisterState CommandProcessor::SnapshotState(uint64_t sequence) {
 	return state;
 }
 
+// Draws and dispatches emitted by every command processor (pipelined), and their count at the
+// last BDA boundary emitted: one command processor thread emits them all.
+static uint64_t g_work_emitted     = 0;
+static uint64_t g_bda_work_emitted = ~uint64_t {0};
+
 uint64_t CommandProcessor::Emit(GpuOperation&& operation) {
 	if (m_pipeline != nullptr) {
 		EXIT_IF(operation.kind != GpuOperationKind::Callback &&
 		        m_pipeline->NextSequence() !=
 		            m_ctx_snapshots.last_use[m_ctx_snapshots.current]);
+		g_work_emitted += operation.kind != GpuOperationKind::Callback ? 1u : 0u;
 		return m_pipeline->EmitOperation(std::move(operation));
 	}
 	Execute(operation);
@@ -1006,7 +1318,7 @@ void CommandProcessor::NoteGuestWrite(uint64_t sequence, uint64_t address, uint6
 }
 
 void CommandProcessor::EmitHostCommand(Common::UniqueFunction<void>&& command) {
-	EmitCallback(std::move(command));
+	EmitCallback(std::move(command), GpuCallbackTag::Host);
 }
 
 void CommandProcessor::ReadDecisionMemory(const volatile void* address, void* value,
@@ -1027,16 +1339,24 @@ void CommandProcessor::BdaBoundary(RenderContext::BdaBoundary kind) {
 		m_renderer.BdaBatchBoundary(kind);
 		return;
 	}
+	// The boundary only makes the next draw or dispatch synchronize again: with none since the
+	// last boundary, that one already does (80,000 boundaries a second were mostly such repeats,
+	// each an operation through the pipeline). Statistics (KYTY_PERF_STATS) count them all.
+	if (g_bda_work_emitted == g_work_emitted && !FrameBreakdown::Enabled()) {
+		return;
+	}
+	g_bda_work_emitted = g_work_emitted;
 	// KYTY_BDA_BATCH orders boundaries with the draws and dispatches that execute around them.
 	const auto saved_trace_op = g_trace_op;
 	g_trace_op                = static_cast<uint16_t>(g_trace_op | 0x4000u);
-	EmitCallback([this, kind] { m_renderer.BdaBatchBoundary(kind); });
+	EmitCallback([this, kind] { m_renderer.BdaBatchBoundary(kind); }, GpuCallbackTag::Bda);
 	g_trace_op = saved_trace_op;
 }
 
-uint64_t CommandProcessor::EmitCallback(GpuCallback&& callback) {
-	auto operation     = MakeOperation(GpuOperationKind::Callback);
-	operation.callback = std::move(callback);
+uint64_t CommandProcessor::EmitCallback(GpuCallback&& callback, GpuCallbackTag tag) {
+	auto operation         = MakeOperation(GpuOperationKind::Callback);
+	operation.callback     = std::move(callback);
+	operation.callback_tag = tag;
 	return Emit(std::move(operation));
 }
 
@@ -1054,9 +1374,40 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 	    operation.kind != GpuOperationKind::DrawIndirect) {
 		executor.InvalidateRenderTargetMemo();
 		// Guest-visible effects (labels, interrupts, flips, host commands) let the guest overwrite
-		// what earlier draws read: their copies complete first.
-		if (auto* copies = GetScheduler().HostCopies(); copies != nullptr) {
-			copies->Drain();
+		// what earlier draws read: their copies complete first. A dispatch has none (a submission
+		// waits for the copies before it; with CpuCopyForward a dispatch also writes guest memory),
+		// and waiting before each of them was 7.6% of this thread.
+		const bool dispatch = operation.kind == GpuOperationKind::DispatchDirect ||
+		                      operation.kind == GpuOperationKind::DispatchIndirect;
+		// Neither have BDA boundaries, barriers and cache events (the occlusion dump is tagged
+		// Other): two thirds of the callbacks in play, and the waits before them were 4.5% of this
+		// thread.
+		const bool invisible =
+		    operation.kind == GpuOperationKind::Callback &&
+		    (operation.callback_tag == GpuCallbackTag::Bda || operation.callback_tag == GpuCallbackTag::Barrier ||
+		     operation.callback_tag == GpuCallbackTag::Event);
+		if (auto* copies = GetScheduler().HostCopies();
+		    copies != nullptr && !invisible &&
+		    (!dispatch || Common::Experiments::Enabled(Common::Experiments::CpuCopyForward))) {
+			if (StageStats::Enabled()) {
+				const auto tag   = operation.kind == GpuOperationKind::Callback
+				                       ? static_cast<size_t>(operation.callback_tag) & 15u
+				                       : size_t {15};
+				const auto start = std::chrono::steady_clock::now();
+				const bool waits = copies->Pending();
+				copies->Drain();
+				StageStats::g_drain_count[tag].fetch_add(1, std::memory_order_relaxed);
+				if (waits) {
+					StageStats::g_drain_waits[tag].fetch_add(1, std::memory_order_relaxed);
+					StageStats::g_drain_ns[tag].fetch_add(
+					    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+					                              std::chrono::steady_clock::now() - start)
+					                              .count()),
+					    std::memory_order_relaxed);
+				}
+			} else {
+				copies->Drain();
+			}
 		}
 	}
 	switch (operation.kind) {
@@ -1114,8 +1465,14 @@ void CommandProcessor::BufferInit() {
 	}
 }
 
-void CommandProcessor::BufferFlush() {
-	EmitCallback([this] { GetScheduler().Flush(); });
+void CommandProcessor::BufferFlush(FlushSite site) {
+	if (StageStats::Enabled()) {
+		g_buffer_flush_emits[static_cast<size_t>(site)].fetch_add(1, std::memory_order_relaxed);
+	}
+	EmitCallback([this] {
+		g_scheduler_flush_sites[0].fetch_add(1, std::memory_order_relaxed);
+		GetScheduler().Flush();
+	}, GpuCallbackTag::Flush);
 }
 
 void CommandProcessor::NoteRecordedWork() {
@@ -1131,20 +1488,23 @@ void CommandProcessor::BufferFlushIfBatchReady() {
 	// Label writes reach guest memory when the packet is executed, and resources are captured
 	// when a draw is recorded, so submitting here only starts the GPU earlier. A submission per
 	// label costs a queue submit and a new command buffer, so wait for a batch of work.
-	EmitCallback([this] {
-		constexpr uint32_t MinBatchWork = 64;
-		if (GetScheduler().CurrentTick() == m_batch_tick && m_batch_work >= MinBatchWork) {
-			GetScheduler().Flush();
-		}
-	});
+	EmitCallback([this] { FlushIfBatchReady(); }, GpuCallbackTag::Flush);
+}
+
+void CommandProcessor::FlushIfBatchReady() {
+	constexpr uint32_t MinBatchWork = 64;
+	if (GetScheduler().CurrentTick() == m_batch_tick && m_batch_work >= MinBatchWork) {
+		g_scheduler_flush_sites[1].fetch_add(1, std::memory_order_relaxed);
+		GetScheduler().Flush();
+	}
 }
 
 void CommandProcessor::BufferWait() {
-	EmitCallback([this] { GetScheduler().Finish(); });
+	EmitCallback([this] { GetScheduler().Finish(); }, GpuCallbackTag::Finish);
 }
 
 void CommandProcessor::RunGarbageCollector() {
-	EmitCallback([this] { m_renderer.RunGarbageCollector(); });
+	EmitCallback([this] { m_renderer.RunGarbageCollector(); }, GpuCallbackTag::Gc);
 }
 
 void CommandProcessor::ResetDeCe() {
@@ -1190,7 +1550,7 @@ void CommandProcessor::DumpConstRam(uint32_t* dst, uint32_t offset, uint32_t dw_
 	std::vector<uint32_t> words(m_const_ram + offset / 4, m_const_ram + offset / 4 + dw_num);
 	const auto            sequence = EmitCallback([dst, words = std::move(words)] {
 		memcpy(dst, words.data(), words.size() * sizeof(uint32_t));
-	});
+	}, GpuCallbackTag::WriteData);
 	NoteGuestWrite(sequence, reinterpret_cast<uint64_t>(dst), uint64_t {dw_num} * 4u,
 	               m_const_ram + offset / 4);
 }
@@ -1398,6 +1758,40 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	// later label.
 	const auto sequence = EmitCallback([this, dst, src, dw_num, write_one_address] {
 		BufferCache::WriteTagScope tag(BufferCache::WriteTag::WriteData);
+		// The pipelined command processor's writes reach here: they take the label path as well
+		// (both copies updated, nothing downloaded), not PrepareGpuWrite, which downloads the
+		// page's GPU-written bytes and waited for their writer, 6-23 ms about once a second in
+		// play (AbPending4: always PrepareGpuWrite).
+		if (Common::RuntimeFlags::Current().pm4_write_data_fast &&
+		    !Common::Experiments::Enabled(Common::Experiments::AbPending4)) {
+			auto& cache = m_renderer.GetBufferCache();
+			if (write_one_address) {
+				uint32_t written = 0;
+				while (written < dw_num) {
+					const uint32_t value = src[written];
+					if (!cache.TryWriteLabel(reinterpret_cast<uint64_t>(dst), &value, sizeof(value))) {
+						break;
+					}
+					written++;
+				}
+				if (written == dw_num) {
+					return;
+				}
+				m_renderer.PrepareGpuWrite(dst, sizeof(uint32_t));
+				for (uint32_t i = written; i < dw_num; i++) {
+					dst[0] = src[i];
+				}
+				return;
+			}
+			if (dw_num <= 64) {
+				std::array<uint32_t, 64> values {};
+				std::memcpy(values.data(), src, static_cast<size_t>(dw_num) * sizeof(uint32_t));
+				if (cache.TryWriteLabel(reinterpret_cast<uint64_t>(dst), values.data(),
+				                        static_cast<uint64_t>(dw_num) * sizeof(uint32_t))) {
+					return;
+				}
+			}
+		}
 		m_renderer.PrepareGpuWrite(dst, uint64_t {write_one_address ? 1u : dw_num} * sizeof(uint32_t));
 		if (write_one_address) {
 			for (uint32_t i = 0; i < dw_num; i++) {
@@ -1406,7 +1800,7 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		} else {
 			memcpy(dst, src, static_cast<size_t>(dw_num) * sizeof(uint32_t));
 		}
-	});
+	}, GpuCallbackTag::WriteData);
 	if (write_one_address) {
 		NoteGuestWrite(sequence, reinterpret_cast<uint64_t>(dst), sizeof(uint32_t),
 		               src + dw_num - 1);
@@ -1432,7 +1826,7 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 			     " size=%u\n",
 			     dst_address, value, num_bytes);
 		}
-	});
+	}, GpuCallbackTag::Clock);
 	NoteGuestWrite(sequence, dst_address, num_bytes, nullptr, "wait-clock-copy", num_bytes == sizeof(uint64_t) ? GuestGpu::WriteOriginClock : GuestGpu::WriteOriginOther);
 }
 
@@ -1485,7 +1879,7 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 	const auto sequence = EmitCallback([=, this] {
 		ExecuteDmaData(dst_gds, dst_address_or_offset, src_sel, src_gds,
 		               src_address_or_offset_or_immediate, num_bytes);
-	});
+	}, GpuCallbackTag::Dma);
 	if (!dst_gds) {
 		NoteGuestWrite(sequence, dst_address_or_offset, num_bytes, nullptr, "wait-dma-data", GuestGpu::WriteOriginDma);
 	}
@@ -1884,7 +2278,9 @@ static std::atomic<int64_t>  g_split_us {0};
 
 static void SubmitSplitRefresh() {
 	// Measured best on an RX 9070 XT: 768 draws / 12 ms when each split costs this thread a
-	// vkQueueSubmit, 48 draws / 0.75 ms with experiment AsyncSubmit (+4.5% paused match).
+	// vkQueueSubmit, 48 draws / 0.75 ms with experiment AsyncSubmit (+4.5% paused match). With the
+	// recording thread submitting and guest command buffers batched, 192 draws / 3 ms (in-boot A/B
+	// through split.ctl, 48 / 192 / 768 draws: 433 / 455 / 451 fps in paired rounds).
 	const bool            async     = Common::Experiments::Enabled(Common::Experiments::AsyncSubmit);
 	static const uint32_t env_draws = [] {
 		const char* s = std::getenv("KYTY_SUBMIT_SPLIT_DRAWS");
@@ -1902,8 +2298,8 @@ static void SubmitSplitRefresh() {
 		return;
 	}
 	last           = now;
-	uint32_t draws = env_draws != 0 ? env_draws : async ? 48u : 768u;
-	int64_t  us    = env_us != 0 ? env_us : async ? int64_t {750} : int64_t {12000};
+	uint32_t draws = env_draws != 0 ? env_draws : async ? 192u : 768u;
+	int64_t  us    = env_us != 0 ? env_us : async ? int64_t {3000} : int64_t {12000};
 	if (FILE* file = std::fopen("split.ctl", "r"); file != nullptr) {
 		char line[64];
 		while (std::fgets(line, sizeof(line), file) != nullptr) {
@@ -2079,6 +2475,13 @@ static bool BdaBoundaryKind(uint32_t opcode, uint32_t header, RenderContext::Bda
 	}
 }
 
+// The end of a guest command buffer submits the host one only once it holds a batch of work
+// (about 1,400 guest submissions a second); frame ends, interrupts and command-buffer splits still
+// submit, and a readback of the open command buffer submits it.
+static void FlushGuestSubmission(CommandProcessor& cp) {
+	cp.BufferFlushIfBatchReady();
+}
+
 bool GuestGpu::Process(Submission& submission) {
 	const bool first_slice = !submission.started;
 	auto&      cp          = GetProcessor(submission.queue_id);
@@ -2128,7 +2531,7 @@ bool GuestGpu::Process(Submission& submission) {
 				}
 			}
 			if (progressed) {
-				cp.BufferFlush();
+				FlushGuestSubmission(cp);
 			}
 			break;
 		}
@@ -2149,7 +2552,7 @@ bool GuestGpu::Process(Submission& submission) {
 			complete = cp.Process(submission.command_execution, submission.commands) ==
 			           Pm4ProcessResult::Complete;
 			if (submission.command_execution.MadeProgress()) {
-				cp.BufferFlush();
+				FlushGuestSubmission(cp);
 			}
 			break;
 		}
@@ -2168,7 +2571,7 @@ bool GuestGpu::Process(Submission& submission) {
 					ready->release();
 				}, true);
 			});
-			cp.BufferFlush();
+			cp.BufferFlush(CommandProcessor::FlushSite::Suspend);
 			cp.Reset();
 			break;
 	}
@@ -2452,7 +2855,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			} else if (g_submit_split.work >= SubmitSplitDraws() ||
 			           std::chrono::duration_cast<std::chrono::microseconds>(now - g_submit_split.since)
 			                   .count() >= SubmitSplitUs()) {
-				BufferFlush();
+				BufferFlush(FlushSite::Split);
 				g_submit_split.work = 0;
 				g_submit_split_count.fetch_add(1, std::memory_order_relaxed);
 			}
@@ -3093,7 +3496,7 @@ void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_
 		GetScheduler().Flush();
 		m_renderer.GetVideoOut().WaitFlipDone(static_cast<int>(video_out_handle),
 		                                      static_cast<int>(display_buffer_index));
-	});
+	}, GpuCallbackTag::FlipWait);
 }
 
 template <typename T>
@@ -3101,7 +3504,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
                                         uint32_t eop_event_type, uint32_t cache_action,
                                         uint32_t event_index, uint32_t event_write_source,
                                         void* dst_gpu_addr, T value, uint32_t interrupt_selector,
-                                        uint32_t interrupt_context_id) {
+                                        uint32_t interrupt_context_id, bool flush_if_batch_ready) {
 	static_assert(sizeof(T) == sizeof(uint32_t) || sizeof(T) == sizeof(uint64_t));
 
 	if (GraphicsRunDebugDumpEnabled()) {
@@ -3131,7 +3534,10 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 		ExecuteWriteAtEndOfPipe(submit_id, eop_event_type, cache_action, event_index,
 		                        event_write_source, dst_gpu_addr, value, interrupt_selector,
 		                        interrupt_context_id);
-	});
+		if (flush_if_batch_ready) {
+			FlushIfBatchReady();
+		}
+	}, GpuCallbackTag::Eop);
 	// What ExecuteWriteAtEndOfPipe() writes: nothing for a graphics end-of-pipe interrupt, GDS
 	// dwords or the clock (values known only then), the low dword of a 64-bit value from source
 	// 1, or the value.
@@ -3349,10 +3755,10 @@ void CommandProcessor::WriteAtEndOfPipe32(uint32_t cache_policy, uint32_t event_
                                           uint32_t event_index, uint32_t event_write_source,
                                           void* dst_gpu_addr, uint32_t value,
                                           uint32_t interrupt_selector,
-                                          uint32_t interrupt_context_id) {
+                                          uint32_t interrupt_context_id, bool flush_if_batch_ready) {
 	WriteAtEndOfPipe(cache_policy, event_write_dest, eop_event_type, cache_action, event_index,
 	                 event_write_source, dst_gpu_addr, value, interrupt_selector,
-	                 interrupt_context_id);
+	                 interrupt_context_id, flush_if_batch_ready);
 }
 
 void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_write_dest,
@@ -3363,11 +3769,11 @@ void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_
                                           uint32_t interrupt_context_id) {
 	WriteAtEndOfPipe(cache_policy, event_write_dest, eop_event_type, cache_action, event_index,
 	                 event_write_source, dst_gpu_addr, value, interrupt_selector,
-	                 interrupt_context_id);
+	                 interrupt_context_id, false);
 }
 
 void CommandProcessor::EmitGlobalBarrier() {
-	EmitCallback([this] { ExecuteGlobalBarrier(); });
+	EmitCallback([this] { ExecuteGlobalBarrier(); }, GpuCallbackTag::Barrier);
 }
 
 void CommandProcessor::ExecuteGlobalBarrier() {
@@ -3400,10 +3806,22 @@ void CommandProcessor::ExecuteGlobalBarrier() {
 	}
 
 	vk::MemoryBarrier2 barrier {};
-	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
-	barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
-	barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
-	barrier.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+	// The device-side accesses by name: with MEMORY_READ/WRITE the driver may also write back and
+	// invalidate for the host (paused GPU A/B: 13.75-13.82 -> 13.65 ms per flip).
+	barrier.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.dstStageMask = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.srcAccessMask = vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eColorAttachmentWrite |
+	                        vk::AccessFlagBits2::eDepthStencilAttachmentWrite | vk::AccessFlagBits2::eTransferWrite;
+	barrier.dstAccessMask =
+	    vk::AccessFlagBits2::eIndirectCommandRead | vk::AccessFlagBits2::eIndexRead |
+	    vk::AccessFlagBits2::eVertexAttributeRead | vk::AccessFlagBits2::eUniformRead |
+	    vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite |
+	    vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite |
+	    vk::AccessFlagBits2::eDepthStencilAttachmentRead | vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
+	    vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite;
+	if (m_renderer.GetGraphics().conditional_rendering_enabled) {
+		barrier.dstAccessMask |= vk::AccessFlagBits2::eConditionalRenderingReadEXT;
+	}
 
 	vk::DependencyInfo dependency {};
 	dependency.memoryBarrierCount = 1;
@@ -3413,7 +3831,8 @@ void CommandProcessor::ExecuteGlobalBarrier() {
 }
 
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {
-	EmitCallback([this, interrupt_context_id] { DeferEopInterrupt(interrupt_context_id); });
+	EmitCallback([this, interrupt_context_id] { DeferEopInterrupt(interrupt_context_id); },
+	             GpuCallbackTag::Eop);
 }
 
 void CommandProcessor::DeferEopInterrupt(uint32_t interrupt_context_id) {
@@ -3450,9 +3869,10 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 		     event_type, event_index, event_address);
 	}
 
+	// The occlusion counter dump writes guest memory (see CommandProcessor::Execute()).
 	const auto sequence = EmitCallback([this, event_type, event_index, event_address] {
 		ExecuteTriggerEvent(event_type, event_index, event_address);
-	});
+	}, event_type == 0x00000039 ? GpuCallbackTag::Other : GpuCallbackTag::Event);
 	if (event_type == 0x00000039) {
 		// Occlusion counter pairs of 16 DBs.
 		NoteGuestWrite(sequence, event_address, 16u * 2u * sizeof(uint64_t), nullptr, "wait-occlusion");
@@ -3538,7 +3958,7 @@ void CommandProcessor::WriteLodStats(void* dst, uint32_t size) {
 			auto* label = static_cast<uint32_t*>(dst);
 			*label      = 1;
 		}
-	});
+	}, GpuCallbackTag::Other);
 	NoteGuestWrite(sequence, reinterpret_cast<uint64_t>(dst), size, nullptr, "wait-lod-stats");
 }
 
@@ -3555,8 +3975,9 @@ void CommandProcessor::Flip() {
 		GetScheduler().DeferHostOperation(
 		    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); },
 		    true);
+		g_scheduler_flush_sites[3].fetch_add(1, std::memory_order_relaxed);
 		GetScheduler().Flush();
-	});
+	}, GpuCallbackTag::Flip);
 }
 
 void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
@@ -3576,8 +3997,9 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 		GetScheduler().DeferHostOperation(
 		    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); },
 		    true);
+		g_scheduler_flush_sites[3].fetch_add(1, std::memory_order_relaxed);
 		GetScheduler().Flush();
-	});
+	}, GpuCallbackTag::Flip);
 	NoteGuestWrite(sequence, reinterpret_cast<uint64_t>(dst_gpu_addr), sizeof(value), &value);
 }
 
@@ -3610,8 +4032,9 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 			    renderer.TriggerInterrupt(event_id, 0);
 		    },
 		    true);
+		g_scheduler_flush_sites[3].fetch_add(1, std::memory_order_relaxed);
 		GetScheduler().Flush();
-	});
+	}, GpuCallbackTag::Flip);
 	NoteGuestWrite(sequence, reinterpret_cast<uint64_t>(dst_gpu_addr), sizeof(value), &value);
 }
 
@@ -3631,12 +4054,13 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 		m_renderer.GetVideoOut().PrepareFlip(request_id, CurrentBuffer());
 		GetScheduler().DeferHostOperation(
 		    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); }, true);
+		g_scheduler_flush_sites[3].fetch_add(1, std::memory_order_relaxed);
 		GetScheduler().Flush();
-	});
+	}, GpuCallbackTag::Flip);
 }
 
 void CommandProcessor::SynchronizeGpu() {
-	EmitCallback([this] { GetScheduler().Finish(); });
+	EmitCallback([this] { GetScheduler().Finish(); }, GpuCallbackTag::Finish);
 }
 
 uint32_t GuestGpu::CurrentQueue() noexcept {

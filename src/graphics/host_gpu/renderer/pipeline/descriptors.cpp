@@ -15,6 +15,7 @@
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/guest_gpu/stageStats.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/hostMemory.h"
@@ -23,6 +24,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
+#include "graphics/host_gpu/renderer/frameDump.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -179,7 +181,8 @@ static bool IsMultisampledTexture(Prospero::ImageType type) {
 
 static vk::DescriptorBufferInfo
 NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource& source,
-                    const ShaderRecompiler::IR::BufferResource& resource, uint32_t& buffer_offset) {
+                    const ShaderRecompiler::IR::BufferResource& resource, uint32_t& buffer_offset,
+                    Buffer** obtained = nullptr) {
 	buffer_offset = 0;
 
 	const auto& [address, size, id] = source;
@@ -194,6 +197,9 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	auto [buffer, offset] = context.GetBufferCache().ObtainBufferCached(
 	    address, size, resource.written,
 	    resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled()), id);
+	if (obtained != nullptr) {
+		*obtained = buffer;
+	}
 	const auto aligned_offset = Common::AlignDown(offset, alignment);
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
@@ -771,7 +777,12 @@ bool RenderExecutor::ReuseTextureLookup(TextureDescDerivation& derived, TextureB
 	texture_cache.TouchImage(*image);
 	binding.image_id   = found.id;
 	binding.image_view = found.view;
-	binding.desc       = found.desc;
+	// The binding of a stage slot usually reuses the same lookup draw after draw: the description
+	// (a few hundred bytes) is copied once per recording.
+	if (binding.desc_serial != found.serial) {
+		binding.desc        = found.desc;
+		binding.desc_serial = found.serial;
+	}
 	binding.layout     = vk::ImageLayout::eUndefined;
 	binding.mip_views.clear();
 	binding.lookup = &derived;
@@ -1147,43 +1158,70 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.shader_data_buffer = {};
 	prepared.shared_memory = {};
 	prepared.push_dwords_valid = false;
-	prepared.images.resize(program.info.images.size());
 	prepared.shader_data.clear();
 	const bool same_program = prepared.last_program == &program &&
 	                          prepared.last_descs_generation == m_texture_descs_generation;
-	const bool same_images  = same_program && prepared.last_images == snapshot.images;
-	if (!same_images) {
-		prepared.image_descs.assign(program.info.images.size(), nullptr);
+	// The T#s and descriptions of the program's last draw: a stage alternates between programs,
+	// and a memo of only the stage's last program missed (the description lookups were 3% of
+	// the execution thread).
+	auto* memo = prepared.last_program == &program ? prepared.image_memo : nullptr;
+	if (memo == nullptr) {
+		memo = &m_program_image_memos[&program];
+	}
+	// The program's own image bindings come back with it: a slot reusing the lookup its last draw
+	// made already holds the description (ReuseTextureLookup copied one for most slots of
+	// alternating programs, 1.2% of the execution thread).
+	if (prepared.image_memo != memo && (memo->holder == nullptr || memo->holder == &prepared)) {
+		if (prepared.image_memo != nullptr && prepared.image_memo->holder == &prepared) {
+			prepared.images.swap(prepared.image_memo->bindings);
+			prepared.image_memo->holder = nullptr;
+		}
+		prepared.images.swap(memo->bindings);
+		memo->holder = &prepared;
+	}
+	prepared.image_memo    = memo;
+	prepared.images.resize(program.info.images.size());
+	auto&      last_images = memo->images;
+	auto&      image_descs = memo->image_descs;
+	const bool same_descs  = memo->descs_generation == m_texture_descs_generation;
+	const bool same_images = same_descs && last_images == snapshot.images;
+	// Draws of a program change some T#s and keep the others: a slot whose T# is unchanged keeps
+	// its description instead of looking it up again.
+	const bool slot_reuse = same_descs && last_images.size() == snapshot.images.size() &&
+	                        image_descs.size() == program.info.images.size();
+	if (!same_images && !slot_reuse) {
+		image_descs.assign(program.info.images.size(), nullptr);
 	}
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		// Sampled textures whose last lookup still holds are written in place.
 		const auto& resource = program.info.images[i];
 		if (!resource.written &&
 		    resource.mip_mode != ShaderRecompiler::IR::ImageMipMode::Dynamic) {
-			auto* derived = prepared.image_descs[i];
-			if (!same_images) {
+			auto* derived = image_descs[i];
+			if (!same_images && !(slot_reuse && last_images[i] == snapshot.images[i])) {
 				const auto cached =
 				    m_texture_descs.find(MakeTextureDescKey(resource, snapshot.images[i]));
 				derived = cached != m_texture_descs.end() ? &cached->second : nullptr;
 			}
 			if (derived != nullptr && derived->found.valid &&
 			    ReuseTextureLookup(*derived, prepared.images[i])) {
-				prepared.image_descs[i] = derived;
+				image_descs[i] = derived;
 				BindImage(prepared.images[i].image_id, false);
 				continue;
 			}
 		}
 		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
 		// The description whose lookups later draws reuse (see ResolveTexture()).
-		prepared.image_descs[i] = binding.lookup;
+		image_descs[i] = binding.lookup;
 		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
 		binding.mip_views.swap(prepared.images[i].mip_views);
 		binding.mip_views.clear();
 		prepared.images[i] = std::move(binding);
 	}
 	if (!same_images) {
-		prepared.last_images = snapshot.images;
+		last_images = snapshot.images;
 	}
+	memo->descs_generation = m_texture_descs_generation;
 	prepared.table_images.clear();
 	prepared.table_sources.clear();
 	prepared.table_roots.clear();
@@ -1245,13 +1283,28 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 		const auto& snapshot = *prepared.runtime->resources;
 		const auto& layout = program.bindings;
 		prepared.buffer_sources.resize(layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)]);
+		prepared.buffer_keys.resize(prepared.buffer_sources.size());
 		if (layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)] == 0) {
 			continue;
 		}
+		// Half the slots bind the range they had the draw before: unchanged V#s keep their source
+		// (the clamp and the buffer lookup) while no buffer was registered or unregistered and no
+		// memory was mapped or unmapped.
+		const uint64_t generation = cache.BufferSetEpoch() * 0x9e3779b97f4a7c15ull ^ m_context.MappingGeneration();
 		for (uint32_t resource = 0; resource < program.info.buffers.size(); ++resource) {
 			const auto& metadata = program.info.buffers[resource];
 			if (metadata.descriptor_index == UINT32_MAX) continue;
 			auto& source = prepared.buffer_sources[metadata.descriptor_index];
+			auto& key    = prepared.buffer_keys[metadata.descriptor_index];
+			if (key.program == &program && key.generation == generation &&
+			    key.value == snapshot.buffers[resource]) {
+				if (StageStats::Enabled()) {
+					StageStats::g_bind_total.fetch_add(1, std::memory_order_relaxed);
+					StageStats::g_bind_same.fetch_add(1, std::memory_order_relaxed);
+				}
+				continue;
+			}
+			key = {snapshot.buffers[resource], &program, generation};
 			const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[resource]);
 			const auto address = descriptor.Base48();
 			auto size = descriptor.GetSize();
@@ -1261,6 +1314,7 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 			}
 			if (descriptor.NumRecords() == UINT32_MAX) {
 				if (program.info.buffers[resource].written) {
+					key.program = nullptr;
 					// Sentinel write ranges end before tables captured by any bound stage.
 					for (const auto* reader: stages) {
 						for (const auto [read_address, read_size]: reader->runtime->resources->specialization_reads) {
@@ -1296,6 +1350,16 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 				source = {};
 				continue;
 			}
+			// KYTY_DBG_STAGE_STATS: bindings, those the slot had the draw before, written ones (NHL27BINDS).
+			if (StageStats::Enabled()) {
+				StageStats::g_bind_total.fetch_add(1, std::memory_order_relaxed);
+				if (source.address == address && source.size == size) {
+					StageStats::g_bind_same.fetch_add(1, std::memory_order_relaxed);
+				}
+				if (metadata.written) {
+					StageStats::g_bind_written.fetch_add(1, std::memory_order_relaxed);
+				}
+			}
 			source = {address, size, cache.FindBuffer(address, size)};
 		}
 	}
@@ -1324,13 +1388,74 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	};
 	FrameBreakdown::Timer lookup_timer(FrameBreakdown::g_counters.dp_rebind_lookup_ns);
 	FrameBreakdown::BufScope buf_scope(1);
+	auto& cache = m_context.GetBufferCache();
+	prepared.buffer_memos.resize(prepared.buffers.size());
+	// Plain reads (most slots) whose range found the same buffer the draw before skip the lookup
+	// while no buffer was registered and the range stayed CPU-clean.
+	const bool slot_memo = Common::RuntimeFlags::Current().buffer_fast;
 	for (const auto& resource: program.info.buffers) {
 		const auto index = resource.descriptor_index;
 		if (index == UINT32_MAX) continue;
-		uint32_t buffer_offset = 0;
-		prepared.buffers[index] = NativeStorageBuffer(m_context, prepared.buffer_sources[index],
-		                                              resource, buffer_offset);
+		uint32_t    buffer_offset = 0;
+		const auto& source        = prepared.buffer_sources[index];
+		auto&       memo          = prepared.buffer_memos[index];
+		const bool  plain = slot_memo && !resource.written && !resource.formatted &&
+		                   !(resource.read && Config::SyncRawImageBuffersEnabled()) && source.address != 0 &&
+		                   source.size != 0;
+		// Written slots too, while the GPU ranges and the buffer set are unchanged.
+		const bool  written = slot_memo && resource.written && source.address != 0 && source.size != 0;
+		// And texel reads while no image starts at the address.
+		const bool  texel = slot_memo && !resource.written && resource.formatted &&
+		                   !(resource.read && Config::SyncRawImageBuffersEnabled()) && source.address != 0 &&
+		                   source.size != 0;
+		if (plain && memo.buffer != nullptr && !memo.written && memo.image_version == 0 &&
+		    memo.address == source.address && memo.size == source.size &&
+		    cache.PlainReadHolds(*memo.buffer, source.address, source.size, memo.cpu_generation,
+		                         memo.registration)) {
+			prepared.buffers[index] = memo.info;
+			pack_memory_offset(index, memo.buffer_offset);
+			continue;
+		}
+		if (written && memo.buffer != nullptr && memo.written && memo.address == source.address &&
+		    memo.size == source.size &&
+		    cache.WrittenBindHolds(*memo.buffer, source.address, source.size, memo.ranges_version,
+		                           memo.registration)) {
+			m_context.GetTextureCache().InvalidateMemoryFromGPU(source.address, source.size);
+			prepared.buffers[index] = memo.info;
+			pack_memory_offset(index, memo.buffer_offset);
+			continue;
+		}
+		if (texel && memo.buffer != nullptr && memo.image_version != 0 && memo.address == source.address &&
+		    memo.size == source.size &&
+		    cache.TexelReadHolds(*memo.buffer, source.address, source.size, memo.cpu_generation,
+		                         memo.registration, memo.image_version)) {
+			prepared.buffers[index] = memo.info;
+			pack_memory_offset(index, memo.buffer_offset);
+			continue;
+		}
+		const auto cpu           = cache.CpuModificationGeneration();
+		const auto registration  = cache.RegistrationGeneration();
+		const auto image_version = texel ? cache.TexelImageVersion(source.address) : 0;
+		Buffer*    obtained      = nullptr;
+		prepared.buffers[index]  = NativeStorageBuffer(m_context, source, resource, buffer_offset, &obtained);
 		pack_memory_offset(index, buffer_offset);
+		if ((plain || written || texel) && obtained != nullptr && !cache.IsStreamBuffer(obtained) &&
+		    registration == cache.RegistrationGeneration() &&
+		    (!texel || (image_version == cache.TexelImageVersion(source.address) &&
+		                cache.TexelReadKeepable(source.address)))) {
+			memo = {.buffer         = obtained,
+			        .address        = source.address,
+			        .size           = source.size,
+			        .cpu_generation = cpu,
+			        .registration   = registration,
+			        .ranges_version = cache.GpuRangesVersion(),
+			        .written        = written,
+			        .image_version  = image_version,
+			        .info           = prepared.buffers[index],
+			        .buffer_offset  = buffer_offset};
+		} else {
+			memo.buffer = nullptr;
+		}
 	}
 	lookup_timer.Stop();
 	FrameBreakdown::Timer upload_timer(FrameBreakdown::g_counters.dp_rebind_upload_ns);
@@ -1410,6 +1535,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			found.image_set_epoch = texture_cache.ImageSetEpoch();
 			found.state           = ImageLookupState::Of(binding.image_id, image);
 			found.valid           = true;
+			found.serial          = ++m_found_serial;
 		}
 		// The binding no longer refers to the description, which may be cleared.
 		binding.lookup = nullptr;
@@ -1769,6 +1895,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 
 	// Keep this draw's push-constant block on each stage for the frame dump (FrameDump::OnDraw).
 	for (auto* prepared: prepared_bindings) {
+		if (!FrameDump::Enabled()) break;
 		prepared->push_dwords       = push_data.dwords;
 		prepared->push_dwords_valid = has_push_data;
 	}

@@ -18,6 +18,7 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
@@ -289,6 +290,12 @@ void TextureCache::RegisterImage(ImageId id) {
 		m_image_page_table[page].push_back(id);
 	});
 	m_images_by_address[image.info.data.address].push_back(id);
+	const auto filter_index = AddressFilterIndex(image.info.data.address);
+	if (m_address_filter_counts[filter_index]++ == 0) {
+		m_address_filter[filter_index / 64].fetch_or(uint64_t {1} << (filter_index % 64), std::memory_order_release);
+	}
+	m_address_filter_versions[filter_index >> 4u].fetch_add(1, std::memory_order_release);
+	m_address_index_version.fetch_add(1, std::memory_order_release);
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
 	image.lru_tick   = m_gc_tick;
@@ -331,6 +338,9 @@ void TextureCache::UnregisterImage(ImageId id) {
 		}
 		ids.erase(found);
 		if (ids.empty()) m_images_by_address.erase(by_address);
+		if (const auto index = AddressFilterIndex(image.info.data.address); --m_address_filter_counts[index] == 0) {
+			m_address_filter[index / 64].fetch_and(~(uint64_t {1} << (index % 64)), std::memory_order_release);
+		}
 	}
 	m_lru_cache.Free(image.lru_id);
 	const auto accounted = image.AccountedSize();
@@ -382,7 +392,9 @@ void TextureCache::DeleteImage(ImageId id) {
 	if (image == nullptr || !image->registered) {
 		return;
 	}
-	if (!image->depth_id) {
+	// Only depth images ever get stencil planes: the scan of every image for them was 1% of the
+	// execution thread in play (images are replaced all the time).
+	if (!image->depth_id && image->stencil_associated) {
 		std::vector<ImageId> associations;
 		m_slot_images.ForEach([&](ImageId candidate, const Image& associated) {
 			if (associated.depth_id == id) {
@@ -1443,24 +1455,22 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	// the buffer cache recorded, the clear code is known without draining the GPU queue. The
 	// fill is dropped by any later write, download or invalidation of the range.
 	uint32_t shadow_value = 0;
-	const bool shadowed = selected_size != 0 && desc.type != BindingType::VideoOut &&
-	                      BufferCache::PerfNoSyncReadback() &&
-	                      m_buffer_cache.HasGpuDirtyBytes(selected_address, selected_size) &&
+	// Asked once: the three checks below wanted it each (0.8% of the execution thread in play).
+	const bool gpu_dirty = selected_size != 0 && m_buffer_cache.HasGpuDirtyBytes(selected_address, selected_size);
+	const bool shadowed  = gpu_dirty && desc.type != BindingType::VideoOut && BufferCache::PerfNoSyncReadback() &&
 	                      m_buffer_cache.TryGetGpuFill(selected_address, selected_size, shadow_value);
 	if (shadowed) {
 		BufferCache::PerfCount(BufferCache::PerfEvent::ColorClearShadowHit);
 	}
 	// Experiment GpuColorClear: the GPU wrote these metadata bytes. Check them on the GPU and clear
 	// through conditional rendering instead of reading them back, which waits for that GPU work.
-	if (!shadowed && selected_size != 0 && m_graphics.conditional_rendering_enabled &&
+	if (!shadowed && gpu_dirty && m_graphics.conditional_rendering_enabled &&
 	    Common::Experiments::Enabled(Common::Experiments::GpuColorClear) &&
-	    m_buffer_cache.HasGpuDirtyBytes(selected_address, selected_size) &&
 	    MaterializeColorClearOnGpu(id, desc, selected_address, slice_size, count, image_first)) {
 		return;
 	}
 	// This may submit; never hold the texture lock across the readback.
-	if (!shadowed && selected_size != 0 &&
-	    m_buffer_cache.HasGpuDirtyBytes(selected_address, selected_size)) {
+	if (!shadowed && gpu_dirty) {
 		static const bool debug_cpu = std::getenv("KYTY_DBG_GPU_CLEAR") != nullptr;
 		static uint32_t   cpu_logged = 0;
 		if (debug_cpu && cpu_logged++ < 32) {
@@ -1719,6 +1729,7 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 		record.depth_id             = depth_id;
 		record.stencil_subresources = depth.stencil_subresources;
 	}
+	depth.stencil_associated = true;
 
 	return association;
 }
@@ -1996,7 +2007,15 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 	if (!GuestRange {address, size}.Valid()) {
 		return {};
 	}
+	if (!AddressFilterHit(address)) {
+		return {};
+	}
 	std::scoped_lock lock {m_lock};
+	// Only images that start at `address` match. Texel buffer binds ask on every draw and nearly
+	// always find none: one hash lookup instead of walking the pages of the range.
+	if (!m_images_by_address.contains(address)) {
+		return {};
+	}
 	ImageIds         matches;
 	for (const auto id: FindImagesInRegion(address, size, false)) {
 		auto owner = m_slot_images.try_get(id);
@@ -2522,20 +2541,27 @@ bool TextureCache::DownloadImageMemory(ImageId id, bool tolerant_write) {
 	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
 	                                               1, &barrier, 0, nullptr);
-	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset, tolerant_write] {
+	// Only what is still mapped by then (unmaps no longer wait for the publish).
+	const auto unmap_sequence = m_scheduler.Context().UnmapSequence();
+	m_scheduler.DeferPriorityOperation([this, &download, range, mapped, offset, tolerant_write, unmap_sequence] {
 		download.Invalidate(offset, range.size);
-		if (tolerant_write) {
-			// The range may have been unmapped after enqueue; skip rather than exit.
-			(void)LibKernel::Memory::TryWriteBacking(range.address, mapped, range.size);
-		} else {
-			LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
-		}
+		m_scheduler.Context().WriteUnlessUnmapped(
+		    unmap_sequence, range.address, range.size, [&](uint64_t address, uint64_t bytes) {
+			    const auto* data = static_cast<const uint8_t*>(mapped) + (address - range.address);
+			    if (tolerant_write) {
+				    (void)LibKernel::Memory::TryWriteBacking(address, data, bytes);
+			    } else {
+				    LibKernel::Memory::WriteBacking(address, data, bytes);
+			    }
+		    });
 	}, range.address, range.size);
 	return true;
 }
 
 void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
-	if (!GuestRange {address, size}.Valid()) {
+	// Only images starting at the address change, and every written storage-buffer bind asks:
+	// the start-address filter answers most without the lock and the page walk.
+	if (!GuestRange {address, size}.Valid() || !AddressFilterHit(address)) {
 		return;
 	}
 	std::scoped_lock lock {m_lock};

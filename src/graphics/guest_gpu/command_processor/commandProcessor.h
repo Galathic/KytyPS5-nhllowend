@@ -73,7 +73,9 @@ public:
 	void BdaBoundary(RenderContext::BdaBoundary kind);
 
 	void BufferInit();
-	void BufferFlush();
+	// Who asked for a submission (KYTY_DBG_STAGE_STATS counts them by site, NHL27EXECIDLE).
+	enum class FlushSite : uint8_t { Other, GuestSubmission, Interrupt, Suspend, Split, Count };
+	void BufferFlush(FlushSite site = FlushSite::Other);
 	void BufferFlushIfBatchReady();
 	void BufferWait();
 	// Register writes go through these; queued operations keep snapshots of the old values.
@@ -118,10 +120,13 @@ public:
 	void DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,
 	                       const volatile uint32_t* count_addr, uint32_t stride_in_bytes,
 	                       IndirectDrawRegisters registers, uint32_t draw_initiator, bool indexed);
+	// flush_if_batch_ready: the write's own operation then does what BufferFlushIfBatchReady()
+	// queues as one more.
 	void WriteAtEndOfPipe32(uint32_t cache_policy, uint32_t event_write_dest,
 	                        uint32_t eop_event_type, uint32_t cache_action, uint32_t event_index,
 	                        uint32_t event_write_source, void* dst_gpu_addr, uint32_t value,
-	                        uint32_t interrupt_selector, uint32_t interrupt_context_id = 0);
+	                        uint32_t interrupt_selector, uint32_t interrupt_context_id = 0,
+	                        bool flush_if_batch_ready = false);
 	void WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_write_dest,
 	                        uint32_t eop_event_type, uint32_t cache_action, uint32_t event_index,
 	                        uint32_t event_write_source, void* dst_gpu_addr, uint64_t value,
@@ -228,7 +233,9 @@ private:
 	void WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_write_dest, uint32_t eop_event_type,
 	                      uint32_t cache_action, uint32_t event_index, uint32_t event_write_source,
 	                      void* dst_gpu_addr, T value, uint32_t interrupt_selector,
-	                      uint32_t interrupt_context_id);
+	                      uint32_t interrupt_context_id, bool flush_if_batch_ready);
+	// Execution thread: submits when the current command buffer holds a batch of work.
+	void FlushIfBatchReady();
 	void ProcessPm4(Pm4Execution& execution);
 	const uint32_t* ShadowPm4Packet(const uint32_t* packet, uint32_t remaining_dw);
 	const uint32_t* ShadowProtectedPm4Packet(const uint32_t* packet, uint32_t remaining_dw);
@@ -241,7 +248,8 @@ private:
 	[[nodiscard]] GpuRegisterState SnapshotState(uint64_t sequence);
 	// Both return the sequence of a pipelined operation, 0 once it executed.
 	uint64_t                   Emit(GpuOperation&& operation);
-	uint64_t                   EmitCallback(GpuCallback&& callback);
+	uint64_t                   EmitCallback(GpuCallback&& callback,
+	                                        GpuCallbackTag tag = GpuCallbackTag::Other);
 	void NoteGuestWrite(uint64_t sequence, uint64_t address, uint64_t size,
 	                    const void* value = nullptr, const char* kind = "write", uint8_t origin = 0);
 

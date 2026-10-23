@@ -153,6 +153,109 @@ uint32_t EmitFPClamp16x2(EmitterState& state, uint32_t a) {
 	    state, EmitExt(state, vec, GLSLstd450FClamp, {BitcastToF16x2(state, a), zero2, one2}));
 }
 
+namespace {
+uint32_t TypeF16(EmitterState& state) {
+	return state.builder.Type(spv::OpTypeFloat, 16u);
+}
+
+// The f16 a U32 holds in its low half, or the lane of an F16LaneExtract's source: a component of
+// the source register viewed as an f16vec2, which the host compiler reads as a register half.
+uint32_t HalfOf(ValueEmitContext& ctx, IR::Value value) {
+	auto&      state    = ctx.state;
+	const auto resolved = value.Resolve();
+	uint32_t   bits     = 0;
+	uint32_t   lane     = 0;
+	const auto* producer = resolved.IsImmediate() ? nullptr : resolved.TryInstruction();
+	if (producer != nullptr && producer->GetOpcode() == IR::ValueOpcode::F16LaneExtract &&
+	    producer->Arg(1).Resolve().IsImmediate()) {
+		bits = ctx.Def(producer->Arg(0));
+		lane = producer->Arg(1).Resolve().U32() & 1u;
+	} else {
+		bits = ctx.Def(value);
+	}
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeF16(state), result, BitcastToF16x2(state, bits), lane);
+	return result;
+}
+
+uint32_t HalfToLow(EmitterState& state, uint32_t half) {
+	const auto zero = state.builder.Constant(spv::OpConstant, TypeF16(state), 0x0000u);
+	const auto pair = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeConstruct, TypeF16Vector2(state), pair, half, zero);
+	return BitcastF16x2ToU32(state, pair);
+}
+
+uint32_t EmitHalfBinary(ValueEmitContext& ctx, const IR::Inst& inst, spv::Op opcode) {
+	auto& state = ctx.state;
+	return HalfToLow(state, Binary(state, opcode, TypeF16(state), HalfOf(ctx, inst.Arg(0)), HalfOf(ctx, inst.Arg(1))));
+}
+} // namespace
+
+uint32_t EmitF16LaneExtract(EmitterState& state, uint32_t bits, uint32_t lane) {
+	const auto offset = Binary(state, spv::OpShiftLeftLogical, TypeU32(state), lane, ConstantU32(state, 4));
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpBitFieldUExtract, TypeU32(state), result, bits, offset, ConstantU32(state, 16));
+	return result;
+}
+
+uint32_t EmitF16LaneInsert(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto&      state = ctx.state;
+	const auto lane  = inst.Arg(2).Resolve();
+	if (!lane.IsImmediate()) {
+		const auto offset = Binary(state, spv::OpShiftLeftLogical, TypeU32(state), ctx.Def(inst.Arg(2)),
+		                           ConstantU32(state, 4));
+		const auto result = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpBitFieldInsert, TypeU32(state), result, ctx.Def(inst.Arg(0)),
+		                          ctx.Def(inst.Arg(1)), offset, ConstantU32(state, 16));
+		return result;
+	}
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeInsert, TypeF16Vector2(state), result, HalfOf(ctx, inst.Arg(1)),
+	                          BitcastToF16x2(state, ctx.Def(inst.Arg(0))), lane.U32() & 1u);
+	return BitcastF16x2ToU32(state, result);
+}
+
+uint32_t EmitFPAdd16Low(ValueEmitContext& ctx, const IR::Inst& inst) {
+	return EmitHalfBinary(ctx, inst, spv::OpFAdd);
+}
+
+uint32_t EmitFPSub16Low(ValueEmitContext& ctx, const IR::Inst& inst) {
+	return EmitHalfBinary(ctx, inst, spv::OpFSub);
+}
+
+uint32_t EmitFPMul16Low(ValueEmitContext& ctx, const IR::Inst& inst) {
+	return EmitHalfBinary(ctx, inst, spv::OpFMul);
+}
+
+uint32_t EmitFPFma16Low(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto& state = ctx.state;
+	return HalfToLow(state, EmitExt(state, TypeF16(state), GLSLstd450Fma,
+	                                {HalfOf(ctx, inst.Arg(0)), HalfOf(ctx, inst.Arg(1)), HalfOf(ctx, inst.Arg(2))}));
+}
+
+uint32_t EmitF16x2Swizzle(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto&      state = ctx.state;
+	const auto bits  = ctx.Def(inst.Arg(0));
+	const auto lo    = inst.Arg(1).Resolve();
+	const auto hi    = inst.Arg(2).Resolve();
+	if (!lo.IsImmediate() || !hi.IsImmediate()) {
+		const auto low = Binary(state, spv::OpShiftRightLogical, TypeU32(state), bits,
+		                        Binary(state, spv::OpShiftLeftLogical, TypeU32(state), ctx.Def(inst.Arg(1)), ConstantU32(state, 4)));
+		const auto high = Binary(state, spv::OpShiftRightLogical, TypeU32(state), bits,
+		                         Binary(state, spv::OpShiftLeftLogical, TypeU32(state), ctx.Def(inst.Arg(2)), ConstantU32(state, 4)));
+		const auto result = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpBitFieldInsert, TypeU32(state), result,
+		                          Binary(state, spv::OpBitwiseAnd, TypeU32(state), low, ConstantU32(state, 0xffffu)), high,
+		                          ConstantU32(state, 16), ConstantU32(state, 16));
+		return result;
+	}
+	const auto vector = BitcastToF16x2(state, bits);
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpVectorShuffle, TypeF16Vector2(state), result, vector, vector, lo.U32() & 1u,
+	                          hi.U32() & 1u);
+	return BitcastF16x2ToU32(state, result);
+}
+
 uint32_t EmitFPFma32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 	const auto result = EmitGlsl<GLSLstd450Fma, IR::Type::F32>(state, a, b, c);
 	state.builder.AddAnnotation(spv::OpDecorate, result, spv::DecorationNoContraction);

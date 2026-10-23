@@ -4,6 +4,7 @@
 #include "common/inlineFunction.h"
 #include "graphics/host_gpu/renderer/render.h"
 
+#include <atomic>
 #include <cstdint>
 
 namespace Libs::Graphics {
@@ -80,6 +81,37 @@ enum class GpuOperationKind : uint8_t {
 	Callback,
 };
 
+enum class GpuCallbackTag : uint8_t {
+	Other,
+	Bda,
+	Flush,
+	Finish,
+	Flip,
+	Eop,
+	Event,
+	Barrier,
+	WriteData,
+	Dma,
+	Clock,
+	Host,
+	Gc,
+	FlipWait,
+	Count
+};
+
+// Experiment DispatchResolver: where the second resolve thread leaves a dispatch's resolution
+// (state 0 free, 1 queued, 2 resolved); the execution thread waits for it and frees it.
+struct GpuDispatchSlot {
+	std::atomic<uint32_t>             state {0};
+	RenderExecutor::ResolvedDispatch* result = nullptr;
+};
+
+// Experiment DrawResolver: the same for a draw the second draw resolver resolves.
+struct GpuDrawSlot {
+	std::atomic<uint32_t>         state {0};
+	RenderExecutor::ResolvedDraw* result = nullptr;
+};
+
 // One unit of emulated GPU work produced by a command processor. Operations execute in the
 // order the command processors produce them; every guest-visible effect of a command buffer
 // (draws, dispatches, labels, interrupts, flips, DMA) is an operation.
@@ -95,6 +127,10 @@ struct GpuOperation {
 	RenderExecutor::ResolvedDraw* resolved = nullptr;
 	// Direct dispatches: the compute program the resolve thread resolved ahead, if any.
 	RenderExecutor::ResolvedDispatch* resolved_dispatch = nullptr;
+	// Experiment DispatchResolver: the resolution of resolved_dispatch is still being made.
+	GpuDispatchSlot* dispatch_slot = nullptr;
+	// Experiment DrawResolver: the resolution of `resolved` is still being made.
+	GpuDrawSlot* draw_slot = nullptr;
 	// The command processor processed a WAIT_REG_MEM since the previous operation: the guest may
 	// have written memory the operations before it read.
 	bool after_wait = false;
@@ -103,6 +139,8 @@ struct GpuOperation {
 	// KYTY_IDLE_TRACE: the PM4 packet that produced the operation (opcode | IT_NOP R code << 8,
 	// 0x4000 = the KYTY_BDA_BATCH boundary after the packet, 0 = outside a packet).
 	uint16_t trace_op = 0;
+	// Callbacks: what they do (KYTY_DBG_STAGE_STATS, NHL27CALLBACKS).
+	GpuCallbackTag callback_tag = GpuCallbackTag::Other;
 	union {
 		DrawIndexArgs       draw_index;
 		DrawAutoArgs        draw_auto;

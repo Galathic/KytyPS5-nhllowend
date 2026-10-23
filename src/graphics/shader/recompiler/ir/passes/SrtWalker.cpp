@@ -2285,6 +2285,13 @@ bool SrtWalker::DirectReadRun(uint32_t slot, uint32_t count, std::vector<uint32_
 	auto&       evaluator = head.clean ? *m_clean_evaluator : *this;
 	const auto& user_data = evaluator.m_runtime.user_data;
 	if (head.low_register >= user_data.size() || head.high_register >= user_data.size()) return false;
+	// The pointer registers are inputs like any GetUserData (a resource memo collecting its register
+	// dependencies otherwise reuses resources read through another pointer).
+	if (const auto& observer = m_runtime.observe_user_data != nullptr ? m_runtime : evaluator.m_runtime;
+	    observer.observe_user_data != nullptr) {
+		observer.observe_user_data(observer.user_data_observer_userdata, head.low_register);
+		observer.observe_user_data(observer.user_data_observer_userdata, head.high_register);
+	}
 	const auto base = ((static_cast<uint64_t>(user_data[head.high_register]) << 32u) |
 	                   user_data[head.low_register]) &
 	                  AddressMask;
@@ -2525,6 +2532,9 @@ bool SrtWalker::RefreshDirectControlFlow(std::vector<uint32_t>& flat) {
 				if (leaf.kind == Kind::UserData) {
 					ready  = leaf.index < m_runtime.user_data.size();
 					now[i] = ready ? m_runtime.user_data[leaf.index] : 0;
+					if (ready && m_runtime.observe_user_data != nullptr) {
+						m_runtime.observe_user_data(m_runtime.user_data_observer_userdata, leaf.index);
+					}
 				} else if (leaf.kind == Kind::Flat) {
 					ready  = leaf.index < filled.size() && filled[leaf.index] != 0u;
 					now[i] = ready ? flat[leaf.index] : 0;

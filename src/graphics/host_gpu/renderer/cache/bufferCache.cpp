@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/pageWriteSeq.h"
 #include "common/experiments.h"
 
 #include "common/alignment.h"
@@ -342,6 +343,25 @@ void MarkGpuFillChunks(std::array<uint64_t, 4>& filter, uint64_t begin, uint64_t
 		filter[(chunk >> 6u) & 3u] |= uint64_t {1} << (chunk & 63u);
 	}
 }
+
+// Whether any m_gpu_fill_filter bit of the 64 KiB chunks [begin, end) touches is set.
+bool TestGpuFillChunks(const std::array<uint64_t, 4>& filter, uint64_t begin, uint64_t end) {
+	const uint64_t first = begin >> GpuFillChunkShift;
+	const uint64_t last  = (end - 1) >> GpuFillChunkShift;
+	if (last - first >= 255u) {
+		return (filter[0] | filter[1] | filter[2] | filter[3]) != 0;
+	}
+	for (uint64_t chunk = first; chunk <= last;) {
+		const uint64_t bit   = chunk & 63u;
+		const uint64_t count = std::min<uint64_t>(64u - bit, last - chunk + 1u);
+		const uint64_t mask  = (count == 64u ? ~uint64_t {0} : (uint64_t {1} << count) - 1u) << bit;
+		if ((filter[(chunk >> 6u) & 3u] & mask) != 0) {
+			return true;
+		}
+		chunk += count;
+	}
+	return false;
+}
 } // namespace
 
 void BufferCache::DropGpuFills(uint64_t vaddr, uint64_t size) {
@@ -350,14 +370,9 @@ void BufferCache::DropGpuFills(uint64_t vaddr, uint64_t size) {
 	}
 	std::scoped_lock lock(m_gpu_fills_mutex);
 	const auto end = vaddr + size;
-	if (size != 0 && ((end - 1) >> GpuFillChunkShift) - (vaddr >> GpuFillChunkShift) < 8u) {
-		bool hit = false;
-		for (uint64_t chunk = vaddr >> GpuFillChunkShift; chunk <= (end - 1) >> GpuFillChunkShift; chunk++) {
-			hit = hit || (m_gpu_fill_filter[(chunk >> 6u) & 3u] & (uint64_t {1} << (chunk & 63u))) != 0;
-		}
-		if (!hit) {
-			return;
-		}
+	// Written buffers (bound by many draws, often megabytes) test the filter a word at a time.
+	if (size != 0 && !TestGpuFillChunks(m_gpu_fill_filter, vaddr, end)) {
+		return;
 	}
 	const auto before = m_gpu_fills.size();
 	std::erase_if(m_gpu_fills, [&](const GpuFill& fill) { return fill.begin < end && vaddr < fill.end; });
@@ -415,6 +430,7 @@ void BufferCache::DiscardGpuModified(uint64_t vaddr, uint64_t size) {
 	{
 		std::unique_lock ranges_lock(m_gpu_ranges_mutex);
 		m_gpu_modified_ranges.Subtract(vaddr, size);
+		PublishGpuRangesVersion();
 	}
 	m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
 }
@@ -427,6 +443,7 @@ void BufferCache::ForgetGpuWrite(uint64_t vaddr, uint64_t size) {
 	{
 		std::unique_lock ranges_lock(m_gpu_ranges_mutex);
 		m_gpu_modified_ranges.Subtract(vaddr, size);
+		PublishGpuRangesVersion();
 	}
 	const auto first = vaddr & ~(TRACKER_PAGE_SIZE - 1);
 	const auto last  = (vaddr + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
@@ -440,6 +457,11 @@ void BufferCache::ForgetGpuWrite(uint64_t vaddr, uint64_t size) {
 void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source,
                                   uint64_t size) {
 	auto* bytes = static_cast<const uint8_t*>(source);
+	// A readback on the second queue waits for the buffer's last writer only: without this, one
+	// that followed a label write (TryWriteLabel) copied the buffer before the label's copy ran
+	// and published the old value over the label in guest memory (match-start hangs on a
+	// counter one short).
+	buffer.last_write_tick = m_scheduler.CurrentTick();
 	while (size != 0) {
 		const auto chunk  = std::min(size, m_staging_buffer.Size());
 		// Copy waits for ring reuse and flushes the fresh host data before submission.
@@ -640,6 +662,8 @@ template <bool async, bool merge>
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
 	static_assert(async || !merge);
 	DropGpuFills(vaddr, size);
+	// The publish writes only what is still mapped by then (unmaps no longer wait for it).
+	const auto unmap_sequence = m_scheduler.Context().UnmapSequence();
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size     = 0;
 	const auto                  buffer_address = buffer.CpuAddress();
@@ -654,6 +678,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		    });
 		    std::unique_lock ranges_lock(m_gpu_ranges_mutex);
 		    m_gpu_modified_ranges.Subtract(address, bytes);
+		    PublishGpuRangesVersion();
 	    });
 	m_last_download_bytes = 0;
 	if (copies.empty()) {
@@ -677,8 +702,10 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		copy.dstOffset += offset;
 	}
 	// Experiment LazySharedWrites: the guest bytes as they are before the faulting CPU write runs.
+	// Asynchronous guest reads publish the same way: bytes the CPU stored while the download was
+	// pending (through a mapping or a path that did not fault) are newer than the GPU's.
 	std::vector<uint8_t> snapshot;
-	if constexpr (merge) {
+	if constexpr (async) {
 		snapshot.resize(m_last_download_bytes);
 		uint64_t at = 0;
 		for (const auto& copy: copies) {
@@ -690,21 +717,49 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 			at += copy.size;
 		}
 	}
-	auto publish = [this, mapped, offset, total_size, buffer_address, copies = copies,
+	auto publish = [this, mapped, offset, total_size, buffer_address, copies = copies, unmap_sequence,
 	                owner = std::move(temporary), snapshot = std::move(snapshot)]() mutable {
 		(owner ? *owner : m_download_buffer).Invalidate(offset, total_size);
 		uint64_t at = 0;
 		for (const auto& copy: copies) {
 			const auto* gpu = mapped + (copy.dstOffset - offset);
-			if (!snapshot.empty()) {
-				// Bytes the CPU stored since the download was queued are newer than the GPU's.
-				if (!Libs::LibKernel::Memory::TryMergeBacking(buffer_address + copy.srcOffset, gpu,
-				                                              snapshot.data() + at, copy.size)) {
-					EXIT("BufferCache: merge of a shared-page download failed\n");
+			if constexpr (!merge) {
+				// Diagnostics: a pending guest read whose bytes changed before their publish (the old
+				// publish wrote the GPU's bytes over them).
+				if (!snapshot.empty()) {
+					std::vector<uint8_t> now(copy.size);
+					if (Libs::LibKernel::Memory::TryReadBacking(buffer_address + copy.srcOffset, now.data(), copy.size) &&
+					    std::memcmp(now.data(), snapshot.data() + at, copy.size) != 0) {
+						uint64_t changed = 0;
+						for (uint64_t i = 0; i < copy.size; i++) {
+							changed += now[i] != snapshot[at + i] ? 1u : 0u;
+						}
+						static std::atomic<uint32_t> reported {0};
+						if (reported.fetch_add(1, std::memory_order_relaxed) < 64) {
+							std::printf("NHL27ASYNCKEEP: guest read download 0x%016llx+0x%llx: %llu bytes changed while "
+							            "pending, kept\n",
+							            static_cast<unsigned long long>(buffer_address + copy.srcOffset),
+							            static_cast<unsigned long long>(copy.size),
+							            static_cast<unsigned long long>(changed));
+							std::fflush(stdout);
+						}
+					}
 				}
-			} else {
-				Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset, gpu, copy.size);
 			}
+			const auto copy_address = buffer_address + copy.srcOffset;
+			const auto* expected     = snapshot.empty() ? nullptr : snapshot.data() + at;
+			m_scheduler.Context().WriteUnlessUnmapped(
+			    unmap_sequence, copy_address, copy.size, [&](uint64_t address, uint64_t bytes) {
+				    const auto skip = address - copy_address;
+				    if (expected != nullptr) {
+					    // Bytes the CPU stored since the download was queued are newer than the GPU's.
+					    if (!Libs::LibKernel::Memory::TryMergeBacking(address, gpu + skip, expected + skip, bytes)) {
+						    EXIT("BufferCache: merge of a shared-page download failed\n");
+					    }
+				    } else {
+					    Libs::LibKernel::Memory::WriteBacking(address, gpu + skip, bytes);
+				    }
+			    });
 			at += copy.size;
 		}
 	};
@@ -1100,7 +1155,24 @@ bool BufferCache::OverlapsPendingGuestRead(uint64_t vaddr, uint64_t size) const 
 	return false;
 }
 
+void BufferCache::RebuildPendingReadRanges() {
+	std::unique_lock ranges_lock(m_gpu_ranges_mutex);
+	m_pending_read_ranges.Clear();
+	for (const auto& read: m_pending_guest_reads) {
+		m_pending_read_ranges.Add(read.vaddr, read.size);
+	}
+	PublishGpuRangesVersion();
+}
+
 void BufferCache::FinishPendingGuestReads(uint64_t vaddr, uint64_t size) {
+	// Once their bytes are in guest memory, finished reads leave the shared set.
+	struct Rebuild {
+		BufferCache* cache;
+		bool         finished = false;
+		~Rebuild() {
+			if (finished) cache->RebuildPendingReadRanges();
+		}
+	} rebuild {this};
 	for (size_t i = 0; i < m_pending_guest_reads.size();) {
 		const auto read = m_pending_guest_reads[i];
 		if (!(read.vaddr < vaddr + size && vaddr < read.vaddr + read.size)) {
@@ -1112,6 +1184,7 @@ void BufferCache::FinishPendingGuestReads(uint64_t vaddr, uint64_t size) {
 		// keep their protection, like ForgetGpuWrite.
 		m_scheduler.WaitPriorityOperations(read.tick);
 		m_pending_guest_read_count.fetch_sub(1, std::memory_order_release);
+		rebuild.finished = true;
 		const auto first = read.vaddr & ~(TRACKER_PAGE_SIZE - 1);
 		const auto last  = (read.vaddr + read.size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
 		for (auto page = first; page < last; page += TRACKER_PAGE_SIZE) {
@@ -1242,189 +1315,239 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadC
 	uint64_t       async_tick = 0;
 	const uint64_t fault_rip = on_gpu ? static_cast<uint64_t>(g_write_tag)
 	                                : g_fault_rip != 0 ? g_fault_rip : static_cast<uint64_t>(WriteTag::Count);
-	m_scheduler.Context().GetGpu().SendUrgentCommandSync([this, vaddr, size, is_write, caller, on_gpu, tid,
-	                                                      fault_rip, origin, &async_tick] {
-		if (!m_pending_guest_reads.empty()) {
-			FinishPendingGuestReads(vaddr, size);
-		}
-		if (is_write && !IsRegionRegistered(vaddr, size)) {
-			return;
-		}
-		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
-		if (!is_write && !on_gpu && Common::Experiments::Enabled(Common::Experiments::AsyncGuestReads)) {
-			// The download covers whole tracker pages; so does the pending record. The bytes it
-			// carries are the GPU-written ones of those pages.
-			const auto first = vaddr & ~(TRACKER_PAGE_SIZE - 1);
-			const auto last  = (vaddr + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
-			std::vector<std::pair<uint64_t, uint64_t>> bytes;
-			m_gpu_modified_ranges.ForEachInRange(first, last - first,
-			                                     [&](uint64_t begin, uint64_t end) { bytes.emplace_back(begin, end); });
-			// Shared queries stay conservative while downloads move bytes out of the ordinary
-			// dirty ranges. Publish before DownloadBufferMemory removes those ranges.
-			m_pending_guest_read_count.fetch_add(1, std::memory_order_release);
-			if (DownloadBufferMemory<true>(buffer, vaddr, size)) {
-				async_tick       = m_scheduler.CurrentTick();
-				m_pending_guest_reads.push_back({first, last - first, async_tick, std::move(bytes)});
-				m_scheduler.Flush();
-				Common::Timeline::Mark("async-guest-read", vaddr);
-			} else {
-				m_pending_guest_read_count.fetch_sub(1, std::memory_order_release);
+	// A guest thread's download whose writer the GPU has not finished comes back with the writer's
+	// tick instead: the guest thread waits for it here while the execution thread goes on, then
+	// asks again (AbPending3: the execution thread waits). Waits for unfinished writers were 7 ms
+	// each, 4% of the execution thread in play.
+	for (uint32_t attempt = 0;; ++attempt) {
+		uint64_t retry_tick = 0;
+		m_scheduler.Context().GetGpu().SendUrgentCommandSync([this, vaddr, size, is_write, caller, on_gpu, tid,
+		                                                      fault_rip, origin, &async_tick, attempt, &retry_tick] {
+			if (!m_pending_guest_reads.empty()) {
+				FinishPendingGuestReads(vaddr, size);
 			}
-			return;
-		}
+			if (is_write && !IsRegionRegistered(vaddr, size)) {
+				return;
+			}
+			auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+			if (!is_write && !on_gpu && Common::Experiments::Enabled(Common::Experiments::AsyncGuestReads)) {
+				// The download covers whole tracker pages; so does the pending record. The bytes it
+				// carries are the GPU-written ones of those pages.
+				const auto first = vaddr & ~(TRACKER_PAGE_SIZE - 1);
+				const auto last  = (vaddr + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
+				std::vector<std::pair<uint64_t, uint64_t>> bytes;
+				m_gpu_modified_ranges.ForEachInRange(first, last - first,
+				                                     [&](uint64_t begin, uint64_t end) { bytes.emplace_back(begin, end); });
+				// Shared queries stay conservative while downloads move bytes out of the ordinary
+				// dirty ranges. Publish before DownloadBufferMemory removes those ranges.
+				m_pending_guest_read_count.fetch_add(1, std::memory_order_release);
+				{
+					std::unique_lock ranges_lock(m_gpu_ranges_mutex);
+					m_pending_read_ranges.Add(first, last - first);
+					PublishGpuRangesVersion();
+				}
+				if (DownloadBufferMemory<true>(buffer, vaddr, size)) {
+					async_tick       = m_scheduler.CurrentTick();
+					m_pending_guest_reads.push_back({first, last - first, async_tick, std::move(bytes)});
+					g_scheduler_flush_sites[2].fetch_add(1, std::memory_order_relaxed);
+					m_scheduler.Flush();
+					Common::Timeline::Mark("async-guest-read", vaddr);
+				} else {
+					m_pending_guest_read_count.fetch_sub(1, std::memory_order_release);
+					RebuildPendingReadRanges();
+				}
+				return;
+			}
 
-		const bool timed = PerfStatsEnabled();
-		const auto start = timed ? std::chrono::steady_clock::now()
-		                         : std::chrono::steady_clock::time_point {};
-		const bool exact_dirty =
-		    timed && caller == ReadCaller::Fault && !is_write && HasGpuDirtyBytes(vaddr, 1);
-		// Experiment LazySharedWrites: a guest thread's store next to a few GPU-written bytes
-		// (NHL 27 builds command buffers in pages a compute shader wrote 16 bytes of) need not wait
-		// for that shader. The download is queued and merged later, keeping any bytes the CPU
-		// changes meanwhile, which are newer.
-		const bool lazy = is_write && !on_gpu &&
-		                  Common::Experiments::Enabled(Common::Experiments::LazySharedWrites) &&
-		                  LazySharedWriteEligible(vaddr, size);
-		if (CpReadDebugEnabled()) {
-			g_readback_origin = origin;
-			g_readback_exact  = !is_write                          ? (HasGpuDirtyBytes(vaddr, size) ? 1u : 0u)
-			                    : HasGpuDirtyBytes(vaddr, size)    ? 3u
-			                    : !LazySharedWriteEligible(vaddr, size) ? 4u
-			                                                       : 5u;
-			g_readback_caller = static_cast<uint32_t>(caller);
-			// A guest store over GPU-written bytes: the GPU-written ranges of its page (NHL27OWNW,
-			// at most 24 lines per 5 s), to see whether the store would cover them all.
-			if (is_write && !on_gpu && g_readback_exact == 3u) {
-				static auto     window = std::chrono::steady_clock::now();
-				static uint32_t lines  = 0;
-				const auto      now    = std::chrono::steady_clock::now();
-				if (now - window >= std::chrono::seconds(5)) {
-					window = now;
-					lines  = 0;
-				}
-				if (lines++ < 24) {
-					const auto  page = vaddr & ~(TRACKER_PAGE_SIZE - 1);
-					std::string ranges;
-					uint64_t    bytes = 0;
-					m_gpu_modified_ranges.ForEachInRange(page, TRACKER_PAGE_SIZE, [&](uint64_t start, uint64_t end) {
-						bytes += end - start;
-						if (ranges.size() < 160) {
-							char text[48];
-							std::snprintf(text, sizeof(text), " +0x%llx..0x%llx",
-							              static_cast<unsigned long long>(start - page),
-							              static_cast<unsigned long long>(end - page));
-							ranges += text;
-						}
-					});
-					std::printf("NHL27OWNW: vaddr=0x%016" PRIx64 " rip=0x%016" PRIx64 " page_gpu_bytes=%llu last_write=%llu "
-					            "current=%llu ranges:%s\n",
-					            vaddr, fault_rip, static_cast<unsigned long long>(bytes),
-					            static_cast<unsigned long long>(buffer.last_write_tick),
-					            static_cast<unsigned long long>(m_scheduler.CurrentTick()), ranges.c_str());
-				}
-			}
-		}
-		// Experiment WideWriteDownloads: NHL 27 fills whole GPU-written pages with memcpy-style
-		// stores (vmovntdq/vmovdqa), each page one fault and one readback (~90 us). The GPU-written
-		// bytes of the store's 64 KiB window (the window a CPU write fault releases) come down at
-		// once, so the next pages of the fill fault only for CPU-write tracking.
-		uint64_t download_vaddr = vaddr;
-		uint64_t download_size  = size;
-		if (is_write && !on_gpu && !lazy &&
-		    Common::Experiments::Enabled(Common::Experiments::WideWriteDownloads)) {
-			constexpr uint64_t Window = 16 * TRACKER_PAGE_SIZE;
-			const auto begin = std::max(vaddr & ~(Window - 1), buffer.CpuAddress());
-			const auto end   = std::min((vaddr + size + Window - 1) & ~(Window - 1),
-			                            buffer.CpuAddress() + buffer.Size());
-			if (begin <= vaddr && vaddr + size <= end) {
-				download_vaddr = begin;
-				download_size  = end - begin;
-			}
-		}
-		const bool downloaded = lazy ? DownloadBufferMemory<true, true>(buffer, vaddr, size)
-		                             : DownloadBufferMemory<false>(buffer, download_vaddr, download_size);
-		if (lazy) {
-			Common::Timeline::Mark("lazy-shared-write", vaddr);
-		}
-		if (timed) {
-			if (downloaded && !is_write) {
-				const auto page = vaddr & ~(TRACKER_PAGE_SIZE - 1);
-				auto&      stat = g_fault_pages[page];
-				stat.via        = caller == ReadCaller::Fault        ? "fault"
-				                  : caller == ReadCaller::ColorClear ? "clear"
-				                                                     : "other";
-				stat.count++;
-				stat.bytes += m_last_download_bytes;
-				stat.exact += exact_dirty ? 1 : 0;
-				stat.tid        = tid;
-				stat.gpu_thread = on_gpu;
-				stat.pm4_op     = on_gpu ? g_perf.pm4_op.load(std::memory_order_relaxed) : 0;
-				stat.ms += static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-				               std::chrono::steady_clock::now() - start).count()) / 1e6;
-				stat.writer = "unknown";
-				stat.writer_hash = 0;
-				for (size_t n = 0; n < m_writer_log.size(); ++n) {
-					const auto& rec = m_writer_log[(m_writer_head + m_writer_log.size() - 1 - n) %
-					                               m_writer_log.size()];
-					if (rec.begin < page + TRACKER_PAGE_SIZE && page < rec.end) {
-						stat.writer      = rec.kind;
-						stat.writer_hash = rec.hash;
-						break;
+			const bool timed = PerfStatsEnabled();
+			const auto start = timed ? std::chrono::steady_clock::now()
+			                         : std::chrono::steady_clock::time_point {};
+			const bool exact_dirty =
+			    timed && caller == ReadCaller::Fault && !is_write && HasGpuDirtyBytes(vaddr, 1);
+			// Experiment LazySharedWrites: a guest thread's store next to a few GPU-written bytes
+			// (NHL 27 builds command buffers in pages a compute shader wrote 16 bytes of) need not wait
+			// for that shader. The download is queued and merged later, keeping any bytes the CPU
+			// changes meanwhile, which are newer.
+			const bool lazy = is_write && !on_gpu &&
+			                  Common::Experiments::Enabled(Common::Experiments::LazySharedWrites) &&
+			                  LazySharedWriteEligible(vaddr, size);
+			if (CpReadDebugEnabled()) {
+				g_readback_origin = origin;
+				g_readback_exact  = !is_write                          ? (HasGpuDirtyBytes(vaddr, size) ? 1u : 0u)
+				                    : HasGpuDirtyBytes(vaddr, size)    ? 3u
+				                    : !LazySharedWriteEligible(vaddr, size) ? 4u
+				                                                       : 5u;
+				g_readback_caller = static_cast<uint32_t>(caller);
+				// A guest store over GPU-written bytes: the GPU-written ranges of its page (NHL27OWNW,
+				// at most 24 lines per 5 s), to see whether the store would cover them all.
+				if (is_write && !on_gpu && g_readback_exact == 3u) {
+					static auto     window = std::chrono::steady_clock::now();
+					static uint32_t lines  = 0;
+					const auto      now    = std::chrono::steady_clock::now();
+					if (now - window >= std::chrono::seconds(5)) {
+						window = now;
+						lines  = 0;
 					}
+					if (lines++ < 24) {
+						const auto  page = vaddr & ~(TRACKER_PAGE_SIZE - 1);
+						std::string ranges;
+						uint64_t    bytes = 0;
+						m_gpu_modified_ranges.ForEachInRange(page, TRACKER_PAGE_SIZE, [&](uint64_t start, uint64_t end) {
+							bytes += end - start;
+							if (ranges.size() < 160) {
+								char text[48];
+								std::snprintf(text, sizeof(text), " +0x%llx..0x%llx",
+								              static_cast<unsigned long long>(start - page),
+								              static_cast<unsigned long long>(end - page));
+								ranges += text;
+							}
+						});
+						std::printf("NHL27OWNW: vaddr=0x%016" PRIx64 " rip=0x%016" PRIx64 " page_gpu_bytes=%llu last_write=%llu "
+						            "current=%llu ranges:%s\n",
+						            vaddr, fault_rip, static_cast<unsigned long long>(bytes),
+						            static_cast<unsigned long long>(buffer.last_write_tick),
+						            static_cast<unsigned long long>(m_scheduler.CurrentTick()), ranges.c_str());
+					}
+				}
+			}
+			// Experiment WideWriteDownloads: NHL 27 fills whole GPU-written pages with memcpy-style
+			// stores (vmovntdq/vmovdqa), each page one fault and one readback (~90 us). The GPU-written
+			// bytes of the store's 64 KiB window (the window a CPU write fault releases) come down at
+			// once, so the next pages of the fill fault only for CPU-write tracking.
+			uint64_t download_vaddr = vaddr;
+			uint64_t download_size  = size;
+			if (is_write && !on_gpu && !lazy &&
+			    Common::Experiments::Enabled(Common::Experiments::WideWriteDownloads)) {
+				constexpr uint64_t Window = 16 * TRACKER_PAGE_SIZE;
+				const auto begin = std::max(vaddr & ~(Window - 1), buffer.CpuAddress());
+				const auto end   = std::min((vaddr + size + Window - 1) & ~(Window - 1),
+				                            buffer.CpuAddress() + buffer.Size());
+				if (begin <= vaddr && vaddr + size <= end) {
+					download_vaddr = begin;
+					download_size  = end - begin;
+				}
+			}
+			if (!lazy && !on_gpu && attempt < 4 && buffer.last_write_tick != 0 &&
+			    !Common::Experiments::Enabled(Common::Experiments::AbPending3) &&
+			    !m_scheduler.IsFree(buffer.last_write_tick) &&
+			    m_gpu_modified_ranges.Intersects(download_vaddr, download_size)) {
+				if (buffer.last_write_tick >= m_scheduler.CurrentTick()) {
+					// The writer is in the open command buffer.
+					m_scheduler.Flush();
+				}
+				retry_tick = buffer.last_write_tick;
+				return;
+			}
+			// KYTY_DBG_CP_READS: the GPU thread's own writes into pages the GPU wrote, whose downloads
+			// wait for the writer (NHL27GPUWRITEWAIT, at most 200 lines): the write's tag, address
+			// and how long it waited.
+			const bool gpu_write_debug = CpReadDebugEnabled() && is_write && on_gpu && !lazy;
+			const auto gpu_write_start = gpu_write_debug ? std::chrono::steady_clock::now()
+			                                             : std::chrono::steady_clock::time_point {};
+			const auto gpu_write_tick  = buffer.last_write_tick;
+			const bool downloaded = lazy ? DownloadBufferMemory<true, true>(buffer, vaddr, size)
+			                             : DownloadBufferMemory<false>(buffer, download_vaddr, download_size);
+			if (gpu_write_debug && downloaded) {
+				const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+				                                                           gpu_write_start).count();
+				static std::atomic<uint32_t> lines {0};
+				if (ms >= 1.0 && lines.fetch_add(1, std::memory_order_relaxed) < 200) {
+					const char* name = WriteTagName(fault_rip);
+					std::printf("NHL27GPUWRITEWAIT: tag=%s vaddr=0x%016" PRIx64 " size=%" PRIu64 " downloaded=%" PRIu64
+					            " writer_tick=%" PRIu64 " current=%" PRIu64 " ms=%.1f\n",
+					            name != nullptr ? name : "?", vaddr, size, m_last_download_bytes, gpu_write_tick,
+					            m_scheduler.CurrentTick(), ms);
+					std::fflush(stdout);
+				}
+			}
+			if (lazy) {
+				Common::Timeline::Mark("lazy-shared-write", vaddr);
+			}
+			if (timed) {
+				if (downloaded && !is_write) {
+					const auto page = vaddr & ~(TRACKER_PAGE_SIZE - 1);
+					auto&      stat = g_fault_pages[page];
+					stat.via        = caller == ReadCaller::Fault        ? "fault"
+					                  : caller == ReadCaller::ColorClear ? "clear"
+					                                                     : "other";
+					stat.count++;
+					stat.bytes += m_last_download_bytes;
+					stat.exact += exact_dirty ? 1 : 0;
+					stat.tid        = tid;
+					stat.gpu_thread = on_gpu;
+					stat.pm4_op     = on_gpu ? g_perf.pm4_op.load(std::memory_order_relaxed) : 0;
+					stat.ms += static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+					               std::chrono::steady_clock::now() - start).count()) / 1e6;
+					stat.writer = "unknown";
+					stat.writer_hash = 0;
+					for (size_t n = 0; n < m_writer_log.size(); ++n) {
+						const auto& rec = m_writer_log[(m_writer_head + m_writer_log.size() - 1 - n) %
+						                               m_writer_log.size()];
+						if (rec.begin < page + TRACKER_PAGE_SIZE && page < rec.end) {
+							stat.writer      = rec.kind;
+							stat.writer_hash = rec.hash;
+							break;
+						}
+					}
+				}
+				if (downloaded) {
+					const auto bucket = is_write                         ? size_t {2}
+					                    : caller == ReadCaller::ColorClear ? size_t {0}
+					                    : caller == ReadCaller::Fault      ? size_t {1}
+					                                                       : size_t {3};
+					// Buckets: 0 color clear, 1 fault, 2 invalidate (CPU write), 3 other.
+					const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+					                    std::chrono::steady_clock::now() - start)
+					                    .count();
+					FrameBreakdown::AddReadback(static_cast<uint64_t>(ns));
+					if (is_write) {
+											WriteBackRecord(fault_rip, on_gpu, vaddr, size, m_last_download_bytes, static_cast<uint64_t>(ns));
+					}
+					g_perf.waits[bucket].fetch_add(1, std::memory_order_relaxed);
+					g_perf.wait_ns[bucket].fetch_add(static_cast<uint64_t>(ns),
+					                                 std::memory_order_relaxed);
+				}
+				PerfMaybePrint();
+			}
+			if (downloaded && is_write && SharedWritesDebug()) {
+				static uint32_t lines = 0;
+				if (lines++ < 200) {
+					const auto page = vaddr & ~(TRACKER_PAGE_SIZE - 1);
+					const char* kind = "unknown";
+					uint64_t    hash = 0, wbegin = 0, wend = 0;
+					for (size_t n = 0; n < m_writer_log.size(); ++n) {
+						const auto& rec = m_writer_log[(m_writer_head + m_writer_log.size() - 1 - n) %
+						                               m_writer_log.size()];
+						if (rec.begin < page + TRACKER_PAGE_SIZE && page < rec.end) {
+							kind = rec.kind; hash = rec.hash; wbegin = rec.begin; wend = rec.end;
+							break;
+						}
+					}
+					std::printf("NHL27SHD: fault=0x%llx bytes=%llu buffer=0x%llx+0x%llx last_write=%llu "
+					            "current=%llu writer=%s %016llx [0x%llx,0x%llx) tid=%llx\n",
+					            static_cast<unsigned long long>(vaddr),
+					            static_cast<unsigned long long>(m_last_download_bytes),
+					            static_cast<unsigned long long>(buffer.CpuAddress()),
+					            static_cast<unsigned long long>(buffer.Size()),
+					            static_cast<unsigned long long>(buffer.last_write_tick),
+					            static_cast<unsigned long long>(m_scheduler.CurrentTick()), kind,
+					            static_cast<unsigned long long>(hash), static_cast<unsigned long long>(wbegin),
+					            static_cast<unsigned long long>(wend), static_cast<unsigned long long>(tid));
 				}
 			}
 			if (downloaded) {
-				const auto bucket = is_write                         ? size_t {2}
-				                    : caller == ReadCaller::ColorClear ? size_t {0}
-				                    : caller == ReadCaller::Fault      ? size_t {1}
-				                                                       : size_t {3};
-				// Buckets: 0 color clear, 1 fault, 2 invalidate (CPU write), 3 other.
-				const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-				                    std::chrono::steady_clock::now() - start)
-				                    .count();
-				FrameBreakdown::AddReadback(static_cast<uint64_t>(ns));
-				if (is_write) {
-										WriteBackRecord(fault_rip, on_gpu, vaddr, size, m_last_download_bytes, static_cast<uint64_t>(ns));
-				}
-				g_perf.waits[bucket].fetch_add(1, std::memory_order_relaxed);
-				g_perf.wait_ns[bucket].fetch_add(static_cast<uint64_t>(ns),
-				                                 std::memory_order_relaxed);
+				m_memory_tracker.UnmarkRegionAsGpuModified(download_vaddr, download_size);
 			}
-			PerfMaybePrint();
-		}
-		if (downloaded && is_write && SharedWritesDebug()) {
-			static uint32_t lines = 0;
-			if (lines++ < 200) {
-				const auto page = vaddr & ~(TRACKER_PAGE_SIZE - 1);
-				const char* kind = "unknown";
-				uint64_t    hash = 0, wbegin = 0, wend = 0;
-				for (size_t n = 0; n < m_writer_log.size(); ++n) {
-					const auto& rec = m_writer_log[(m_writer_head + m_writer_log.size() - 1 - n) %
-					                               m_writer_log.size()];
-					if (rec.begin < page + TRACKER_PAGE_SIZE && page < rec.end) {
-						kind = rec.kind; hash = rec.hash; wbegin = rec.begin; wend = rec.end;
-						break;
-					}
-				}
-				std::printf("NHL27SHD: fault=0x%llx bytes=%llu buffer=0x%llx+0x%llx last_write=%llu "
-				            "current=%llu writer=%s %016llx [0x%llx,0x%llx) tid=%llx\n",
-				            static_cast<unsigned long long>(vaddr),
-				            static_cast<unsigned long long>(m_last_download_bytes),
-				            static_cast<unsigned long long>(buffer.CpuAddress()),
-				            static_cast<unsigned long long>(buffer.Size()),
-				            static_cast<unsigned long long>(buffer.last_write_tick),
-				            static_cast<unsigned long long>(m_scheduler.CurrentTick()), kind,
-				            static_cast<unsigned long long>(hash), static_cast<unsigned long long>(wbegin),
-				            static_cast<unsigned long long>(wend), static_cast<unsigned long long>(tid));
+			if (is_write) {
+				m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 			}
+		});
+		if (retry_tick == 0) {
+			break;
 		}
-		if (downloaded) {
-			m_memory_tracker.UnmarkRegionAsGpuModified(download_vaddr, download_size);
-		}
-		if (is_write) {
-			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
-		}
-	});
+		m_scheduler.WaitSubmitted(retry_tick);
+		m_scheduler.GetMasterSemaphore().Wait(retry_tick);
+	}
 	if (async_tick != 0) {
 		m_scheduler.WaitPriorityOperations(async_tick);
 		m_scheduler.Context().GetGpu().SendUrgentCommandSync(
@@ -1635,6 +1758,10 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 
 	auto temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Upload, 0,
 	                                         vk::BufferUsageFlagBits::eTransferSrc, total_size);
+	// Copies made here must come after the protections the host copy thread still applies.
+	if (PageManager::DeferringProtection()) {
+		m_scheduler.HostCopies()->Drain();
+	}
 	for (const auto& copy: copies) {
 		const auto address = buffer.CpuAddress() + copy.dstOffset;
 		std::memcpy(temporary->Mapped().data() + copy.srcOffset,
@@ -1653,11 +1780,17 @@ void BufferCache::StreamGuestData(uint8_t* destination, uint64_t vaddr, uint64_t
 	constexpr uint64_t MinHostCopy = 256;
 	auto*              copies      = m_scheduler.HostCopies();
 	// Callers write coherent memory (the stream buffer, coherent staging).
-	if (copies != nullptr && size >= MinHostCopy && GuestGpu::IsGpuThread()) {
+	// While protection is deferred, every copy goes there too (after the protections queued
+	// before it), or waits for them.
+	const bool deferring = PageManager::DeferringProtection();
+	if (copies != nullptr && (size >= MinHostCopy || deferring) && GuestGpu::IsGpuThread()) {
 		if (const void* source = Libs::LibKernel::Memory::FindBackingPointer(vaddr, size)) {
 			copies->Copy(destination, source, size);
 			return;
 		}
+	}
+	if (deferring && copies != nullptr) {
+		copies->Drain();
 	}
 	std::memcpy(destination, reinterpret_cast<const void*>(vaddr), size);
 }
@@ -1683,14 +1816,36 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	// it), the lookup finds the same buffer and has nothing to upload. The epoch is read before
 	// the dirty check: a page dirtied after it advances it.
 	const bool  plain_read = !is_written && !is_texel_buffer;
-	ObtainMemo* memo       = nullptr;
-	uint64_t    cpu_epoch  = 0;
-	if (plain_read) {
+	// Texel (formatted) reads too, while no image starts at the address: only such an image is
+	// copied into the buffer (SynchronizeBufferFromImage), and they are most of the bindings.
+	// The memo keeps the image registration version its answer was found at: asking the texture
+	// cache (a lock and a hash lookup) on every bind was 3.6% of the execution thread.
+	const bool  texel_candidate = !is_written && is_texel_buffer;
+	bool        texel_read      = false;
+	uint64_t    image_version   = 0;
+	ObtainMemo* memo            = nullptr;
+	uint64_t    cpu_epoch       = 0;
+	if (plain_read || texel_candidate) {
 		const auto hash = (vaddr ^ (size << 40u)) * 0x9e3779b97f4a7c15ull;
 		memo            = &(*m_obtain_memo)[(hash >> 32u) % ObtainMemoSlots];
-		cpu_epoch       = CpuDirtyEpoch(vaddr, size);
-		if (memo->vaddr == vaddr && memo->size == size &&
-		    memo->buffer_epoch == m_buffer_set_epoch && memo->cpu_epoch == cpu_epoch) {
+		if (texel_candidate) {
+			// Only registrations of images at addresses sharing the filter bit change the answer (the
+			// version of every registration made the memo miss most texel binds).
+			image_version = m_texture_cache.AddressBucketVersion(vaddr);
+			texel_read    = (memo->vaddr == vaddr && memo->texel && memo->image_version == image_version) ||
+			             !m_texture_cache.HasImageAt(vaddr);
+		}
+	}
+	if (plain_read || texel_read) {
+		cpu_epoch = CpuDirtyEpoch(vaddr, size);
+		// The epochs move whenever the game writes other bytes of the 64 KiB blocks: a range with
+		// no CPU-dirty page has nothing to upload either (about 4,000 synchronizations a frame in
+		// play found nothing).
+		if (memo->vaddr == vaddr && memo->size == size && memo->texel == texel_read &&
+		    memo->buffer_epoch == m_buffer_set_epoch &&
+		    (memo->cpu_epoch == cpu_epoch || !m_memory_tracker.IsRegionCpuModified(vaddr, size))) {
+			memo->cpu_epoch = cpu_epoch;
+			if (texel_read) memo->image_version = image_version;
 			auto& buffer = m_slot_buffers[memo->id];
 			TouchBuffer(buffer);
 			return {&buffer, memo->offset};
@@ -1742,19 +1897,22 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		FrameBreakdown::Timer touch_timer(bs.ob_touch_ns, bon);
 		TouchBuffer(buffer);
 	}
+	bool synced_from_image = false;
 	{
 		FrameBreakdown::Timer sync_timer(bs.ob_sync_ns, bon);
 		if (bon) bs.ob_syncs.fetch_add(1, std::memory_order_relaxed);
-		(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
+		synced_from_image = SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	}
 	FrameBreakdown::Timer book_timer(bs.ob_book_ns, bon);
-	if (plain_read) {
+	if (plain_read || (texel_read && !synced_from_image)) {
 		*memo = {.vaddr        = vaddr,
 		         .size         = size,
 		         .buffer_epoch = m_buffer_set_epoch,
 		         .cpu_epoch    = cpu_epoch,
 		         .offset       = buffer.Offset(vaddr),
-		         .id           = id};
+		         .id           = id,
+		         .texel        = texel_read,
+		         .image_version = image_version};
 	}
 	if (is_written || is_texel_buffer) {
 		DropGpuFills(vaddr, size);
@@ -1771,6 +1929,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		{
 			std::unique_lock ranges_lock(m_gpu_ranges_mutex);
 			m_gpu_modified_ranges.Add(vaddr, size);
+			PublishGpuRangesVersion();
+			PageWriteSeq::RaiseCurrent(vaddr, size);
 		}
 		++m_gpu_dirty_generation;
 		if (!m_watched_writes.empty() && !m_submit_requested &&
@@ -1792,7 +1952,12 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferCached(uint64_t vaddr, uin
 	if (is_written || is_texel_buffer || !Common::RuntimeFlags::Current().buffer_fast) {
 		return ObtainBuffer(vaddr, size, is_written, is_texel_buffer, id);
 	}
-	auto&      entry = m_obtain_cache[((vaddr >> 4) * 0x9E3779B97F4A7C15ull ^ size) % kObtainCacheSize];
+	// The slot comes from the high bits of the product: its low bits only depend on the low bits of
+	// the address, and with 256-byte aligned ranges the old index (the low bits, 512 slots) used
+	// one slot in sixteen.
+	const auto slot =
+	    static_cast<size_t>(((vaddr ^ (size << 40u)) * 0x9E3779B97F4A7C15ull) >> 32u) % kObtainCacheSize;
+	auto&      entry = m_obtain_cache[slot];
 	const auto cpu   = m_memory_tracker.CpuModificationGeneration();
 	if (entry.vaddr == vaddr && entry.size == size && entry.registration == m_registration_generation &&
 	    !IsBufferInvalid(entry.id) && m_slot_buffers[entry.id].IsInBounds(vaddr, size) &&
@@ -1818,6 +1983,75 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferCached(uint64_t vaddr, uin
 		}
 	}
 	return result;
+}
+
+bool BufferCache::PlainReadHolds(Buffer& buffer, uint64_t vaddr, uint64_t size, uint64_t& cpu_generation,
+                                 uint64_t registration) {
+	if (&buffer == &m_stream_buffer || registration != m_registration_generation) {
+		return false;
+	}
+	const auto cpu = m_memory_tracker.CpuModificationGeneration();
+	if (cpu != cpu_generation && m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
+		return false;
+	}
+	cpu_generation = cpu;
+	FrameBreakdown::BdaBatchNoteUsed(vaddr, size);
+	TouchBuffer(buffer);
+	return true;
+}
+
+bool BufferCache::WrittenBindHolds(Buffer& buffer, uint64_t vaddr, uint64_t size, uint64_t& ranges_version,
+                                   uint64_t registration) {
+	if (registration != m_registration_generation) {
+		return false;
+	}
+	if (const auto version = GpuRangesVersion(); version != ranges_version) {
+		// Other ranges change all the time (new written ranges, downloads): the range still holds
+		// while it is wholly GPU-written, as its pages are then GPU-owned with nothing to upload.
+		std::shared_lock ranges_lock(m_gpu_ranges_mutex);
+		if (!m_gpu_modified_ranges.Contains(vaddr, size) || m_pending_read_ranges.Intersects(vaddr, size)) {
+			return false;
+		}
+		ranges_version = version;
+	}
+	FrameBreakdown::BdaBatchNoteUsed(vaddr, size);
+	TouchBuffer(buffer);
+	// As ObtainBuffer for a written binding, after SynchronizeBuffer (which found the pages GPU-owned).
+	DropGpuFills(vaddr, size);
+	buffer.last_write_tick = m_scheduler.CurrentTick();
+	if (PerfStatsEnabled()) {
+		LogGpuWrite(vaddr, size);
+	}
+	if (FrameDump::TraceEnabled()) {
+		FrameDump::TraceWrite("buffer-write", vaddr, vaddr + size, m_writer_kind, m_writer_hash);
+	}
+	m_gpu_write_generation++;
+	PageWriteSeq::RaiseCurrent(vaddr, size);
+	++m_gpu_dirty_generation;
+	if (!m_watched_writes.empty() && !m_submit_requested &&
+	    Common::Experiments::Enabled(Common::Experiments::EarlySubmitWriters)) {
+		for (const auto& [address, bytes]: m_watched_writes) {
+			if (address < vaddr + size && vaddr < address + bytes) {
+				m_submit_requested = true;
+				break;
+			}
+		}
+	}
+	return true;
+}
+
+bool BufferCache::TexelReadHolds(Buffer& buffer, uint64_t vaddr, uint64_t size, uint64_t& cpu_generation,
+                                 uint64_t registration, uint64_t image_version) {
+	return image_version == m_texture_cache.AddressBucketVersion(vaddr) &&
+	       PlainReadHolds(buffer, vaddr, size, cpu_generation, registration);
+}
+
+bool BufferCache::TexelReadKeepable(uint64_t vaddr) {
+	return !m_texture_cache.HasImageAt(vaddr);
+}
+
+uint64_t BufferCache::TexelImageVersion(uint64_t vaddr) const {
+	return m_texture_cache.AddressBucketVersion(vaddr);
 }
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
@@ -1951,11 +2185,38 @@ bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 }
 
 bool BufferCache::HasGpuDirtyBytesShared(uint64_t vaddr, uint64_t size) const {
+	// The resolve thread asks per page for each read log: while neither set changed, a page's
+	// answer holds (written buffers are added again on every bind, which changes nothing).
+	struct PageAnswer {
+		uint64_t page    = ~uint64_t {0};
+		uint64_t version = 0;
+		bool     dirty   = false;
+	};
+	static thread_local std::array<PageAnswer, 64> answers {};
+	const bool page_query = (vaddr & 0xfffu) == 0 && size == 0x1000 &&
+	                        !Common::Experiments::Enabled(Common::Experiments::AbLegacy);
+	if (page_query) {
+		const auto& answer = answers[(vaddr >> 12u) & 63u];
+		if (answer.page == vaddr && answer.version == m_gpu_ranges_version.load(std::memory_order_acquire)) {
+			return answer.dirty;
+		}
+	}
 	std::shared_lock ranges_lock(m_gpu_ranges_mutex);
-	// Pending records are owned by the execution thread. Other threads conservatively
-	// refuse the clean-backing fast path until all asynchronous downloads finish.
-	return m_pending_guest_read_count.load(std::memory_order_acquire) != 0 ||
-	       m_gpu_modified_ranges.Intersects(vaddr, size);
+	if (page_query) {
+		auto& answer   = answers[(vaddr >> 12u) & 63u];
+		answer.page    = vaddr;
+		answer.version = m_gpu_modified_ranges.Version() + m_pending_read_ranges.Version();
+		answer.dirty   = m_pending_read_ranges.Intersects(vaddr, size) || m_gpu_modified_ranges.Intersects(vaddr, size);
+		return answer.dirty;
+	}
+	// Pending records are owned by the execution thread. Other threads see the pages of pending
+	// asynchronous downloads as dirty until their bytes are in guest memory (AbLegacy: every range
+	// while any download is pending).
+	if (Common::Experiments::Enabled(Common::Experiments::AbLegacy)) {
+		return m_pending_guest_read_count.load(std::memory_order_acquire) != 0 ||
+		       m_gpu_modified_ranges.Intersects(vaddr, size);
+	}
+	return m_pending_read_ranges.Intersects(vaddr, size) || m_gpu_modified_ranges.Intersects(vaddr, size);
 }
 
 uint64_t BufferCache::GpuDirtyByteCount(uint64_t vaddr, uint64_t size) const {
@@ -2246,6 +2507,8 @@ void BufferCache::NoteGpuWrites(uint64_t vaddr, uint64_t size) {
 			    const auto last  = std::min(page + bytes, finish);
 			    std::unique_lock ranges_lock(m_gpu_ranges_mutex);
 			    m_gpu_modified_ranges.Add(first, last - first);
+			    PublishGpuRangesVersion();
+			    PageWriteSeq::RaiseCurrent(first, last - first);
 		    });
 	}
 }
@@ -2267,8 +2530,13 @@ uint64_t BufferCache::SynchronizeBuffersInRanges(const RangeSet& ranges, bool fu
 	return visited;
 }
 
-bool BufferCache::SynchronizeBuffersInRangesBefore(const RangeSet& ranges, bool full, uint32_t limit,
-                                                   uint32_t& first_left) {
+bool BufferCache::SynchronizeBuffersInRangesBefore(const RangeSet& ranges, const RangeSet* full_ranges,
+                                                   uint32_t limit, uint32_t& first_left) {
+	// Pages uploaded here are protected again by the host copy thread, before the uploads' copies
+	// (which it makes as well: the staging memory is coherent).
+	auto* const host_copies = m_scheduler.HostCopies();
+	const bool  defer       = host_copies != nullptr && m_staging_buffer.IsCoherent() && GuestGpu::IsGpuThread();
+	const PageManager::DeferredProtectionScope deferred(defer ? host_copies : nullptr);
 	bool       left = false;
 	const auto sync = [&](uint64_t vaddr, uint64_t size) {
 		left |= m_memory_tracker.ForEachCpuDirtySpanBefore(
@@ -2289,13 +2557,14 @@ bool BufferCache::SynchronizeBuffersInRangesBefore(const RangeSet& ranges, bool 
 		    });
 	};
 	// Drain before a full scan so a CPU write during that scan remains queued.
+	const bool all = full_ranges == &ranges;
 	m_memory_tracker.DrainCpuDirtyRegions([&](uint64_t address, uint64_t size) {
-		if (!full) {
+		if (!all) {
 			ranges.ForEachInRange(address, size, [&](uint64_t begin, uint64_t end) { sync(begin, end - begin); });
 		}
 	});
-	if (full) {
-		ranges.ForEach([&](uint64_t begin, uint64_t end) { sync(begin, end - begin); });
+	if (full_ranges != nullptr) {
+		full_ranges->ForEach([&](uint64_t begin, uint64_t end) { sync(begin, end - begin); });
 	}
 	return left;
 }

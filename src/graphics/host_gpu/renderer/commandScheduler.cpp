@@ -16,6 +16,7 @@
 #include <chrono>
 #include <cstring>
 #include <cstdio>
+#include <fmt/format.h>
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
@@ -176,16 +177,27 @@ void DumpCpuCrumbs() {
 	std::printf("NHL27HANG: GPU finished tick %llu, recording tick %llu\n",
 	            static_cast<unsigned long long>(known),
 	            static_cast<unsigned long long>(g_crumb_master->CurrentTick()));
-	uint32_t shown = 0;
-	for (auto n = first; n < next && shown < 48; n++) {
+	// The first unfinished commands and the last ones (the GPU hangs somewhere in between, most
+	// likely early, but the last ones show what was queued behind).
+	uint64_t unfinished = 0;
+	for (auto n = first; n < next; n++) {
+		const auto& c = g_cpu_crumbs[n % g_cpu_crumbs.size()];
+		unfinished += (c.kind != nullptr && c.tick > known) ? 1u : 0u;
+	}
+	std::printf("NHL27HANG: %llu unfinished commands\n", static_cast<unsigned long long>(unfinished));
+	uint64_t index = 0;
+	for (auto n = first; n < next; n++) {
 		const auto& c = g_cpu_crumbs[n % g_cpu_crumbs.size()];
 		if (c.kind == nullptr || c.tick <= known) {
 			continue;
 		}
-		std::printf("NHL27HANG:   tick %llu %s a=0x%016llx b=0x%016llx info=0x%llx\n",
-		            static_cast<unsigned long long>(c.tick), c.kind, static_cast<unsigned long long>(c.hash_a),
-		            static_cast<unsigned long long>(c.hash_b), static_cast<unsigned long long>(c.info));
-		shown++;
+		if (index < 32 || index + 32 >= unfinished) {
+			std::printf("NHL27HANG:   #%llu tick %llu %s a=0x%016llx b=0x%016llx info=0x%llx\n",
+			            static_cast<unsigned long long>(index), static_cast<unsigned long long>(c.tick), c.kind,
+			            static_cast<unsigned long long>(c.hash_a), static_cast<unsigned long long>(c.hash_b),
+			            static_cast<unsigned long long>(c.info));
+		}
+		index++;
 	}
 	std::fflush(stdout);
 }
@@ -338,6 +350,26 @@ void GpuTimingReport() {
 	            window, g_timing.total_ms, window > 0.0 ? g_timing.total_ms / window : 0.0,
 	            static_cast<unsigned long long>(g_timing.samples),
 	            static_cast<unsigned long long>(g_timing.dropped), sorted.size());
+	{
+		// Every key by kind (draw, dispatch...): operations, time, and those under 10 us each.
+		std::map<std::string, std::array<double, 4>> kinds;
+		for (const auto& [key, acc]: sorted) {
+			auto&      sums = kinds[std::get<0>(*key)];
+			const auto avg  = acc->count != 0 ? acc->total_ms * 1000.0 / static_cast<double>(acc->count) : 0.0;
+			sums[0] += static_cast<double>(acc->count);
+			sums[1] += acc->total_ms;
+			if (avg < 10.0) {
+				sums[2] += static_cast<double>(acc->count);
+				sums[3] += acc->total_ms;
+			}
+		}
+		std::string line = "NHL27GPUKINDS:";
+		for (const auto& [kind, sums]: kinds) {
+			line += fmt::format(" {}: n={:.0f} {:.1f} ms (under 10 us: n={:.0f} {:.1f} ms)", kind, sums[0], sums[1],
+			                    sums[2], sums[3]);
+		}
+		std::printf("%s\n", line.c_str());
+	}
 	for (size_t i = 0; i < sorted.size() && i < GPU_TIMING_TOP; i++) {
 		const GpuTimingKey&   key = *sorted[i].first;
 		const GpuTimingAccum& acc = *sorted[i].second;
@@ -924,7 +956,10 @@ void GpuTracePoll() {
 
 uint32_t GpuTraceCmdBegin(GraphicContext& graphics, const CommandRecorder& cmd, const char* kind,
                           uint64_t hash_a, uint64_t hash_b, uint64_t info, uint64_t aux) {
-	if (!Common::EventTrace::g_capturing.load(std::memory_order_relaxed)) {
+	// KYTY_IDLE_TRACE_NO_CMDS=1: command buffer timestamps only, so the GPU busy time per flip is
+	// measured without the cost of a timestamp pair around every draw and dispatch.
+	static const bool no_cmds = std::getenv("KYTY_IDLE_TRACE_NO_CMDS") != nullptr;
+	if (no_cmds || !Common::EventTrace::g_capturing.load(std::memory_order_relaxed)) {
 		return 0;
 	}
 	std::lock_guard lock(g_gtrace.mutex);
@@ -1071,7 +1106,11 @@ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graph
       m_command_pool(graphics, m_master), m_deferred(deferred_recording),
       m_stream(&m_chunk_queue), m_command(*this, deferred_recording ? &m_stream : nullptr),
       m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {
-	g_crumb_master = &m_master;
+	// The CPU crumbs count in the render scheduler's ticks; the presenter has a scheduler of its
+	// own, made later, whose ticks made every recorded command look unfinished in hang reports.
+	if (&context.GetCommandScheduler() == this) {
+		g_crumb_master = &m_master;
+	}
 	if (m_deferred) {
 		m_host_copies = std::make_unique<HostCopyQueue>(
 		    [] { Config::ConfigureGpuStageThread(Config::GpuStageThread::HostCopy); });
@@ -1160,6 +1199,7 @@ void CommandScheduler::Flush() {
 }
 
 void CommandScheduler::Flush(SubmitInfo& submit) {
+	g_scheduler_flushes.fetch_add(1, std::memory_order_relaxed);
 	Submit(submit);
 	BeginNext();
 }

@@ -163,6 +163,13 @@ bool IsLaneWise(ValueOpcode op) {
 		case ValueOpcode::FPMul16x2:
 		case ValueOpcode::FPFma16x2:
 		case ValueOpcode::FPClamp16x2:
+		case ValueOpcode::F16LaneExtract:
+		case ValueOpcode::F16LaneInsert:
+		case ValueOpcode::FPAdd16Low:
+		case ValueOpcode::FPSub16Low:
+		case ValueOpcode::FPMul16Low:
+		case ValueOpcode::FPFma16Low:
+		case ValueOpcode::F16x2Swizzle:
 		case ValueOpcode::FPAdd64:
 		case ValueOpcode::FPMul64:
 		case ValueOpcode::FPFma64:
@@ -229,6 +236,18 @@ bool ReadsNeighborLanes(ValueOpcode op) {
 }
 
 } // namespace
+
+bool IsLaneWiseOpcode(ValueOpcode op) {
+	return IsLaneWise(op);
+}
+
+bool IsExecPredicatedMemoryOp(const Inst& inst) {
+	return IsExecPredicatedMemory(inst);
+}
+
+bool ReadsNeighborLanesOpcode(ValueOpcode op) {
+	return ReadsNeighborLanes(op);
+}
 
 uint32_t EliminateExecSelects(const BlockList& blocks) {
 	std::vector<Inst*>                       insts;
