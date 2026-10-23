@@ -543,8 +543,8 @@ bool GuestReadLog::StillValid(bool without_faults) const {
 	const bool        skips        = m_base_valid && !Common::Experiments::Enabled(Common::Experiments::AbLegacy) &&
 	                    m_base >= PageWriteSeq::g_floor.load(std::memory_order_acquire);
 	// KYTY_DBG_STAGE_STATS: NHL27CHECKS (reads, bytes and page switches per check).
-	const bool stats = StageStats::Enabled();
-	if (stats) {
+	const bool stage_stats = StageStats::Enabled();
+	if (stage_stats) {
 		const auto kind = without_faults ? 1 : 0;
 		uint64_t   pages = 0, last = ~uint64_t {0};
 		for (const auto& entry: m_entries) {
@@ -586,7 +586,7 @@ bool GuestReadLog::StillValid(bool without_faults) const {
 				later = PageWriteSeq::Last(entry.address, entry.size) > m_base;
 			}
 			const bool skippable = skips && !entry.unsafe && !later;
-			if (stats) {
+			if (stage_stats) {
 				const auto kind = without_faults ? 1 : 0;
 				(skippable      ? StageStats::g_check_skipped[kind]
 				 : entry.unsafe ? StageStats::g_check_unsafe[kind]
@@ -642,7 +642,7 @@ bool GuestReadLog::StillValid(bool without_faults) const {
 		const auto& entry = m_entries[i];
 		if (entry.run_count != 0 && skips && !verify_skips &&
 		    PageWriteSeq::Last(entry.address & ~uint64_t {0xfff}, 1) <= m_base) {
-			if (stats) {
+			if (stage_stats) {
 				StageStats::g_check_skipped[without_faults ? 1 : 0].fetch_add(entry.run_count, std::memory_order_relaxed);
 			}
 			i += entry.run_count;
