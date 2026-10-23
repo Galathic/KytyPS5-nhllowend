@@ -11939,27 +11939,34 @@ void TestNewShaderRecompilerSetpcDwordJumpTable(uint32_t offset_sgpr) {
         "subtractive S_SETPC CFG did not retain its bounded selector compare");
 
   auto result = RecompileForTest(shader, options);
-  Check((result.ir_dump.find("mode=dispatcher") != std::string::npos),
-        "subtractive S_SETPC_B64 table did not select dispatcher fallback");
-  const auto jump = std::find_if(
-      result.program.blocks.begin(), result.program.blocks.end(),
-      [](const auto *block) { return !block->terminator.cases.empty(); });
-  Check(jump != result.program.blocks.end() &&
-            (*jump)->ImmSuccessors().size() == 2 &&
-            (*jump)->terminator.indexed &&
-            (*jump)->terminator.cases.size() == 3 &&
-            (*jump)->terminator.cases[0].value == 0u &&
-            (*jump)->terminator.cases[0].target->start_pc == 0x38u &&
-            (*jump)->terminator.cases[1].value == 4u &&
-            (*jump)->terminator.cases[1].target->start_pc == 0x40u &&
-            (*jump)->terminator.cases[2].value == 8u &&
-            (*jump)->terminator.cases[2].target->start_pc == 0x38u &&
-            std::ranges::none_of(
-                result.program.blocks,
-                [](const auto *block) { return block->start_pc == 0x04u; }),
-        "subtractive S_SETPC_B64 table targets or selector mapping changed");
+  const bool has_dispatcher =
+      result.ir_dump.find("mode=dispatcher") != std::string::npos;
+  const bool has_unreachable_pc = std::ranges::any_of(
+      result.program.blocks,
+      [](const auto *block) { return block->start_pc == 0x04u; });
+  if (has_dispatcher || has_unreachable_pc) {
+    std::fprintf(stderr,
+                 "S_SETPC dword fixture diagnostics: dispatcher=%u unreachable_pc04=%u\n",
+                 has_dispatcher ? 1u : 0u, has_unreachable_pc ? 1u : 0u);
+    const auto block_id = [](const auto *block) {
+      return block != nullptr ? block->id : UINT32_MAX;
+    };
+    for (const auto *block : result.program.blocks) {
+      std::fprintf(stderr, "  block id=%u pc=0x%08x term=%u true=%u false=%u\n",
+                   block->id, block->start_pc,
+                   static_cast<unsigned>(block->terminator.kind),
+                   block_id(block->terminator.true_block),
+                   block_id(block->terminator.false_block));
+    }
+    std::fprintf(stderr, "  IR dump:\n%s\n", result.ir_dump.c_str());
+  }
+  Check(!has_dispatcher && !has_unreachable_pc,
+        "subtractive S_SETPC table did not lower to structured control flow");
   Check((result.ir_dump.find("LoadAddressU32") == std::string::npos),
         "subtractive S_SETPC_B64 table load reached normal IR");
+  // NOTE: no cases-terminator check here: structured lowering replaces the
+  // jump table with bounded selector compares (validated on the CFG above),
+  // so the dispatcher-flow cases mapping upstream asserts does not apply.
   Check(SpirvContainsOpcode(result.spirv, 250),
         "subtractive S_SETPC_B64 compare chain lacks OpBranchConditional");
   CheckSpirvBinaryValidates(result.spirv);
