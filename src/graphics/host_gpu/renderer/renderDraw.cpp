@@ -694,7 +694,7 @@ void RenderExecutor::StoreRenderTargetMemo(const RenderColorInfo* colors, uint32
 	auto& memo   = *m_render_target_memo;
 	memo.pending = false;
 	// Clears consume their state; the next draw acquires its targets itself.
-	if (depth.depth_clear_enable || depth.depth_load_clear_enable || depth.stencil_clear_enable) {
+	if (depth.depth_clear_enable || depth.load_clear_aspects || depth.stencil_clear_enable) {
 		return;
 	}
 	auto& cache             = m_context.GetTextureCache();
@@ -1063,11 +1063,12 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			EXIT("depth target changed after render-state discovery\n");
 		}
 		// A reused acquisition had no depth clear and no HTile clear to consume.
-		const auto image_view_stage =
+		const auto image_view =
 		    memo != nullptr ? memo->depth_view
 		                    : cache.FindDepthTarget(depth.image_id, depth.desc, &stencil_id);
-		depth_view = image_view_stage;
+		depth_view = image_view;
 		if (memo == nullptr) {
+			const auto& metadata = depth.desc.info.metadata;
 			if (metadata.kind == ImageMetadataKind::Htile && depth.depth_clear_enable &&
 			    !cache.ClearMeta(metadata.range.address)) {
 				EXIT("failed to acquire HTile metadata for a depth clear\n");
@@ -1075,27 +1076,16 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			const bool meta_clear =
 			    metadata.kind == ImageMetadataKind::Htile &&
 			    cache.IsMetaCleared(metadata.range.address, depth.desc.view_info.base_layer);
-			depth.depth_load_clear_enable = depth.depth_clear_enable || meta_clear;
+			depth.load_clear_aspects = {};
+			if (depth.depth_clear_enable || meta_clear)
+				depth.load_clear_aspects |= vk::ImageAspectFlagBits::eDepth;
+			// Apply pending clears to compressed stencil as well as depth.
+			if (depth.stencil_clear_enable || (meta_clear && metadata.stencil_compressed))
+				depth.load_clear_aspects |= vk::ImageAspectFlagBits::eStencil;
 			if (meta_clear &&
 			    !cache.TouchMeta(metadata.range.address, depth.desc.view_info.base_layer, false)) {
 				EXIT("failed to consume HTile clear state\n");
 			}
-		const auto  image_view = cache.FindDepthTarget(depth.image_id, depth.desc);
-		const auto& metadata   = depth.desc.info.metadata;
-		const bool meta_clear =
-		    metadata.kind == ImageMetadataKind::Htile &&
-		    cache.IsMetaCleared(metadata.range.address, depth.desc.view_info.base_layer);
-		depth.load_clear_aspects = {};
-		if (depth.depth_clear_enable || meta_clear)
-			depth.load_clear_aspects |= vk::ImageAspectFlagBits::eDepth;
-		// Apply pending clears to compressed stencil as well as depth.
-		if (depth.stencil_clear_enable || (meta_clear && metadata.stencil_compressed))
-			depth.load_clear_aspects |= vk::ImageAspectFlagBits::eStencil;
-		if (meta_clear &&
-		    !cache.TouchMeta(metadata.range.address, depth.desc.view_info.base_layer, false)) {
-			EXIT("failed to consume HTile clear state\n");
-
-		}
 		}
 		auto& image = cache.GetImage(depth.image_id);
 		EXIT_IF(image_view == nullptr || image.backing.samples != depth.desc.info.samples);
@@ -1122,11 +1112,10 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 				std::printf("NHL27DEPTHFEEDBACK: a draw samples the depth attachment it writes; the "
 				            "host lacks attachment feedback loops, using the general layout\n");
 				std::fflush(stdout);
+			}
 			static std::atomic_bool logged = false;
 			if (!logged.exchange(true, std::memory_order_relaxed)) {
 				std::printf("depth attachment feedback loop is not supported by the host\n");
-
-			}
 			}
 		}
 		auto layout = depth_attachment_layout(depth);
@@ -1233,16 +1222,6 @@ bool RenderExecutor::ConsumeMetadataColorOperation(CommandBuffer& buffer,
 	// future CMask/FMask support can consume its state through the same TextureCache path.
 	return mode == static_cast<uint8_t>(CbColorMode::EliminateFastClear) ||
 	       mode == static_cast<uint8_t>(CbColorMode::FmaskDecompress) ||
-	if (mode == static_cast<uint8_t>(CbColorMode::EliminateFastClear)) {
-		// FCE can precede any ordinary draw. Discover the target to materialize its native
-		// clear metadata before the expanded image is sampled.
-		RenderColorInfo target {};
-		ResolveRenderColorTarget(buffer, target, render_target_slice_offset, 0, true);
-		return true;
-	}
-	// Metadata/decompression shaders must not export colors into the expanded image.
-	return mode == static_cast<uint8_t>(CbColorMode::FmaskDecompress) ||
-
 	       mode == static_cast<uint8_t>(CbColorMode::DccDecompress);
 }
 
@@ -1783,9 +1762,6 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 	}
 	auto& ucfg = buffer.GetUserConfig();
 	const auto& hw = buffer.GetRegisters();
-	auto& depth_stage = *state.depth_stage;
-	auto& color_stage = state.colors[0];
-	EXIT_NOT_IMPLEMENTED(!m_context.GetGraphics().depth_color_copy_enabled ||
 	auto& depth = state.depth_info;
 	auto& color = state.color_info[0];
 	EXIT_NOT_IMPLEMENTED(!m_context.GetGraphics().maintenance8_enabled ||
@@ -1902,19 +1878,19 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		descriptor_stages[stage_count++] = &*bindings.pixel;
 	}
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
-	if (emit.indirect != nullptr && state.vertex_info[0].stage.program->info.native_draw &&
-	    emit.indirect->snapshot->HasDeviceAddress()) {
+	if (emit.indirect_stage != nullptr && state.vertex_info[0].stage.program->info.native_draw &&
+	    emit.indirect_stage->snapshot->HasDeviceAddress()) {
 		const auto dword = state.vertex_info[0].stage.program->bindings.native_draw_dword;
-		const auto address = emit.indirect->snapshot->BufferDeviceAddress();
+		const auto address = emit.indirect_stage->snapshot->BufferDeviceAddress();
 		bindings.vertex[0].shader_data[dword] = static_cast<uint32_t>(address);
 		bindings.vertex[0].shader_data[dword + 1] = static_cast<uint32_t>(address >> 32u);
-		bindings.vertex[0].shader_data[dword + 2] = emit.indirect->stride;
+		bindings.vertex[0].shader_data[dword + 2] = emit.indirect_stage->stride;
 	}
 	// Discover indirect ranges before finalizing descriptors and vertex buffer handles.
-	if (emit.indirect != nullptr) {
+	if (emit.indirect_stage != nullptr) {
 		FrameBreakdown::Timer buffers_timer(FrameBreakdown::g_counters.dp_buffers_ns);
 		FrameBreakdown::Timer indirect_timer(FrameBreakdown::g_counters.dp_indirect_ns);
-		auto& source = *emit.indirect;
+		auto& source = *emit.indirect_stage;
 		auto& cache = m_context.GetBufferCache();
 		(void)cache.FindBuffer(source.args_addr, source.ArgsSize());
 		if (source.count_addr != 0) (void)cache.FindBuffer(source.count_addr, sizeof(uint32_t));
@@ -1944,10 +1920,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
 	}
-	if (emit.indirect != nullptr) {
+	if (emit.indirect_stage != nullptr) {
 		FrameBreakdown::Timer buffers_timer(FrameBreakdown::g_counters.dp_buffers_ns);
 		FrameBreakdown::Timer indirect_timer(FrameBreakdown::g_counters.dp_indirect_ns);
-		auto& source = *emit.indirect;
+		auto& source = *emit.indirect_stage;
 		auto& cache = m_context.GetBufferCache();
 		const auto [args, args_offset] = cache.ObtainBuffer(source.args_addr, source.ArgsSize(), false);
 		Buffer* count = nullptr;
@@ -2208,8 +2184,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		if (mesh_active) {
 			vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 		} else {
-			if (emit.indirect != nullptr) {
-				const auto& source = *emit.indirect;
+			if (emit.indirect_stage != nullptr) {
+				const auto& source = *emit.indirect_stage;
 				if (source.indexed && source.count_addr != 0) {
 					vk_buffer.drawIndexedIndirectCount(source.snapshot->Handle(), 0, source.snapshot->Handle(), source.ArgsSize(), source.max_count, source.stride);
 				} else if (source.indexed) {
@@ -2263,7 +2239,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		log.instances     = draw.instance_count;
 		log.indexed       = draw.IsIndexed();
 		log.mesh          = mesh_active;
-		log.indirect      = emit.indirect != nullptr;
+		log.indirect      = emit.indirect_stage != nullptr;
 		log.ps_active     = state.ps_active;
 		log.depth_test    = state.depth->depth_test_enable;
 		log.depth_write   = state.depth->depth_write_enable;
@@ -2277,12 +2253,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		log.ps_images = state.ps_active && bindings.pixel ? &bindings.pixel->images : nullptr;
 		log.ps_bindings = state.ps_active && bindings.pixel ? &*bindings.pixel : nullptr;
 		log.skipped = skip_draw;
-		if (emit.indirect != nullptr) {
-			log.indirect_snapshot = emit.indirect->snapshot;
-			log.indirect_args_size = emit.indirect->ArgsSize();
-			log.indirect_guest_addr = emit.indirect->args_addr;
-			log.indirect_stride = emit.indirect->stride;
-			log.indirect_max_count = emit.indirect->max_count;
+		if (emit.indirect_stage != nullptr) {
+			log.indirect_snapshot = emit.indirect_stage->snapshot;
+			log.indirect_args_size = emit.indirect_stage->ArgsSize();
+			log.indirect_guest_addr = emit.indirect_stage->args_addr;
+			log.indirect_stride = emit.indirect_stage->stride;
+			log.indirect_max_count = emit.indirect_stage->max_count;
 		}
 		const auto& regs = buffer.GetRegisters();
 		const auto& dc = regs.GetDepthControl();
@@ -2318,16 +2294,6 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	BufferCache::PerfCount(BufferCache::PerfEvent::Draw);
 	NoteShaderWork();
-	vk::PipelineStageFlags shader_write_stages = {};
-	for (const auto& stage: vertex_stages) {
-		if (HasShaderBufferWrites(stage.stage)) {
-			shader_write_stages |= ShaderPipelineStages(NativeShaderStage(stage.logical_stage));
-		}
-	}
-	if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage)) {
-		shader_write_stages |= vk::PipelineStageFlagBits::eFragmentShader;
-	}
-
 	if (shader_write_stages) {
 		m_context.GetCommandScheduler().EndRendering();
 		ShaderWriteBarrier(vk_buffer, shader_write_stages);
@@ -2416,7 +2382,6 @@ struct DrawCostScope {
 };
 } // namespace
 
-void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 // Vulkan offsets for a prepared draw, or nullopt when its indirect records need CPU counts, as
 // mesh and quad-list draws do. Indirect records carry their own offsets.
 static std::optional<DrawEmitInfo> ResolveDrawEmit(const HW::UserConfig&        ucfg,
@@ -2434,10 +2399,13 @@ static std::optional<DrawEmitInfo> ResolveDrawEmit(const HW::UserConfig&        
 	}
 	if (source == DrawOffsetSource::IndirectArgs) {
 		// Native fetches consume the patched SGPRs; rewritten fetches need Vulkan offsets.
-		return vs.fetch_embedded ? DrawEmitInfo {first_vertex, first_instance} : DrawEmitInfo {};
+		return vs.fetch_embedded
+		           ? DrawEmitInfo {.vertex_offset = first_vertex, .first_instance = first_instance}
+		           : DrawEmitInfo {};
 	}
 	const auto [vertex_offset, instance_offset] = ResolveDrawOffsets(ucfg.GetIndexOffset(), vs);
-	return DrawEmitInfo {vertex_offset + first_vertex, instance_offset};
+	return DrawEmitInfo {.vertex_offset = vertex_offset + first_vertex,
+	                     .first_instance = instance_offset};
 }
 
 bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
@@ -2462,13 +2430,10 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	                    reinterpret_cast<uint64_t>(args.index_addr));
 
 	Common::LockGuard lock(m_context.GetMutex());
-	if (args.index_count == 0 || args.instance_count == 0) {
+	if (args.index_count == 0 || (args.instance_count == 0 && args.indirect.address == 0)) {
 		LogZeroInstanceDraw("index", submit_id, buffer, args.index_count, args.instance_count,
 		                    args.instance_source, args.instance_args_addr);
-		return;
-	if (args.index_count == 0 || (args.instance_count == 0 && args.indirect.address == 0)) {
 		return true;
-
 	}
 
 	if (ConsumeMetadataColorOperation(buffer, args.render_target_slice_offset) ||
@@ -2583,13 +2548,10 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	                    args.first_instance);
 
 	Common::LockGuard lock(m_context.GetMutex());
-	if (args.vertex_count == 0 || args.instance_count == 0) {
+	if (args.indirect.address == 0 && (args.vertex_count == 0 || args.instance_count == 0)) {
 		LogZeroInstanceDraw("auto", submit_id, buffer, args.vertex_count, args.instance_count,
 		                    args.instance_source, args.instance_args_addr);
-		return;
-	if (args.indirect.address == 0 && (args.vertex_count == 0 || args.instance_count == 0)) {
 		return true;
-
 	}
 
 	if (ConsumeMetadataColorOperation(buffer, args.render_target_slice_offset) ||
@@ -2742,7 +2704,7 @@ bool RenderExecutor::DrawAutoIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	// The scheduler retains ownership even if SET_NUM_INSTANCES discards the CPU snapshot early.
 
 	DrawEmitInfo emit {};
-	emit.indirect = &source;
+	emit.indirect_stage = &source;
 	buffer.SetDebugInfo(static_cast<uint32_t>(debug_op), submit_id,
 	                    UINT32_MAX, 0, 1, UINT32_MAX, source.args_addr);
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source, restart);
@@ -2791,8 +2753,6 @@ bool RenderExecutor::ResolveColorTargets(CommandBuffer& buffer, uint32_t render_
 	destination.Resolve(source, {src.guest_mip_level, 1, src.guest_array_layer, 1},
 	                    {dst.guest_mip_level, 1, dst.guest_array_layer, 1});
 	return true;
-}
-}
 }
 
 } // namespace Libs::Graphics

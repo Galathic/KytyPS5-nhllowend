@@ -556,7 +556,6 @@ void RenderContext::PrepareBda() {
 	m_bda_batch_synced = true;
 	total_timer.Stop();
 	// Lazy BDA faults still need processing even when uploads were unchanged.
-	std::shared_lock lock(m_mapped_ranges_mutex);
 	m_buffer_cache.SynchronizeBda(m_mapped_ranges);
 
 	m_fault_process_pending = true;
