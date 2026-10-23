@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -470,10 +471,29 @@ void Swapchain::Create() {
 		case Config::PresentMode::Fifo:
 		default: create_info.presentMode = vk::PresentModeKHR::eFifo; break;
 	}
-	if (std::find(surface.present_modes.begin(), surface.present_modes.end(),
-	              create_info.presentMode) == surface.present_modes.end()) {
+	const auto available = [&](vk::PresentModeKHR mode) {
+		return std::find(surface.present_modes.begin(), surface.present_modes.end(), mode) !=
+		       surface.present_modes.end();
+	};
+	if (create_info.presentMode == vk::PresentModeKHR::eMailbox && !available(create_info.presentMode) &&
+	    available(vk::PresentModeKHR::eImmediate)) {
+		// No Mailbox on AMD under Windows: there FIFO (and FIFO latest ready) blocked every present
+		// until the monitor's refresh, and the game's flips with it (NHL 27 played at exactly 60 fps
+		// on a 60 Hz monitor; Immediate: 61-78). A window the desktop composes does not tear.
+		create_info.presentMode = vk::PresentModeKHR::eImmediate;
+	}
+	if (!available(create_info.presentMode)) {
 		LOGF("warning: requested present mode is unavailable; falling back to Fifo\n");
 		create_info.presentMode = vk::PresentModeKHR::eFifo;
+	}
+	{
+		std::string modes;
+		for (const auto mode: surface.present_modes) {
+			modes += " " + vk::to_string(mode);
+		}
+		std::printf("NHL27VIDEO: swapchain present mode %s (available:%s) %ux%u\n",
+		            vk::to_string(create_info.presentMode).c_str(), modes.c_str(), m_extent.width, m_extent.height);
+		std::fflush(stdout);
 	}
 	create_info.clipped = VK_TRUE;
 	RequireVulkanSuccess(graphics.device.createSwapchainKHR(&create_info, nullptr, &m_handle),
@@ -1130,6 +1150,19 @@ static void WritePresentCapture(GraphicContext& graphics, PresentCapture& captur
 
 void Presenter::Impl::Present() {
 	KYTY_PROFILER_FUNCTION();
+
+	{
+		// Every 5 s: the frames the window showed.
+		static auto     next  = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+		static uint64_t shown = 0;
+		if (const auto now = std::chrono::steady_clock::now(); now >= next) {
+			next                 = now + std::chrono::seconds(5);
+			const auto shown_now = window.loop.presented_frames.load(std::memory_order_relaxed);
+			std::printf("NHL27PRESENT: shown=%llu in 5 s\n", static_cast<unsigned long long>(shown_now - shown));
+			std::fflush(stdout);
+			shown = shown_now;
+		}
+	}
 
 	const auto overlay_visual = GetSystemOverlayVisualState();
 	// Keep black/blank flips in the current color space; only real main-bus frames switch it.

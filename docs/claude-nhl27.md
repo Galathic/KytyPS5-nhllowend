@@ -913,6 +913,26 @@ of the second, shaders compiled during the match 104 -> 0, and the match reached
 (212.8 -> 197.5 s). Eighteen soak matches in a row on the code before: 54.8-59.6 fps at 60 Hz, no
 errors. `KytyPS5-tools\play-nhl.ps1` now runs with the store on.
 
+Three more soak matches with profile v12: 59.4, 59.0 and 59.2 fps at 60 Hz, no errors.
+
+The 60 fps that play held to was the host display, not the game. The swapchain asks for Mailbox,
+which the AMD driver does not offer under Windows (it offers Immediate, FIFO, FIFO relaxed and
+FIFO latest ready), so it fell back to FIFO, and on Petr's 60 Hz monitor every `vkQueuePresentKHR`
+waited for the next refresh (while holding the queue lock the render submissions use); the
+presenter's flips, and so the game's frames, followed at exactly 60 per second (the idle trace's
+presents 16.66-16.72 ms apart, whatever the emulated 240 Hz vblank did). FIFO latest ready also
+held 60. Without Mailbox the swapchain now takes Immediate (a window the desktop composes does not
+tear); `--present-mode Fifo` keeps vsync. The swapchain prints its mode (`NHL27VIDEO: swapchain
+present mode`) and the presenter the frames it showed every 5 s (`NHL27PRESENT`). One boot: 65.1 fps
+at 60 Hz over 111 s (stretches of 61-78), 30 Hz scenes 39.9. The execution thread is then 91-94%
+busy at about 400k operations/s (2.2-2.4 us each) and the GPU near its 14.6 ms per frame: 120 fps
+needs both about halved. The game asks whether 119.88 Hz output is supported (`KYTY_VBLANK_HZ=120`
+answers yes; `NHL27VIDEO` lines) but did not switch to it, and play ran the same.
+
+`KYTY_DBG_LONG_OPS=<us>`: execution-thread operations taking that long print where the time went
+(`NHL27LONGOP`: waiting for their resolution, then the parts of executing them; the parts need
+`KYTY_PERF_STATS=1`; `KytyPS5-tools\longops.py` sums them up).
+
 Bit 42 `KYTY_BDA_LOAD_GROUPS` (default off; key bit 8192; `KYTY_DBG_BDA_GROUPS=1` prints
 `NHL27BDAGROUP` per shader): consecutive DWORD loads of one guest load through an address share
 one page lookup and issue together when the group lies in one page. Grouped loads turned up in

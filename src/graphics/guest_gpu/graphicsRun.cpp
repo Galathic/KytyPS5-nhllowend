@@ -800,6 +800,52 @@ void GuestGpu::ExecuteSync(Common::UniqueFunction<void>&& command) {
 	WaitForExecution();
 }
 
+// KYTY_DBG_LONG_OPS=<us>: every operation the execution thread spends that long on prints where the
+// time went (NHL27LONGOP: waiting for its resolution, then the parts of executing it; the parts need
+// KYTY_PERF_STATS=1, and readback, fault and protect counts include other threads).
+static const int64_t g_long_op_ns = [] {
+	const char* value = std::getenv("KYTY_DBG_LONG_OPS");
+	return value != nullptr ? std::strtoll(value, nullptr, 10) * 1000 : int64_t {0};
+}();
+
+namespace {
+struct LongOpCounters {
+	static constexpr size_t Count = 17;
+	std::array<uint64_t, Count> values {};
+
+	static LongOpCounters Take() {
+		auto&          c = FrameBreakdown::g_counters;
+		LongOpCounters s;
+		const std::array<const std::atomic<uint64_t>*, Count> sources {
+		    &c.dp_materialize_ns, &c.dp_textures_ns, &c.dp_buffers_ns, &c.dp_bda_ns, &c.dp_rebind_ns,
+		    &c.dp_descriptors_ns, &c.dp_pipeline_ns, &c.dc_total_ns,  &c.dc_bda_ns, &c.readback_ns,
+		    &c.fault_ns,          &c.compile_ns,     &c.sync_uploads, &c.sync_bytes, &c.protect_calls,
+		    &c.protect_ns,        &c.gpu_wait_ns};
+		for (size_t i = 0; i < Count; i++) {
+			s.values[i] = sources[i]->load(std::memory_order_relaxed);
+		}
+		return s;
+	}
+};
+
+void PrintLongOp(uint64_t op_kind, int64_t start, int64_t resolved, int64_t end, const LongOpCounters& before) {
+	const auto after = LongOpCounters::Take();
+	std::array<double, LongOpCounters::Count> d {};
+	for (size_t i = 0; i < d.size(); i++) {
+		d[i] = static_cast<double>(after.values[i] - before.values[i]);
+	}
+	const auto us = [](double ns) { return ns / 1000.0; };
+	std::printf("NHL27LONGOP kind=%u op=0x%x total=%.0fus resolve_wait=%.0fus exec=%.0fus | draw: mat=%.0f tex=%.0f "
+	            "buf=%.0f bda=%.0f rebind=%.0f desc=%.0f pipe=%.0f | dispatch=%.0f bda=%.0f | readback=%.0f "
+	            "fault=%.0f compile=%.0f gpu_wait=%.0f | uploads=%.0f kb=%.0f protects=%.0f (%.0fus)\n",
+	            static_cast<uint32_t>(op_kind & 0xffu), static_cast<uint32_t>(op_kind >> 8u),
+	            us(static_cast<double>(end - start)), us(static_cast<double>(resolved - start)),
+	            us(static_cast<double>(end - resolved)), us(d[0]), us(d[1]), us(d[2]), us(d[3]), us(d[4]), us(d[5]),
+	            us(d[6]), us(d[7]), us(d[8]), us(d[9]), us(d[10]), us(d[11]), us(d[16]), d[12], d[13] / 1024.0, d[14],
+	            us(d[15]));
+}
+} // namespace
+
 void GuestGpu::ExecutionThread() {
 	KYTY_PROFILER_THREAD("Thread_GpuExecute");
 	Config::ConfigureGpuStageThread(Config::GpuStageThread::Execution);
@@ -842,6 +888,9 @@ void GuestGpu::ExecutionThread() {
 		const auto op_kind  = static_cast<uint64_t>(operation->kind) | (uint64_t {operation->trace_op} << 8u);
 		const auto op_start = traced ? Common::EventTrace::NowNs() : int64_t {0};
 		g_exec_op           = op_kind;
+		const bool long_ops   = g_long_op_ns != 0;
+		const auto long_start = long_ops ? Common::EventTrace::NowNs() : int64_t {0};
+		const auto long_before = long_ops ? LongOpCounters::Take() : LongOpCounters {};
 		if (auto* slot = operation->dispatch_slot; slot != nullptr) {
 			if (slot->state.load(std::memory_order_acquire) != 2) {
 				const auto start = StageStats::Enabled() ? std::chrono::steady_clock::now()
@@ -879,6 +928,7 @@ void GuestGpu::ExecutionThread() {
 			operation->draw_slot = nullptr;
 		}
 		PageWriteSeq::SetOperation(operation->sequence);
+		const auto long_resolved = long_ops ? Common::EventTrace::NowNs() : int64_t {0};
 		if (StageStats::Enabled()) {
 			const auto kind  = static_cast<size_t>(operation->kind) & 7u;
 			const auto start = std::chrono::steady_clock::now();
@@ -899,6 +949,12 @@ void GuestGpu::ExecutionThread() {
 			operation->processor->Execute(*operation);
 		}
 		g_exec_op = 0;
+		if (long_ops) {
+			const auto long_end = Common::EventTrace::NowNs();
+			if (long_end - long_start >= g_long_op_ns) {
+				PrintLongOp(op_kind, long_start, long_resolved, long_end, long_before);
+			}
+		}
 		if (traced) {
 			const auto op_ns = Common::EventTrace::NowNs() - op_start;
 			if (op_ns >= 20000) {

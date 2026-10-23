@@ -2038,7 +2038,13 @@ KYTY_SYSV_ABI int VideoOutIsOutputSupported(int handle, uint64_t mode,
 	}
 
 	if (mode == VIDEO_OUT_OUTPUT_MODE_119_88HZ) {
-		return (Config::GetVblankFrequency() >= 119 ? VIDEO_OUT_TRUE : VIDEO_OUT_FALSE);
+		const bool supported = Config::GetVblankFrequency() >= 119;
+		static std::atomic<int> reported {0};
+		if (reported.fetch_add(1, std::memory_order_relaxed) < 2) {
+			std::printf("NHL27VIDEO: game asks whether 119.88 Hz output is supported: %s\n", supported ? "yes" : "no");
+			std::fflush(stdout);
+		}
+		return (supported ? VIDEO_OUT_TRUE : VIDEO_OUT_FALSE);
 	}
 
 	return VIDEO_OUT_TRUE;
@@ -2065,6 +2071,11 @@ KYTY_SYSV_ABI int VideoOutConfigureOutput(int handle, uint64_t mode,
 	}
 
 	ctx->mutex.Lock();
+	if (ctx->output_mode != mode) {
+		std::printf("NHL27VIDEO: output mode 0x%llx (%s)\n", static_cast<unsigned long long>(mode),
+		            mode == VIDEO_OUT_OUTPUT_MODE_119_88HZ ? "119.88 Hz" : "default");
+		std::fflush(stdout);
+	}
 	ctx->output_mode = mode;
 	Common::LightingApiTrace("VideoOutConfigureOutput handle=%d mode=0x%llx result=0",
 	    handle, static_cast<unsigned long long>(mode));
