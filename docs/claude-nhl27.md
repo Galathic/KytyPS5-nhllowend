@@ -904,6 +904,15 @@ recorded work, compared when it lands) removed those waits, but the time went to
 thread's own faults on the same GPU-written pages (`StillValid`'s plain loads, 37%), and the boot
 reached the match no sooner (243 s against 244-247): dropped.
 
+The program store (`KYTY_SHADER_PREGEN`, on by default; the compile inputs of every program a
+session compiled, queued to the compile workers at the next start) was named after the build's
+commit, so every new build started without it. It is now named after a hash of the committed
+shader translator and program cache directories (`KYTY_GIT_SHADER_TREE`; the per-commit name while
+either has local changes). Two boots of one build with it on: 1,424 programs queued at the start
+of the second, shaders compiled during the match 104 -> 0, and the match reached 15 s sooner
+(212.8 -> 197.5 s). Eighteen soak matches in a row on the code before: 54.8-59.6 fps at 60 Hz, no
+errors. `KytyPS5-tools\play-nhl.ps1` now runs with the store on.
+
 Bit 42 `KYTY_BDA_LOAD_GROUPS` (default off; key bit 8192; `KYTY_DBG_BDA_GROUPS=1` prints
 `NHL27BDAGROUP` per shader): consecutive DWORD loads of one guest load through an address share
 one page lookup and issue together when the group lies in one page. Grouped loads turned up in
