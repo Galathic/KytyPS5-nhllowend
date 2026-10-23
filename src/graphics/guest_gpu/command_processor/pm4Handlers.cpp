@@ -1285,8 +1285,9 @@ KYTY_CP_OP_PARSER(CpOpAcquireMem) {
 	BufferCache::PerfCount(BufferCache::PerfEvent::AcquireMem);
 	if (BufferCache::GuestSyncOnly()) {
 		// Without the automatic per-dispatch barriers, the guest's cache acquire is the point
-		// where earlier shader writes must become visible.
-		cp.EmitGlobalBarrier();
+		// where earlier shader writes must become visible. Stage-2 merge: the merged header
+		// keeps only the private execution-side barrier, so order through the public sync.
+		cp.SynchronizeGpu();
 	}
 	return KYTY_PM4_LEN(cmd_id) - 1;
 }
