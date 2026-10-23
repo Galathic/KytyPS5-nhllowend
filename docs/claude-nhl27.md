@@ -953,6 +953,16 @@ GPU side at uncapped rates (2026-10-23):
   change (14.53-14.56 vs 14.52 ms per flip); with them the heavy shaders read 7-21% faster, which
   was mostly how they overlap. Two soak matches with it on: 69.5 and 64.0 fps at 60 Hz, no errors.
 * `KYTY_PERF_GPU_TIMING` reports also print `NHL27GPUKINDS`: every key's time summed by kind.
+* Bit 51 `KYTY_F16_LANE_VIEWS` (default on; key bit 32768): scalar f16 ops on SDWA/op_sel lanes read
+  their sources as components of the register viewed as an f16vec2 (`F16LaneExtract`), compute in
+  half precision (`FPAdd16Low`, `FPSub16Low`, `FPMul16Low`, `FPFma16Low`) and write the destination
+  half with `F16LaneInsert`; packed f16 sources pick their lanes with an f16vec2 shuffle
+  (`F16x2Swizzle`). The AMD compiler then reads and writes register halves itself
+  (`v_sub_f16 v43.l, v11.h, v63.l`) instead of masking: crowd VS 8,691 -> 7,533 ISA lines
+  (`v_and_b32` 862 -> 158, `v_xor_b32` 289 -> 1), `a36f0b4f` 75-78 -> 59 VGPRs, `d46af19f` 67 -> 54.
+  The new IR opcodes are appended (stored records number opcodes by position). All 1,584 SPIR-V
+  modules of a match validate. Paused scene, no per-draw timestamps: 13.70-13.72 -> 13.19 ms GPU
+  per flip (-3.8%), 69 -> 76 fps. Two soak matches: 64.2 and 66.4 fps at 60 Hz, no errors, crowd close-ups normal.
 * `ExecBranches` off (bits 39/40) made the heaviest compute shaders 19-23% slower again.
 
 Execution thread at uncapped rates: about 400k operations/s, 92-94% busy; draws 3.4-3.7 us,

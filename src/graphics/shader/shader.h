@@ -128,6 +128,11 @@ inline std::atomic<bool> g_shader_native_pkrtz {false};
 [[nodiscard]] inline bool ShaderExecBranchContinue() {
 	return ShaderExecBranches() && Common::Experiments::Enabled(Common::Experiments::ExecBranchContinue);
 }
+// Codegen option: experiment F16LaneViews (key bit 32768): scalar f16 ops on SDWA/op_sel lanes as
+// f16vec2 components (F16LaneExtract / FP*16Low / F16LaneInsert) instead of integer masking.
+[[nodiscard]] inline bool ShaderF16LaneViews() {
+	return ShaderNativeFp16() && Common::Experiments::Enabled(Common::Experiments::F16LaneViews);
+}
 // Codegen option: experiment BdaLoadGroups (key bit 8192): consecutive DWORD loads of one guest
 // load through an address share one page lookup when they are in one page.
 [[nodiscard]] inline bool ShaderBdaLoadGroups() {
@@ -141,7 +146,8 @@ inline std::atomic<bool> g_shader_native_pkrtz {false};
 	       (ShaderNativePkrtz() ? 128u : 0u) | (ShaderNativeF16Sdwa() ? 256u : 0u) |
 	       (ShaderRobustSpillLoads() ? 512u : 0u) | (ShaderBranchlessFormattedLoads() ? 1024u : 0u) |
 	       (ShaderExecBranches() ? 2048u : 0u) | (ShaderExecBranchMemory() ? 4096u : 0u) |
-	       (ShaderBdaLoadGroups() ? 8192u : 0u) | (ShaderExecBranchContinue() ? 16384u : 0u);
+	       (ShaderBdaLoadGroups() ? 8192u : 0u) | (ShaderExecBranchContinue() ? 16384u : 0u) |
+	       (ShaderF16LaneViews() ? 32768u : 0u);
 }
 [[nodiscard]] inline uint32_t ShaderNativeFp16Modes() {
 	return g_shader_native_fp16_modes.load(std::memory_order_relaxed);

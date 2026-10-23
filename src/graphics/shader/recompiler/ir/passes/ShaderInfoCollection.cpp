@@ -294,7 +294,10 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 	const auto shared_access = SharedAccessOf(op);
 	info.float64 |= inst.GetType() == Type::F64;
 	info.float16 |= op == ValueOpcode::FPAdd16x2 || op == ValueOpcode::FPMul16x2 ||
-	                op == ValueOpcode::FPFma16x2 || op == ValueOpcode::FPClamp16x2;
+	                op == ValueOpcode::FPFma16x2 || op == ValueOpcode::FPClamp16x2 ||
+	                op == ValueOpcode::F16LaneInsert || op == ValueOpcode::FPAdd16Low ||
+	                op == ValueOpcode::FPSub16Low || op == ValueOpcode::FPMul16Low ||
+	                op == ValueOpcode::FPFma16Low || op == ValueOpcode::F16x2Swizzle;
 	info.buffer_int64_atomics |= buffer_access == BufferAccess::Atomic &&
 	                             inst.GetType() == Type::U64;
 	if (buffer_access != BufferAccess::None || address_access != AddressAccess::None ||

@@ -86,6 +86,9 @@ enum Bit : uint64_t {
 	// KYTY_EXEC_BRANCH_CONTINUE (default on; with ExecBranches): runs in loop continue targets
 	// (loop bodies that branch back) too; part of shader keys.
 	ExecBranchContinue = uint64_t {1} << 50u,
+	// KYTY_F16_LANE_VIEWS (default on; with NativeFp16): scalar f16 ops read and write their
+	// 16-bit lanes as halves of an f16vec2 instead of masking them out of U32s; part of shader keys.
+	F16LaneViews = uint64_t {1} << 51u,
 };
 
 namespace Detail {

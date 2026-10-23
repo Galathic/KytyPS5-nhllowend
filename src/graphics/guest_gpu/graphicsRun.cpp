@@ -910,7 +910,7 @@ void GuestGpu::ExecutionThread() {
 		g_exec_op           = op_kind;
 		const bool long_ops   = g_long_op_ns != 0;
 		const auto long_start = long_ops ? Common::EventTrace::NowNs() : int64_t {0};
-		const auto long_before = long_ops ? LongOpCounters::Take() : LongOpCounters {};
+		const auto long_before = long_ops ? std::optional(LongOpCounters::Take()) : std::nullopt;
 		if (auto* slot = operation->dispatch_slot; slot != nullptr) {
 			if (slot->state.load(std::memory_order_acquire) != 2) {
 				const auto start = StageStats::Enabled() ? std::chrono::steady_clock::now()
@@ -972,7 +972,7 @@ void GuestGpu::ExecutionThread() {
 		if (long_ops) {
 			const auto long_end = Common::EventTrace::NowNs();
 			if (long_end - long_start >= g_long_op_ns) {
-				PrintLongOp(op_kind, long_start, long_resolved, long_end, long_before);
+				PrintLongOp(op_kind, long_start, long_resolved, long_end, *long_before);
 			}
 		}
 		if (traced) {

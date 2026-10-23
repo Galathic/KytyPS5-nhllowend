@@ -29,7 +29,14 @@ IR::U32 Translator::NativePackedF16Source(const Decoder::Operand& op) {
 	const auto raw = ReadRawU32(op);
 	const auto c16 = IR::U32(IR::Value(16u));
 	IR::U32    v   = raw;
-	if (!op.op_sel && op.op_sel_hi) {
+	if (ShaderF16LaneViews()) {
+		// Experiment F16LaneViews: the lanes op_sel/op_sel_hi pick, as an f16vec2 shuffle the host
+		// compiler folds into the packed instruction's own operand selects.
+		if (op.op_sel || !op.op_sel_hi) {
+			v = IR::U32(ir.Emit(IR::ValueOpcode::F16x2Swizzle,
+			                    {raw, IR::Value(op.op_sel ? 1u : 0u), IR::Value(op.op_sel_hi ? 1u : 0u)}));
+		}
+	} else if (!op.op_sel && op.op_sel_hi) {
 		v = raw;
 	} else if (op.op_sel && !op.op_sel_hi) {
 		v = ir.BitwiseOr(ir.ShiftLeftLogical(raw, c16), ir.ShiftRightLogical(raw, c16));
@@ -71,6 +78,11 @@ bool Translator::NativeScalarF16(const Decoder::Instruction& inst, IR::ValueOpco
 	for (const auto* s: srcs) {
 		if (s != nullptr && !NativeScalarF16Source(*s)) return false;
 	}
+	if (ShaderF16LaneViews()) {
+		NativeScalarF16Lanes(inst, native, negate_b, three, srcs);
+		fp16_native = true;
+		return true;
+	}
 	const auto lane = [&](const Decoder::Operand& op) { return Read16LaneBits(op, false); };
 	const auto a    = lane(*srcs[0]);
 	auto       b    = lane(*srcs[1]);
@@ -87,6 +99,48 @@ bool Translator::NativeScalarF16(const Decoder::Instruction& inst, IR::ValueOpco
 	Write16Bits(DestinationOperand(inst), result);
 	fp16_native = true;
 	return true;
+}
+
+// Experiment F16LaneViews: NativeScalarF16 with the source lanes as F16LaneExtract (plain register
+// halves; other sources as Read16LaneBits makes them), the FP*16Low form of the op, and the result
+// written into the destination half with F16LaneInsert when the other half is kept.
+void Translator::NativeScalarF16Lanes(const Decoder::Instruction& inst, IR::ValueOpcode native, bool subtract,
+                                      bool three, const Decoder::Operand* const* srcs) {
+	const auto lane = [&](const Decoder::Operand& op) {
+		if ((op.kind == Decoder::OperandKind::Vgpr || op.kind == Decoder::OperandKind::Sgpr) && !op.absolute &&
+		    !op.negate && !op.dpp && !op.dpp8 && (op.sdwa_sel == 4u || op.sdwa_sel == 5u || op.sdwa_sel == 6u)) {
+			const uint32_t index = op.sdwa_sel == 5u ? 1u : op.sdwa_sel == 4u ? 0u : op.op_sel ? 1u : 0u;
+			return IR::U32(ir.Emit(IR::ValueOpcode::F16LaneExtract, {ReadRawU32(op), IR::Value(index)}));
+		}
+		return Read16LaneBits(op, false);
+	};
+	IR::ValueOpcode opcode = IR::ValueOpcode::FPFma16Low;
+	switch (native) {
+		case IR::ValueOpcode::FPAdd16x2: opcode = subtract ? IR::ValueOpcode::FPSub16Low : IR::ValueOpcode::FPAdd16Low; break;
+		case IR::ValueOpcode::FPMul16x2: opcode = IR::ValueOpcode::FPMul16Low; break;
+		default: break;
+	}
+	const auto a = lane(*srcs[0]);
+	const auto b = lane(*srcs[1]);
+	auto       result = three ? IR::U32(ir.Emit(opcode, {a, b, lane(*srcs[2])})) : IR::U32(ir.Emit(opcode, {a, b}));
+	if (inst.dst.clamp) {
+		result = IR::U32(ir.Emit(IR::ValueOpcode::FPClamp16x2, {result}));
+	}
+	auto destination = DestinationOperand(inst);
+	if (!destination.explicit_sdwa_dst) {
+		if (destination.sdwa_sel == 6u) {
+			destination.sdwa_sel = 4u;
+		}
+		destination.sdwa_dst_unused = 2u;
+	}
+	if (destination.kind == Decoder::OperandKind::Vgpr && destination.sdwa_dst_unused == 2u &&
+	    (destination.sdwa_sel == 4u || destination.sdwa_sel == 5u)) {
+		const auto plain = PlainOperand(destination);
+		WriteRawU32(plain, IR::U32(ir.Emit(IR::ValueOpcode::F16LaneInsert,
+		                                   {ReadRawU32(plain), result, IR::Value(destination.sdwa_sel == 5u ? 1u : 0u)})));
+		return;
+	}
+	Write16Bits(DestinationOperand(inst), result);
 }
 
 void Translator::PackedFloat16(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
