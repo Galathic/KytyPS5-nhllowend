@@ -118,6 +118,7 @@ public:
 	int GetPortHandle(bool args_valid);
 	int ClosePort(int handle);
 	int CheckPortHandle(int handle);
+	[[nodiscard]] bool PadOpenArgsAreValid(int user_id, int type, int index) const;
 
 	void SetDevices(int active_id);
 	void Button(int id, uint32_t button, bool down);
@@ -145,7 +146,6 @@ private:
 	enum class PortState { Uninitialized, Closed, Open };
 
 	int CheckPortHandleLocked(int handle) const;
-	[[nodiscard]] bool PadOpenArgsAreValid(int user_id, int type, int index) const;
 
 	const int m_player;
 
@@ -1280,14 +1280,12 @@ void SetButton(int id, uint32_t button, bool down) {
 			}
 		}
 	}
-	}
 }
 
 void SetAxis(int id, Axis axis, int value) {
 	Common::LockGuard lock(g_router_mutex);
 	if (auto* player = PlayerForDevice(id)) {
 		player->Axis(id, axis, value);
-	}
 	}
 }
 
@@ -1296,7 +1294,6 @@ void SetRightStick(int id, int x, int y) {
 	if (auto* player = PlayerForDevice(id)) {
 		player->RightStick(id, x, y);
 	}
-	}
 }
 
 void SetTouchPad(int id, int finger, bool down, float x, float y) {
@@ -1304,14 +1301,12 @@ void SetTouchPad(int id, int finger, bool down, float x, float y) {
 	if (auto* player = PlayerForDevice(id)) {
 		player->TouchPad(id, finger, down, x, y);
 	}
-	}
 }
 
 void SetSensor(int id, Sensor sensor, const float* data, uint64_t time_us) {
 	Common::LockGuard lock(g_router_mutex);
 	if (auto* player = PlayerForDevice(id)) {
 		player->Motion(id, sensor, data, time_us);
-	}
 	}
 }
 
