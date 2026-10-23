@@ -52,6 +52,10 @@ bool IsPlayerControllerConnected(int player_index) {
 	}
 	return connected;
 }
+// The configured-guest-user path asks this; the test's guests are its controller slots.
+bool IsPlayerConnected(int player) {
+	return player >= 0 && player < PLAYER_SLOT_COUNT && g_connected[player];
+}
 bool PollPlayerConnectionEvent(int32_t* user_id, bool* connected) {
 	if (g_events.empty()) {
 		return false;

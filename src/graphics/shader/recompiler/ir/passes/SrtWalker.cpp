@@ -2552,6 +2552,9 @@ bool SrtWalker::RefreshDirectControlFlow(std::vector<uint32_t>& flat) {
 	visited.assign(blocks.size(), 0u);
 	pending.clear();
 	pending.push_back(0u);
+	// No settled reachability here: control Phis see every predecessor (not a stale set).
+	m_reachable_blocks = nullptr;
+	if (m_clean_evaluator != nullptr) m_clean_evaluator->m_reachable_blocks = nullptr;
 	auto& predicate = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
 	while (!pending.empty()) {
 		const auto index = pending.back();
@@ -3004,22 +3007,28 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	auto& visited = m_program.visited_blocks;
 	auto& reachable = m_program.reachable_blocks;
 	auto& pending = m_program.pending_blocks;
-	visited.assign(m_program.control_flow.size(), 1u);
-	ResetUnknowns();
-	m_reachable_blocks = &visited;
+	// Control Phis read only reachable predecessors, so their programs settle reachability
+	// first (a fixed point). The set stays in `reachable` while the walk below reuses
+	// `visited`; programs without control Phis leave reachability to that walk alone.
+	const bool control_phis = !m_program.control_phi_predecessors.empty();
+	m_reachable_blocks = control_phis ? &reachable : nullptr;
 	if (m_clean_evaluator != nullptr) {
-		m_clean_evaluator->ResetUnknowns();
-		m_clean_evaluator->m_reachable_blocks = &visited;
+		m_clean_evaluator->m_reachable_blocks = m_reachable_blocks;
 	}
-	for (;;) {
-		reachable.assign(m_program.control_flow.size(), 0u);
+	if (control_phis) {
+		reachable.assign(m_program.control_flow.size(), 1u);
+		ResetUnknowns();
+		if (m_clean_evaluator != nullptr) m_clean_evaluator->ResetUnknowns();
+	}
+	for (; control_phis;) {
+		visited.assign(m_program.control_flow.size(), 0u);
 		pending.clear();
 		pending.push_back(0u);
 		while (!pending.empty()) {
 			const auto index = pending.back();
 			pending.pop_back();
-			if (reachable.at(index)) continue;
-			reachable[index] = 1u;
+			if (visited.at(index)) continue;
+			visited[index] = 1u;
 			const auto& block = m_program.control_flow[index];
 			uint32_t condition = 0;
 			auto& predicate = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
@@ -3031,9 +3040,8 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 				pending.insert(pending.end(), block.successors.begin(), block.successors.end());
 			}
 		}
-		if (reachable == visited) break;
-		visited.swap(reachable);
-		if (m_program.control_phi_predecessors.empty()) break;
+		if (visited == reachable) break;
+		reachable.swap(visited);
 		// Only unknown values need another evaluation: successful Phi facts remain
 		// true as their possible predecessors shrink. Keep uniform-read memos stable.
 		ResetUnknowns();

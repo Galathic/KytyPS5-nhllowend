@@ -2311,10 +2311,6 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 				StreamGuestData(mapped, vaddr, size);
 			} else {
 				std::memcpy(mapped, reinterpret_cast<const void*>(vaddr), size);
-			if (!LibKernel::Memory::CopySparseMemory(vaddr, mapped, size)) {
-				EXIT("BufferCache: failed to read sparse guest buffer memory\n");
-
-			}
 			}
 			m_stream_buffer.Commit();
 			if (bon) bs.ob_stream.fetch_add(1, std::memory_order_relaxed);
@@ -2387,9 +2383,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 				}
 			}
 		}
-		m_gpu_modified_ranges.Add(vaddr, size);
 		ForgetColorMetadataChecks(vaddr, size);
-
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }

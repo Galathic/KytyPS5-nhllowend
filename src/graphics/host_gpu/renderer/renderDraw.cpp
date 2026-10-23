@@ -1614,10 +1614,6 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, bool shaders_
 		}
 		ResolveRenderDepthTarget(buffer, state.depth_info);
 	}
-	if (draw.IsIndexed()) {
-		LogDrawPhase(draw.Name(), "ResolveRenderDepthTarget");
-	}
-	ResolveRenderDepthTarget(buffer, state.depth_info);
 	// TODO(PPSA09243): Vulkan passes take one sample count. Where PS5 attachments mix counts,
 	// keep those matching the raster count instead of resolving multisampled shadows.
 	const auto colors       = std::span {state.color_info, state.color_count};
@@ -1909,14 +1905,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
 	}
-	std::pair<Buffer*, uint64_t> args_buffer {};
-	if (emit.indirect.address != 0) {
-		const auto size = static_cast<uint64_t>(emit.indirect.count - 1) * emit.indirect.stride +
-		                  (draw.IsIndexed() ? sizeof(vk::DrawIndexedIndirectCommand)
-		                                    : sizeof(vk::DrawIndirectCommand));
-		args_buffer = m_context.GetBufferCache().ObtainBuffer(emit.indirect.address, size, false);
-		EXIT_IF((args_buffer.second & 3u) != 0);
-	}
+	// Upstream's DrawIndirectArgs records are never produced here: indirect draws take
+	// emit.indirect_stage (NativeIndirectDraw).
+	EXIT_IF(emit.indirect.address != 0);
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
 	}
@@ -2014,10 +2005,6 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                            vk::ShaderStageFlagBits::eFragment,
 		                        0, sizeof(draw_data), draw_data);
 	} else {
-	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
-	if (!mesh_active) {
-	}
-
 		CommitIndexBuffer(vk_buffer, index_binding);
 	}
 	vcommit2_timer.reset();

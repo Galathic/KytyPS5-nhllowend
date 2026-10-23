@@ -402,24 +402,11 @@ void TextureCache::DeleteImage(ImageId id) {
 	if (image == nullptr || !image->registered) {
 		return;
 	}
-	// Only depth images ever get stencil planes: the scan of every image for them was 1% of the
-	// execution thread in play (images are replaced all the time).
-	if (!image->depth_id && image->stencil_associated) {
-		std::vector<ImageId> associations;
-		m_slot_images.ForEach([&](ImageId candidate, const Image& associated) {
-			if (associated.depth_id == id) {
-				associations.push_back(candidate);
-			}
-		});
-		for (const auto association: associations) {
 	if (image->depth_id) {
 		std::erase(m_slot_images[image->depth_id].stencil_ids, id);
-	} else {
+	} else if (image->stencil_associated) {
 		// Detach first: deleting each association also unlinks it from its depth owner.
 		for (const auto association: std::exchange(image->stencil_ids, {})) {
-	}
-	}
-
 			FreeImage(association);
 		}
 	}
@@ -1467,7 +1454,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		std::scoped_lock lock {m_lock};
 		auto& image         = m_slot_images[id];
 		image.info.metadata = desc.info.metadata;
-		// Native color metadata must not retain a reused HTile clear flag.
+		// Native color metadata must not retain a reused HTile/CMask/FMask clear flag.
 		m_surface_metas.erase(range.address);
 		if (range.size == 0 || desc.info.resources.levels != 1) {
 			return;
@@ -1488,10 +1475,9 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	if (first >= layers || count > layers - first) {
 		EXIT("TextureCache: color view exceeds its native metadata slices\n");
 	}
-	const auto       slice_size = range.size / layers;
-	const GuestRange viewed {range.address + slice_size * first, slice_size * count};
 	// Only the selected slices are inspected below. Synchronize actual dirty bytes in that
 	// interval, rather than other layers or unrelated GPU-owned bytes on tracked pages.
+	const auto slice_size = range.size / layers;
 	const auto selected_address = range.address + slice_size * first;
 	const auto selected_size = slice_size * count;
 	// KYTY_PERF_NO_SYNC_READBACK: when the GPU wrote these slices with a uniform dword fill that
@@ -1547,77 +1533,6 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		}
 		m_buffer_cache.ReadMemory(selected_address, selected_size, false,
 		                          BufferCache::ReadCaller::ColorClear);
-	if (m_buffer_cache.IsRegionGpuModified(viewed.address, viewed.size)) {
-		std::array<vk::ClearAttachment, TileManager::ColorClearSlots> clears {};
-		uint32_t keys = 0;
-		for (uint32_t key = 0; key < clears.size(); key++) {
-			clears[key].aspectMask = vk::ImageAspectFlagBits::eColor;
-			if (DecodeColorClear(desc, static_cast<uint8_t>(key << 5u),
-			                     clears[key].clearValue.color)) {
-				keys |= 1u << key;
-			}
-		}
-		// No selected key to clear, or none left since the last check.
-		if (m_buffer_cache.IsColorMetadataChecked(viewed.address, viewed.size, keys)) {
-			return;
-		}
-		{
-			std::scoped_lock lock {m_lock};
-			auto&            image = m_slot_images[id];
-			// Compressed images cannot upload, so they must already hold native contents.
-			const bool native_current = (image.usage.render_target || image.IsGpuModified()) &&
-			                            !image.IsBufferModified() && !image.IsCpuDirty();
-			// 2D-array attachment views select 2D layers or, of a volume, depth slices.
-			if (m_graphics.conditional_rendering_enabled &&
-			    image.backing.image_type != vk::ImageType::e1D &&
-			    count <= m_graphics.GetPhysicalDeviceProperties().limits.maxFramebufferLayers &&
-			    (image.backing.usage & vk::ImageUsageFlagBits::eColorAttachment) &&
-			    (m_graphics.GetFormatProperties(view.format).optimalTilingFeatures &
-			     vk::FormatFeatureFlagBits::eColorAttachment) &&
-			    (desc.info.metadata.compression == VideoOutCompression::Uncompressed ||
-			     native_current)) {
-				// The GPU selects each slice's clear, so the CPU never waits for the metadata.
-				Common::DebugCounters::Add(Common::DebugCounters::Counter::ColorMetadataChecks);
-				InitializeImage(id);
-				const bool expand = desc.type != BindingType::VideoOut;
-				const auto [buffer, offset] =
-				    m_buffer_cache.ObtainBuffer(viewed.address, viewed.size, expand);
-				const auto predicates = m_tiler.CheckColorClear(
-				    {buffer->Handle(), offset, viewed.size}, count, keys, expand);
-				if (expand) {
-					m_buffer_cache.MarkColorMetadataChecked(viewed.address, viewed.size, keys);
-				}
-				const auto command = m_scheduler.Current().Handle();
-				const auto area    = BeginColorRendering(image, view.format, view.base_level,
-				                                         image_first, count, nullptr, command);
-				vk::ClearRect rect {.rect = area, .layerCount = 1};
-				for (uint32_t slice = 0; slice < count; slice++) {
-					rect.baseArrayLayer = slice;
-					for (uint32_t key = 0; key < clears.size(); key++) {
-						if ((keys & (1u << key)) != 0) {
-							const vk::ConditionalRenderingBeginInfoEXT predicate {
-							    .buffer = predicates,
-							    .offset = (slice * clears.size() + key) * sizeof(uint32_t)};
-							command.beginConditionalRenderingEXT(&predicate);
-							command.clearAttachments(1, &clears[key], 1, &rect);
-							command.endConditionalRenderingEXT();
-						}
-					}
-				}
-				command.endRendering();
-				CommitGpuWrite(image);
-				return;
-			}
-		}
-		// Finish native metadata writes before reading backing bytes. This can submit the
-		// scheduler, so discovery runs before final draw uploads and never holds the texture
-		// lock across it.
-		Common::DebugCounters::ScopedTimer timer(
-		    Common::DebugCounters::Counter::ColorMetadataReadbacks,
-		    Common::DebugCounters::Counter::ColorMetadataReadbackNs);
-		m_buffer_cache.ReadMemory(viewed.address, viewed.size, false);
-
-	}
 	}
 	for (uint32_t slice = 0; slice < count; slice++) {
 		const auto address = range.address + slice_size * (first + slice);

@@ -89,16 +89,13 @@ static KYTY_SYSV_ABI int UserServiceGetEvent(SceUserServiceEvent* event) {
 	EXIT_NOT_IMPLEMENTED(event == nullptr);
 
 	// Player one logs in once; secondary players follow in the order their controllers changed.
-	static bool logged_in[Config::MAX_PLAYERS] = {};
+	static bool logged_in = false;
 
-	for (int player = 0; player < Config::MAX_PLAYERS; player++) {
-		const bool connected = IsPlayerLoggedIn(player);
-		if (connected != logged_in[player]) {
-			logged_in[player] = connected;
-			event->event_type = connected ? UserServiceEventTypeLogin : UserServiceEventTypeLogout;
-			event->user_id    = Config::GetPlayerUserId(player);
-			return OK;
-		}
+	if (!logged_in) {
+		logged_in         = true;
+		event->event_type = UserServiceEventTypeLogin;
+		event->user_id    = Config::GetUserId();
+		return OK;
 	}
 
 	int32_t user_id   = 0;

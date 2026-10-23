@@ -1819,13 +1819,6 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	} else {
 		NoteGuestWrite(sequence, reinterpret_cast<uint64_t>(dst),
 		               uint64_t {dw_num} * sizeof(uint32_t), src);
-	// Completion labels can be reused immediately; memcpy may write a destination twice.
-	auto* output = static_cast<volatile uint32_t*>(dst);
-	for (uint32_t i = 0; i < dw_num; i++) {
-		*output = src[i];
-		output += !write_one_address;
-
-	}
 	}
 }
 
@@ -2177,13 +2170,11 @@ void GuestGpu::ThreadRun(void* data) {
 					} else {
 						Common::Timeline::Mark("gpu-blocked");
 						StageStats::CpStateScope state(StageStats::CpState::Blocked);
-						gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+						// A wake that came before this wait must not be lost.
+						if (!std::exchange(gpu->m_wake_pending, false)) {
+							gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+						}
 						Common::Timeline::Mark("gpu-unblocked");
-					// A wake that came before this wait must not be lost.
-					if (!std::exchange(gpu->m_wake_pending, false)) {
-						gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
-
-					}
 					}
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {

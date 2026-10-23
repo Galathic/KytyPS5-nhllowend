@@ -179,10 +179,7 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 				m_buffer_cache.MarkCpuDirtyAhead(next, kAheadBytes);
 			}
 		}
-		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
-		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_image_heap.InvalidateMemory(fault_vaddr, fault_size);
-
 	} else {
 		FrameBreakdown::FaultTimer t(FrameBreakdown::g_fault_cost.rd_readmem_ns);
 		if (GuestGpu::IsGpuThread()) {
