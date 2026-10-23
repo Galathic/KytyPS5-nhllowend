@@ -135,6 +135,13 @@ inline void NoteFixApplied() {
 }
 
 } // namespace InstanceZeroDiag
+// Nonzero address: the GPU reads count Vulkan indirect draw records, stride bytes apart.
+struct DrawIndirectArgs {
+	uint64_t address = 0;
+	uint32_t count   = 0;
+	uint32_t stride  = 0;
+};
+
 
 struct DrawIndexArgs {
 	uint32_t         index_count                = 0;
@@ -148,6 +155,8 @@ struct DrawIndexArgs {
 	// Diagnostics only: see InstanceZeroDiag.
 	uint8_t  instance_source     = InstanceZeroDiag::kSourceExplicit;
 	uint64_t instance_args_addr  = 0;
+	// With indirect records, index_count is INDEX_BUFFER_SIZE.
+	DrawIndirectArgs indirect;
 };
 
 class Buffer;
@@ -171,6 +180,7 @@ struct NativeIndirectDraw {
 	[[nodiscard]] uint64_t ArgsSize() const {
 		return static_cast<uint64_t>(max_count - 1u) * stride + RecordSize();
 	}
+
 };
 
 struct DrawAutoArgs {
@@ -183,6 +193,8 @@ struct DrawAutoArgs {
 	// Diagnostics only: see InstanceZeroDiag.
 	uint8_t  instance_source    = InstanceZeroDiag::kSourceExplicit;
 	uint64_t instance_args_addr = 0;
+	DrawIndirectArgs indirect;
+
 };
 
 struct SubmitInfo {
@@ -327,11 +339,15 @@ public:
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
 	                    const PipelineCache::Pipeline&     pipeline,
 	                    std::span<PreparedBindings* const> bindings);
+	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
+	                                            const ShaderRecompiler::IR::DescriptorValue& value);
 
 private:
-	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
-	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
+	// False, with nothing drawn, when the draw's indirect records need CPU counts.
+	bool DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
+	bool DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
 	bool DrawAutoIndirect(uint64_t submit_id, CommandBuffer& buffer, NativeIndirectDraw& source);
+
 
 	struct GraphicsBindings {
 		std::array<PreparedBindings, 3> vertex;
@@ -420,6 +436,7 @@ private:
 	ResolveTableTexture(const ShaderRecompiler::IR::ImageResource&   root,
 	                    const ShaderRecompiler::IR::DescriptorValue& value,
 	                    GuestRange*                                  examined = nullptr);
+
 	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
 	                             std::span<RenderColorInfo> colors);
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
@@ -468,14 +485,16 @@ private:
 	                                                        uint32_t render_target_slice_offset);
 	[[nodiscard]] bool        ResolveColorTargets(CommandBuffer& buffer,
 	                                              uint32_t render_target_slice_offset);
+	[[nodiscard]] bool        ConsumeMetadataColorOperation(CommandBuffer& buffer,
+	                                                       uint32_t render_target_slice_offset);
 	void                      BindImage(ImageId id, bool storage);
 	void                      BindRenderTarget(ImageId id);
 	void                      ResetBindings();
 	[[nodiscard]] bool        TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
 	                                                     const CommandBuffer&          buffer);
-	[[nodiscard]] bool TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
-	                                              CommandBuffer& command, uint32_t group_x,
-	                                              uint32_t group_y, uint32_t group_z, uint32_t mode);
+	[[nodiscard]] bool TryConsumeComputeFill(const ShaderComputeInputInfo& input,
+	                                        CommandBuffer& command, uint32_t group_x,
+	                                        uint32_t group_y, uint32_t group_z, uint32_t mode);
 
 	RenderContext&                        m_context;
 	GraphicsBindings                     m_graphics_bindings;

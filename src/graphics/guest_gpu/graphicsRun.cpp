@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/renderer/bindEpoch.h"
 
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/experiments.h"
 #include "common/logging/log.h"
@@ -46,6 +47,7 @@
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
+
 #include <utility>
 #include <vector>
 
@@ -145,6 +147,7 @@ static void CopyFromGuest(void* destination, const volatile void* source, size_t
 	}
 }
 
+
 static bool GraphicsRunDebugDumpEnabled() {
 	return Config::GraphicsDebugDumpEnabled() &&
 	       Config::GetPrintfDirection() != Config::LogDirection::Silent;
@@ -218,6 +221,12 @@ void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command) {
 	m_commands.push_back(std::move(command));
 	m_pending_commands.fetch_add(1, std::memory_order_release);
 	m_work_epoch.fetch_add(1, std::memory_order_release);
+	m_work_available.Signal();
+}
+
+void GuestGpu::Wake() {
+	Common::LockGuard lock(m_queue_mutex);
+	m_wake_pending = true;
 	m_work_available.Signal();
 }
 
@@ -1198,6 +1207,9 @@ void CommandProcessor::Reset() {
 	m_num_instances.value              = 1;
 	m_num_instances.sequence++;
 	m_pending_shader_offsets.clear();
+	m_num_instances                    = 1;
+	m_num_instances_addr               = 0;
+
 	m_predicate_skip                   = false;
 	m_user_data_marker                 = HW::UserSgprType::Unknown;
 	m_draw_indirect_args_base_addr     = 0;
@@ -1807,6 +1819,13 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	} else {
 		NoteGuestWrite(sequence, reinterpret_cast<uint64_t>(dst),
 		               uint64_t {dw_num} * sizeof(uint32_t), src);
+	// Completion labels can be reused immediately; memcpy may write a destination twice.
+	auto* output = static_cast<volatile uint32_t*>(dst);
+	for (uint32_t i = 0; i < dw_num; i++) {
+		*output = src[i];
+		output += !write_one_address;
+
+	}
 	}
 }
 
@@ -2160,6 +2179,11 @@ void GuestGpu::ThreadRun(void* data) {
 						StageStats::CpStateScope state(StageStats::CpState::Blocked);
 						gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
 						Common::Timeline::Mark("gpu-unblocked");
+					// A wake that came before this wait must not be lost.
+					if (!std::exchange(gpu->m_wake_pending, false)) {
+						gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+
+					}
 					}
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {
@@ -2572,6 +2596,11 @@ bool GuestGpu::Process(Submission& submission) {
 				}, true);
 			});
 			cp.BufferFlush(CommandProcessor::FlushSite::Suspend);
+			m_renderer.RunGarbageCollector();
+			m_renderer.GetCommandScheduler().DeferPriorityOperation(
+			    [ready = m_suspend_point_ready] { ready->release(); });
+			cp.BufferFlush();
+
 			cp.Reset();
 			break;
 	}
@@ -2922,6 +2951,17 @@ uint32_t CommandProcessor::ResolveNumInstances(const GpuOperation& operation) {
 		return m_indirect_instances;
 	}
 	return operation.num_instances.value;
+	m_num_instances      = num_instances;
+	m_num_instances_addr = 0;
+}
+
+uint32_t CommandProcessor::NumInstances() {
+	if (m_num_instances_addr != 0) {
+		m_num_instances      = *reinterpret_cast<const uint32_t*>(m_num_instances_addr);
+		m_num_instances_addr = 0;
+	}
+	return m_num_instances;
+
 }
 
 void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t wait_op,
@@ -3038,12 +3078,17 @@ void CommandProcessor::ExecuteDrawIndex(const GpuOperation& operation, DrawIndex
 	if (GraphicsRunDebugDumpEnabled() && (args.base_vertex != 0 || args.first_instance != 0)) {
 		LOGF("\t draw indexed offsets: base_vertex = %" PRId32 ", first_instance = %" PRIu32 "\n",
 		     args.base_vertex, args.first_instance);
+		args.instance_count = NumInstances();
+
 	}
 	m_renderer.GetRenderExecutor().DrawIndex(operation.submit_id, CurrentBuffer(), args);
 }
 
 void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_count) {
 	++g_work_items;
+const void* CommandProcessor::IndexAddress(uint32_t first_index) const {
+	}
+
 	uint64_t index_size = 0;
 	switch (m_index_type_and_size) {
 		case 0: index_size = 2; break;
@@ -3051,11 +3096,11 @@ void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_cou
 		case 2: index_size = 1; break;
 		default: EXIT("unknown index_type_and_size: %u\n", m_index_type_and_size);
 	}
+	return reinterpret_cast<const void*>(m_index_base_addr + first_index * index_size);
+}
 
-	auto* index_addr = reinterpret_cast<const void*>(
-	    m_index_base_addr + static_cast<uint64_t>(index_offset) * index_size);
-
-	DrawIndex({.index_count = index_count, .index_addr = index_addr});
+void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_count) {
+	DrawIndex({.index_count = index_count, .index_addr = IndexAddress(index_offset)});
 }
 
 // Writes indirect draw offsets to the live SH registers (KYTY_NATIVE_INDIRECT write-back).
@@ -3113,7 +3158,10 @@ void CommandProcessor::ResolveNativeShaderRegisters() {
 void CommandProcessor::DrawIndirect(uint32_t data_offset, IndirectDrawRegisters registers,
                                     uint32_t draw_initiator, bool indexed) {
 	++g_work_items;
-	const auto args_size = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
+	const auto args_size_stage = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
+	const auto args_size =
+	    indexed ? sizeof(vk::DrawIndexedIndirectCommand) : sizeof(vk::DrawIndirectCommand);
+
 	DrawIndirectMulti(data_offset, 1, nullptr, args_size, registers, draw_initiator, indexed);
 }
 
@@ -3124,6 +3172,10 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	++g_work_items;
 	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != (indexed ? 0u : 2u));
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
+	// The guest records match Vulkan's indirect commands byte for byte.
+	EXIT_NOT_IMPLEMENTED((stride_in_bytes & 3u) != 0 ||
+	                     stride_in_bytes < (indexed ? sizeof(vk::DrawIndexedIndirectCommand)
+	                                                : sizeof(vk::DrawIndirectCommand)));
 
 	// Report packet shapes without reading GPU-written argument or count memory.
 	// These SH destinations determine which shader inputs must become GPU draw parameters.
@@ -3327,17 +3379,23 @@ void CommandProcessor::ExecuteDrawIndirect(const GpuOperation& operation) {
 	}
 	ResolveNativeShaderRegisters();
 
-	uint32_t draw_count = indirect.max_count;
+	uint32_t draw_count_stage = indirect.max_count;
 	if (indirect.count_addr != nullptr) {
-		draw_count = PeekGuest(indirect.count_addr);
-		if (draw_count > indirect.max_count) {
-			draw_count = indirect.max_count;
+		draw_count_stage = PeekGuest(indirect.count_addr);
+		if (draw_count_stage > indirect.max_count) {
+			draw_count_stage = indirect.max_count;
 		}
 	}
+	const auto draw_count = count_addr == nullptr
+	                            ? max_count_or_count
+	                            : std::min(uint32_t {*count_addr}, max_count_or_count);
+
 	if (draw_count == 0) {
 		return;
 	}
 	m_pending_instances.clear();
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::IndirectDraws, draw_count);
+
 
 	const auto args_size =
 	    indirect.indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
@@ -3351,8 +3409,28 @@ void CommandProcessor::ExecuteDrawIndirect(const GpuOperation& operation) {
 			case 2: index_size = 1; break;
 			default: EXIT("unknown index_type_and_size: %u\n", indirect.index_type);
 		}
+	auto&      executor  = m_renderer.GetRenderExecutor();
+	const auto args_addr = m_draw_indirect_args_base_addr + data_offset;
+	// NUM_INSTANCES keeps the last draw's instance count.
+	m_num_instances_addr = args_addr + static_cast<uint64_t>(draw_count - 1) * stride_in_bytes +
+	                       offsetof(vk::DrawIndirectCommand, instanceCount);
+	// With no SGPRs to patch, the GPU reads the records if the shaders allow. Shaders apply
+	// the records' offsets only through those SGPRs; Vulkan applies them, which matches
+	// while they are zero.
+	const DrawIndirectArgs records {args_addr, draw_count, stride_in_bytes};
+	if (registers.vertex_offset == Pm4::SH_NOP && registers.instance_offset == Pm4::SH_NOP &&
+	    registers.index_offset == Pm4::SH_NOP && (!indexed || m_index_buffer_size != 0) &&
+	    (indexed ? executor.DrawIndex(m_submit_id, CurrentBuffer(),
+	                                  {.index_count         = m_index_buffer_size,
+	                                   .index_addr          = IndexAddress(0),
+	                                   .index_type_and_size = m_index_type_and_size,
+	                                   .indirect            = records})
+	             : executor.DrawAuto(m_submit_id, CurrentBuffer(), {.indirect = records}))) {
+		return;
+
 	}
 
+	const uint32_t max_indices = m_index_buffer_size != 0 ? m_index_buffer_size : UINT32_MAX;
 	for (uint32_t i = 0; i < draw_count; i++) {
 		const auto* args_addr = reinterpret_cast<const void*>(
 		    indirect.args_base + indirect.data_offset + static_cast<uint64_t>(i) * indirect.stride);
@@ -3370,6 +3448,17 @@ void CommandProcessor::ExecuteDrawIndirect(const GpuOperation& operation) {
 			                            .first_vertex   = args.start_vertex_location,
 			                            .first_instance = args.start_instance_location,
 			                            .offset_source  = DrawOffsetSource::IndirectArgs});
+		const auto addr = args_addr + static_cast<uint64_t>(i) * stride_in_bytes;
+		if (!indexed) {
+			const auto& args = *reinterpret_cast<const vk::DrawIndirectCommand*>(addr);
+			PatchIndirectDrawOffsets(*this, registers, args.firstVertex, args.firstInstance, 0);
+			executor.DrawAuto(m_submit_id, CurrentBuffer(),
+			                  {.vertex_count   = args.vertexCount,
+			                   .instance_count = args.instanceCount,
+			                   .first_vertex   = args.firstVertex,
+			                   .first_instance = args.firstInstance,
+			                   .offset_source  = DrawOffsetSource::IndirectArgs});
+
 			continue;
 		}
 
@@ -3404,6 +3493,19 @@ void CommandProcessor::ExecuteDrawIndirect(const GpuOperation& operation) {
 		                             .base_vertex    = static_cast<int32_t>(args.base_vertex_location),
 		                             .first_instance = args.start_instance_location,
 		                             .offset_source  = DrawOffsetSource::IndirectArgs});
+	}
+		const auto& args = *reinterpret_cast<const vk::DrawIndexedIndirectCommand*>(addr);
+		PatchIndirectDrawOffsets(*this, registers, static_cast<uint32_t>(args.vertexOffset),
+		                         args.firstInstance, args.firstIndex);
+		executor.DrawIndex(m_submit_id, CurrentBuffer(),
+		                   {.index_count         = std::min(args.indexCount, max_indices),
+		                    .index_addr          = IndexAddress(args.firstIndex),
+		                    .instance_count      = args.instanceCount,
+		                    .index_type_and_size = m_index_type_and_size,
+		                    .base_vertex         = args.vertexOffset,
+		                    .first_instance      = args.firstInstance,
+		                    .offset_source       = DrawOffsetSource::IndirectArgs});
+
 	}
 }
 
@@ -3487,6 +3589,8 @@ void CommandProcessor::ExecuteDrawAuto(const GpuOperation& operation, DrawAutoAr
 		args.instance_source    = from_pending ? InstanceZeroDiag::kSourcePending
 		                                       : InstanceZeroDiag::kSourcePersist;
 		args.instance_args_addr = m_last_instance_args_addr;
+		args.instance_count = NumInstances();
+
 	}
 	m_renderer.GetRenderExecutor().DrawAuto(operation.submit_id, CurrentBuffer(), args);
 }
@@ -3497,6 +3601,12 @@ void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_
 		m_renderer.GetVideoOut().WaitFlipDone(static_cast<int>(video_out_handle),
 		                                      static_cast<int>(display_buffer_index));
 	}, GpuCallbackTag::FlipWait);
+	// Stall only this command processor, not the host command lane or other queues.
+	if (!m_renderer.GetVideoOut().IsSafeForRendering(static_cast<int>(video_out_handle),
+	                                                 static_cast<int>(display_buffer_index))) {
+		SuspendPm4();
+	}
+
 }
 
 template <typename T>
@@ -3830,6 +3940,7 @@ void CommandProcessor::ExecuteGlobalBarrier() {
 	CurrentBuffer().Handle().pipelineBarrier2(dependency);
 }
 
+
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {
 	EmitCallback([this, interrupt_context_id] { DeferEopInterrupt(interrupt_context_id); },
 	             GpuCallbackTag::Eop);
@@ -3882,12 +3993,18 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 void CommandProcessor::ExecuteTriggerEvent(uint32_t event_type, uint32_t event_index,
                                            uint64_t event_address) {
 	const auto valid_cache_event_index = event_index == 0x00000000 || event_index == 0x00000007;
+	// Partial flushes and cache writebacks only order GPU work, which the renderer's resource
+	// barriers already order.
 	switch (event_type) {
 		// CsPartialFlush, GsPartialFlush, PsPartialFlush.
 		case 0x00000007:
 		case 0x0000000f:
 		case 0x00000010: ExecuteGlobalBarrier(); break;
 		// CbDbDataWritebackInvalidate, CbDataWritebackInvalidate.
+		case 0x00000010: break;
+		// CbDbDataWritebackInvalidate, CbDataWritebackInvalidate, DbDataWritebackInvalidate,
+		// DbMetadataWritebackInvalidate, CbMetadataWritebackInvalidate.
+
 		case 0x00000016:
 		case 0x00000031:
 			if (!valid_cache_event_index) {
@@ -3897,6 +4014,7 @@ void CommandProcessor::ExecuteTriggerEvent(uint32_t event_type, uint32_t event_i
 			ExecuteGlobalBarrier();
 			break;
 		// DbDataWritebackInvalidate, DbMetadataWritebackInvalidate, CbMetadataWritebackInvalidate.
+
 		case 0x0000002a:
 		case 0x0000002c:
 		case 0x0000002e:
@@ -3905,6 +4023,7 @@ void CommandProcessor::ExecuteTriggerEvent(uint32_t event_type, uint32_t event_i
 				     event_index);
 			}
 			ExecuteGlobalBarrier();
+
 			break;
 		case 0x0000000d:
 		case 0x0000000e:
@@ -4114,6 +4233,7 @@ void NoteCpRead(const char* kind, uint64_t address, const uint32_t* pairs, uint3
 	const auto now = std::chrono::steady_clock::now();
 	if (now - last < std::chrono::seconds(2)) {
 		return;
+	}
 	}
 	last = now;
 	std::vector<const Stat*> sorted;

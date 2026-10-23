@@ -82,6 +82,7 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	                    Common::Experiments::Enabled(Common::Experiments::PooledBdaBuffers);
 	const VmaAllocationCreateFlags bda_flag =
 	    with_bda && !pooled ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
+
 	VmaAllocationCreateInfo allocation_info {};
 	// Experiment DirectGpuReads: game buffers go to CPU-visible video memory when the driver offers
 	// it (Resizable BAR), so finished GPU results can be read without a GPU copy. Otherwise VMA
@@ -93,6 +94,7 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	        : 0;
 	allocation_info.flags =
 	    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag | AllocationFlags(usage) | host_flags;
+
 	allocation_info.usage = AllocationUsage(usage);
 	allocation_info.preferredFlags = usage == MemoryUsage::DeviceLocal
 	                                     ? VkMemoryPropertyFlags {}

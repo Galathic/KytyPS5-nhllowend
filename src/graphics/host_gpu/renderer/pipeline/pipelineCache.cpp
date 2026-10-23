@@ -3,6 +3,7 @@
 #include "graphics/host_gpu/pageWriteSeq.h"
 
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/experiments.h"
 #include "common/file.h"
@@ -10,6 +11,7 @@
 #include "common/profiler.h"
 #include "common/runtimeFlags.h"
 #include "common/threads.h"
+#include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
@@ -28,7 +30,6 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvHalfLanes.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
-#include "kytyGitVersion.h"
 #include "loader/systemContent.h"
 
 #include <algorithm>
@@ -38,6 +39,7 @@
 #include <cctype>
 #include <chrono>
 #include <condition_variable>
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -59,6 +61,8 @@
 namespace Libs::Graphics {
 
 namespace {
+
+constexpr auto DriverCacheSaveInterval = std::chrono::minutes {5};
 
 uint8_t RemapSourceAlphaFactor(uint8_t factor) {
 	switch (static_cast<Prospero::BlendFactor>(factor)) {
@@ -103,6 +107,10 @@ std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties)
 	// data from another emulator build is safe to reuse.
 	return fmt::format("KytyPC2:{:08x}:{:08x}:{:08x}:{}\n", properties.vendorID,
 	                   properties.deviceID, properties.driverVersion, uuid);
+	// Driver cache entries already distinguish shader code and pipeline state across builds.
+	return fmt::format("KytyPC2:{:08x}:{:08x}:{:08x}:{}\n",
+	                   properties.vendorID, properties.deviceID, properties.driverVersion, uuid);
+
 }
 
 std::string PipelineCacheTitleId() {
@@ -726,7 +734,7 @@ void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
 }
 
 bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
-                         const std::vector<uint32_t>& spirv) {
+                         const std::vector<uint32_t>& spirv, bool maintenance8_enabled) {
 	if (!Config::ShaderValidationEnabled()) {
 		return true;
 	}
@@ -738,7 +746,9 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 		                        static_cast<int>(position.column), static_cast<int>(position.index),
 		                        message);
 	});
-	if (tools.Validate(spirv)) {
+	spvtools::ValidatorOptions validator_options;
+	validator_options.SetAllowOffsetTextureOperand(maintenance8_enabled);
+	if (tools.Validate(spirv.data(), spirv.size(), validator_options)) {
 		return true;
 	}
 	spvtools::SpirvTools disassembler(SPV_ENV_VULKAN_1_2);
@@ -869,6 +879,9 @@ struct PipelineCache::ProgramCache {
 		PlanGuard(const PlanGuard&)            = delete;
 		PlanGuard& operator=(const PlanGuard&) = delete;
 		SourceEntry& source;
+		std::vector<Permutation>                    permutations;
+		bool                                       skip_dispatch = false;
+
 	};
 
 	struct ProgramKeyHash {
@@ -898,6 +911,10 @@ struct PipelineCache::ProgramCache {
 		// KYTY_PERF_STATS: shader permutation compile time (SPIR-V generation and module creation).
 		FrameBreakdown::Timer compile_timer(FrameBreakdown::g_counters.compile_ns);
 		FrameBreakdown::Add(FrameBreakdown::g_counters.compile_count);
+		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::ShadersCompiled,
+		                                         Common::DebugCounters::Counter::ShaderCompileNs,
+		                                         Common::DebugCounters::Peak::ShaderCompileNs);
+
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
 		if (ShaderRecompiler::Spirv::HalfVectorEnabled()) {
@@ -933,6 +950,10 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv)) {
+		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv,
+		                         options.profile->maintenance8)) {
+	}
+
 			DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 			EXIT("%s failed hash=0x%016" PRIx64 ": SPIR-V validation failed\n", options.dump_label,
 			     options.shader_hash);
@@ -951,7 +972,7 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 
-		const auto module = CompileSPV(result.spirv, device);
+		const auto module = CompileSPV(result.spirv, graphics.device);
 		EXIT_IF(module == nullptr);
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
@@ -1319,9 +1340,12 @@ struct PipelineCache::ProgramCache {
 		                                       ? PeekShaderCleanSpan : ReadShaderNativeSpan) : nullptr,
 		    .try_read_specialization_span = runtime_flags.srt_scalar_batch
 		                                        ? PeekShaderCleanSpan : nullptr,
+		    .image_heap                 = image_heap,
+
 		};
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			runtime.workgroup_counts = input_info.workgroup_counts;
+			runtime.indirect_args_address = input_info.indirect_args_address;
 		}
 		if (replaying != nullptr) {
             runtime.read_memory = ReplayRawWords;
@@ -1384,6 +1408,19 @@ struct PipelineCache::ProgramCache {
 						if (std::ranges::find(input_info.native_draw.registers, reg) != input_info.native_draw.registers.end()) return false;
 					}
 				}
+		bool source_changed = false;
+		if (entry != programs.end()) {
+			auto& cached = entry->second;
+			if (cached.skip_dispatch) return {};
+			Permutation* permutation = nullptr;
+			if (cached.call_source) {
+				source_changed = cached.RefreshCallSource(runtime);
+				if (!source_changed) permutation = cached.FindPermutation<true>(runtime, push_data_cursor);
+			} else {
+				permutation = cached.FindPermutation<false>(runtime, push_data_cursor);
+	}
+	}
+
 			}
 			return true;
 		};
@@ -1464,13 +1501,67 @@ struct PipelineCache::ProgramCache {
 		// A worker may be compiling this program: use it once it is there.
 		if (WaitForCompile()) {
 			return Get(params, input_info, push_data_cursor);
+		ShaderStageInputInfo stage_input {};
+		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+			stage_input.vertex = &input_info;
+		} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
+			stage_input.pixel = &input_info;
+		} else {
+			stage_input.compute = &input_info;
+		}
+		const char* label = nullptr;
+		const char* stage_name = nullptr;
+		switch (stage) {
+			case ShaderType::Vertex: label = "ShaderRecompiler VS"; stage_name = "vs"; break;
+			case ShaderType::Mesh: label = "ShaderRecompiler MS"; stage_name = "ms"; break;
+			case ShaderType::Local: label = "ShaderRecompiler LS"; stage_name = "ls"; break;
+			case ShaderType::TessellationControl: label = "ShaderRecompiler HS"; stage_name = "hs"; break;
+			case ShaderType::TessellationEvaluation: label = "ShaderRecompiler DS"; stage_name = "ds"; break;
+			case ShaderType::Pixel: label = "ShaderRecompiler PS"; stage_name = "ps"; break;
+			case ShaderType::Compute: label = "ShaderRecompiler CS"; stage_name = "cs"; break;
+			default: EXIT("invalid pipeline shader stage\n");
+		}
+		ShaderRecompiler::CompileOptions options;
+		options.stage       = stage;
+		options.profile     = &profile;
+		options.shader_hash = params.hash;
+		options.user_data   = user_data;
+		options.back_code      = params.back_code;
+		options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
+		options.early_dump  = options.dump_ir;
+		options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
+		options.dump_label  = label;
+		options.input_info  = stage_input;
+
+		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+			options.user_data_base = 8;
+			options.wave_size = input_info.wave_size;
+			if (stage == ShaderType::Mesh || stage == ShaderType::TessellationControl) {
+				options.user_data_base = 0;
+				options.wave_size = stage == ShaderType::Mesh ? input_info.mesh.wave_size : 64u;
+			}
+		} else {
+			options.wave_size = input_info.wave_size;
+
+		}
 		}
 		const auto [options, stage_name] = MakeCompileOptions(stage, params, input_info);
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
 		const auto push_data_start = push_data_cursor;
 		ShaderRecompiler::ShaderSource source;
 		if (entry == nullptr) source = ShaderRecompiler::PrepareShaderSource(params.code, options);
-		auto* current = entry == nullptr ? &source : entry->call_source.get();
+		auto* current_stage = entry == nullptr ? &source : entry->call_source.get();
+		if (entry == programs.end()) source = ShaderRecompiler::PrepareShaderSource(params.code, options);
+		if (source.unsupported_call_pc != UINT32_MAX) {
+			PipelineCacheLog("!!! TEMPORARY COMPUTE DISPATCH SKIP !!! shader=0x{:016x} pc=0x{:08x} "
+			                 "reason=unsupported GPU-selected callable target; rendering is incomplete",
+			                 params.hash, source.unsupported_call_pc);
+			programs.try_emplace(lookup_key, ShaderRecompiler::IR::ResourcePlan{}, nullptr)
+			    .first->second.skip_dispatch = true;
+			return {};
+		}
+		auto* current = entry == programs.end() ? &source : entry->second.call_source.get();
+
 		ShaderRecompiler::TranslateResult translated;
 		if (current != nullptr && current->call) {
 			if (entry == nullptr) ShaderRecompiler::RefreshShaderSource(*current, runtime);
@@ -1478,6 +1569,15 @@ struct PipelineCache::ProgramCache {
 			translated.program.source_reads = current->reads;
 		} else if (current != nullptr) {
 			translated = ShaderRecompiler::TranslateProgram(current->decoded, options);
+		if (current != nullptr) {
+			if (!current->calls.empty()) {
+				if (entry == programs.end()) ShaderRecompiler::RefreshShaderSource(*current, runtime);
+				translated = ShaderRecompiler::TranslateProgram(current->linked->decoded, options);
+				translated.program.source_reads = current->reads;
+			} else {
+				translated = ShaderRecompiler::TranslateProgram(current->decoded, options);
+			}
+
 		} else {
 			translated = ShaderRecompiler::TranslateProgram(params.code, options);
 		}
@@ -1487,10 +1587,15 @@ struct PipelineCache::ProgramCache {
 			return {};
 		}
 		if (entry == nullptr) {
-			auto retained = source.call
+			auto retained_stage = source.call
 			                    ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source))
 			                    : nullptr;
 			const auto found = programs.try_emplace(lookup_key,
+		if (entry == programs.end()) {
+			auto retained = !source.calls.empty() ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source)) : nullptr;
+			entry = programs.try_emplace(lookup_key,
+	}
+
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program), std::move(retained)).first;
 			entry = &found->second;
 			last = {&found->first, entry};
@@ -1716,7 +1821,13 @@ struct PipelineCache::ProgramCache {
 		std::printf("NHL27RESOURCE: experiments batch_reads=%d\n", batch_reads ? 1 : 0);
 	}
 
-	explicit ProgramCache(vk::Device device): device(device) {
+	ProgramCache(GraphicContext& graphics, ShaderRecompiler::IR::ImageHeapSource* image_heap)
+	    : graphics(graphics), image_heap(image_heap),
+	      // AMD GPUs (vendor 0x1002) run NMin/NMax as v_min/v_max, which give the guest's NaN and
+	      // signed-zero results; GLSL.std.450 alone does not order -0 below +0.
+	      profile {.maintenance8 = graphics.maintenance8_enabled,
+		           .native_float_min_max =
+		               graphics.physical_device_properties.vendorID == 0x1002u} {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 		ahead_key.static_state.reserve(MaxStaticKeyWords);
 		const char* timing = std::getenv("KYTY_PERF_RESOURCE_TIMING");
@@ -1735,7 +1846,7 @@ struct PipelineCache::ProgramCache {
 		for (const auto& [key, entry]: programs) {
 			(void)key;
 			for (const auto& permutation: entry.permutations) {
-				device.destroyShaderModule(permutation.handle.module, nullptr);
+				graphics.device.destroyShaderModule(permutation.handle.module, nullptr);
 			}
 		}
 	}
@@ -2090,10 +2201,17 @@ struct PipelineCache::ProgramCache {
 		job_available.notify_all();
 		workers.clear();
 	}
+	GraphicContext&                                             graphics;
+	ShaderRecompiler::IR::ImageHeapSource*                      image_heap;
+	const ShaderRecompiler::Spirv::Profile                      profile;
+	uint64_t                                                    next_shader_id = 0;
+
 };
 
-PipelineCache::PipelineCache(GraphicContext& graphics)
-    : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
+PipelineCache::PipelineCache(GraphicContext&                         graphics,
+                             ShaderRecompiler::IR::ImageHeapSource* image_heap)
+    : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics, image_heap)),
+      m_next_driver_cache_save(std::chrono::steady_clock::now() + DriverCacheSaveInterval) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	// LoadStore takes the program lock, so it must be set before the store is read.
 	m_program_cache->program_lock = &m_program_lock;
@@ -2202,7 +2320,7 @@ void PipelineCache::InitializeDriverCache() {
 			    XXH3_64bits(initial_data.data(), initial_data.size()) != payload_hash) {
 				initial_data.clear();
 				PipelineCacheLog(
-				    "Vulkan pipeline cache: invalidating {} (driver, emulator, or data mismatch)",
+				    "Vulkan pipeline cache: invalidating {} (driver or data mismatch)",
 				    path);
 			}
 		} else {
@@ -2229,8 +2347,8 @@ void PipelineCache::InitializeDriverCache() {
 		return;
 	}
 	if (!initial_data.empty()) {
-		PipelineCacheLog("Vulkan pipeline cache: loaded {} bytes from {}", initial_data.size(),
-		                 path);
+		PipelineCacheLog("Vulkan pipeline cache: loaded {:.2f} MB from {}",
+		                 static_cast<double>(initial_data.size()) / 1'000'000.0, path);
 	} else {
 		PipelineCacheLog("Vulkan pipeline cache: initialized empty");
 	}
@@ -2255,6 +2373,9 @@ void PipelineCache::Save() {
 		m_save_thread.request_stop();
 		m_save_thread.join();
 	}
+void PipelineCache::CheckpointDriverCache() {
+	}
+
 	if (m_driver_cache == nullptr) {
 		return;
 	}
@@ -2266,6 +2387,18 @@ void PipelineCache::Save() {
 void PipelineCache::WriteDriverCache() {
 	// Pipeline creation may continue meanwhile: the driver synchronizes the cache object.
 	Common::LockGuard lock(m_write_mutex);
+	m_driver_cache_dirty = true;
+	if (std::chrono::steady_clock::now() >= m_next_driver_cache_save) {
+		Save();
+	}
+}
+
+void PipelineCache::Save() {
+	if (m_driver_cache == nullptr || !m_driver_cache_dirty) {
+		return;
+	}
+	m_next_driver_cache_save = std::chrono::steady_clock::now() + DriverCacheSaveInterval;
+
 
 	size_t               size = 0;
 	vk::Result           result;
@@ -2285,8 +2418,8 @@ void PipelineCache::WriteDriverCache() {
 	}
 	if (result != vk::Result::eSuccess || size == 0 ||
 	    size > std::numeric_limits<uint32_t>::max()) {
-		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {} bytes)",
-		                 vk::to_string(result), size);
+		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {:.2f} MB)",
+		                 vk::to_string(result), static_cast<double>(size) / 1'000'000.0);
 		return;
 	}
 	payload.resize(size);
@@ -2308,13 +2441,18 @@ void PipelineCache::WriteDriverCache() {
 	}
 	const bool flushed = !file.IsInvalid() && file.Flush();
 	file.Close();
-	if (prefix_written != prefix.size() || payload_written != payload.size() || !flushed ||
-	    !Common::File::RenameFile(temp_path, m_driver_cache_path)) {
+	const bool written = prefix_written == prefix.size() && payload_written == payload.size() && flushed;
+	std::error_code error;
+	if (written) {
+		std::filesystem::rename(temp_path, m_driver_cache_path, error);
+	}
+	if (!written || error) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to write {}",
 		                 Common::PathToString(m_driver_cache_path));
 		return;
 	}
-	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
+	PipelineCacheLog("Vulkan pipeline cache: saved {:.2f} MB to {}",
+	                 static_cast<double>(payload.size()) / 1'000'000.0,
 	                 Common::PathToString(m_driver_cache_path));
 }
 
@@ -2460,6 +2598,8 @@ void PipelineCache::RecordGraphicsPipeline(const GraphicsPipelineKey&           
 		record.pixel = *ps_input_info;
 	}
 	m_record->AppendGraphicsPipeline(record);
+	m_driver_cache_dirty = false;
+
 }
 
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
@@ -2488,6 +2628,17 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		return {};
 	}
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
+	const bool object_primitive_id = context.HasObjectPrimitiveIdOutput();
+	if (object_primitive_id) {
+		// CxObjectIdMode: register source plus a 32-bit pipelined primitive-ID addition.
+		EXIT_NOT_IMPLEMENTED(sh.m_paClObjprimIdCntl != 2u || mesh_active || tess_active ||
+		                     !pixel_active || (sh.m_vgtDrawPayloadCntl & 8u) == 0 ||
+		                     user_config.GetPrimType() != Prospero::PrimitiveType::kTriList);
+		const auto& target = context.GetRenderTarget(7);
+		EXIT_NOT_IMPLEMENTED(Prospero::ResolveRenderTargetFormat(target.info.format,
+		                                                       target.info.channel_type)
+		                         .buffer_format != Prospero::BufferFormat::k32UInt);
+	}
 	if (mesh_active) {
 		EXIT_NOT_IMPLEMENTED(!m_graphics.mesh_shader_enabled);
 		auto& mesh              = vertex_info[0].mesh;
@@ -2514,6 +2665,30 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 			return flag != nullptr && flag[0] == '1';
 		}();
 		pixel_info.pixel_quad_correct = quad_enabled && m_graphics.pixel_quad_supported;
+		pixel_info.object_primitive_id = object_primitive_id;
+		for (uint32_t export_index = 0; export_index < 8u; export_index++) {
+			const auto slot = ShaderPixelExportTarget(pixel_info.target_shader_mask, export_index);
+			if (slot >= 8u || pixel_info.target_output_mode[export_index] == 0u) continue;
+			const auto& rt = context.GetRenderTarget(slot);
+			const auto target_mask = render_target_mask_slot(context.GetRenderTargetMask(), slot);
+			if (rt.base.addr == 0 || target_mask == 0u) continue;
+			const auto format = Prospero::ResolveRenderTargetFormat(rt.info.format, rt.info.channel_type);
+			if (format.buffer_format != Prospero::BufferFormat::k11_11_10UNorm) continue;
+			const auto mapping = pixel_info.target_export_mapping[export_index];
+			const auto shader_mask = render_target_mask_slot(pixel_info.target_shader_mask, slot);
+			const bool blend = context.GetBlendControl(slot).enable && !rt.info.blend_bypass;
+			if (blend || (mapping.ApplyMask(target_mask) & 7u) != 7u ||
+			    (mapping.ApplyMask(shader_mask) & 7u) != 7u ||
+			    pixel_info.target_output_mode[export_index] != 9u) {
+				EXIT("unsupported packed UNorm render-target export: slot=%u export=%u mode=%u "
+				     "target_mask=0x%x shader_mask=0x%x mapping=0x%02x blend=%u\n",
+				     slot, export_index, pixel_info.target_output_mode[export_index], target_mask,
+				     shader_mask, mapping.packed, static_cast<uint32_t>(blend));
+			}
+			pixel_info.target_packed_unorm_mask |= 1u << export_index;
+			pixel_info.target_round_mode |= static_cast<uint8_t>(rt.info.round_mode) << export_index;
+		}
+
 		if (!mesh_active && !tess_active && Prospero::IsRectList(user_config.GetPrimType())) {
 			pixel_info.parameter_mode = ShaderPixelParameterMode::Rectangle;
 		} else if (context.GetModeControl().provoking_vtx_last) {
@@ -2556,10 +2731,12 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 			}
 		}
 	}
-	if (context.GetClipControl().clip_disable) {
+	auto&       last_stage   = vertex_info[tess_active ? 2u : 0u];
+	const auto& clip_control = context.GetClipControl();
+	if (clip_control.clip_disable) {
 		const auto& viewport = context.GetScreenViewport().viewports[0];
 		const auto& limits   = m_graphics.GetPhysicalDeviceProperties().limits;
-		auto&       clip     = vertex_info[tess_active ? 2u : 0u].clip_space;
+		auto&       clip     = last_stage.clip_space;
 		clip.scale[0]        = viewport.xscale;
 		clip.scale[1]        = viewport.yscale;
 		clip.offset[0]       = viewport.xoffset;
@@ -2569,18 +2746,25 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		clip.half_extent[1] =
 		    static_cast<float>(std::min(limits.maxViewportDimensions[1], 16384u)) * 0.5f;
 		clip.enabled = true;
+	} else if (clip_control.user_clip_planes != 0) {
+		// CLIP_DISABLE also disables user planes. How they combine with shader clip and cull
+		// distances is unverified; draw push constants only reach VS/mesh and PS, and the
+		// generated RECTLIST stages do not forward clip distances.
+		EXIT_NOT_IMPLEMENTED((last_stage.pa_cl_vs_out_cntl & 0xffffu) != 0 || tess_active ||
+		                     Prospero::IsRectList(user_config.GetPrimType()));
+		last_stage.user_clip_planes = clip_control.user_clip_planes;
 	}
-	uint32_t          push_data_cursor =
+	uint32_t          push_data_cursor_stage =
 	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
 	GraphicsPrograms       result;
 	if (ahead != nullptr && Common::Experiments::Enabled(Common::Experiments::ProgramLockSplit)) {
 		if (pixel_active) {
 			result.pixel = m_program_cache->GetAheadUnlocked(pixel_params, pixel_info,
-			                                                 push_data_cursor, *ahead);
+			                                                 push_data_cursor_stage, *ahead);
 		}
 		if (!ahead->reads.Failed()) {
 			result.vertex[0] = m_program_cache->GetAheadUnlocked(vertex_params[0], vertex_info[0],
-			                                                     push_data_cursor, *ahead);
+			                                                     push_data_cursor_stage, *ahead);
 		}
 		return ahead->reads.Failed() ? GraphicsPrograms {} : result;
 	}
@@ -2588,15 +2772,19 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	if (ahead != nullptr) {
 		if (pixel_active) {
 			result.pixel =
-			    m_program_cache->GetAhead(pixel_params, pixel_info, push_data_cursor, *ahead);
+			    m_program_cache->GetAhead(pixel_params, pixel_info, push_data_cursor_stage, *ahead);
 		}
 		if (!ahead->reads.Failed()) {
 			result.vertex[0] = m_program_cache->GetAhead(vertex_params[0], vertex_info[0],
-			                                             push_data_cursor, *ahead);
+			                                             push_data_cursor_stage, *ahead);
 		}
 		return ahead->reads.Failed() ? GraphicsPrograms {} : result;
 	}
 	bool build_failed = false;
+	uint32_t push_data_cursor = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(
+	    mesh_active, object_primitive_id, last_stage.user_clip_planes);
+	GraphicsPrograms  result;
+
 	if (pixel_active) {
 		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
 		build_failed |= !result.pixel;
@@ -2704,6 +2892,9 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		EXIT_IF(!colors[i].image_id || colors[i].desc.view_info.format == vk::Format::eUndefined);
 		static_params.color_mask[slot] = colors[i].export_mapping.ApplyMask(
 		    render_target_mask_slot(ctx.GetRenderTargetMask(), colors[i].target_slot));
+		if (colors[i].desc.info.guest_format == Prospero::BufferFormat::k11_11_10UNorm) {
+			static_params.color_mask[slot] = 1u;
+		}
 		rendering.color_formats[slot] = colors[i].desc.view_info.format;
 		if (attachment_samples == 0) {
 			attachment_samples = colors[i].desc.info.samples;
@@ -2803,6 +2994,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	if (static_params.sample_shading_enable && !m_graphics.sample_rate_shading_enabled) {
 		EXIT("Pipeline: sample-rate shading is required but unsupported by the host\n");
 	}
+	static_params.alpha_to_coverage_enable = ps_active && ctx.GetShaderRegisters().AlphaToMask();
 	const bool rect_list = Prospero::IsRectList(command.GetUserConfig().GetPrimType());
 	static_params.cull_back  = !rect_list && mc.cull_back;
 	static_params.cull_front = !rect_list && mc.cull_front;
@@ -2882,8 +3074,13 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 
 	auto cached = std::make_unique<Pipeline>();
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
-	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
-	                       ps_input_info, programs, static_params, m_driver_cache);
+	{
+		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
+		                                         Common::DebugCounters::Counter::PipelineCreateNs,
+		                                         Common::DebugCounters::Peak::PipelineCreateNs);
+		CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
+		                       ps_input_info, programs, static_params, m_driver_cache);
+	}
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 	m_unsaved_pipelines.fetch_add(1, std::memory_order_relaxed);
 
@@ -2893,6 +3090,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	RecordGraphicsPipeline(key, vertex_info, ps_input_info);
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 	EXIT_IF(!inserted);
+	CheckpointDriverCache();
 
 	return *iter->second;
 }
@@ -2921,6 +3119,14 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	auto cached = std::make_unique<Pipeline>();
 	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
 	m_unsaved_pipelines.fetch_add(1, std::memory_order_relaxed);
+	{
+		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
+		                                         Common::DebugCounters::Counter::PipelineCreateNs,
+		                                         Common::DebugCounters::Peak::PipelineCreateNs);
+		CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module,
+		                       m_driver_cache);
+	}
+
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
@@ -2931,7 +3137,9 @@ if (m_record != nullptr && m_record->IsOpen() && m_program_cache->replaying == n
     }
     auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
 	EXIT_IF(!inserted);
+	CheckpointDriverCache();
 
 	return *iter->second;
 }
+} // namespace Libs::Graphics
 } // namespace Libs::Graphics
