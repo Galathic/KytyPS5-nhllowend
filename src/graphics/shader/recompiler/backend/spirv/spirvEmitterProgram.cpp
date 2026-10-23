@@ -739,15 +739,20 @@ void EmitStructuredFunction(ValueEmitContext& ctx) {
 	const auto& program = ctx.state.program;
 	StructuredFunctionState structured;
 	ctx.state.builder.AddFunction(spv::OpBranch, program.blocks.front()->Definition());
-	// Experiment ExecBranches: not in loop headers and continue targets (their structure must stay
-	// as it is) nor with wave64 emulation (each instruction is emitted per half).
+	// Experiment ExecBranches: not in loop headers (their OpLoopMerge ends their one block) nor with
+	// wave64 emulation (each instruction is emitted per half); in continue targets only with
+	// ExecBranchContinue (the selection constructs then lie inside the continue construct, which
+	// the back-edge block, the last of them, still post-dominates).
 	const bool exec_branches = ShaderExecBranches() && ctx.state.lane_count == 1;
+	const bool in_continue   = ShaderExecBranchContinue();
 	std::unordered_set<const IR::Block*> loop_blocks;
 	if (exec_branches) {
 		for (const auto* block: program.blocks) {
 			if (block->terminator.loop_header) {
 				loop_blocks.insert(block);
-				if (block->terminator.continue_block != nullptr) loop_blocks.insert(block->terminator.continue_block);
+				if (block->terminator.continue_block != nullptr && !in_continue) {
+					loop_blocks.insert(block->terminator.continue_block);
+				}
 			}
 		}
 	}

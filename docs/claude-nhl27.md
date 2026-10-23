@@ -945,6 +945,14 @@ GPU side at uncapped rates (2026-10-23):
   the reads of every device stage) instead of MEMORY_WRITE/MEMORY_READ, which may also make the
   driver write back and invalidate for the host: paused GPU A/B/A 13.75 / 13.65 / 13.82 ms per flip.
 * The game renders at 2348x1320 and upscales to 3840x2160.
+* Bit 50 `KYTY_EXEC_BRANCH_CONTINUE` (default on; key bit 16384): ExecBranches runs also in loop
+  continue targets, the bodies of the sampling loops (`d46af19f`'s inner loop selected every write
+  per lane: 113 -> 64 `v_cndmask`, the loop body 330 -> 270 ISA lines; the pass 6.4-6.6 -> 5.5 ms
+  per frame in one boot). All 1,607 SPIR-V modules of a match pass `spirv-val`
+  (`KYTY_DBG_DUMP_ALL_SPIRV=1` dumps them). A paused scene without per-draw timestamps did not
+  change (14.53-14.56 vs 14.52 ms per flip); with them the heavy shaders read 7-21% faster, which
+  was mostly how they overlap. Two soak matches with it on: 69.5 and 64.0 fps at 60 Hz, no errors.
+* `KYTY_PERF_GPU_TIMING` reports also print `NHL27GPUKINDS`: every key's time summed by kind.
 * `ExecBranches` off (bits 39/40) made the heaviest compute shaders 19-23% slower again.
 
 Execution thread at uncapped rates: about 400k operations/s, 92-94% busy; draws 3.4-3.7 us,

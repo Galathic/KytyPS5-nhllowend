@@ -83,6 +83,9 @@ enum Bit : uint64_t {
 	// KYTY_GUEST_OFF_CP_CORES (default off; with GuestOffStageCores): the command processor's and
 	// the recording thread's cores too.
 	GuestOffCpCores = uint64_t {1} << 48u,
+	// KYTY_EXEC_BRANCH_CONTINUE (default on; with ExecBranches): runs in loop continue targets
+	// (loop bodies that branch back) too; part of shader keys.
+	ExecBranchContinue = uint64_t {1} << 50u,
 };
 
 namespace Detail {

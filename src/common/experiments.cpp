@@ -60,6 +60,7 @@ uint64_t EnvironmentMask() {
 	set("KYTY_EXEC_SELECTS", ExecSelects, false);
 	set("KYTY_EXEC_BRANCHES", ExecBranches, true);
 	set("KYTY_EXEC_BRANCH_MEMORY", ExecBranchMemory, true);
+	set("KYTY_EXEC_BRANCH_CONTINUE", ExecBranchContinue, true);
 	set("KYTY_BDA_LOAD_GROUPS", BdaLoadGroups, false);
 	// On since 2026-10-22: with the stage cores kept for the stages, the resolve thread limited the
 	// heavier scenes; sharing its core with the game, the second resolver took 60 Hz play 57.4 ->

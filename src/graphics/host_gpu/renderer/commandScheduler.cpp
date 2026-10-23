@@ -16,6 +16,7 @@
 #include <chrono>
 #include <cstring>
 #include <cstdio>
+#include <fmt/format.h>
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
@@ -349,6 +350,26 @@ void GpuTimingReport() {
 	            window, g_timing.total_ms, window > 0.0 ? g_timing.total_ms / window : 0.0,
 	            static_cast<unsigned long long>(g_timing.samples),
 	            static_cast<unsigned long long>(g_timing.dropped), sorted.size());
+	{
+		// Every key by kind (draw, dispatch...): operations, time, and those under 10 us each.
+		std::map<std::string, std::array<double, 4>> kinds;
+		for (const auto& [key, acc]: sorted) {
+			auto&      sums = kinds[std::get<0>(*key)];
+			const auto avg  = acc->count != 0 ? acc->total_ms * 1000.0 / static_cast<double>(acc->count) : 0.0;
+			sums[0] += static_cast<double>(acc->count);
+			sums[1] += acc->total_ms;
+			if (avg < 10.0) {
+				sums[2] += static_cast<double>(acc->count);
+				sums[3] += acc->total_ms;
+			}
+		}
+		std::string line = "NHL27GPUKINDS:";
+		for (const auto& [kind, sums]: kinds) {
+			line += fmt::format(" {}: n={:.0f} {:.1f} ms (under 10 us: n={:.0f} {:.1f} ms)", kind, sums[0], sums[1],
+			                    sums[2], sums[3]);
+		}
+		std::printf("%s\n", line.c_str());
+	}
 	for (size_t i = 0; i < sorted.size() && i < GPU_TIMING_TOP; i++) {
 		const GpuTimingKey&   key = *sorted[i].first;
 		const GpuTimingAccum& acc = *sorted[i].second;

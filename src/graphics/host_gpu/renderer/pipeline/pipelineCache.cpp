@@ -540,7 +540,10 @@ private:
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
                      const std::vector<uint32_t>& spirv) {
-	if (!Config::GraphicsDebugDumpEnabled() && !ForceDumpShader(shader_hash)) {
+	// KYTY_DBG_DUMP_ALL_SPIRV=1: every shader's SPIR-V, nothing else (to validate code-gen changes
+	// with spirv-val).
+	static const bool all_spirv = std::getenv("KYTY_DBG_DUMP_ALL_SPIRV") != nullptr;
+	if (!all_spirv && !Config::GraphicsDebugDumpEnabled() && !ForceDumpShader(shader_hash)) {
 		return;
 	}
 	static std::atomic_int id = 0;
