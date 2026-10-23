@@ -1069,7 +1069,8 @@ execution thread's loop and the BDA synchronization changed): cross-build A/B ag
 comparable pair of paused boots: draw 3.69 / 3.71 us, dispatch 3.01 / 2.89 us (the other pair
 landed in 30 fps scenes); kept as it matches the current code. Profile v11 (2026-10-22, recorded on bdc062b3:
 the buffer slot memos, texel version table, unmap log and guest CPU sets had changed
-`RebindBuffers`, `ObtainBuffer` and the execution loop since v10).
+`RebindBuffers`, `ObtainBuffer` and the execution loop since v10). Profile v12 (2026-10-23, recorded on 610b5dbe: submission
+batching, the second draw resolver and the label path of `WRITE_DATA` since v11).
 
 Single fixed-save matches of the same build differ by up to 5 fps at 60 Hz (52.2 and 57.1 within
 an hour): compare builds with `exe-ab.sh` (per-draw cost in paused boots), not one match each.
