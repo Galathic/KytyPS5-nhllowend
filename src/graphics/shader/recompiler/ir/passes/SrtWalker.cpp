@@ -4443,8 +4443,8 @@ bool SrtWalker::ExecuteTapeOp(const ResourcePlan::SrtTape::Op& op,
 				                      ? static_cast<uint64_t>(static_cast<uint32_t>(records))
 				                      : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
 				if (byte_offset > size || size - byte_offset < sizeof(uint32_t)) {
-					g_tape_stats.failed.fetch_add(1, std::memory_order_relaxed);
-					return false;
+					result = 0;
+					break;
 				}
 				address = (base & ~uint64_t{3}) + byte_offset;
 			} else {

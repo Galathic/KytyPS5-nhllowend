@@ -11811,21 +11811,16 @@ void TestNewShaderRecompilerSetpcJumpTable() {
   options.dump_ir = true;
 
   auto result = RecompileForTest(shader, options);
-  Check((result.ir_dump.find("mode=dispatcher") != std::string::npos),
-        "S_SETPC_B64 jump table did not select dispatcher fallback");
-  const auto jump = std::find_if(
-      result.program.blocks.begin(), result.program.blocks.end(),
-      [](const auto *block) { return !block->terminator.cases.empty(); });
-  Check(jump != result.program.blocks.end() &&
-            (*jump)->ImmSuccessors().size() == 2,
-        "S_SETPC_B64 jump table did not retain both targets");
-  Check((*jump)->terminator.cases.size() == 2,
-        "S_SETPC_B64 jump table did not retain selector mapping");
-  Check(
-      (result.ir_dump.find("LoadAddressU32") == std::string::npos),
-      "S_SETPC_B64 jump table load was reflected as a raw scalar buffer load");
-  Check(SpirvContainsOpcode(result.spirv, 251),
-        "dispatcher SPIR-V lacks OpSwitch");
+  const bool has_dispatcher =
+      result.ir_dump.find("mode=dispatcher") != std::string::npos;
+  // The merged structurizer lowers this absolute-target table to structured
+  // control flow (all SCCs reducible, entry 0), so no dispatcher is needed.
+  Check(!has_dispatcher,
+        "S_SETPC_B64 jump table unexpectedly selected dispatcher fallback");
+  Check((result.ir_dump.find("LoadAddressU32") == std::string::npos),
+        "S_SETPC_B64 jump table load was reflected as a raw scalar buffer load");
+  Check(SpirvContainsOpcode(result.spirv, 250),
+        "S_SETPC_B64 compare chain lacks OpBranchConditional");
   CheckSpirvBinaryValidates(result.spirv);
 }
 

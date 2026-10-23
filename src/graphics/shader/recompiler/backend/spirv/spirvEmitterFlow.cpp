@@ -54,13 +54,13 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 		const auto value = state.builder.AllocateId();
 		const auto bits  = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpLoad, TypeBool(state), value, variable);
-		// SPI_BARYC_CNTL.FRONT_FACE_ALL_BITS selects uint masks or float +/-1.
-		// PS5 initializes v_front_face with float +1.0/-1.0 bits.
+		// SPI_BARYC_CNTL.FRONT_FACE_ALL_BITS selects integer 1/0 instead
+		// of the default float +1.0/-1.0 bit patterns in the guest VGPR.
 		const auto* ps = state.input_info.pixel;
-		const bool all_bits = ps != nullptr && ps->ps_front_face_all_bits;
-		const auto front = ConstantU32(state, all_bits ? 0xffffffffu : 0x3f800000u);
-		const auto back  = ConstantU32(state, all_bits ? 0u : 0xbf800000u);
-		state.builder.AddFunction(spv::OpSelect, TypeU32(state), bits, value, front, back);
+		const bool integer_encoding = ps != nullptr && ps->ps_front_face_all_bits;
+		state.builder.AddFunction(spv::OpSelect, TypeU32(state), bits, value,
+		                          ConstantU32(state, integer_encoding ? 1u : 0x3f800000u),
+		                          ConstantU32(state, integer_encoding ? 0u : 0xbf800000u));
 		return bits;
 	}
 	if (kind == IR::StageInputKind::DrawIndex || kind == IR::StageInputKind::VertexIndex || kind == IR::StageInputKind::InstanceIndex ||

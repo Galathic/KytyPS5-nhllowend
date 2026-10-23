@@ -1941,11 +1941,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		return finish(Value(&node));
 	};
 	plan.control_flow = ResourceControlFlow(program, ClonePredicate);
-	plan.uniform_fill = AnalyzeUniformFill(program);
 	plan.uniform_copy = AnalyzeUniformCopy(program);
-	for (uint32_t i = 0; i < plan.uniform_fill.fill.words; ++i) {
-		plan.uniform_fill.values[i] = Clone(plan.uniform_fill.values[i]);
-	}
 	if (!uniform_control) {
 		plan.control_flow.clear();
 		plan.control_phi_predecessors.clear();
