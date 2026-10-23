@@ -281,7 +281,6 @@ ImageId TextureCache::InsertImage(const ImageInfo& info) {
 		RegisterImage(id);
 		BumpGeneration(info.data.address, info.data.address + info.data.size);
 	}
-	RegisterImage(id);
 
 	return id;
 }
