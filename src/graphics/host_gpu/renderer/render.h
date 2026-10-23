@@ -464,6 +464,8 @@ private:
 	                                               uint32_t color_count, RenderDepthInfo& depth,
 	                                               vk::ImageAspectFlags& feedback_aspects,
 	                                               std::span<PreparedBindings* const> stages = {});
+	[[nodiscard]] bool        ConsumeMetadataColorOperation(CommandBuffer& buffer,
+	                                                        uint32_t render_target_slice_offset);
 	[[nodiscard]] bool        ResolveColorTargets(CommandBuffer& buffer,
 	                                              uint32_t render_target_slice_offset);
 	void                      BindImage(ImageId id, bool storage);
@@ -576,7 +578,8 @@ private:
 [[nodiscard]] bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t group_x,
                                             uint32_t group_y, uint32_t group_z, uint32_t mode,
                                             ShaderBufferResource& descriptor,
-                                            uint32_t& packed_clear, uint64_t& size);
+                                            uint32_t& packed_clear, uint64_t& size,
+                                            const char** why = nullptr);
 
 } // namespace Libs::Graphics
 

@@ -29,6 +29,46 @@ struct Nhl27Fsr3Constants {
 			if (words[i] != other.words[i]) return false;
 		return true;
 	}
+	// Names the first check Decode() fails (diagnostics), or nullptr when it would accept the block.
+	static const char* RejectReason(std::span<const uint32_t> source) {
+		if (source.size() != 52) return "size";
+		Nhl27Fsr3Constants c;
+		std::copy(source.begin(), source.end(), c.words.begin());
+		if (c.Width() < 320 || c.Height() < 180 || c.OutputWidth() < c.Width() ||
+			c.OutputHeight() < c.Height() || c.OutputWidth() > 8192 || c.OutputHeight() > 8192)
+			return "dimensions";
+		for (size_t i : {size_t(4), size_t(5), size_t(8), size_t(9)})
+			if (c.words[i] != c.words[i + 2]) return "dynamic-size";
+		for (size_t i = 0; i < 4; ++i) {
+			const size_t offset = 12 + i * 2;
+			const float w = float(c.words[4 + i * 2]), h = float(c.words[5 + i * 2]);
+			if (!std::isfinite(c.Float(offset + 8)) || !std::isfinite(c.Float(offset + 9)) ||
+				c.Float(offset) != w || c.Float(offset + 1) != h ||
+				std::abs(c.Float(offset + 8) * w - 1) > 1e-5f ||
+				std::abs(c.Float(offset + 9) * h - 1) > 1e-5f)
+				return "size-floats";
+		}
+		for (size_t i : {size_t(0), size_t(1), size_t(2), size_t(3), size_t(28), size_t(29),
+						size_t(30), size_t(31), size_t(32), size_t(33), size_t(34), size_t(35),
+						size_t(36), size_t(37), size_t(38)})
+			if (!std::isfinite(c.Float(i))) return "nonfinite";
+		if (c.Float(0) >= 0 || c.Float(1) <= 0 || c.Float(2) <= 0 || c.Float(3) <= 0) return "depth-or-fov-sign";
+		if (!std::isfinite(c.Near()) || !std::isfinite(c.Far()) || c.Near() <= 0 || c.Far() <= c.Near())
+			return "near-far";
+		if (c.FovY() >= 3.141593f) return "fov";
+		if (c.Float(32) != -0.5f || c.Float(33) != 0.5f) return "motion-scale";
+		if (c.Float(36) < 0 || c.Float(36) > 1) return "delta-time";
+		if (c.Float(37) <= 0) return "pre-exposure";
+		if (c.Float(38) <= 0) return "word38";
+		for (size_t i = 28; i < 32; ++i)
+			if (std::abs(c.Float(i)) > 0.50001f) return "jitter";
+		if (std::abs(c.Float(34) - float(c.Width()) / c.OutputWidth()) > 1e-5f ||
+			std::abs(c.Float(35) - float(c.Height()) / c.OutputHeight()) > 1e-5f)
+			return "downscale";
+		return nullptr;
+	}
+	// Word 36 (frame time, seconds) is 0 on some frames (player selection does it about once a
+	// second); those frames are accepted and the caller substitutes the last real frame time.
 	static std::optional<Nhl27Fsr3Constants> Decode(std::span<const uint32_t> source) {
 		if (source.size() != 52) return std::nullopt;
 		Nhl27Fsr3Constants c;
@@ -56,7 +96,7 @@ struct Nhl27Fsr3Constants {
 			!std::isfinite(c.Near()) || !std::isfinite(c.Far()) || c.Near() <= 0 ||
 			c.Far() <= c.Near() || c.FovY() >= 3.141593f ||
 			c.Float(32) != -0.5f || c.Float(33) != 0.5f ||
-			c.Float(36) <= 0 || c.Float(36) > 1 || c.Float(37) <= 0 || c.Float(38) <= 0)
+			c.Float(36) < 0 || c.Float(36) > 1 || c.Float(37) <= 0 || c.Float(38) <= 0)
 			return std::nullopt;
 		for (size_t i = 28; i < 32; ++i)
 			if (std::abs(c.Float(i)) > 0.50001f) return std::nullopt;

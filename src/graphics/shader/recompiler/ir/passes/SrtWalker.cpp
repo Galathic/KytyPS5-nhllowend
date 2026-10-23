@@ -13,7 +13,9 @@
 #include <xbyak/xbyak.h>
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>

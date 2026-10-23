@@ -271,6 +271,8 @@ set(gpu_tiler_shader_names
 	dispatch_guard
 	color_transform
 	color_clear_check
+	fsr_color_clean
+	fsr_ghost_guard
 )
 file(GLOB gpu_tiler_shader_includes CONFIGURE_DEPENDS "${gpu_tiler_shader_dir}/gpu_tiler_*.inc")
 foreach(shader_name IN LISTS gpu_tiler_shader_names)
@@ -384,6 +386,29 @@ if(KYTY_ENABLE_FSR3)
 	install(FILES "${FIDELITYFX_SDK_DIR}/sdk/LICENSE.txt" DESTINATION licenses/FidelityFX-SDK)
 endif()
 install(FILES "${KYTY_THIRD_PARTY_DIR}/fsr1/LICENSE.txt" DESTINATION licenses/FSR1)
+option(KYTY_ENABLE_FSR4 "FSR 4 through a D3D12 bridge (Windows; FidelityFX SDK 2.x with its signed DLLs)" OFF)
+set(FIDELITYFX4_SDK_DIR "" CACHE PATH "FidelityFX SDK 2.x root (the folder that holds Kits)")
+if(KYTY_ENABLE_FSR4)
+	if(NOT WIN32)
+		message(FATAL_ERROR "The FSR 4 bridge needs Direct3D 12 (Windows x64 only)")
+	endif()
+	set(ffx4_kit "${FIDELITYFX4_SDK_DIR}/Kits/FidelityFX")
+	foreach(ffx4_dll amd_fidelityfx_loader_dx12 amd_fidelityfx_upscaler_dx12)
+		if(NOT EXISTS "${ffx4_kit}/signedbin/${ffx4_dll}.dll")
+			message(FATAL_ERROR "Missing FSR 4 runtime: ${ffx4_kit}/signedbin/${ffx4_dll}.dll")
+		endif()
+		list(APPEND kyty_fsr4_dlls "${ffx4_kit}/signedbin/${ffx4_dll}.dll")
+	endforeach()
+	if(NOT EXISTS "${ffx4_kit}/api/include/ffx_api.h" OR NOT EXISTS "${ffx4_kit}/upscalers/include/ffx_upscale.h")
+		message(FATAL_ERROR "Missing FSR 4 headers under ${ffx4_kit}")
+	endif()
+	include_directories(SYSTEM "${ffx4_kit}/api/include" "${ffx4_kit}/upscalers/include")
+	add_compile_definitions(KYTY_ENABLE_FSR4=1)
+	install(FILES ${kyty_fsr4_dlls} DESTINATION .)
+	if(EXISTS "${FIDELITYFX4_SDK_DIR}/LICENSE.txt")
+		install(FILES "${FIDELITYFX4_SDK_DIR}/LICENSE.txt" DESTINATION licenses/FidelityFX-SDK-2)
+	endif()
+endif()
 
 # Linux system libraries. Threads is also needed on macOS by experiments_tests.
 if(LINUX OR APPLE)

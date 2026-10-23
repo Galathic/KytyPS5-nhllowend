@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/emulatorConfig.h"
+#include "common/experiments.h"
 #include "common/profiler.h"
 #include "common/runtimeFlags.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -1505,6 +1506,17 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	if (m_trace_slot != 0) {
 		m_command.EndRendering(); // Idempotent; keeps the end timestamp after the last pass.
 		GpuTraceEnd(m_command.Handle(), m_trace_slot);
+	}
+	if (Common::Experiments::DirectGpuReadsMemory()) {
+		// Experiment DirectGpuReads: this submission's writes become visible to the CPU once its
+		// tick is reached, so the buffer cache can read finished results from mapped game buffers.
+		m_command.EndRendering();
+		vk::MemoryBarrier host {};
+		host.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+		host.dstAccessMask = vk::AccessFlagBits::eHostRead;
+		m_command.Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                                   vk::PipelineStageFlagBits::eHost, {}, 1, &host, 0, nullptr, 0,
+		                                   nullptr);
 	}
 	m_command.End();
 

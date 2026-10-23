@@ -373,6 +373,88 @@ uint32_t PackedOffset(ValueEmitContext& ctx, IR::Value value, ImageDimension dim
 	return result;
 }
 
+// KYTY_SAMPLE_RUNTIME_OFFSETS=1 (default off): Vulkan accepts a non-constant Offset image operand
+// only on gathers, so a runtime texel offset of SAMPLE*_O moves the coordinates by offset / size of
+// the mip level the sample reads, instead of being dropped. The level is the given LOD, or the LOD
+// of the gradients when grad_x and grad_y are set, rounded to the nearest level and clamped to the
+// view; the array layer is left untouched. Ported from KytyPS5/KytyPS5 PR #1446 (overlordxrz-source,
+// after TheCruZ's #1220), which targets NHL 27's compute shader 0x8ff7afec7c5ab786.
+uint32_t OffsetSampleCoordinates(ValueEmitContext& ctx, uint32_t resource, uint32_t array_index,
+                                 IR::Value offset, uint32_t coord, uint32_t level,
+                                 uint32_t grad_x = 0u, uint32_t grad_y = 0u) {
+	auto&       state     = ctx.state;
+	const auto  dimension = state.program.info.images[resource].dimension;
+	const auto& info      = ImageDimensionInfoFor(dimension);
+	const auto  f32       = TypeF32(state);
+	state.builder.RequireCapability(spv::CapabilityImageQuery);
+	const auto image   = LoadImageDescriptor(state, resource, 0u, array_index);
+	const auto Extract = [&](uint32_t type, uint32_t vector, uint32_t components, uint32_t index) {
+		if (components == 1u) return vector;
+		const auto result = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, type, result, vector, index);
+		return result;
+	};
+	const auto QuerySize = [&](uint32_t lod) {
+		const auto size = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpImageQuerySizeLod, ImageViewSizeType(state, dimension),
+		                          size, image, lod);
+		return size;
+	};
+	const auto Extent = [&](uint32_t size, uint32_t index) {
+		return Unary(state, spv::OpConvertUToF, f32,
+		             Extract(TypeU32(state), size, info.coordinate_components, index));
+	};
+	if (grad_x != 0u && grad_y != 0u) {
+		// lod = log2(max(|ddx|, |ddy|)) with the gradients scaled to texels of the base level.
+		const auto base     = QuerySize(ConstantU32(state, 0));
+		uint32_t   length_x = 0;
+		uint32_t   length_y = 0;
+		for (uint32_t index = 0; index < info.spatial_components; index++) {
+			const auto extent = Extent(base, index);
+			const auto Square = [&](uint32_t gradient) {
+				const auto texels =
+				    Binary(state, spv::OpFMul, f32,
+				           Extract(f32, gradient, info.spatial_components, index), extent);
+				return Binary(state, spv::OpFMul, f32, texels, texels);
+			};
+			const auto x = Square(grad_x);
+			const auto y = Square(grad_y);
+			length_x     = index == 0u ? x : Binary(state, spv::OpFAdd, f32, length_x, x);
+			length_y     = index == 0u ? y : Binary(state, spv::OpFAdd, f32, length_y, y);
+		}
+		const auto longest = EmitGlsl<GLSLstd450FMax, IR::Type::F32>(state, length_x, length_y);
+		level = Binary(state, spv::OpFMul, f32, EmitGlsl<GLSLstd450Log2, IR::Type::F32>(state, longest),
+		               ConstantF32Value(state, 0.5f));
+	}
+	// NMax also maps a NaN or -inf LOD (zero gradients) to level zero.
+	const auto rounded = EmitGlsl<GLSLstd450Floor, IR::Type::F32>(
+	    state, Binary(state, spv::OpFAdd, f32, level, ConstantF32Value(state, 0.5f)));
+	const auto clamped = EmitGlsl<GLSLstd450NMax, IR::Type::F32>(state, rounded, ZeroF32(state));
+	const auto levels  = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpImageQueryLevels, TypeU32(state), levels, image);
+	const auto mip = EmitUMin32(state, Unary(state, spv::OpConvertFToU, TypeU32(state), clamped),
+	                            Binary(state, spv::OpISub, TypeU32(state), levels, ConstantU32(state, 1)));
+	const auto size = QuerySize(mip);
+	// RDNA2 packs signed six-bit texel offsets into the low bits of each byte.
+	const auto packed = Unary(state, spv::OpBitcast, TypeI32(state), ctx.Def(offset));
+	auto       result = coord;
+	for (uint32_t index = 0; index < info.spatial_components; index++) {
+		const auto texels = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpBitFieldSExtract, TypeI32(state), texels, packed,
+		                          ConstantU32(state, index * 8u), ConstantU32(state, 6));
+		const auto delta = Binary(state, spv::OpFDiv, f32, Unary(state, spv::OpConvertSToF, f32, texels),
+		                          Extent(size, index));
+		const auto moved = Binary(state, spv::OpFAdd, f32,
+		                          Extract(f32, coord, info.coordinate_components, index), delta);
+		if (info.coordinate_components == 1u) return moved;
+		const auto inserted = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeInsert, TypeF32Vector(state, info.coordinate_components),
+		                          inserted, moved, result, index);
+		result = inserted;
+	}
+	return result;
+}
+
 uint32_t HorizontalOffsets(EmitterState& state, ImageDimension dimension) {
 	const auto components   = ImageDimensionInfoFor(dimension).spatial_components;
 	const auto count        = ConstantU32(state, 4);
@@ -976,6 +1058,12 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		}();
 		const bool sample_offset = sample_offsets_enabled && layout.offset != NoImageComponent &&
 		                           offset_value.IsImmediate();
+		static const bool runtime_offsets_enabled = [] {
+			const char* setting = std::getenv("KYTY_SAMPLE_RUNTIME_OFFSETS");
+			return setting != nullptr && setting[0] == '1';
+		}();
+		const bool runtime_offset = sample_offsets_enabled && runtime_offsets_enabled &&
+		                            layout.offset != NoImageComponent && !offset_value.IsImmediate();
 		const auto sampler_id = LoadSamplerDescriptor(state, mem.sampler, sampler_index);
 		const auto EmitSample = [&](uint32_t resource, uint32_t array_index) {
 			const auto& candidate = state.program.info.images[resource];
@@ -986,12 +1074,35 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				sample_operands[sample_operand_count++] = PackedOffset(
 				    ctx, offset_value, candidate.dimension, sample_operands[0]);
 			}
-			const auto coord =
-			    CoordF32(ctx, mem, *address, layout.coord,
-			             ImageDimensionInfoFor(candidate.dimension).coordinate_components,
-			             candidate.cube);
+			const auto& candidate_info = ImageDimensionInfoFor(candidate.dimension);
+			auto        coord          = CoordF32(ctx, mem, *address, layout.coord,
+			                                      candidate_info.coordinate_components, candidate.cube);
 			const auto sampled = MakeSampledImage(state, resource, sampler_id, 0u, array_index,
 			                                      sampler_index != 0u);
+			// KYTY_SAMPLE_RUNTIME_OFFSETS: move the coordinates for a computed offset (cube maps
+			// take no texel offsets).
+			if (runtime_offset && !candidate.cube) {
+				if (HasFlag(mem, Decoder::ImageSampleFlagDerivative)) {
+					coord = OffsetSampleCoordinates(ctx, resource, array_index, offset_value, coord,
+					                                ZeroF32(state), operands[1], operands[2]);
+				} else if (explicit_lod) {
+					coord = OffsetSampleCoordinates(ctx, resource, array_index, offset_value, coord,
+					                                operands[1]);
+				} else {
+					// Implicit LOD in a pixel shader: query it, plus the bias the query does not see.
+					state.builder.RequireCapability(spv::CapabilityImageQuery);
+					const auto query = state.builder.AllocateId();
+					state.builder.AddFunction(spv::OpImageQueryLod, TypeF32Vector(state, 2), query, sampled,
+					                          CoordF32(ctx, mem, *address, layout.coord,
+					                                   candidate_info.spatial_components));
+					auto level = state.builder.AllocateId();
+					state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), level, query, 1u);
+					if (layout.bias != NoImageComponent) {
+						level = Binary(state, spv::OpFAdd, TypeF32(state), level, operands[1]);
+					}
+					coord = OffsetSampleCoordinates(ctx, resource, array_index, offset_value, coord, level);
+				}
+			}
 			const auto sample = state.builder.AllocateId();
 			state.builder.AddFunction(opcode, result_type, sample, sampled, coord,
 			                          std::span(&dref_value, dref ? 1u : 0u),

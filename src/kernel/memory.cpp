@@ -1198,6 +1198,12 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 			if (speculate && buffers.TrySpeculativeRead(vaddr, data, size)) {
 				return true;
 			}
+			// KYTY_SRT_UNION_DIRTY: the caller can do without these bytes (it keeps both sides of a
+			// branch), so do not stop to download bytes strict guessing keeps refusing. Other dirty
+			// bytes download as before (keeping both sides everywhere crashed on a garbage address).
+			if (Common::Experiments::g_no_wait_dirty_reads && buffers.IsStrictRefused(vaddr, size)) {
+				return false;
+			}
 			if (!BackingReadStatsEnabled() && !speculate) {
 				buffers.ReadMemory(vaddr, size);
 			} else {

@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/Tessellation.h"
+#include "graphics/shader/recompiler/backend/spirv/spirvHalfLanes.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "graphics/shader/shaderVertexMetadata.h"
@@ -675,7 +676,14 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 	words.push_back(static_cast<uint32_t>(ShaderExecSelects()));
 	words.push_back(static_cast<uint32_t>(ShaderLdsLaneSlots()));
 	if (ShaderFastMinMax()) words.push_back(0x464d4d31u);
+	if (ShaderNanClamp()) words.push_back(0x4e434c31u);
 	if (ShaderSkipBoundsChecks()) words.push_back(0x53424331u);
+	if (ShaderRecompiler::Spirv::HalfVectorEnabled()) words.push_back(0x48564331u);
+	if (ShaderRecompiler::Spirv::LaneDemandEnabled()) words.push_back(0x4c444d31u);
+	if (ShaderRecompiler::Spirv::LaneRegionsEnabled()) {
+		words.push_back(0x4c524730u + static_cast<uint32_t>(ShaderRecompiler::Spirv::LaneRegionsMode()) + 0x10u);
+	}
+	if (ShaderRecompiler::Spirv::FastDenormEnabled()) words.push_back(0x46444e31u);
 	words.push_back(info.pa_cl_vs_out_cntl);
 	words.push_back(static_cast<uint32_t>(info.clip_space.enabled));
 	if (info.clip_space.enabled) {
@@ -760,7 +768,14 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 	words.push_back(static_cast<uint32_t>(ShaderExecSelects()));
 	words.push_back(static_cast<uint32_t>(ShaderLdsLaneSlots()));
 	if (ShaderFastMinMax()) words.push_back(0x464d4d31u);
+	if (ShaderNanClamp()) words.push_back(0x4e434c31u);
 	if (ShaderSkipBoundsChecks()) words.push_back(0x53424331u);
+	if (ShaderRecompiler::Spirv::HalfVectorEnabled()) words.push_back(0x48564331u);
+	if (ShaderRecompiler::Spirv::LaneDemandEnabled()) words.push_back(0x4c444d31u);
+	if (ShaderRecompiler::Spirv::LaneRegionsEnabled()) {
+		words.push_back(0x4c524730u + static_cast<uint32_t>(ShaderRecompiler::Spirv::LaneRegionsMode()) + 0x10u);
+	}
+	if (ShaderRecompiler::Spirv::FastDenormEnabled()) words.push_back(0x46444e31u);
 	words.CopyTo(key);
 }
 
@@ -782,7 +797,14 @@ void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_
 	words.push_back(ShaderFloatCodegenKey());
 	words.push_back(static_cast<uint32_t>(ShaderExecSelects()));
 	if (ShaderFastMinMax()) words.push_back(0x464d4d31u);
+	if (ShaderNanClamp()) words.push_back(0x4e434c31u);
 	if (ShaderSkipBoundsChecks()) words.push_back(0x53424331u);
+	if (ShaderRecompiler::Spirv::HalfVectorEnabled()) words.push_back(0x48564331u);
+	if (ShaderRecompiler::Spirv::LaneDemandEnabled()) words.push_back(0x4c444d31u);
+	if (ShaderRecompiler::Spirv::LaneRegionsEnabled()) {
+		words.push_back(0x4c524730u + static_cast<uint32_t>(ShaderRecompiler::Spirv::LaneRegionsMode()) + 0x10u);
+	}
+	if (ShaderRecompiler::Spirv::FastDenormEnabled()) words.push_back(0x46444e31u);
 	words.CopyTo(key);
 }
 

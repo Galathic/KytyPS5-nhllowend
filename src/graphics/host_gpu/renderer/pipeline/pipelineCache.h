@@ -34,7 +34,8 @@ public:
 		m_entries.clear();
 		m_run_head = NoRun;
 		m_bytes.clear();
-		m_failed     = false;
+		m_failed      = false;
+		m_fail_reason = 0;
 		m_base       = t_resolve_base;
 		m_base_valid = t_resolve_base_valid;
 		m_unsafe_pages.fill(~uint64_t {0});
@@ -48,12 +49,19 @@ public:
 	// Reads the backing store without faulting. Strict reads are checked the way specialization
 	// memory is read (GPU-owned bytes fail), the others as plain loads.
 	bool               Read(uint64_t address, void* data, uint64_t size, bool strict);
-	void               Fail() { m_failed = true; }
+	void               Fail() {
+		if (!m_failed) m_fail_reason = 3;
+		m_failed = true;
+	}
 	[[nodiscard]] bool Failed() const { return m_failed; }
 	// Execution thread: whether every read still gives the recorded bytes.
 	// without_faults: bytes the GPU may have written since fail the check instead of being read back
 	// (a plain load of their page would fault and wait for all queued GPU work).
 	[[nodiscard]] bool StillValid(bool without_faults = false) const;
+	// NHL27AHEAD (KYTY_PERF_STATS): how ahead resolutions end. Resolve thread: a finished
+	// resolution (ok or why it failed). Execution thread: a draw without a resolution.
+	static void NoteResolved(const GuestReadLog& log);
+	static void NoteNoResolution();
 
 private:
 	static constexpr uint64_t StrictCheckBytes = 64;
@@ -77,7 +85,8 @@ private:
 		return !entry.strict && !entry.unsafe && (entry.address >> 12u) == ((entry.address + entry.size - 1) >> 12u);
 	}
 	std::vector<uint8_t> m_bytes;
-	bool                 m_failed     = false;
+	bool                 m_failed      = false;
+	uint8_t              m_fail_reason = 0; // 1 plain read, 2 strict read, 3 other (program/permutation)
 	uint64_t             m_base       = 0;
 	bool                 m_base_valid = false;
 	// The last pages Read() looked up and whether their bytes may be GPU-owned.

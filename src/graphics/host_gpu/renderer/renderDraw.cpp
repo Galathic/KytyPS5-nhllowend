@@ -779,6 +779,9 @@ DrawRenderState& RenderExecutor::AcquireDrawRenderState(bool tessellation, bool&
 	// The operations before this draw executed: the resolution holds when the guest memory it
 	// read still has the same bytes.
 	auto* resolved = std::exchange(m_resolved_draw, nullptr);
+	if (resolved == nullptr || tessellation) {
+		GuestReadLog::NoteNoResolution();
+	}
 	shaders_resolved =
 	    resolved != nullptr && !tessellation && resolved->programs.reads.StillValid();
 	// KYTY_DBG_CP_READS=1: how many draws use the resolve thread's read-ahead (NHL27AHEAD, 2 s).
@@ -1179,9 +1182,27 @@ enum class CbColorMode : uint8_t {
 	DccDecompress      = 6,
 };
 
-static bool ConsumeMetadataColorOperation(const CommandBuffer& buffer) {
+bool RenderExecutor::ConsumeMetadataColorOperation(CommandBuffer& buffer,
+                                                   uint32_t render_target_slice_offset) {
 	const auto& ctx  = buffer.GetRegisters();
 	const auto  mode = ctx.GetColorControl().mode;
+	// KYTY_FCE_MATERIALIZE=1, off by default: NHL 27 test Oct 22 (together with KYTY_NAN_CLAMP)
+	// gave pitch-black ice.
+	static const bool materialize_fce = [] {
+		const char* value = std::getenv("KYTY_FCE_MATERIALIZE");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (materialize_fce && mode == static_cast<uint8_t>(CbColorMode::EliminateFastClear)) {
+		// FCE can precede sampling the target with no ordinary draw to it in between. Resolve the
+		// target so its pending clear is written into the expanded image first (upstream 31b7be9f).
+		RenderColorInfo target {};
+		ResolveRenderColorTarget(buffer, target, render_target_slice_offset, 0, true);
+		static std::atomic<uint32_t> fce_count {0};
+		if (fce_count.fetch_add(1, std::memory_order_relaxed) == 0) {
+			Log::WriteToConsoleAndLog("NHL27FCE: first eliminate-fast-clear draw materialized\n");
+		}
+		return true;
+	}
 	// These special modes run color-buffer metadata or decompression operations. The shader is a
 	// vehicle for that operation, and its exported color must not be applied as a normal draw.
 	// Kyty stores expanded Vulkan images rather than compressed guest surfaces, so no equivalent
@@ -1521,6 +1542,7 @@ RenderExecutor::ResolvedDraw* RenderExecutor::ResolveDrawAhead(const HW::Context
 	state.ps_active              = PixelShaderActive(context, shaders, color_output_mask);
 	RefreshShaderPrograms(m_context.GetPipelineCache(), context, shaders, user_config,
 	                      color_output_mask, state, &draw.programs);
+	GuestReadLog::NoteResolved(draw.programs.reads);
 	if (draw.programs.reads.Failed()) {
 		return nullptr;
 	}
@@ -1807,7 +1829,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		descriptor_stages[stage_count++] = &*bindings.pixel;
 	}
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
-	if (emit.indirect != nullptr && state.vertex_info[0].stage.program->info.native_draw) {
+	if (emit.indirect != nullptr && state.vertex_info[0].stage.program->info.native_draw &&
+	    emit.indirect->snapshot->HasDeviceAddress()) {
 		const auto dword = state.vertex_info[0].stage.program->bindings.native_draw_dword;
 		const auto address = emit.indirect->snapshot->BufferDeviceAddress();
 		bindings.vertex[0].shader_data[dword] = static_cast<uint32_t>(address);
@@ -2276,7 +2299,8 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 
-	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
+	if (ConsumeMetadataColorOperation(buffer, args.render_target_slice_offset) ||
+	    DepthStencilCopy(buffer) ||
 	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
 		InvalidateRenderTargetMemo();
 		ResetBindings();
@@ -2400,7 +2424,8 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		return;
 	}
 
-	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
+	if (ConsumeMetadataColorOperation(buffer, args.render_target_slice_offset) ||
+	    DepthStencilCopy(buffer) ||
 	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
 		InvalidateRenderTargetMemo();
 		ResetBindings();
@@ -2542,9 +2567,14 @@ bool RenderExecutor::DrawAutoIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	     state.vertex_info[0].stage.program->param_export_mask == 0 &&
 	     state.ps_input_info.input_num != 0)) { ResetBindings(); return false; }
 	auto& scheduler = m_context.GetCommandScheduler();
+	// The snapshot needs a device address whenever the draw path below reads it through one: indexed
+	// draws (NativeIndirectPrep) and vertex programs built with native draw parameters. The program can
+	// carry native_draw even when this draw's native_draw info is off (Oct 18 crash: Buffer without BDA).
+	const bool snapshot_bda = source.indexed || state.vertex_info[0].native_draw.Enabled() ||
+	                          (state.vertex_info[0].stage.program != nullptr &&
+	                           state.vertex_info[0].stage.program->info.native_draw);
 	source.snapshot = std::make_shared<Buffer>(m_context.GetGraphics(), scheduler,
-	    MemoryUsage::Download, 0, AllFlags | (source.indexed || state.vertex_info[0].native_draw.Enabled() ||
-	                                          state.vertex_info[0].stage.program->info.native_draw
+	    MemoryUsage::Download, 0, AllFlags | (snapshot_bda
 	        ? vk::BufferUsageFlagBits::eShaderDeviceAddress : vk::BufferUsageFlags {}),
 	    source.ArgsSize() + sizeof(uint32_t));
 	// The scheduler retains ownership even if SET_NUM_INSTANCES discards the CPU snapshot early.

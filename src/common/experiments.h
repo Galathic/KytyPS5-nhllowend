@@ -32,6 +32,9 @@ enum Bit : uint64_t {
 	CpBackingReads     = 1u << 4u, // KYTY_CP_BACKING_READS (default on; command-processor reads of read-protected pages go through the execution thread and the backing store instead of faulting; was SrtJit, now env-only KYTY_SRT_JIT)
 	FaultPageDirect    = 1u << 5u, // KYTY_FAULT_PAGE_DIRECT (default on; direct SRT reads and read-ahead checks of pages that faulted before use the backing)
 	WideWriteDownloads = 1u << 6u, // KYTY_WIDE_WRITE_DOWNLOADS (default on; a guest store into a GPU-written page downloads the GPU-written bytes of its 64 KiB window at once; was FalseShareReads, now env-only KYTY_FALSE_SHARE_READS)
+	ProgramLockSplit   = uint64_t {1} << 38u, // KYTY_PROGRAM_LOCK_SPLIT (default off; the resolve thread walks shader tables without holding the program lock)
+	FillPatterns       = uint64_t {1} << 39u, // KYTY_FILL_PATTERNS (default off; a proven compute fill of a repeating 2-4 word pattern is remembered like a uniform fill, so color-clear decoding needs no readback)
+	UnmapBufferWait    = uint64_t {1} << 40u, // KYTY_UNMAP_BUFFER_WAIT (default off; an unmap of GPU-written buffer bytes waits only for their writers, not for the whole GPU)
 	SrtBatchReads      = 1u << 7u, // KYTY_SRT_BATCH_READS (default on; also read by the program cache)
 	DirectSrtReads     = 1u << 10u, // KYTY_DIRECT_SRT_READS (default on; SRT reads without the IR walk)
 	GpuConditionsBothPaths = 1u << 13u, // KYTY_GPU_CONDITIONS_BOTH_PATHS (default on; a resource walk takes both paths of a branch on GPU-written bytes instead of waiting for them; was ClockWaitAhead, now env-only)
@@ -65,6 +68,9 @@ enum Bit : uint64_t {
 	BdaLoadGroups        = uint64_t {1} << 42u, // KYTY_BDA_LOAD_GROUPS (default off; consecutive DWORD loads through an address share one page lookup; part of shader keys)
 	DrawResolver         = uint64_t {1} << 43u, // KYTY_DRAW_RESOLVER (default on since 2026-10-22; earlier off for 2 guest job-thread crashes in 8 boots, since fixed causes; a second resolve thread resolves about half of the draws ahead, by shader addresses)
 	SpeculateDirtyReads  = uint64_t {1} << 37u, // KYTY_SPECULATE_DIRTY_READS (default off; shader-table reads of GPU-written bytes the GPU keeps rewriting unchanged use the backing, checked later)
+	DirectGpuReads       = uint64_t {1} << 41u, // KYTY_DIRECT_GPU_READS (default off; downloads of bytes whose GPU writer already finished read the mapped game buffer, needs the same variable at startup)
+	AsyncReadback        = uint64_t {1} << 42u, // KYTY_ASYNC_READBACK (default off; guest and command-processor downloads wait on their own thread, not the execution thread)
+	SpeculateStrict      = uint64_t {1} << 43u, // KYTY_SPECULATE_STRICT (default off; with SpeculateDirtyReads, never guess bytes that changed twice or were guessed wrong once)
 	// A/B only (no environment variable): selects the code a pending change replaces.
 	AbLegacy = 1u << 31u,
 	// A/B only, like AbLegacy, for the changes made after it was taken (AbLegacy also turns off
@@ -115,6 +121,19 @@ extern std::atomic<uint64_t> g_mask;
 // reads of clean bytes on GPU-written pages through the backing.
 [[nodiscard]] bool FalseShareReads() noexcept;
 
+// KYTY_DIRECT_GPU_READS=1 at startup: game buffers are allocated CPU-visible (Resizable BAR) and every
+// submission makes its writes visible to the CPU. Fixed for the whole run; the DirectGpuReads bit
+// only decides whether downloads use it.
+[[nodiscard]] bool DirectGpuReadsMemory() noexcept;
+
+// KYTY_SRT_UNION_DIRTY=1 at startup (default off): when a shader-table branch condition would need
+// GPU-written bytes that are not downloaded yet, the walker does not wait for them. It treats the
+// branch as "could go either way" and keeps the resources of both sides (RefreshDirectControlFlow).
+[[nodiscard]] bool SrtUnionDirty() noexcept;
+// Set by the walker while it evaluates such a condition: strict reads of GPU-dirty bytes then fail
+// instead of downloading (TryReadBufferBacking).
+inline thread_local bool g_no_wait_dirty_reads = false;
+
 } // namespace Common::Experiments
 
 namespace Common::Timeline {
@@ -129,5 +148,15 @@ void Mark(const char* what, uint64_t value = 0) noexcept;
 void MarkStack() noexcept;
 
 } // namespace Common::Timeline
+
+namespace Common::Sampler {
+
+// Diagnostics: KYTY_PERF_SAMPLE=1 samples the registered threads about 1000 times a second
+// (suspend, read the instruction pointer, unwind) and every 10 s prints the functions they were
+// in (NHL27SAMPLE self = innermost function, incl = anywhere on the stack). Addresses are
+// absolute; for the exe (fixed base 0x140000000) resolve them with the linker map.
+void RegisterCurrentThread(const char* name) noexcept;
+
+} // namespace Common::Sampler
 
 #endif // EMULATOR_SRC_COMMON_EXPERIMENTS_H_

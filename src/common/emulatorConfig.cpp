@@ -1,6 +1,7 @@
 #include "common/emulatorConfig.h"
 
 #include "common/assert.h"
+#include "common/experiments.h"
 #include "common/threads.h"
 
 #include <algorithm>
@@ -211,6 +212,9 @@ int GpuStageCpu(GpuStageThread stage) {
 }
 
 void ConfigureGpuStageThread(GpuStageThread stage) {
+	// KYTY_PERF_SAMPLE=1: sample this GPU stage thread (NHL27SAMPLE lines).
+	static constexpr const char* stage_names[] = {"cp", "exec", "record", "resolve", "hostcopy"};
+	Common::Sampler::RegisterCurrentThread(stage_names[static_cast<uint32_t>(stage) % 5u]);
 	const auto& cpus = GpuStageCpus();
 	static const bool high_priority = [] {
 		const char* value = std::getenv("KYTY_GPU_THREAD_PRIORITY");

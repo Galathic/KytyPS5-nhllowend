@@ -63,6 +63,10 @@ struct ResourceSnapshot {
 	std::vector<std::pair<uint64_t, uint64_t>> specialization_reads;
 	UniformFill                 uniform_fill;
 	UniformCopy                 uniform_copy;
+	// Experiment FillPatterns: the planned fill when its words evaluate but differ (uniform_fill
+	// stays None then). fill.value is unused; values holds the element's words.
+	UniformFill                 uniform_pattern;
+	std::array<uint32_t, 4>     uniform_pattern_values {};
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
