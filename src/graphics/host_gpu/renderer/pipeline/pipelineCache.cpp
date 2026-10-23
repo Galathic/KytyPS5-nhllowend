@@ -1798,9 +1798,15 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 		// One store per build: the records copy the layouts of the stage input structures, and
 		// what a program key means may change between builds. A build with local changes uses the
 		// time pipelineCache.cpp (which includes those structures) was compiled.
-		const std::string_view hash = KYTY_GIT_HASH;
-		auto build = std::string(std::string_view(KYTY_GIT_REVISION).substr(0, 12));
-		if (hash.ends_with("-dirty")) {
+		// Builds whose shader translator and program cache are the same committed sources share a
+		// store (KYTY_GIT_SHADER_TREE): the records are compile inputs, recompiled by the running
+		// build and checked against its keys, and only those sources give them their meaning. A
+		// new build of the rest (most changes) then starts with the programs played before.
+		const std::string_view hash   = KYTY_GIT_HASH;
+		const std::string_view shared = KYTY_GIT_SHADER_TREE;
+		auto build = shared.empty() ? std::string(std::string_view(KYTY_GIT_REVISION).substr(0, 12))
+		                            : "s" + std::string(shared.substr(0, 12));
+		if (shared.empty() && hash.ends_with("-dirty")) {
 			build += fmt::format("-{:08x}", static_cast<uint32_t>(XXH3_64bits(
 			                                    __DATE__ __TIME__, sizeof(__DATE__ __TIME__))));
 		}
