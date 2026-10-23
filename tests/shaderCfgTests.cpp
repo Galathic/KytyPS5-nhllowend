@@ -14572,7 +14572,7 @@ void BuildTypedPlan(const uint32_t *code, uint32_t words,
     ShaderRecompiler::IR::RemoveIdentities(ir);
     ShaderRecompiler::IR::EliminateDeadCode(ir.blocks);
   }
-  ShaderRecompiler::IR::TrackResources(ir, decoded, cfg, options.input_info);
+  ShaderRecompiler::IR::TrackResources(ir, decoded, cfg, false, options.input_info);
   ShaderRecompiler::IR::EliminateDeadCode(ir.blocks);
 }
 
@@ -17067,7 +17067,8 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--setpc-dword-only") == 0) {
-    TestNewShaderRecompilerSetpcDwordJumpTable();
+    TestNewShaderRecompilerSetpcDwordJumpTable(6);
+    TestNewShaderRecompilerSetpcDwordJumpTable(106);
     TestSetpcDwordJumpTableAliasedLoadSelector();
     return 0;
   }
