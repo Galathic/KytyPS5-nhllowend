@@ -2180,18 +2180,12 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 		// The copies into coherent staging memory go to the host copy thread like the stream
 		// buffer's (StreamGuestData); the submission waits for them.
 		const bool async = m_staging_buffer.IsCoherent();
-	const auto source = UploadMemory(m_graphics, m_scheduler, m_staging_buffer, total_size, 4,
-	    vk::BufferUsageFlagBits::eTransferSrc, [&](uint8_t* mapped, uint64_t base_offset) {
-
 		for (auto& copy: copies) {
 			const auto address = buffer.CpuAddress() + copy.dstOffset;
 			if (async) {
 				StreamGuestData(mapped + copy.srcOffset, address, copy.size);
 			} else {
 				std::memcpy(mapped + copy.srcOffset, reinterpret_cast<const void*>(address), copy.size);
-			if (!LibKernel::Memory::CopySparseMemory(address, mapped + copy.srcOffset, copy.size)) {
-				EXIT("BufferCache: failed to read sparse guest buffer memory\n");
-
 			}
 			copy.srcOffset += base_offset;
 		}
@@ -2214,10 +2208,6 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	const auto handle = temporary->Handle();
 	m_scheduler.DeferHostOperation([owner = std::move(temporary)]() mutable { owner.reset(); });
 	return handle;
-	});
-	return source.first->Handle();
-
-}
 }
 
 void BufferCache::StreamGuestData(uint8_t* destination, uint64_t vaddr, uint64_t size) {
