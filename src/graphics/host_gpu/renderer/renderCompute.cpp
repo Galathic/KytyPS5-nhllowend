@@ -907,7 +907,10 @@ RenderExecutor::ResolvedDispatch* RenderExecutor::ResolveDispatchAhead(const HW:
                                                                        bool async_compute, bool indirect) {
 	if ((!indirect && (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0)) ||
 	    shaders.GetCs().cs_regs.data_addr == 0 ||
-	    (indirect && (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0)) {
+	    (indirect && (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0) ||
+	    // Resolving ahead must not reach a shader the guest has not registered yet; the
+	    // execution thread looks it up in order.
+	    !ShaderMapContains({shaders.GetCs().cs_regs.data_addr})) {
 		return nullptr;
 	}
 	Common::RuntimeFlags::EvaluationScope flags_scope;

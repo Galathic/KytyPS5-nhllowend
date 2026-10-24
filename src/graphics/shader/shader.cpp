@@ -73,6 +73,15 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	(*g_shader_map)[addr] = {data, hash};
 }
 
+bool ShaderMapContains(std::initializer_list<uint64_t> addrs) {
+	EXIT_IF(g_shader_map == nullptr);
+
+	std::scoped_lock lock(g_shader_map_mutex);
+	return std::ranges::all_of(addrs, [](uint64_t addr) {
+		return addr == 0 || g_shader_map->contains(addr);
+	});
+}
+
 static ShaderMapEntry ShaderGetMappedData(uint64_t addr, const char* label) {
 	EXIT_IF(g_shader_map == nullptr);
 
