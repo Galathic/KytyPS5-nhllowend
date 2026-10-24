@@ -944,6 +944,15 @@ add_custom_target(kyty_trophy_sound
 add_dependencies(kyty_emulator kyty_trophy_sound)
 install(FILES "${KYTY_TROPHY_UNLOCK_SOUND}" DESTINATION assets/sounds)
 
+# Build-wide config the launcher reads from the emulator's folder.
+set(KYTY_GLOBAL_CONFIG "${CMAKE_CURRENT_SOURCE_DIR}/assets/cfgGlobal.json")
+add_custom_target(kyty_global_config
+	COMMAND ${CMAKE_COMMAND} -E copy_if_different "${KYTY_GLOBAL_CONFIG}"
+		"$<TARGET_FILE_DIR:kyty_emulator>/cfgGlobal.json"
+	VERBATIM)
+add_dependencies(kyty_emulator kyty_global_config)
+install(FILES "${KYTY_GLOBAL_CONFIG}" DESTINATION .)
+
 add_custom_target(kyty_touch_cursors
 	COMMAND ${CMAKE_COMMAND} -E copy_directory
 		"${CMAKE_CURRENT_SOURCE_DIR}/assets/cursors"
