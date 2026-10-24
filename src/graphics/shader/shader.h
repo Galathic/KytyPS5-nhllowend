@@ -11,6 +11,7 @@
 #include <array>
 #include <atomic>
 #include <cstdlib>
+#include <initializer_list>
 #include <span>
 #include <string>
 #include <string_view>
@@ -525,6 +526,8 @@ struct ShaderMappedData {
 
 void ShaderInit();
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
+// True when every address is an unset stage (0) or a shader AgcCreateShader registered.
+bool ShaderMapContains(std::initializer_list<uint64_t> addrs);
 uint32_t ShaderPixelExportTarget(uint32_t shader_mask, uint32_t export_index);
 
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);

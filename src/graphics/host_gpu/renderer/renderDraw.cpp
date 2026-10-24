@@ -1534,6 +1534,12 @@ RenderExecutor::ResolvedDraw* RenderExecutor::ResolveDrawAhead(const HW::Context
 	if (user_config.GetPrimType() == Prospero::PrimitiveType::kPatch) {
 		return nullptr;
 	}
+	// As for dispatches: shaders the guest has not registered yet are looked up in order.
+	const auto& vs = shaders.GetVs();
+	if (!ShaderMapContains({vs.es_regs.data_addr, vs.gs_regs.data_addr, vs.ls_regs.data_addr,
+	                        vs.hs_regs.data_addr, shaders.GetPs().ps_regs.data_addr})) {
+		return nullptr;
+	}
 	auto& ring_storage = ring_index == 0 ? m_resolved_ring : m_resolved_ring_second;
 	if (ring_storage == nullptr) {
 		ring_storage = {new ResolvedDrawRing {}, [](ResolvedDrawRing* ring) { delete ring; }};
