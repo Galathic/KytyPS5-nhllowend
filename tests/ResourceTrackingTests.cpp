@@ -2166,7 +2166,7 @@ void TestFmaskLoadSpecialization() {
                              specialization),
         "FMASK resources did not materialize");
   ApplyResourceSpecialization(fixture.program, specialization);
-  RemoveIdentities(fixture.program.blocks);
+  RemoveIdentities(fixture.program);
   EliminateDeadCode(fixture.program.blocks);
   Check(fixture.program.info.images.size() == 1 && snapshot.images.size() == 1 &&
             snapshot.images[0].dwords[0] == 0x2000u &&
@@ -3013,7 +3013,7 @@ void TestLoopCycleEnteredThroughRuntimeValue() {
                {handle, Value(0u), Value(0u), Value(0u), Value(true)},
                fixture.AddMemory(memory, 16), loop);
   ConstantPropagationPass(fixture.program.blocks);
-  RemoveIdentities(fixture.program.blocks);
+  RemoveIdentities(fixture.program);
   fixture.PlanAndTrack();
   auto plan = ExtractResourcePlan(fixture.program);
   const std::array<uint32_t, 1> user_data{0x4000u};
@@ -3268,12 +3268,12 @@ void TestDmaBaseRegisters() {
   const auto offset = fixture.Emit(
       ValueOpcode::IMul32, {fixture.UserData(10), fixture.UserData(11)});
   const auto index = fixture.Emit(ValueOpcode::IAdd32, {lane, offset});
-  const auto sum =
-      fixture.Emit(ValueOpcode::IAddCarry32, {fixture.UserData(12), index});
   const auto low =
-      fixture.Emit(ValueOpcode::CompositeExtractU32x2, {sum, Value(0u)});
+      fixture.Emit(ValueOpcode::IAdd32, {fixture.UserData(12), index});
+  const auto carry_flag =
+      fixture.Emit(ValueOpcode::ULessThan32, {low, fixture.UserData(12)});
   const auto carry =
-      fixture.Emit(ValueOpcode::CompositeExtractU32x2, {sum, Value(1u)});
+      fixture.Emit(ValueOpcode::SelectU32, {carry_flag, Value(1u), Value(0u)});
   const auto high =
       fixture.Emit(ValueOpcode::IAdd32, {fixture.UserData(13), carry});
   const auto address = fixture.Address(low, high, 0xa0);
@@ -3943,7 +3943,7 @@ void TestResourceLimitIsTransactional() {
   Fixture accepted;
   MemoryInfo accepted_memory;
   accepted_memory.kind = ResourceKind::Buffer;
-  for (uint32_t index = 0; index < ShaderInfo::MaxBuffers; index++) {
+  for (uint32_t index = 0; index < ShaderInfo::MaxBufferRoots; index++) {
     const auto handle = accepted.Buffer(
         {Value(index), Value(index + 1u), Value(index + 2u), Value(index + 3u)},
         index * 4u);
@@ -3964,7 +3964,7 @@ void TestResourceLimitIsTransactional() {
   Fixture fixture;
   MemoryInfo memory;
   memory.kind = ResourceKind::Buffer;
-  for (uint32_t index = 0; index <= ShaderInfo::MaxBuffers; index++) {
+  for (uint32_t index = 0; index <= ShaderInfo::MaxBufferRoots; index++) {
     const auto handle = fixture.Buffer(
         {Value(index), Value(index + 1u), Value(index + 2u), Value(index + 3u)},
         index * 4u);
