@@ -195,7 +195,7 @@ if (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 12.0.0)
 	)
 endif()
 
-option(KYTY_BUILD_LAUNCHER "Build Qt launcher" ON)
+option(KYTY_BUILD_LAUNCHER "Build Slint launcher (fetches Slint, needs Rust)" ON)
 
 config_compiler_and_linker()
 
