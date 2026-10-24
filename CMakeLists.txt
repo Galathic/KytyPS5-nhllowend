@@ -421,6 +421,7 @@ endif()
 
 set(inc_headers
 	${KYTY_SOURCE_DIR}
+	${KYTY_THIRD_PARTY_DIR}/Vulkan-Headers/include
 	${KYTY_THIRD_PARTY_DIR}/VulkanMemoryAllocator/include
 	${KYTY_THIRD_PARTY_DIR}/SPIRV-Tools/include
 	${KYTY_THIRD_PARTY_DIR}/SPIRV-Headers/include

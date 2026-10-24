@@ -164,6 +164,24 @@ struct ResourcePlanFixture {
   void operator()(SampledResourcePair& v) { Fields(v.image,v.sampler,v.first_use_pc); }
   void operator()(ShaderInfo& v) { Fields(v.buffers,v.images,v.samplers,v.sampled_pairs,
    v.vertex_fetch_components,v.vertex_offset_sgpr,v.instance_offset_sgpr,v.has_bitwise_xor,v.uses_dma,v.native_draw); }
+  void operator()(DescriptorSource::IndirectDescriptor::SelectorRead::CountedRows& v) {
+    Fields(v.source, v.stride);
+  }
+  void operator()(std::optional<DescriptorSource::IndirectDescriptor::SelectorRead::CountedRows>& v) {
+    bool present = v.has_value();
+    (*this)(present);
+    if (!input) {
+      if (present && ok) (*this)(*v);
+      return;
+    }
+    v.reset();
+    if (!present || !ok) return;
+    uint32_t source = 0, stride = 0;
+    (*this)(source);
+    (*this)(stride);
+    if (!ok) return;
+    v.emplace(source, stride);
+  }
   void operator()(DescriptorSource::IndirectDescriptor::SelectorRead& v) {
     Fields(v.source, v.stride, v.offset, v.maximum, v.bit_offset, v.bit_mask,
            v.global, v.bitset, v.rows, v.byte_ranges);
@@ -195,6 +213,27 @@ struct ResourcePlanFixture {
     if (!ok) return;
     v.emplace(source, stride, offset, maximum, bit_offset, bit_mask, global, bitset,
               std::move(rows), std::move(byte_ranges));
+  }
+  void operator()(DescriptorSource::IndirectDescriptor::PointerTable& v) {
+    Fields(v.offset, v.stride, v.count, v.indexed);
+  }
+  void operator()(std::optional<DescriptorSource::IndirectDescriptor::PointerTable>& v) {
+    bool present = v.has_value();
+    (*this)(present);
+    if (!input) {
+      if (present && ok) (*this)(*v);
+      return;
+    }
+    v.reset();
+    if (!present || !ok) return;
+    uint32_t offset = 0, stride = 0, count = 0;
+    bool indexed = false;
+    (*this)(offset);
+    (*this)(stride);
+    (*this)(count);
+    (*this)(indexed);
+    if (!ok) return;
+    v.emplace(offset, stride, count, indexed);
   }
   void operator()(DescriptorSource::IndirectDescriptor& v) {
     Fields(v.selector, v.table_source, v.table_offset, v.table_immediate, v.table_stride,
