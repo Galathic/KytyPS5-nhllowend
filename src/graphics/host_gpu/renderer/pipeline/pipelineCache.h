@@ -13,6 +13,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+
 #include <cstddef>
 #include <atomic>
 #include <filesystem>
@@ -126,6 +128,10 @@ class UserConfig;
 struct ComputeShaderInfo;
 } // namespace HW
 
+namespace ShaderRecompiler::IR {
+class ImageHeapSource;
+} // namespace ShaderRecompiler::IR
+
 #pragma pack(push, 1)
 
 struct PipelineStaticParameters {
@@ -135,6 +141,7 @@ struct PipelineStaticParameters {
 	bool                       primitive_restart_enable = false;
 	uint32_t                   samples                  = 1;
 	bool                       sample_shading_enable    = false;
+	bool                       alpha_to_coverage_enable = false;
 	uint32_t                   color_mask[RENDER_COLOR_ATTACHMENTS_MAX]           = {};
 	bool                       cull_front                                         = false;
 	bool                       cull_back                                          = false;
@@ -158,7 +165,7 @@ struct PipelineStaticParameters {
 static_assert(std::is_trivially_copyable_v<PipelineStaticParameters>);
 static_assert(std::is_standard_layout_v<PipelineStaticParameters>);
 static_assert(alignof(PipelineStaticParameters) == 1);
-static_assert(sizeof(PipelineStaticParameters) == 116);
+static_assert(sizeof(PipelineStaticParameters) == 117);
 
 struct PipelineRenderingState {
 	std::array<vk::Format, RENDER_COLOR_ATTACHMENTS_MAX> color_formats {};
@@ -207,7 +214,7 @@ namespace PipelineRecord { class RecordFile; struct Records; }
 
 class PipelineCache {
 public:
-	explicit PipelineCache(GraphicContext& graphics);
+	PipelineCache(GraphicContext& graphics, ShaderRecompiler::IR::ImageHeapSource* image_heap);
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
 	void Save();
@@ -217,6 +224,7 @@ public:
 		vk::Pipeline            pipeline              = nullptr;
 		vk::DescriptorSetLayout descriptor_set_layout = nullptr;
 		bool                    uses_push_descriptors = false;
+		bool                    uses_image_heap       = false;
 	};
 
 	struct GraphicsPrograms {
@@ -292,6 +300,9 @@ private:
 	std::atomic_uint64_t          m_unsaved_pipelines {0};
 	Common::Mutex                 m_write_mutex;
 	std::jthread                  m_save_thread;
+	std::chrono::steady_clock::time_point m_next_driver_cache_save;
+	bool                          m_driver_cache_dirty = false;
+
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
@@ -313,6 +324,8 @@ private:
 	                            const ShaderPixelInputInfo* ps_input_info);
 	// Writes the driver cache data to m_driver_cache_path; the cache must stay alive meanwhile.
 	void WriteDriverCache();
+	void CheckpointDriverCache();
+
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);

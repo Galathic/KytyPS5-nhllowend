@@ -28,9 +28,10 @@ RenderContext::RenderContext(GraphicContext& graphics)
       m_command_scheduler(*this, graphics,
                           (Config::GpuPipelineStages() & Config::GPU_PIPELINE_RECORDING) != 0),
       m_descriptor_heap(graphics, m_command_scheduler.GetMasterSemaphore()),
-      m_pipeline_cache(graphics), m_sampler_cache(graphics),
+      m_pipeline_cache(graphics, &m_image_heap), m_sampler_cache(graphics),
       m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache),
-      m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache) {
+      m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache),
+      m_image_heap(*this, m_page_manager) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	// Experiment FaultPageReads: resource-table reads of a page the GPU thread took a read fault on
 	// (the GPU wrote other bytes of it) read clean bytes through the backing instead of faulting
@@ -178,6 +179,7 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 				m_buffer_cache.MarkCpuDirtyAhead(next, kAheadBytes);
 			}
 		}
+		m_image_heap.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
 		FrameBreakdown::FaultTimer t(FrameBreakdown::g_fault_cost.rd_readmem_ns);
 		if (GuestGpu::IsGpuThread()) {
@@ -208,6 +210,7 @@ bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	}
 	m_buffer_cache.InvalidateMemory(vaddr, size);
 	m_texture_cache.InvalidateMemory(vaddr, size);
+	m_image_heap.InvalidateMemory(vaddr, size);
 	return true;
 }
 
@@ -359,6 +362,8 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 			m_unmap_log[m_unmap_sequence % m_unmap_log.size()] = {m_unmap_sequence, vaddr, vaddr + size};
 			m_unmap_sequence++;
 		}
+		m_image_heap.UnmapMemory(vaddr, size);
+
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
 		m_bda_new_ranges.Subtract(vaddr, size);
@@ -545,7 +550,6 @@ void RenderContext::PrepareBda() {
 	}
 	m_bda_batch_synced = true;
 	total_timer.Stop();
-	// Lazy BDA faults still need processing even when uploads were unchanged.
 	m_fault_process_pending = true;
 	if (stats_enabled && ((m_bda_stats.scans + m_bda_stats.reused) & 4095u) == 0) {
 		static auto last = std::chrono::steady_clock::now();

@@ -4,6 +4,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/runtimeFlags.h"
@@ -94,6 +95,26 @@ const bool g_perf_no_sync_readback = EnvFlag("KYTY_PERF_NO_SYNC_READBACK");
 
 bool PerfStatsEnabled() {
 	return g_perf_stats_enabled;
+}
+
+std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandScheduler& scheduler,
+                                        StreamBuffer& staging, uint64_t size, uint64_t alignment,
+                                        vk::BufferUsageFlags usage, const auto& write) {
+	const auto [mapped, offset] = staging.Map(size, alignment);
+	if (mapped != nullptr) {
+		write(mapped, offset);
+		staging.Commit();
+		return {&staging, offset};
+	}
+
+	// Large transfers use the same one-time host allocation as ordinary buffer uploads.
+	auto temporary = std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::Upload, 0,
+	                                         usage, size);
+	write(temporary->Mapped().data(), 0);
+	temporary->Flush(0, size);
+	auto* buffer = temporary.get();
+	scheduler.DeferOperation([owner = std::move(temporary)]() mutable { owner.reset(); });
+	return {buffer, 0};
 }
 
 } // namespace
@@ -898,6 +919,8 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		    std::unique_lock ranges_lock(m_gpu_ranges_mutex);
 		    m_gpu_modified_ranges.Subtract(address, bytes);
 		    PublishGpuRangesVersion();
+		    ForgetColorMetadataChecks(address, bytes);
+
 	    });
 	m_last_download_bytes = 0;
 	if (copies.empty()) {
@@ -977,6 +1000,8 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 			}
 		}
 	}
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferDownloadBytes, total_size);
+
 
 	auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
 	std::unique_ptr<Buffer> temporary;
@@ -1264,6 +1289,10 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
 	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
 	                     "BDA Page Table Buffer");
+	m_scheduler.BeginCommand();
+	for (auto* buffer: {&m_bda_pagetable_buffer, m_fault_manager.GetFaultBuffer()}) {
+		buffer->Fill(0, buffer->Size(), 0);
+	}
 	const auto null_id =
 	    m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16);
 	EXIT_IF(null_id != NULL_BUFFER_ID);
@@ -2143,6 +2172,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	if (copies.empty()) {
 		return nullptr;
 	}
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferUploadBytes, total_size);
 
 	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4);
 	if (mapped != nullptr) {
@@ -2352,6 +2382,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 				}
 			}
 		}
+		ForgetColorMetadataChecks(vaddr, size);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }
@@ -2481,12 +2512,13 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 		return ObtainBuffer(vaddr, size, false, false);
 	}
 
-	auto [staging, stage_offset] = m_staging_buffer.Map(size, 16);
-	if (staging == nullptr || !Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, staging, size)) {
-		EXIT("BufferCache: failed to read mapped guest image backing\n");
-	}
-	m_staging_buffer.Commit();
-	return {&m_staging_buffer, stage_offset};
+	return UploadMemory(m_graphics, m_scheduler, m_staging_buffer, size, 16,
+	    vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eStorageBuffer,
+	    [&](uint8_t* mapped, uint64_t) {
+		if (!Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, mapped, size)) {
+			EXIT("BufferCache: failed to read mapped guest image backing\n");
+		}
+	});
 }
 
 void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds) {
@@ -2575,6 +2607,29 @@ bool BufferCache::IsRegionRegistered(uint64_t vaddr, uint64_t size) {
 	}
 	const auto& [address, id] = *std::prev(candidate);
 	return address + m_slot_buffers[id].Size() > vaddr;
+}
+
+void BufferCache::MarkColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys) {
+	for (uint32_t slot = 0; slot < m_checked_color_metadata.size(); slot++) {
+		if ((keys & (1u << slot)) != 0) {
+			m_checked_color_metadata[slot].Add(vaddr, size);
+		}
+	}
+}
+
+bool BufferCache::IsColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys) const {
+	for (uint32_t slot = 0; slot < m_checked_color_metadata.size(); slot++) {
+		if ((keys & (1u << slot)) != 0 && !m_checked_color_metadata[slot].Contains(vaddr, size)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+void BufferCache::ForgetColorMetadataChecks(uint64_t vaddr, uint64_t size) {
+	for (auto& checked: m_checked_color_metadata) {
+		checked.Subtract(vaddr, size);
+	}
 }
 
 bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
@@ -2910,6 +2965,7 @@ void BufferCache::RunGarbageCollector() {
 				m_released_ranges.Add(buffer.CpuAddress(), buffer.Size());
 			}
 			DeleteBuffer(id);
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferEvictions);
 		}
 		return ++retire_count == limit;
 	});
@@ -2975,6 +3031,25 @@ void BufferCache::NoteGpuWrites(uint64_t vaddr, uint64_t size) {
 			    }
 		    });
 	}
+}
+
+void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
+	// Only tracking regions with pending CPU writes can have anything to upload.
+	m_memory_tracker.ForEachCpuDirtySpan(vaddr, size, [&](uint64_t span, uint64_t span_size) {
+		const auto end = span + span_size;
+		auto       it  = m_buffers.upper_bound(span);
+		if (it != m_buffers.begin()) {
+			--it;
+		}
+		for (; it != m_buffers.end() && it->first < end; ++it) {
+			auto&      buffer = m_slot_buffers[it->second];
+			const auto start  = std::max(buffer.CpuAddress(), span);
+			const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
+			if (start < finish) {
+				(void)SynchronizeBuffer(buffer, start, finish - start, false, false);
+			}
+		}
+	});
 }
 
 uint64_t BufferCache::SynchronizeBuffersInRanges(const RangeSet& ranges, bool full) {
@@ -3073,25 +3148,6 @@ void BufferCache::SynchronizeDirtyRegionsInRanges(const RangeSet& ranges, bool a
 	for (const auto& [index, epoch]: m_sync_regions) {
 		m_synced_region_epochs[index] = epoch;
 	}
-}
-
-void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
-	// Only tracking regions with pending CPU writes can have anything to upload.
-	m_memory_tracker.ForEachCpuDirtySpan(vaddr, size, [&](uint64_t span, uint64_t span_size) {
-		const auto end = span + span_size;
-		auto       it  = m_buffers.upper_bound(span);
-		if (it != m_buffers.begin()) {
-			--it;
-		}
-		for (; it != m_buffers.end() && it->first < end; ++it) {
-			auto&      buffer = m_slot_buffers[it->second];
-			const auto start  = std::max(buffer.CpuAddress(), span);
-			const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
-			if (start < finish) {
-				(void)SynchronizeBuffer(buffer, start, finish - start, false, false);
-			}
-		}
-	});
 }
 
 } // namespace Libs::Graphics

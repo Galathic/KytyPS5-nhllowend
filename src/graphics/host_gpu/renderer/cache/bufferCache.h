@@ -15,6 +15,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+
 #include <map>
 #include <atomic>
 #include <mutex>
@@ -284,6 +285,11 @@ public:
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               PrepareFaultBuffer() { m_fault_manager.PrepareFaultBuffer(); }
+	// Color metadata the GPU found free of the clear keys in `keys` (bits of code >> 5) stays so
+	// until a GPU write or download.
+	void               MarkColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys);
+	[[nodiscard]] bool IsColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys) const;
+
 	void               ProcessFaultBuffer();
 	void ProcessWriteBuffer(FaultManager::PagesHandler&& handler) {
 		m_fault_manager.ProcessWriteBuffer(std::move(handler));
@@ -397,6 +403,8 @@ private:
 	void RebuildPendingReadRanges();
 	[[nodiscard]] bool OverlapsPendingGuestRead(uint64_t vaddr, uint64_t size) const;
 	[[nodiscard]] bool OverlapsPendingGuestBytes(uint64_t vaddr, uint64_t size) const;
+	void               ForgetColorMetadataChecks(uint64_t vaddr, uint64_t size);
+
 
 	// Experiment EarlySubmitWriters: GPU-written ranges strict resource reads downloaded (oldest
 	// replaced first), and whether a write to one of them asks for a submit.
@@ -429,6 +437,9 @@ private:
 	uint64_t                                          m_gpu_dirty_generation = 0;
 	RangeSet                                          m_released_ranges;
 	bool                                              m_record_released = false;
+	// One per TileManager::ColorClearSlots key slot.
+	std::array<RangeSet, 8>                           m_checked_color_metadata;
+
 	MemoryTracker                                     m_memory_tracker;
 	uint64_t                                           m_gpu_write_generation = 0;
 	StreamBuffer                                      m_staging_buffer;

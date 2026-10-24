@@ -1715,7 +1715,7 @@ static bool MaterializeResourcesCore(const ResourcePlan& program, const SrtRunti
 					FrameBreakdown::Timer indirect_timer(FrameBreakdown::g_counters.mat_indirect_ns);
 					if (!MaterializeIndirectDescriptor(
 					        program, *source->indirect_descriptor, i, 4u, observed, clean, snapshot,
-					        snapshot.buffers, specialization.buffers, ShaderInfo::MaxBuffers,
+					        snapshot.buffers, specialization.buffers, ShaderInfo::MaxBufferRoots,
 					        NormalizeIndirectStoreBuffer))
 						return false;
 				}
@@ -2277,6 +2277,43 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		}
 	}
 	image_remap.Apply(images);
+}
+
+uint32_t ImageHeapKind(const ImageResource& root, DescriptorValue& value) {
+	// Mirrors BuildResourceSpecialization for sampled roots: entries it would reject, and
+	// entries that need shader-side conversion, read as null instead of failing the draw.
+	const auto format = static_cast<Prospero::BufferFormat>((value.dwords[1] >> 20u) & 0x1ffu);
+	const auto tile = static_cast<Prospero::TileMode>((value.dwords[3] >> 20u) & 0x1fu);
+	const auto numeric_class =
+	    Prospero::SampledTextureNumericClass(Prospero::RemapTextureFormat(format));
+	if (NullImageDescriptor(value) || !ValidImageDescriptor(value, root.r128) ||
+	    DescriptorDimension(value, root.dimension) != root.dimension ||
+	    Prospero::IsFmaskTextureFormat(format) || format == Prospero::BufferFormat::k11_11_10UNorm ||
+	    ImageConversionFormat(format) != Prospero::BufferFormat::kInvalid ||
+	    (root.unfiltered_access_only && format == Prospero::BufferFormat::k16UInt &&
+	     tile == Prospero::TileMode::kDepth) ||
+	    numeric_class == Prospero::TextureNumericClass::Unsupported ||
+	    (root.depth_compare && numeric_class != Prospero::TextureNumericClass::Float)) {
+		value.dwords.fill(0u);
+		return 0u;
+	}
+	return 1u + static_cast<uint32_t>(numeric_class) * 2u + (DescriptorIsCube(value) ? 1u : 0u);
+}
+
+ImageResource ImageHeapResource(const ImageResource& root, uint32_t kind) {
+	ImageResource resource;
+	resource.resource_class         = ImageResourceClass::Sampled;
+	resource.read                   = true;
+	resource.heap                   = true;
+	resource.dimension              = root.dimension;
+	resource.unfiltered_access_only = root.unfiltered_access_only;
+	resource.depth_compare          = root.depth_compare;
+	resource.r128                   = root.r128;
+	if (kind != 0u) {
+		resource.numeric_class = static_cast<Prospero::TextureNumericClass>((kind - 1u) / 2u);
+		resource.cube          = ((kind - 1u) & 1u) != 0u;
+	}
+	return resource;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
