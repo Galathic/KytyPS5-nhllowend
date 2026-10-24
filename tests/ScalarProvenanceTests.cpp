@@ -80,7 +80,7 @@ struct Fixture {
     return static_cast<uint32_t>(program.memory_info.size() - 1u);
   }
 
-  void Plan() { TrackResources(program, {}, {}, {.compute = &compute}); }
+  void Plan() { TrackResources(program, {}, {}, false, {.compute = &compute}); }
 };
 
 struct TestMemory {
