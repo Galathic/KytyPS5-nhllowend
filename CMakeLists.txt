@@ -480,6 +480,7 @@ add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
 	"${KYTY_SOURCE_DIR}/common/experiments.cpp"
+	"${KYTY_SOURCE_DIR}/common/emulatorConfig.cpp"
 )
 target_link_libraries(scalar_provenance_tests fmt::fmt xbyak::xbyak)
 target_include_directories(scalar_provenance_tests PRIVATE ${inc_headers})
@@ -546,6 +547,7 @@ target_include_directories(memory_tracker_tests PRIVATE ${inc_headers})
 add_executable(experiments_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ExperimentsTests.cpp"
 	"${KYTY_SOURCE_DIR}/common/experiments.cpp"
+	"${KYTY_SOURCE_DIR}/common/emulatorConfig.cpp"
 )
 target_include_directories(experiments_tests PRIVATE "${KYTY_SOURCE_DIR}")
 if(LINUX OR APPLE)
@@ -573,6 +575,7 @@ add_executable(resource_materialization_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
+	"${KYTY_SOURCE_DIR}/common/emulatorConfig.cpp"
 )
 target_link_libraries(resource_materialization_tests fmt::fmt xbyak::xbyak)
 if(KYTY_SRT_PROFILE)
@@ -595,6 +598,7 @@ add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ShaderInfoCollection.cpp"
 	"${KYTY_SOURCE_DIR}/common/experiments.cpp"
+	"${KYTY_SOURCE_DIR}/common/emulatorConfig.cpp"
 )
 target_link_libraries(resource_tracking_tests fmt::fmt xbyak::xbyak)
 target_include_directories(resource_tracking_tests PRIVATE ${inc_headers})
