@@ -2105,7 +2105,9 @@ void TestContiguousScalarReadBatches() {
     runtime.userdata = &reads;
   }
   auto bounded = make_plan(true, 15);
-  Check(!MaterializeResources(bounded, runtime, snapshot, specialization), "batch crossed scalar buffer bounds");
+  Check(MaterializeResources(bounded, runtime, snapshot, specialization) &&
+            snapshot.flattened_srt == std::vector<uint32_t>({11, 22, 33, 0}),
+        "batch crossing scalar buffer bounds did not zero-fill its out-of-range word");
   auto gap = make_plan(false, 32, true);
   reads.calls = 0;
   Check(gap.srt_batch_counts[0] == 1 && gap.srt_batch_counts[1] == 3 &&

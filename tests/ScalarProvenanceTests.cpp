@@ -1158,33 +1158,42 @@ void DbgExit(int) { std::abort(); }
 
 int main() {
   try {
-    TestImmediateFlatteningAndGvn();
-    TestRawScalarComponentAlignment();
-    TestScalarMemoryDomainMismatchFails();
-    TestDynamicReadRemainsTyped();
-    TestNestedSrtWalk();
-    TestShaderBaseAndUserData();
-    TestCarryAndBitFields();
-    TestInvariantAndDivergentPhi();
-    TestOperandMutationLifecycle();
-    TestControlDependentStandaloneLoadStaysTyped();
-    TestRuntime64BitDescriptorOps();
-    TestUniformFirstLaneSamplerLod();
-    TestFloatComparisonDescriptorInputs();
-    TestSharedIntegerRuntimeDependencies();
-    TestConstantBufferBounds();
-    TestReadLaneElimination();
-    TestPartialWaveReductionStructure();
-    TestPartialWaveReductionFoldedFill();
-    TestPartialWaveReductionRejectsUnprovenPatterns();
-    TestPartialWaveReductionCompoundFillCondition();
-    TestPartialWaveReductionCompareDerivedFillCondition();
-    TestPartialWaveReductionEquivalence();
-    TestCompleteUMinReduction();
-    TestOptimizationPipeline();
-    TestControlFlowValueSurvivesReadLaneFolding();
-    TestDeadPhiCyclesAndPlanningRoots();
-    TestUndefinedRuntimeValueFails();
+    const auto Run = [](const char *name, auto test) {
+      std::cout << "TypedValuePlanningTests: run " << name << std::endl;
+      try {
+        test();
+      } catch (const std::exception &exception) {
+        throw std::runtime_error(std::string(name) + ": " + exception.what());
+      }
+      std::cout << "TypedValuePlanningTests: ok " << name << std::endl;
+    };
+    Run("immediate-flattening", TestImmediateFlatteningAndGvn);
+    Run("raw-scalar-alignment", TestRawScalarComponentAlignment);
+    Run("scalar-domain-mismatch", TestScalarMemoryDomainMismatchFails);
+    Run("dynamic-read-typed", TestDynamicReadRemainsTyped);
+    Run("nested-walk", TestNestedSrtWalk);
+    Run("shader-base", TestShaderBaseAndUserData);
+    Run("carry-bitfields", TestCarryAndBitFields);
+    Run("invariant-divergent-phi", TestInvariantAndDivergentPhi);
+    Run("operand-mutation", TestOperandMutationLifecycle);
+    Run("control-dependent-load", TestControlDependentStandaloneLoadStaysTyped);
+    Run("runtime-64bit", TestRuntime64BitDescriptorOps);
+    Run("uniform-lod", TestUniformFirstLaneSamplerLod);
+    Run("float-comparison", TestFloatComparisonDescriptorInputs);
+    Run("shared-integer-deps", TestSharedIntegerRuntimeDependencies);
+    Run("constant-buffer-bounds", TestConstantBufferBounds);
+    Run("read-lane-elim", TestReadLaneElimination);
+    Run("partial-reduction", TestPartialWaveReductionStructure);
+    Run("reduction-folded", TestPartialWaveReductionFoldedFill);
+    Run("reduction-reject", TestPartialWaveReductionRejectsUnprovenPatterns);
+    Run("reduction-compound", TestPartialWaveReductionCompoundFillCondition);
+    Run("reduction-compare", TestPartialWaveReductionCompareDerivedFillCondition);
+    Run("reduction-equiv", TestPartialWaveReductionEquivalence);
+    Run("complete-umin", TestCompleteUMinReduction);
+    Run("opt-pipeline", TestOptimizationPipeline);
+    Run("control-flow-fold", TestControlFlowValueSurvivesReadLaneFolding);
+    Run("dead-phi-roots", TestDeadPhiCyclesAndPlanningRoots);
+    Run("undef-runtime", TestUndefinedRuntimeValueFails);
     std::cout << "TypedValuePlanningTests: all cases passed\n";
     return 0;
   } catch (const std::exception &e) {
