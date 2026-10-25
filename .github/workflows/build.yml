@@ -29,8 +29,8 @@ jobs:
 
   windows:
     name: Build KytyPS5 (Windows)
-    # Skipped for now: 25 min glslang install per run. Re-enable by deleting this line.
-    if: false
+    # The glslang vcpkg install costs ~25 min on a cold cache; the cache key above
+    # keeps it warm after the first run.
     needs: metadata
     runs-on: windows-2022
 
