@@ -29,6 +29,8 @@ jobs:
 
   windows:
     name: Build KytyPS5 (Windows)
+    # Skipped for now: 25 min glslang install per run. Re-enable by deleting this line.
+    if: false
     needs: metadata
     runs-on: windows-2022
 
@@ -416,8 +418,7 @@ jobs:
     if: >-
       always() &&
       github.event_name == 'workflow_dispatch' &&
-      (needs.windows.result == 'success' ||
-       needs.linux.result == 'success')
+      needs.linux.result == 'success'
     needs: [metadata, windows, macos, linux]
     runs-on: ubuntu-latest
     permissions:
