@@ -986,7 +986,8 @@ void TestCompleteUMinReduction() {
     const auto cross = fixture.Emit(ValueOpcode::Permlane16U32,
         {test == Case::CrossSource ? source : prefix,
          Value(test == Case::CrossSelectorLow ? 0xfffffff0u : UINT32_MAX),
-         Value(test == Case::CrossSelectorHigh ? 0xfffffff0u : UINT32_MAX), cross_exec});
+         Value(test == Case::CrossSelectorHigh ? 0xfffffff0u : UINT32_MAX), cross_exec,
+         Value(0u)});
     cross.Instruction()->SetFlags(PermlaneFlags{
         .x16 = test != Case::CrossRow, .fetch_inactive = test == Case::CrossFetch,
         .bound_control = test != Case::CrossBound});
@@ -1150,6 +1151,12 @@ int DbgExitHandler(const char *, int, std::string_view text) {
 
 int DbgExitHandler(const char *, int, fmt::text_style, std::string_view text) {
   throw std::runtime_error(std::string(text));
+}
+
+// Reached through Common::Thread on Windows (threads.cpp is linked in for the config/experiment
+// globals); report it as an ordinary failure instead of leaving the symbol undefined.
+int DbgNotImplementedHandler(const char *expr, const char *, int) {
+  throw std::runtime_error(std::string("not implemented (") + expr + ")");
 }
 
 void DbgExit(int) { std::abort(); }
