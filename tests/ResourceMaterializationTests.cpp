@@ -2568,6 +2568,10 @@ int DbgExitHandler(const char *, int, fmt::text_style, std::string_view) {
 
 int DbgExitIfHandler(const char *, const char *, int) { return 1; }
 
+// Reached through Common::Thread on Windows (threads.cpp is linked in for the
+// config/experiment globals); without it the target does not link there.
+int DbgNotImplementedHandler(const char *, const char *, int) { std::abort(); }
+
 void DbgExit(int) { std::abort(); }
 
 } // namespace Common
