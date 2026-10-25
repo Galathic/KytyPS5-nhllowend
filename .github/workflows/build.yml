@@ -43,33 +43,24 @@ jobs:
       - name: Setup Visual Studio environment
         uses: ilammy/msvc-dev-cmd@v1
 
-      - name: Locate vcpkg
-        id: vcpkg
-        shell: pwsh
-        run: |
-          $vcpkgRoot = Split-Path (Get-Command vcpkg).Source
-          $portHash = (Get-FileHash "$vcpkgRoot\ports\glslang\vcpkg.json" -Algorithm SHA256).Hash
-          "root=$vcpkgRoot" |
-            Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          "port_hash=$($portHash.ToLowerInvariant())" |
-            Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-
-      - name: Cache glslang
-        id: glslang_cache
-        uses: actions/cache@v4
-        with:
-          path: ${{ steps.vcpkg.outputs.root }}\installed\x64-windows
-          key: glslang-${{ runner.os }}-${{ runner.arch }}-${{ steps.vcpkg.outputs.port_hash }}-tools-opt
-
       - name: Install glslang
         shell: pwsh
         run: |
-          $vcpkgRoot = "${{ steps.vcpkg.outputs.root }}"
-          if ("${{ steps.glslang_cache.outputs.cache-hit }}" -ne "true") {
-            vcpkg install glslang[tools,opt]:x64-windows
+          # Prebuilt Khronos binary instead of the vcpkg port: building glslang from
+          # source cost ~20 min per run and that cache never populated, so every
+          # Windows run spent its first half hour here before reaching the build.
+          $version = "16.6.0"
+          $url = "https://github.com/KhronosGroup/glslang/releases/download/$version/glslang-$version-windows-x86_64-release.zip"
+          $zip = Join-Path $env:RUNNER_TEMP "glslang.zip"
+          $dir = Join-Path $env:RUNNER_TEMP "glslang-$version"
+          curl.exe --silent --show-error --fail --location --retry 3 --output $zip $url
+          Expand-Archive $zip -DestinationPath $dir -Force
+          $bin = Join-Path $dir "bin"
+          if (-not (Test-Path (Join-Path $bin "glslang.exe"))) {
+            throw "glslang.exe is missing from $url"
           }
-          "$vcpkgRoot\installed\x64-windows\tools\glslang" |
-            Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & (Join-Path $bin "glslang.exe") --version
+          $bin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -84,7 +75,7 @@ jobs:
           cmake --version
           ninja --version
           clang-cl --version
-          glslangValidator --version
+          glslang --version
           cargo --version
           rustc --version
 
