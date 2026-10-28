@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdlib>
 #include <mutex>
 #include <vector>
 
@@ -42,6 +43,30 @@ struct RecycledImage {
 constexpr size_t   RecycledImagesMax     = 32;
 // NHL 27 frees and recreates about seven aliased full-screen targets (some 125 MiB) every frame.
 constexpr uint64_t RecycledImageBytesMax = 768ull * 1024 * 1024;
+// On a GPU with little video memory the kept images compete with the game's live ones, so the pool
+// is limited to a sixth of the device-local memory (768 MiB from 4.5 GiB up, so larger cards behave as
+// before; never below 256 MiB). KYTY_IMAGE_RECYCLE_MB overrides it (0 turns recycling off).
+constexpr uint64_t RecycledImageBytesMin = 256ull * 1024 * 1024;
+
+uint64_t RecycledImageBytesLimit(const vk::PhysicalDeviceMemoryProperties& memory) {
+	if (const char* value = std::getenv("KYTY_IMAGE_RECYCLE_MB"); value != nullptr) {
+		char*      end    = nullptr;
+		const auto parsed = std::strtoull(value, &end, 10);
+		if (end != value && *end == '\0' && parsed <= (1ull << 20)) {
+			return parsed * 1024ull * 1024ull;
+		}
+	}
+	uint64_t local = 0;
+	for (uint32_t heap = 0; heap < memory.memoryHeapCount; heap++) {
+		if (memory.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+			local += memory.memoryHeaps[heap].size;
+		}
+	}
+	if (local == 0) {
+		return RecycledImageBytesMax;
+	}
+	return std::clamp(local / 6, RecycledImageBytesMin, RecycledImageBytesMax);
+}
 
 std::mutex                 g_recycled_mutex;
 std::vector<RecycledImage> g_recycled;
@@ -265,13 +290,15 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
 	create.usage         = image.usage;
 	create.sharingMode   = vk::SharingMode::eExclusive;
 	create.initialLayout = vk::ImageLayout::eUndefined;
-	if (image.recyclable) {
+	static const uint64_t recycled_bytes_limit =
+	    RecycledImageBytesLimit(physical_device_memory_properties);
+	if (image.recyclable && recycled_bytes_limit != 0) {
 		VmaAllocationInfo allocation_info {};
 		vmaGetAllocationInfo(allocator, image.allocation, &allocation_info);
 		std::lock_guard lock(g_recycled_mutex);
 		g_recycled.push_back({create, image.image, image.allocation, allocation_info.size});
 		g_recycled_bytes += allocation_info.size;
-		while (g_recycled.size() > RecycledImagesMax || g_recycled_bytes > RecycledImageBytesMax) {
+		while (g_recycled.size() > RecycledImagesMax || g_recycled_bytes > recycled_bytes_limit) {
 			const auto& oldest = g_recycled.front();
 			vmaDestroyImage(allocator, oldest.image, oldest.allocation);
 			g_recycled_bytes -= oldest.size;

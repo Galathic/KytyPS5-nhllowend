@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <memory>
 #include <string_view>
+#include <thread>
 
 namespace Config {
 
@@ -240,6 +241,21 @@ uint32_t ParseGpuPipelineStages(const char* value) {
 
 static const std::array<int, 7>& GpuStageCpus();
 
+// The default stage CPUs (2, 4, 6, 8, 10 for the five stages that run by default) and the raised
+// stage thread priority were tuned on machines with at least 12 logical CPUs. On a smaller CPU the
+// pins would name CPUs that do not exist (the OS ignores them, so the stages float) or stack the
+// stages on the cores the game threads need, and five busy highest-priority threads would starve
+// the guest threads. Below this count the stages are left unpinned at normal priority, so the OS
+// scheduler shares the few cores. KYTY_GPU_THREAD_CPUS and KYTY_GPU_THREAD_PRIORITY still override.
+// (0 means the count is unknown: keep the tuned defaults.)
+static bool HasCpusForStageTuning() {
+	static const bool enough = [] {
+		const unsigned cpus = std::thread::hardware_concurrency();
+		return cpus == 0 || cpus >= 12;
+	}();
+	return enough;
+}
+
 int GpuStageCpu(GpuStageThread stage) {
 	return GpuStageCpus()[static_cast<uint32_t>(stage)];
 }
@@ -251,7 +267,10 @@ void ConfigureGpuStageThread(GpuStageThread stage) {
 	const auto& cpus = GpuStageCpus();
 	static const bool high_priority = [] {
 		const char* value = std::getenv("KYTY_GPU_THREAD_PRIORITY");
-		return value == nullptr || std::string_view(value) != "0";
+		if (value == nullptr) {
+			return HasCpusForStageTuning();
+		}
+		return std::string_view(value) != "0";
 	}();
 	if (high_priority) {
 		Common::Thread::RaiseCurrentPriority();
@@ -275,6 +294,9 @@ static const std::array<int, 7>& GpuStageCpus() {
 		std::array<int, 7> result {4, 6, 8, 10, 2, 12, 14};
 		const char*        value = std::getenv("KYTY_GPU_THREAD_CPUS");
 		if (value == nullptr) {
+			if (!HasCpusForStageTuning()) {
+				return std::array<int, 7> {-1, -1, -1, -1, -1, -1, -1};
+			}
 			return result;
 		}
 		if (std::string_view(value) == "off") {
