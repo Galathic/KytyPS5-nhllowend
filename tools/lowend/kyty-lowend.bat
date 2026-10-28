@@ -35,16 +35,27 @@ set KYTY_PERF_NO_SYNC_READBACK=1
 rem ---- Performance switches measured by the fork's authors on NHL 27 (high-end hardware). ----
 rem These cost no extra video memory and need no special GPU feature
 rem (KYTY_GPU_COLOR_CLEAR is skipped by the emulator on GPUs without VK_EXT_conditional_rendering).
-set KYTY_DIRECT_EOP_INTERRUPTS=1
-set KYTY_SPARSE_BUFFER_GC=1
-set KYTY_PM4_WRITE_DATA_FAST=1
-set KYTY_FALSE_SHARE_READS=1
-set KYTY_ASYNC_SUBMIT=1
-set KYTY_LAZY_SHARED_WRITES=1
-set KYTY_FAULT_PAGE_READS=1
-set KYTY_GPU_COLOR_CLEAR=1
-set KYTY_ASYNC_GUEST_READS=1
-set KYTY_BDA_DIRTY_REGIONS=1
+rem Skipped when KYTY_LOWEND_SAFE is set (see kyty-lowend-safe.bat).
+if not defined KYTY_LOWEND_SAFE (
+  set KYTY_DIRECT_EOP_INTERRUPTS=1
+  set KYTY_SPARSE_BUFFER_GC=1
+  set KYTY_PM4_WRITE_DATA_FAST=1
+  set KYTY_FALSE_SHARE_READS=1
+  set KYTY_ASYNC_SUBMIT=1
+  set KYTY_LAZY_SHARED_WRITES=1
+  set KYTY_FAULT_PAGE_READS=1
+  set KYTY_GPU_COLOR_CLEAR=1
+  set KYTY_ASYNC_GUEST_READS=1
+  set KYTY_BDA_DIRTY_REGIONS=1
+)
+
+rem Safe mode: no performance switches, and this fork's own changes are switched back to the
+rem upstream behavior (768 MiB image pool, highest GPU thread priority, upstream thread pins).
+if defined KYTY_LOWEND_SAFE (
+  set KYTY_IMAGE_RECYCLE_MB=768
+  set KYTY_GPU_THREAD_PRIORITY=1
+  set KYTY_GPU_THREAD_CPUS=4,6,8,10,2,12,14
+)
 
 rem ---- Left out on purpose; try them one at a time if you have room to spare. ----
 rem More video/system memory (keeps idle buffers 10x longer, +9% in the authors' test):

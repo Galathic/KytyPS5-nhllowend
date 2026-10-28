@@ -39,3 +39,27 @@ download the result. Builds from forks do not replace themselves with official r
 To build locally instead, follow the README (clang-cl, Ninja, Qt 6). `-DKYTY_PGO=use` needs clang
 22.1.8 exactly and gave about +15% upstream. `-DKYTY_THIN_LTO=ON` makes linking slow and memory
 hungry, which is a bad trade on a weak build machine.
+
+## Stuck at 0 fps when entering Free Skate or a game
+
+Two different things look the same on screen.
+
+1. **Shader compilation.** The first time a mode is entered, its shaders are compiled, and the
+   upstream notes say this takes minutes at 0 fps. On a weak CPU it can take far longer. Open Task
+   Manager: if `kyty_emulator.exe` uses a lot of CPU, it is compiling, so wait (one time, possibly
+   20-30 minutes) and do not close it. The results are saved in a `_PipelineCache` folder in the
+   folder you start the emulator from, so always start it from the same place (use the .bat, not
+   a shortcut that starts elsewhere). Starting a different build can recompile some of it.
+2. **A real hang.** CPU use near zero and nothing moving for several minutes.
+
+To find out whether this fork's own changes or the extra performance switches are involved, run
+`kyty-lowend-safe.bat` instead. It uses only the switches the README calls required and puts the
+upstream behavior back (768 MiB image pool, highest GPU thread priority, upstream thread pins).
+
+- Works in safe mode, freezes in the normal profile: one of the performance switches or this fork's
+  changes is the cause. Then `set KYTY_IMAGE_RECYCLE_MB=768`, `set KYTY_GPU_THREAD_PRIORITY=1` and
+  `set KYTY_GPU_THREAD_CPUS=4,6,8,10,2,12,14` (one at a time, before running the normal profile)
+  show which of this fork's changes it is.
+- Freezes in safe mode too: not caused by this fork's changes; send the console output. Start the
+  .bat from a Command Prompt window so the text stays visible. Lines starting with `NHL27HANG` or
+  `NHL27STUCKWAIT` and the `Shader warm-up` lines are the useful ones.
